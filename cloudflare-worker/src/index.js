@@ -308,6 +308,6 @@ export default {
       return handleWebhook(request, env);
     }
 
-    return new Response("Not Found", { status: 404 });
+    return new Response("Invalid Request", { status: 400 });
   }
 };
