@@ -115,7 +115,8 @@ async function handleWebhook(request, env) {
     if (reportFormality.warnings.length > 0) {
       const commentWarnings = reportFormality.warnings.filter(w => 
         !w.includes("No reference link (e.g.") && 
-        !w.includes("Commit is unsigned or")
+        !w.includes("Commit is unsigned or") &&
+        !w.includes("Subject line exceeds soft limit")
       );
       if (commentWarnings.length > 0) {
         allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n` + commentWarnings.map(w => `- ⚠️ ${w}`).join("\n"));
