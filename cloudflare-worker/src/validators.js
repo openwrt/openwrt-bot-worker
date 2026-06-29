@@ -76,7 +76,7 @@ export function validateFormalities(fullCommit, CONFIG) {
   if (subjectLen > CONFIG.max_subject_len_hard) {
     subjectErrors.push(`Subject line exceeds hard limit (${subjectLen}/${CONFIG.max_subject_len_hard} chars)`);
   } else if (subjectLen > CONFIG.max_subject_len_soft) {
-    subjectErrors.push(`Subject line exceeds soft limit (${subjectLen}/${CONFIG.max_subject_len_soft} chars)`);
+    warnings.push(`Subject line exceeds soft limit (${subjectLen}/${CONFIG.max_subject_len_soft} chars)`);
   }
 
   if (subjectErrors.length === 0) {
