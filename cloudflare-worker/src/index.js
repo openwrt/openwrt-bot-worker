@@ -99,6 +99,18 @@ async function handleWebhook(request, env) {
     };
   }));
 
+  // Pre-scan all commit patches to see if this PR introduces or drops any package Makefiles
+  for (const item of commitDetails) {
+    if (item.commitPatch) {
+      if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(item.commitPatch)) {
+        state.isNewPackage = true;
+      }
+      if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(item.commitPatch)) {
+        state.isDroppedPackage = true;
+      }
+    }
+  }
+
   // RUN CHECKS ON COMMITS
   for (const item of commitDetails) {
     const { sha, html_url, fullCommit, commitPatch } = item;
@@ -223,16 +235,31 @@ async function handleWebhook(request, env) {
       }
     });
 
-    if (!formalityPassed || allPrWarnings.length > 0) {
-      const titleStatus = !formalityPassed ? "Failed" : "Suggestions Available";
+    if (!allPassed || allPrWarnings.length > 0) {
+      const titleStatus = !allPassed ? "Failed" : "Suggestions Available";
       let commentBody = `## Formality Check: ${titleStatus}\n\n`;
       commentBody += "We completed the verification flow. Please review the formatting overview logs below.\n\n";
 
-      if (!formalityPassed) {
+      if (!allPassed) {
         commentBody += "### 🛑 CRITICAL ERRORS\n";
-        allFormalityErrors.forEach(errorBlock => {
-          commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
-        });
+        
+        if (!formalityPassed) {
+          allFormalityErrors.forEach(errorBlock => {
+            commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+          });
+        }
+        
+        if (!makefilePassed) {
+          allMakefileErrors.forEach(errorBlock => {
+            commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+          });
+        }
+        
+        if (!patchesPassed) {
+          allPatchesErrors.forEach(errorBlock => {
+            commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+          });
+        }
       }
 
       if (allPrWarnings.length > 0) {

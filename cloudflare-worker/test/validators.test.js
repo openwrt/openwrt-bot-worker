@@ -206,6 +206,7 @@ describe('validateMakefileContext', () => {
     assert.ok(res.errors.some(e => e.includes('PKG_MAINTAINER')));
     assert.ok(res.errors.some(e => e.includes('PKG_LICENSE')));
     assert.ok(res.errors.some(e => e.includes('PKG_LICENSE_FILES')));
+    assert.ok(!res.errors.some(e => e.includes('PKG_VERSION')), 'PKG_VERSION should not be checked for new packages');
   });
 
   test('detects CRLF line endings', () => {

@@ -219,7 +219,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     state.isDroppedPackage = true;
   }
 
-  if (CONFIG.check_pkg_version) {
+  if (CONFIG.check_pkg_version && !state.isNewPackage) {
     const versionMatch = commitPatch.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
     if (versionMatch) {
       const newVersion = versionMatch[1].replace(/["']/g, "").trim();
