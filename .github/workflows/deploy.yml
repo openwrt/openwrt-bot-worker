@@ -1,0 +1,25 @@
+name: Deploy Webhooks to Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy Worker
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Inject Deploy Variables into wrangler.toml
+        run: |
+          sed -i "s/DEPLOY_HASH = \"unknown\"/DEPLOY_HASH = \"${{ github.sha }}\"/" cloudflare-worker/wrangler.toml
+          sed -i "s/DEPLOY_DATE = \"unknown\"/DEPLOY_DATE = \"$(TZ='Europe/Prague' date +'%Y-%m-%d %H:%M:%S %Z')\"/" cloudflare-worker/wrangler.toml
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          workingDirectory: 'cloudflare-worker'

@@ -1,0 +1,12 @@
+name = "openwrt-bot"
+main = "src/index.js"
+compatibility_date = "2026-06-29"
+workers_dev = false
+preview_urls = false
+
+[observability]
+enabled = true
+
+[vars]
+DEPLOY_HASH = "unknown"
+DEPLOY_DATE = "unknown"

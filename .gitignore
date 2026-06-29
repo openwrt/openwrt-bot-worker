@@ -1,0 +1,4 @@
+openwrt/config.local.php
+openwrt/version.php
+node_modules/
+.wrangler/

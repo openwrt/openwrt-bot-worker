@@ -1,0 +1,111 @@
+# OpenWrt PR Gatekeeper
+
+A modern GitHub App webhook engine running on **Cloudflare Workers** that automates Pull Request validations, styling constraints, OpenWrt build recipe (Makefile) checks, downstream patches testing, and timeline triage.
+
+## Features Matrix
+
+The validation engine splits checks into three distinct asynchronous status streams grouped natively under the GitHub App interface:
+
+### 1. Formalities Check
+Focuses on Git history hygiene, developer metadata constraints, and layout standards:
+
+*   **Branch Target Enforcement:** Ensures pull requests originate from dedicated feature branches, blocking accidental direct PRs from `main`, `master`, or active stable branches.
+*   **Merge Commit Elimination:** Rejects merge commits inside the PR tracking chain to preserve a clean linear history.
+*   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
+*   **Autosquash Compliance:** Automatically bypasses style constraints for development-phase `fixup!` and `squash!` syntax blocks.
+*   **Subject String Hygiene:** Enforces `<package name or prefix>: ` prefix headers, checks lowercase starting strings post-prefix, and rejects trailing periods.
+*   **Length Constraints:** Implements dual-layered (soft and hard) line width boundaries for both subject lines and description body text blocks.
+*   **Signed-off-by Check:** Ensures a consistent, properly structured `Signed-off-by:` declaration is present and matches the original author metadata.
+*   **Signature Verification:** Validates cryptographic GPG/SSH commit signatures if present.
+*   **Description Quality Warnings:** Inspects message bodies and issues non-blocking warnings for lazy/identical description text mirroring the subject or for completely missing reference links (changelogs/release notes).
+
+### 2. Makefile Check
+Inspects file modification trees targeting OpenWrt build recipes:
+
+*   **PKG_VERSION Sync:** Validates that if a version bump is introduced inside a Makefile, the matching version string exists within the commit subject line context.
+*   **Mandatory Metadata:** Enforces the inclusion of `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` variables whenever a new package is introduced.
+*   **Conffiles Tracker:** Mandates the definition of the `Package/.../conffiles` tracking macro whenever configuration file installations (`INSTALL_CONF`) are triggered.
+*   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
+
+### 3. Patches Check
+Scans the contribution tree for nested downstream patch targets:
+
+*   **Git-Am Compliance:** Automatically isolates modified `.patch` assets and checks for accurate `From:` and `Subject:` header identifiers to ensure smooth downstream `git am` deployment runs.
+
+---
+
+### Automated Triage (Labels & Comments)
+
+*   **`not following guidelines`:** A high-visibility tag automatically attached to the PR if any critical validation check drops a failure blueprint. Clears itself upon a successful push.
+*   **`add package` / `drop package`:** Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages.
+*   **Stable Branch Tracking:** Auto-generates matching grey tags (e.g., `openwrt-24.10`, `openwrt-25.12`) whenever a PR is targeted directly into an active backport branch.
+*   **Clean Timelines:** Drops descriptive, cleanly formatted markdown dashboards into the PR conversation section on failure, automatically editing or removing itself once instructions are followed to keep the timeline clean.
+*   **Header Footnote:** PR comments include a dynamic footnote linking directly to this repository's issues page for reporting validation bugs.
+
+---
+
+## Setup & Deployment
+
+The engine is built as a headless JavaScript service hosted on **Cloudflare Workers**. It operates with zero local npm/Node dependencies inside the repository, making it highly secure and maintenance-free.
+
+### 1. GitHub App Configuration
+
+The GitHub App requires the following permissions and event subscriptions:
+
+*   **Repository permissions:**
+    *   **Checks:** `Read & write` (to publish validation audit check runs)
+    *   **Commit statuses:** `Read & write` (to update commit statuses)
+    *   **Pull requests:** `Read & write` (to add review comments and manage triage labels)
+    *   **Contents:** `Read-only` (to fetch repository-specific configurations like `.github/formalities.json`)
+*   **Event Subscriptions:**
+    *   Subscribe to **Pull request** events (triggers on opened, synchronized, and reopened).
+
+### 2. Cloudflare Worker Configuration
+
+1.  Deploy the Worker to your Cloudflare account (managed automatically via the CI/CD pipeline).
+2.  In the Cloudflare Dashboard under **Workers & Pages -> Settings -> Variables**, configure the following variables as **Secrets** (encrypted):
+    *   **`APP_ID`**: Your GitHub App ID (e.g., `123456`).
+    *   **`WEBHOOK_SECRET`**: The secret token used to verify GitHub webhook HMAC-SHA256 signatures.
+    *   **`PRIVATE_KEY`**: The complete text of your GitHub App private key PEM file.
+        > [!IMPORTANT]
+        > The private key must be in **PKCS#8** format (starting with `-----BEGIN PRIVATE KEY-----`). If your downloaded key starts with `-----BEGIN RSA PRIVATE KEY-----` (PKCS#1), convert it using:
+        > `openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in rsa_key.pem -out pkcs8_key.pem`
+
+### 3. CI/CD Pipeline (GitHub Actions)
+
+The repository includes a GitHub Actions workflow in [`.github/workflows/deploy.yml`](file:///.github/workflows/deploy.yml) that builds and deploys the Worker automatically on every push to `main`:
+*   Runs on a lightweight `ubuntu-slim` container.
+*   Automatically injects the build commit hash (`DEPLOY_HASH`) and deploy timestamp in Prague timezone (`DEPLOY_DATE`) into the wrangler variables before deployment.
+*   To enable deployment, add your **`CLOUDFLARE_API_TOKEN`** (with edit permissions for Workers) as a secret in your GitHub repository's **Settings -> Secrets and variables -> Actions**.
+
+### 4. Repository Level Customization
+
+If individual source repositories wish to tweak defaults or scale back rule restrictions, creators can commit a custom `.github/formalities.json` file inside their repository branch root.
+
+Here is a comprehensive example containing all available toggle options:
+
+```json
+{
+  "check_branch": true,
+  "check_merge_commits": true,
+  "check_noreply_email": true,
+  "check_signoff": true,
+  "check_signature": true,
+  "allow_autosquash": true,
+  "enable_comments": true,
+  "max_subject_len_soft": 60,
+  "max_subject_len_hard": 80,
+  "max_body_line_len": 100,
+  "warn_duplicate_body": true,
+  "warn_generic_subjects": true,
+  "require_release_notes": true,
+  "check_pkg_version": true,
+  "check_crlf": true,
+  "add_package_label": true,
+  "drop_package_label": true,
+  "branch_labeling": true,
+  "check_openwrt_meta": true,
+  "check_conffiles": true,
+  "check_patch_headers": true
+}
+```
