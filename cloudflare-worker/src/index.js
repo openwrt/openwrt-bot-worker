@@ -195,8 +195,10 @@ async function handleWebhook(request, env) {
   }
 
   if (CONFIG.branch_labeling && /^openwrt-\d{2}\.\d{2}$/.test(baseBranch)) {
-    labelOperations.push(ensureLabelExists(baseBranch, '6b7280', `Pull request targets the stable release branch ${baseBranch}`));
-    labelsToAdd.push(baseBranch);
+    const version = baseBranch.split('-')[1];
+    const labelName = `release/${version}`;
+    labelOperations.push(ensureLabelExists(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
+    labelsToAdd.push(labelName);
   }
 
   // Pre-create any missing repository labels in parallel
