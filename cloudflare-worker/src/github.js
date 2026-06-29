@@ -37,13 +37,14 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   return {
     code: response.status,
     data,
-    raw: text
+    raw: text,
+    headers: response.headers
   };
 }
 
 export async function fetchRepositoryConfig(data, token, defaultConfig) {
   const repoFullname = data.repository.full_name;
-  const branchRef = data.pull_request.head.ref;
+  const branchRef = data.pull_request.base.ref;
   const configUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/formalities.json?ref=${encodeURIComponent(branchRef)}`;
 
   const res = await githubApiCall(configUrl, token, 'GET', null, 'application/vnd.github.raw');

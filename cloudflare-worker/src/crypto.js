@@ -1,3 +1,5 @@
+import { githubApiCall } from './github.js';
+
 // --- CRYPTO HELPERS FOR JWT SIGNING ---
 function base64ToArrayBuffer(b64) {
   const byteString = atob(b64);
@@ -63,16 +65,9 @@ export async function generateJWT(appId, privateKeyPEM) {
 
 export async function getInstallationToken(installationId, appId, privateKeyPEM) {
   const jwt = await generateJWT(appId, privateKeyPEM);
-  const response = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${jwt}`,
-      "Accept": "application/vnd.github+json",
-      "User-Agent": "FormalityCheck-Bot"
-    }
-  });
-  const data = await response.json();
-  return data.token || null;
+  const url = `https://api.github.com/app/installations/${installationId}/access_tokens`;
+  const res = await githubApiCall(url, jwt, 'POST');
+  return res.data?.token || null;
 }
 
 // --- CRYPTO HELPERS FOR WEBHOOK HMAC SIGNATURE ---

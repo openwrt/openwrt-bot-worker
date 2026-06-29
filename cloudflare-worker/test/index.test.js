@@ -1,6 +1,7 @@
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import worker from '../src/index.js';
+import { handleScheduled } from '../src/stale.js';
 
 async function calculateHmac(secret, payload) {
   const encoder = new TextEncoder();
@@ -17,11 +18,30 @@ async function calculateHmac(secret, payload) {
   return `sha256=${hashHex}`;
 }
 
-describe('Cloudflare Worker Webhook & Error Handling', () => {
+async function generateTestPrivateKeyPEM() {
+  const keyPair = await crypto.subtle.generateKey(
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256"
+    },
+    true,
+    ["sign", "verify"]
+  );
+
+  const exported = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+  const exportedB64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
+  return `-----BEGIN PRIVATE KEY-----\n${exportedB64}\n-----END PRIVATE KEY-----`;
+}
+
+describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () => {
   let originalFetch;
   let fetchMock;
+  let privateKeyPEM;
 
-  before(() => {
+  before(async () => {
+    privateKeyPEM = await generateTestPrivateKeyPEM();
     originalFetch = globalThis.fetch;
     globalThis.fetch = async (url, options) => {
       if (fetchMock) {
@@ -347,6 +367,306 @@ index 123456..789012 100644
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+
+  test('does not scan repository if enable_stale_bot is not true in formalities.json', async () => {
+    const urls = [];
+    fetchMock = async (url, options) => {
+      urls.push(url);
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      if (url.includes('/contents/.github/formalities.json')) {
+        // formalities.json exists but enable_stale_bot is unset / false
+        return new Response(JSON.stringify({ enable_stale_bot: false }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const env = {
+        APP_ID: "12345",
+        PRIVATE_KEY: privateKeyPEM
+      };
+      const ctx = {
+        waitUntil: async (promise) => {
+          await promise;
+        }
+      };
+
+      // Invoke handleScheduled directly to await execution
+      await handleScheduled(env);
+
+      // Should have checked config but skipped label list and issues query
+      assert.ok(urls.some(u => u.includes('/contents/.github/formalities.json')));
+      assert.ok(!urls.some(u => u.includes('/labels')));
+      assert.ok(!urls.some(u => u.includes('/issues')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('marks inactive PRs stale if they violate guidelines', async () => {
+    const apiCalls = [];
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      if (url.includes('/contents/.github/formalities.json')) {
+        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
+      }
+      if (url.includes('/labels') && !url.includes('/issues/')) {
+        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/events')) {
+        // Query returns 1 open guidelines-violating PR (number 55) which is older than 14 days and doesn't have the stale label
+        const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          {
+            number: 55,
+            updated_at: daysAgo15,
+            labels: [{ name: 'not following guidelines' }],
+            pull_request: {}
+          }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const env = {
+        APP_ID: "12345",
+        PRIVATE_KEY: privateKeyPEM
+      };
+      const ctx = {
+        waitUntil: async (promise) => {
+          await promise;
+        }
+      };
+
+      await handleScheduled(env);
+
+      // Verify it added the "stale" label and posted a warning comment
+      const labelCall = apiCalls.find(c => c.url.includes('/issues/55/labels') && c.method === 'POST');
+      assert.ok(labelCall);
+      assert.deepStrictEqual(labelCall.body, { labels: ['stale'] });
+
+      const commentCall = apiCalls.find(c => c.url.includes('/issues/55/comments') && c.method === 'POST');
+      assert.ok(commentCall);
+      assert.ok(commentCall.body.body.includes('inactive for 14 days'));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('removes stale label from active PRs (activity detected post-stale)', async () => {
+    const apiCalls = [];
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      if (url.includes('/contents/.github/formalities.json')) {
+        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
+      }
+      if (url.includes('/labels') && !url.includes('/issues/')) {
+        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/events')) {
+        // PR number 66 has both 'stale' and 'not following guidelines' labels
+        // and was updated 1 minute ago (recent activity)
+        const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          {
+            number: 66,
+            updated_at: minuteAgo,
+            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
+            pull_request: {}
+          }
+        ]), { status: 200 });
+      }
+      if (url.includes('/issues/66/events')) {
+        // Stale label was added 1 hour ago (which is older than the recent 1-minute-ago update, i.e., user active post-stale)
+        const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          {
+            event: 'labeled',
+            label: { name: 'stale' },
+            created_at: hourAgo
+          }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const env = {
+        APP_ID: "12345",
+        PRIVATE_KEY: privateKeyPEM
+      };
+      const ctx = {
+        waitUntil: async (promise) => {
+          await promise;
+        }
+      };
+
+      await handleScheduled(env);
+
+      // Verify it sent a DELETE request for the stale label
+      const deleteCall = apiCalls.find(c => c.url.includes('/issues/66/labels/stale') && c.method === 'DELETE');
+      assert.ok(deleteCall);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('closes stale PRs if close threshold is reached without activity', async () => {
+    const apiCalls = [];
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      if (url.includes('/contents/.github/formalities.json')) {
+        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
+      }
+      if (url.includes('/labels') && !url.includes('/issues/')) {
+        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/events')) {
+        // PR 77 has stale and guidelines labels and was updated 15 days ago
+        const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          {
+            number: 77,
+            updated_at: daysAgo15,
+            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
+            pull_request: {}
+          }
+        ]), { status: 200 });
+      }
+      if (url.includes('/issues/77/events')) {
+        // Stale label was added 15 days ago (older than 14 days stale threshold)
+        const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          {
+            event: 'labeled',
+            label: { name: 'stale' },
+            created_at: daysAgo15
+          }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const env = {
+        APP_ID: "12345",
+        PRIVATE_KEY: privateKeyPEM
+      };
+      const ctx = {
+        waitUntil: async (promise) => {
+          await promise;
+        }
+      };
+
+      await handleScheduled(env);
+
+      // Verify it sent a POST comment and a PATCH pulls state:closed
+      const commentCall = apiCalls.find(c => c.url.includes('/issues/77/comments') && c.method === 'POST');
+      assert.ok(commentCall);
+      assert.ok(commentCall.body.body.includes('closed because it has been marked stale'));
+
+      const patchCall = apiCalls.find(c => c.url.includes('/pulls/77') && c.method === 'PATCH');
+      assert.ok(patchCall);
+      assert.deepStrictEqual(patchCall.body, { state: 'closed' });
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('removes stale label immediately if guidelines label was removed (resolved)', async () => {
+    const apiCalls = [];
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      if (url.includes('/contents/.github/formalities.json')) {
+        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
+      }
+      if (url.includes('/labels') && !url.includes('/issues/')) {
+        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/events')) {
+        // PR 88 has only the stale label (the guidelines label is missing/resolved)
+        return new Response(JSON.stringify([
+          {
+            number: 88,
+            updated_at: new Date().toISOString(),
+            labels: [{ name: 'stale' }],
+            pull_request: {}
+          }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const env = {
+        APP_ID: "12345",
+        PRIVATE_KEY: privateKeyPEM
+      };
+      const ctx = {
+        waitUntil: async (promise) => {
+          await promise;
+        }
+      };
+
+      await handleScheduled(env);
+
+      // Verify it sent a DELETE request for the stale label of PR 88
+      const deleteCall = apiCalls.find(c => c.url.includes('/issues/88/labels/stale') && c.method === 'DELETE');
+      assert.ok(deleteCall);
+    } finally {
       fetchMock = null;
     }
   });

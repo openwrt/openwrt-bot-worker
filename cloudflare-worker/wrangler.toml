@@ -10,6 +10,9 @@ enabled = true
 [placement]
 hostname = "api.github.com"
 
+[triggers]
+crons = ["30 5 * * *"]
+
 [vars]
 DEPLOY_HASH = "unknown"
 DEPLOY_DATE = "unknown"

@@ -39,13 +39,18 @@ Scans the contribution tree for nested downstream patch targets:
 
 ---
 
-### Automated Triage (Labels & Comments)
+### Automated Triage & Stale PR Management
 
-*   **`not following guidelines`:** A high-visibility tag automatically attached to the PR if any critical validation check drops a failure blueprint. Clears itself upon a successful push.
-*   **`add package` / `drop package`:** Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages.
-*   **Stable Branch Tracking:** Auto-generates matching grey tags (e.g., `openwrt-24.10`, `openwrt-25.12`) whenever a PR is targeted directly into an active backport branch.
-*   **Clean Timelines:** Drops descriptive, cleanly formatted markdown dashboards into the PR conversation section on failure, automatically editing or removing itself once instructions are followed to keep the timeline clean.
-*   **Header Footnote:** PR comments include a dynamic footnote linking directly to this repository's issues page for reporting validation bugs.
+*   **`not following guidelines`**: A high-visibility tag automatically attached to the PR if any critical validation check drops a failure blueprint. Clears itself upon a successful push.
+*   **`add package` / `drop package`**: Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages.
+*   **Stable Branch Tracking**: Auto-generates matching grey release tags (e.g., `release/24.10`, `release/25.12`) whenever a PR targets an active release backport branch.
+*   **Stale PR Cleanup**: A daily scheduled cron task (05:30 UTC) scans all repositories where the App is installed. If explicitly enabled in a repository's configuration (\`"enable_stale_bot": true\`), it marks PRs containing the \`not following guidelines\` label as \`stale\` (with a warning comment) after 14 days of inactivity, and closes them after another 14 days of silence.
+
+> [!TIP]
+> Stale PR cleanup is completely disabled by default. If a repository wants to enable this automated cleanup flow, it must commit a `.github/formalities.json` file in its default branch containing `"enable_stale_bot": true`. 
+
+*   **Clean Timelines**: Drops descriptive, cleanly formatted markdown dashboards into the PR conversation section on failure, automatically editing or removing itself once instructions are followed to keep the timeline clean.
+*   **Header Footnote**: PR comments include a dynamic footnote linking directly to this repository's issues page for reporting validation bugs.
 
 ---
 
@@ -90,6 +95,7 @@ If individual source repositories wish to tweak defaults or scale back rule rest
 Some configuration keys offer advanced options:
 *   `check_openwrt_meta`: Can be `true` (enforces standard `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` for new packages), `false` (disabled), or an array of custom required fields (e.g., `["PKG_MAINTAINER", "PKG_LICENSE"]`).
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
+*   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 
 Here is a comprehensive example containing all available toggle options:
 
@@ -118,6 +124,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_conffiles": true,
   "check_patch_headers": true,
   "check_pkg_release": "warning",
-  "require_linked_github_account": true
+  "require_linked_github_account": true,
+  "enable_stale_bot": false
 }
 ```

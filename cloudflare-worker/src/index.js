@@ -2,6 +2,7 @@ import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps } from './validators.js';
+import { handleScheduled } from './stale.js';
 
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
 async function scanPrComments(repoFullname, prNumber, token) {
@@ -647,5 +648,9 @@ export default {
         headers: { "Content-Type": "application/json" }
       });
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(handleScheduled(env));
   }
 };
