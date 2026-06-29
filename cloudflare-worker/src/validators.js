@@ -1,7 +1,6 @@
 export function isValidName(name) {
-  const pLRegex = /^[A-Z\p{L}a-z]+( [A-Z\p{L}a-z]+)+$/u;
-  const fallbackRegex = /^[a-zA-Z0-9_-]+$/;
-  return pLRegex.test(name) || fallbackRegex.test(name);
+  const nameRegex = /^[\p{L}'.-]+(?: [\p{L}'.-]+)+$/u;
+  return nameRegex.test(name);
 }
 
 // --- ENGINE CHECKS ---
