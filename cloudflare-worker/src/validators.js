@@ -59,7 +59,7 @@ export function validateFormalities(fullCommit, CONFIG) {
   if (!isAutosquash) {
     if (/^\s/.test(lines[0])) subjectErrors.push("Commit subject must not start with whitespace");
     if (!/^[a-zA-Z0-9_-]+: /.test(subject)) {
-      subjectErrors.push("Commit subject must start with '<package name or prefix>: '");
+      subjectErrors.push("Commit subject must start with \`<package name or prefix>: \`");
     } else {
       const afterPrefix = subject.replace(/^[a-zA-Z0-9_-]+: \s*/, '');
       if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
@@ -154,7 +154,7 @@ export function validateFormalities(fullCommit, CONFIG) {
         const sobEmail = matches[2].trim();
 
         if (sobName.toLowerCase() !== authorName.toLowerCase() || sobEmail.toLowerCase() !== authorEmail.toLowerCase()) {
-          signoffErrors.push(`Signed-off-by value (${sobName} <${sobEmail}>) does not match commit author (${authorName} <${authorEmail}>)`);
+          signoffErrors.push(`Signed-off-by value (\`${sobName} <${sobEmail}>\`) does not match commit author (\`${authorName} <${authorEmail}>\`)`);
         }
         if (sobEmail.includes('noreply.github.com')) {
           signoffErrors.push("Signed-off-by email must not be a GitHub noreply address");
@@ -209,8 +209,10 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     return { errors: [], successes: ["✅ No codebase text files changed to analyze"] };
   }
 
+  let isNewPackageThisCommit = false;
   if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(commitPatch)) {
     state.isNewPackage = true;
+    isNewPackageThisCommit = true;
   }
 
   if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(commitPatch)) {
@@ -230,7 +232,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
-  if (CONFIG.check_openwrt_meta && state.isNewPackage) {
+  if (CONFIG.check_openwrt_meta && isNewPackageThisCommit) {
     const requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
     requiredMeta.forEach(meta => {
       const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');

@@ -219,6 +219,29 @@ describe('validateMakefileContext', () => {
     const res = validateMakefileContext(commit, patch, CONFIG, state);
     assert.ok(res.errors.some(e => e.includes('CRLF')));
   });
+
+  test('does not enforce openwrt metadata on subsequent commits even if state.isNewPackage is true', () => {
+    const commit1 = { commit: { message: 'newpkg: add package' } };
+    const patch1 = `
+--- /dev/null
++++ b/package/newpkg/Makefile
++PKG_NAME:=newpkg
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    // This call sets state.isNewPackage = true
+    validateMakefileContext(commit1, patch1, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, true);
+
+    const commit2 = { commit: { message: 'newpkg: update version to 1.0.0' } };
+    const patch2 = `
+--- a/package/newpkg/Makefile
++++ b/package/newpkg/Makefile
++PKG_VERSION:=1.0.0
+    `;
+    // This call should not complain about missing PKG_MAINTAINER, etc.
+    const res = validateMakefileContext(commit2, patch2, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
 });
 
 // ─── Embedded Patches ────────────────────────────────────────────
