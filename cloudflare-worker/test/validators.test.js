@@ -161,6 +161,19 @@ describe('validateFormalities', () => {
     assert.ok(res.errors.some(e => e.includes('description body is empty')),
       `Expected empty body error but got: ${JSON.stringify(res.errors)}`);
   });
+
+  test('warns when subject and body are semantically identical (e.g. mypkg: update to 1.2.3)', () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: update to 1.2.3\n\n- Update MyPkg to v1.2.3\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = validateFormalities(commit, CONFIG);
+    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
 });
 
 // ─── Makefile Context ────────────────────────────────────────────

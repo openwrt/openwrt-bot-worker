@@ -3,6 +3,19 @@ export function isValidName(name) {
   return nameRegex.test(name);
 }
 
+export function getNormalizedText(str, pkgName) {
+  let cleaned = str.toLowerCase();
+  if (pkgName) {
+    cleaned = cleaned.replace(new RegExp(pkgName.toLowerCase(), 'g'), '');
+  }
+  // Remove common list bullet markers and generic words
+  cleaned = cleaned.replace(/^[\s\-*+•#]+/, '');
+  // Remove leading 'v' before a digit (e.g., v1.2 -> 1.2, but keep words like version)
+  cleaned = cleaned.replace(/\bv(?=\d)/g, '');
+  // Remove all non-alphanumeric characters
+  return cleaned.replace(/[^a-z0-9]/g, '');
+}
+
 // --- ENGINE CHECKS ---
 export function validateFormalities(fullCommit, CONFIG) {
   const errors = [];
@@ -117,9 +130,13 @@ export function validateFormalities(fullCommit, CONFIG) {
 
   if (fullCleanBody.length > 0) {
     if (CONFIG.warn_duplicate_body) {
-      const coreSubject = lines[0].replace(/^[a-zA-Z0-9_-]+: \s*/, '').trim();
-      if (coreSubject.toLowerCase() === fullCleanBody.toLowerCase() || lines[0].toLowerCase() === fullCleanBody.toLowerCase()) {
-        warnings.push("Commit subject and description body are identical. Avoid repeating the subject line in the body; provide context instead.");
+      const pkgPrefixMatch = lines[0].match(/^([a-zA-Z0-9_-]+):/);
+      const pkgName = pkgPrefixMatch ? pkgPrefixMatch[1] : '';
+      const normSubject = getNormalizedText(lines[0], pkgName);
+      const normBody = getNormalizedText(fullCleanBody, pkgName);
+
+      if (normSubject === normBody || (normBody.includes(normSubject) && normBody.length < normSubject.length + 20) || (normSubject.includes(normBody) && normSubject.length < normBody.length + 20)) {
+        warnings.push("Commit subject and description body are identical or virtually identical. Avoid repeating the subject line in the body; provide context instead.");
       }
     }
     if (CONFIG.require_release_notes && !/https?:\/\/[^\s]+/i.test(fullCleanBody)) {
