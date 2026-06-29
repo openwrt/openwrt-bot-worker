@@ -77,7 +77,7 @@ describe('isValidName', () => {
 // ─── Commit Formalities ──────────────────────────────────────────
 
 describe('validateFormalities', () => {
-  test('passes a fully valid commit', () => {
+  test('passes a fully valid commit', async () => {
     const commit = {
       parents: [{ sha: 'parent-sha' }],
       commit: {
@@ -87,23 +87,23 @@ describe('validateFormalities', () => {
         verification: { verified: true, key_id: 'GPGKEYID' }
       }
     };
-    const res = validateFormalities(commit, CONFIG);
+    const res = await validateFormalities(commit, CONFIG);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
     assert.ok(res.successes.length > 0);
   });
 
-  test('catches empty commit message', () => {
+  test('catches empty commit message', async () => {
     const commit = {
       commit: {
         message: '',
         author: { name: 'John Doe', email: 'john@doe.com' }
       }
     };
-    const res = validateFormalities(commit, CONFIG);
+    const res = await validateFormalities(commit, CONFIG);
     assert.ok(res.errors.some(e => e.includes('empty')));
   });
 
-  test('catches noreply email and missing Signed-off-by', () => {
+  test('catches noreply email and missing Signed-off-by', async () => {
     const commit = {
       commit: {
         message: 'bash: test subject line',
@@ -111,12 +111,12 @@ describe('validateFormalities', () => {
         committer: { name: 'John Doe', email: 'john@noreply.github.com' }
       }
     };
-    const res = validateFormalities(commit, CONFIG);
+    const res = await validateFormalities(commit, CONFIG);
     assert.ok(res.errors.some(e => e.includes('noreply address')));
     assert.ok(res.errors.some(e => e.includes('Signed-off-by')));
   });
 
-  test('rejects merge commits', () => {
+  test('rejects merge commits', async () => {
     const commit = {
       parents: [{ sha: 'parent-sha-1' }, { sha: 'parent-sha-2' }],
       commit: {
@@ -125,18 +125,18 @@ describe('validateFormalities', () => {
         committer: { name: 'John Doe', email: 'john@doe.com' }
       }
     };
-    const res = validateFormalities(commit, CONFIG);
+    const res = await validateFormalities(commit, CONFIG);
     assert.ok(res.errors.some(e => e.includes('Merge commits are not allowed')));
   });
 
-  test('enforces soft and hard subject length limits', () => {
+  test('enforces soft and hard subject length limits', async () => {
     const commitHard = {
       commit: {
         message: 'bash: ' + 'a'.repeat(85),
         author: { name: 'John Doe', email: 'john@doe.com' }
       }
     };
-    const resHard = validateFormalities(commitHard, CONFIG);
+    const resHard = await validateFormalities(commitHard, CONFIG);
     assert.ok(resHard.errors.some(e => e.includes('exceeds hard limit')));
 
     const commitSoft = {
@@ -145,11 +145,11 @@ describe('validateFormalities', () => {
         author: { name: 'John Doe', email: 'john@doe.com' }
       }
     };
-    const resSoft = validateFormalities(commitSoft, CONFIG);
+    const resSoft = await validateFormalities(commitSoft, CONFIG);
     assert.ok(resSoft.warnings.some(w => w.includes('exceeds soft limit')));
   });
 
-  test('rejects commit with only Signed-off-by and no description', () => {
+  test('rejects commit with only Signed-off-by and no description', async () => {
     const commit = {
       commit: {
         message: 'mypkg: fix build issue\n\nSigned-off-by: Jane Smith <jane@example.com>',
@@ -157,12 +157,12 @@ describe('validateFormalities', () => {
         committer: { name: 'Jane Smith', email: 'jane@example.com' }
       }
     };
-    const res = validateFormalities(commit, CONFIG);
+    const res = await validateFormalities(commit, CONFIG);
     assert.ok(res.errors.some(e => e.includes('description body is empty')),
       `Expected empty body error but got: ${JSON.stringify(res.errors)}`);
   });
 
-  test('warns when subject and body are semantically identical (e.g. mypkg: update to 1.2.3)', () => {
+  test('warns when subject and body are semantically identical (e.g. mypkg: update to 1.2.3)', async () => {
     const commit = {
       commit: {
         message: 'mypkg: update to 1.2.3\n\n- Update MyPkg to v1.2.3\n\nSigned-off-by: Jane Smith <jane@example.com>',
@@ -170,9 +170,29 @@ describe('validateFormalities', () => {
         committer: { name: 'Jane Smith', email: 'jane@example.com' }
       }
     };
-    const res = validateFormalities(commit, CONFIG);
+    const res = await validateFormalities(commit, CONFIG);
     assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
       `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
+  test('correctly extracts SSH key signature fingerprint without the footer tag', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: fix build issue\n\nSome description body text\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' },
+        verification: {
+          verified: true,
+          reason: 'valid',
+          signature: '-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAAtteSBwdWJsaWNrZXk=\n-----END SSH SIGNATURE-----'
+        }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    const successStr = res.successes.find(s => s.includes('cryptographic signature'));
+    assert.ok(successStr, 'Expected cryptographic signature success message');
+    assert.ok(successStr.includes('SSH Key Fingerprint: SHA256:+TBIvMqpQRHPC3Z8XrLcBD54NjV/OozKzSaDG13PLm0'),
+      `Expected key details containing fingerprint but got: ${successStr}`);
   });
 });
 

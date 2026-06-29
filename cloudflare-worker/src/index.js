@@ -120,7 +120,7 @@ async function handleWebhook(request, env) {
     const commitSubject = commitMsgLines[0].trim();
 
     // 1. Formalities
-    const reportFormality = validateFormalities(fullCommit, CONFIG);
+    const reportFormality = await validateFormalities(fullCommit, CONFIG);
     formalityOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
     reportFormality.successes.forEach(s => { formalityOutputText += `  ${s}\n`; });
 

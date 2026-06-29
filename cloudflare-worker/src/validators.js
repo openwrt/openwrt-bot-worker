@@ -16,8 +16,44 @@ export function getNormalizedText(str, pkgName) {
   return cleaned.replace(/[^a-z0-9]/g, '');
 }
 
+async function getSshKeyFingerprint(sigText) {
+  try {
+    let cleanSig = sigText.replace(/-----[a-zA-Z0-9\s]+-----/g, '');
+    cleanSig = cleanSig.replace(/[^a-zA-Z0-9+\/=]/g, '');
+
+    const binaryString = atob(cleanSig);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    if (bytes[0] !== 0x53 || bytes[1] !== 0x53 || bytes[2] !== 0x48 || 
+        bytes[3] !== 0x53 || bytes[4] !== 0x49 || bytes[5] !== 0x47) {
+      return null;
+    }
+
+    const pubKeyLen = (bytes[10] << 24) | (bytes[11] << 16) | (bytes[12] << 8) | bytes[13];
+    if (pubKeyLen <= 0 || pubKeyLen + 14 > bytes.length) {
+      return null;
+    }
+
+    const pubKeyBlob = bytes.slice(14, 14 + pubKeyLen);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", pubKeyBlob);
+    const hashBytes = new Uint8Array(hashBuffer);
+
+    let binaryHash = '';
+    for (let i = 0; i < hashBytes.length; i++) {
+      binaryHash += String.fromCharCode(hashBytes[i]);
+    }
+    return btoa(binaryHash).replace(/=+$/, '');
+  } catch (e) {
+    return null;
+  }
+}
+
 // --- ENGINE CHECKS ---
-export function validateFormalities(fullCommit, CONFIG) {
+export async function validateFormalities(fullCommit, CONFIG) {
   const errors = [];
   const successes = [];
   const warnings = [];
@@ -198,9 +234,9 @@ export function validateFormalities(fullCommit, CONFIG) {
       if (verification.key_id) {
         keyDetails = ` (GPG Key ID: ${verification.key_id})`;
       } else if (sigText.includes('SSH SIGNATURE')) {
-        const cleanSig = sigText.replace(/[^a-zA-Z0-9+\/]/g, '');
-        if (cleanSig) {
-          keyDetails = ` (SSH Key snippet: ...${cleanSig.slice(-12)})`;
+        const fingerprint = await getSshKeyFingerprint(sigText);
+        if (fingerprint) {
+          keyDetails = ` (SSH Key Fingerprint: SHA256:${fingerprint})`;
         } else {
           keyDetails = " (Verified via SSH)";
         }
