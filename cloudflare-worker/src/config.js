@@ -15,6 +15,7 @@ export const DEFAULT_CONFIG = {
   warn_duplicate_body: true,
   warn_generic_subjects: true,
   require_release_notes: true,
+  require_body: true,
 
   // Makefile Check features
   check_pkg_version: true,

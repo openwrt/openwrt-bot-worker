@@ -96,6 +96,11 @@ export function validateFormalities(fullCommit, CONFIG) {
   });
   const fullCleanBody = cleanBodyLines.join(" ");
 
+  // Require meaningful commit body (not just trailers)
+  if (CONFIG.require_body && fullCleanBody.length === 0) {
+    errors.push("- Commit description body is empty or contains only trailers (e.g. Signed-off-by). Please provide a meaningful description of what this change does and why");
+  }
+
   // Generic phrase checking
   if (CONFIG.warn_generic_subjects) {
     const genericPatterns = [

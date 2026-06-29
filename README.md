@@ -18,6 +18,7 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Signed-off-by Check:** Ensures a consistent, properly structured `Signed-off-by:` declaration is present and matches the original author metadata.
 *   **Signature Verification:** Validates cryptographic GPG/SSH commit signatures if present.
 *   **Description Quality Warnings:** Inspects message bodies and issues non-blocking warnings for lazy/identical description text mirroring the subject or for completely missing reference links (changelogs/release notes).
+*   **Mandatory Description Body:** Rejects commits whose description body is empty or contains only trailers (e.g. `Signed-off-by:`). Every commit must include a meaningful explanation of what the change does and why.
 
 ### 2. Makefile Check
 Inspects file modification trees targeting OpenWrt build recipes:
@@ -99,6 +100,7 @@ Here is a comprehensive example containing all available toggle options:
   "warn_duplicate_body": true,
   "warn_generic_subjects": true,
   "require_release_notes": true,
+  "require_body": true,
   "check_pkg_version": true,
   "check_crlf": true,
   "add_package_label": true,

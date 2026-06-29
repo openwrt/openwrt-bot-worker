@@ -17,6 +17,7 @@ const CONFIG = {
   warn_duplicate_body: true,
   warn_generic_subjects: true,
   require_release_notes: true,
+  require_body: true,
   check_pkg_version: true,
   check_crlf: true,
   add_package_label: true,
@@ -146,6 +147,19 @@ describe('validateFormalities', () => {
     };
     const resSoft = validateFormalities(commitSoft, CONFIG);
     assert.ok(resSoft.warnings.some(w => w.includes('exceeds soft limit')));
+  });
+
+  test('rejects commit with only Signed-off-by and no description', () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: fix build issue\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('description body is empty')),
+      `Expected empty body error but got: ${JSON.stringify(res.errors)}`);
   });
 });
 
