@@ -169,9 +169,7 @@ export function validateFormalities(fullCommit, CONFIG) {
   // Signature check
   if (CONFIG.check_signature) {
     const verification = fullCommit.commit.verification || {};
-    if (verification.verified === false && verification.reason !== 'no_user_key') {
-      errors.push(`- Cryptographic signature verification failed (Reason: ${verification.reason})`);
-    } else {
+    if (verification.verified === true) {
       let keyDetails = "";
       const reason = verification.reason || '';
       const sigText = verification.signature || '';
@@ -188,7 +186,10 @@ export function validateFormalities(fullCommit, CONFIG) {
       } else if (reason === 'valid' || reason === 'valid_signature') {
         keyDetails = " (Verified via GitHub Profile)";
       }
-      successes.push("✅ Commit contains a valid cryptographic signature (GPG/SSH)" + keyDetails);
+      successes.push("✅ Excellent! Commit contains a valid cryptographic signature (GPG/SSH). Thank you for signing your work!" + keyDetails);
+    } else {
+      const reason = verification.reason || 'unsigned';
+      warnings.push(`Commit is unsigned or cryptographic signature verification failed (Reason: ${reason}). Signing commits is a recommended best practice for verifying identity, but is not mandatory.`);
     }
   }
 
@@ -204,11 +205,11 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     return { errors: [], successes: ["✅ No codebase text files changed to analyze"] };
   }
 
-  if (/^(\+\+\+\s+b\/.*Makefile)/m.test(commitPatch)) {
+  if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(commitPatch)) {
     state.isNewPackage = true;
   }
 
-  if (/^---\s+a\/(.*Makefile)\r?$/m.test(commitPatch) && /^\+\+\+\s+\/dev\/null\r?$/m.test(commitPatch)) {
+  if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(commitPatch)) {
     state.isDroppedPackage = true;
   }
 

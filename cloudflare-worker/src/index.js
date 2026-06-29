@@ -113,7 +113,13 @@ async function handleWebhook(request, env) {
     reportFormality.successes.forEach(s => { formalityOutputText += `  ${s}\n`; });
 
     if (reportFormality.warnings.length > 0) {
-      allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n` + reportFormality.warnings.map(w => `- ⚠️ ${w}`).join("\n"));
+      const commentWarnings = reportFormality.warnings.filter(w => 
+        !w.includes("No reference link (e.g.") && 
+        !w.includes("Commit is unsigned or")
+      );
+      if (commentWarnings.length > 0) {
+        allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n` + commentWarnings.map(w => `- ⚠️ ${w}`).join("\n"));
+      }
       reportFormality.warnings.forEach(w => { formalityOutputText += `  ⚠️ Warning: ${w}\n`; });
     }
 
