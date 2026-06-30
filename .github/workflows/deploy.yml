@@ -9,6 +9,8 @@ jobs:
   deploy:
     name: Deploy Worker
     runs-on: ubuntu-slim
+    environment:
+      name: production
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
