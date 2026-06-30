@@ -82,6 +82,9 @@ export async function verifySignature(payload, signatureHeader, secret) {
   if (parts.length !== 2 || parts[0] !== "sha256") return false;
   const signatureHex = parts[1];
 
+  // Validate that signatureHex is a valid 64-character hex string to avoid crashes
+  if (!/^[0-9a-fA-F]{64}$/.test(signatureHex)) return false;
+
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -91,7 +94,10 @@ export async function verifySignature(payload, signatureHeader, secret) {
     ["verify"]
   );
 
-  const sigBytes = new Uint8Array(signatureHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+  const matches = signatureHex.match(/.{1,2}/g);
+  if (!matches) return false;
+
+  const sigBytes = new Uint8Array(matches.map(byte => parseInt(byte, 16)));
   return await crypto.subtle.verify(
     "HMAC",
     key,
