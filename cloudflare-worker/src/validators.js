@@ -3,6 +3,13 @@ export function isValidName(name) {
   return nameRegex.test(name);
 }
 
+export function isNoreplyEmail(email) {
+  const parts = email.split('@');
+  if (parts.length !== 2) return false;
+  const domain = parts[1].toLowerCase();
+  return domain === 'noreply.github.com' || domain === 'users.noreply.github.com';
+}
+
 export function getNormalizedText(str, pkgName) {
   let cleaned = str.toLowerCase();
   if (pkgName) {
@@ -78,8 +85,8 @@ export async function validateFormalities(fullCommit, CONFIG) {
   if (!isValidName(authorName)) identityErrors.push(`Author name format is invalid ('${authorName}')`);
   if (!isValidName(committerName)) identityErrors.push(`Committer name format is invalid ('${committerName}')`);
   if (CONFIG.check_noreply_email) {
-    if (authorEmail.includes('noreply.github.com')) identityErrors.push("Author email must not be a GitHub noreply address");
-    if (committerEmail.includes('noreply.github.com')) identityErrors.push("Committer email must not be a GitHub noreply address");
+    if (isNoreplyEmail(authorEmail)) identityErrors.push("Author email must not be a GitHub noreply address");
+    if (isNoreplyEmail(committerEmail)) identityErrors.push("Committer email must not be a GitHub noreply address");
   }
 
   if (identityErrors.length === 0) {
@@ -209,7 +216,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
         if (sobName.toLowerCase() !== authorName.toLowerCase() || sobEmail.toLowerCase() !== authorEmail.toLowerCase()) {
           signoffErrors.push(`Signed-off-by value (\`${sobName} <${sobEmail}>\`) does not match commit author (\`${authorName} <${authorEmail}>\`)`);
         }
-        if (sobEmail.includes('noreply.github.com')) {
+        if (isNoreplyEmail(sobEmail)) {
           signoffErrors.push("Signed-off-by email must not be a GitHub noreply address");
         }
       }
