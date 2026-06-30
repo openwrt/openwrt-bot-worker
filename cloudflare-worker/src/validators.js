@@ -292,16 +292,38 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
-  if (CONFIG.check_openwrt_meta && isNewPackageThisCommit) {
+  if (CONFIG.check_openwrt_meta) {
     const requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
-    requiredMeta.forEach(meta => {
-      const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
-      if (!metaRegex.test(commitPatch)) {
-        errors.push(`- New OpenWrt package is missing the mandatory parameter: '${meta}'`);
-      } else {
-        successes.push(`✅ Mandatory structural metadata present: '${meta}'`);
+    if (isNewPackageThisCommit) {
+      requiredMeta.forEach(meta => {
+        const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
+        if (!metaRegex.test(commitPatch)) {
+          errors.push(`- New OpenWrt package is missing the mandatory parameter: '${meta}'`);
+        } else {
+          successes.push(`✅ Mandatory structural metadata present: '${meta}'`);
+        }
+      });
+    }
+
+    const maintainerLines = commitPatch.split('\n').filter(line => line.startsWith('+') && line.includes('PKG_MAINTAINER'));
+    for (const line of maintainerLines) {
+      const match = line.match(/^\+\s*PKG_MAINTAINER\s*(?::=|=)\s*(.+)$/);
+      if (match) {
+        const value = match[1].trim();
+        const emails = (value.match(/<([^>]+)>/g) || []).map(m => m.slice(1, -1).trim());
+        if (emails.length === 0) {
+          errors.push(`- PKG_MAINTAINER format is invalid; it should contain an email address inside angle brackets '<>'`);
+        } else {
+          for (const email of emails) {
+            if (email.includes('://') || email.includes('http') || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+              errors.push(`- PKG_MAINTAINER contains an invalid email address: '${email}'. In angle brackets '<>' must be a valid email address and not a website/URL.`);
+            } else {
+              successes.push(`✅ PKG_MAINTAINER email address format is valid: '${email}'`);
+            }
+          }
+        }
       }
-    });
+    }
   }
 
   if (CONFIG.check_conffiles && /INSTALL_CONF/m.test(commitPatch)) {

@@ -276,6 +276,54 @@ describe('validateMakefileContext', () => {
     const res = validateMakefileContext(commit2, patch2, CONFIG, state);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
+
+  test('accepts PKG_MAINTAINER with valid email format', () => {
+    const commit = { commit: { message: 'bash: test' } };
+    const patch = `
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_MAINTAINER:=Jane Doe <jane.doe@example.com>
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts multiple PKG_MAINTAINER names and emails', () => {
+    const commit = { commit: { message: 'bash: test' } };
+    const patch = `
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_MAINTAINER:=Jane Doe <jane.doe@example.com>, John Doe <john.doe@example.com>
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('rejects PKG_MAINTAINER with URL/website inside angle brackets', () => {
+    const commit = { commit: { message: 'bash: test' } };
+    const patch = `
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_MAINTAINER:=Jane Doe <https://example.com/janedoe>
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must be a valid email address and not a website/URL')));
+  });
+
+  test('rejects PKG_MAINTAINER without angle brackets / email', () => {
+    const commit = { commit: { message: 'bash: test' } };
+    const patch = `
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_MAINTAINER:=Jane Doe
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("should contain an email address inside angle brackets '<>'")));
+  });
 });
 
 // ─── Embedded Patches ────────────────────────────────────────────
