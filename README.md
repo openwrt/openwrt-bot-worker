@@ -12,6 +12,7 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Branch Target Enforcement:** Ensures pull requests originate from dedicated feature branches, blocking accidental direct PRs from `main`, `master`, or active stable branches.
 *   **Merge Commit Elimination:** Rejects merge commits inside the PR tracking chain to preserve a clean linear history.
 *   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
+*   **Linked GitHub Account:** Verifies that the commit author email address is registered and verified on a GitHub account, linking the commit to a valid GitHub username.
 *   **Autosquash Compliance:** Automatically bypasses style constraints for development-phase `fixup!` and `squash!` syntax blocks.
 *   **Subject String Hygiene:** Enforces `<package name or prefix>: ` prefix headers, checks lowercase starting strings post-prefix, and rejects trailing periods.
 *   **Length Constraints:** Implements dual-layered (soft and hard) line width boundaries for both subject lines and description body text blocks.
@@ -110,6 +111,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_openwrt_meta": true,
   "check_conffiles": true,
   "check_patch_headers": true,
-  "check_pkg_release": "warning"
+  "check_pkg_release": "warning",
+  "require_linked_github_account": true
 }
 ```

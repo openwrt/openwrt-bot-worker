@@ -25,7 +25,8 @@ const CONFIG = {
   branch_labeling: true,
   check_openwrt_meta: true,
   check_conffiles: true,
-  check_patch_headers: true
+  check_patch_headers: true,
+  require_linked_github_account: false
 };
 
 // ─── Name Validation ─────────────────────────────────────────────
@@ -193,6 +194,34 @@ describe('validateFormalities', () => {
     assert.ok(successStr, 'Expected cryptographic signature success message');
     assert.ok(successStr.includes('SSH Key Fingerprint: SHA256:+TBIvMqpQRHPC3Z8XrLcBD54NjV/OozKzSaDG13PLm0'),
       `Expected key details containing fingerprint but got: ${successStr}`);
+  });
+
+  test('passes when require_linked_github_account is true and author is linked to GitHub user', async () => {
+    const commit = {
+      author: { login: 'johndoe' }, // linked GitHub account
+      commit: {
+        message: 'mypkg: fix bug\n\nSome description text\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const customConfig = { ...CONFIG, require_linked_github_account: true };
+    const res = await validateFormalities(commit, customConfig);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('fails when require_linked_github_account is true and author is not linked to GitHub user', async () => {
+    const commit = {
+      author: null, // not linked to GitHub account
+      commit: {
+        message: 'mypkg: fix bug\n\nSome description text\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const customConfig = { ...CONFIG, require_linked_github_account: true };
+    const res = await validateFormalities(commit, customConfig);
+    assert.ok(res.errors.some(e => e.includes('is not linked to any registered GitHub account')));
   });
 });
 

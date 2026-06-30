@@ -88,6 +88,11 @@ export async function validateFormalities(fullCommit, CONFIG) {
     if (isNoreplyEmail(authorEmail)) identityErrors.push("Author email must not be a GitHub noreply address");
     if (isNoreplyEmail(committerEmail)) identityErrors.push("Committer email must not be a GitHub noreply address");
   }
+  if (CONFIG.require_linked_github_account) {
+    if (!fullCommit.author || !fullCommit.author.login) {
+      identityErrors.push(`Commit author email '${authorEmail}' is not linked to any registered GitHub account. Please add and verify this email in your GitHub profile settings.`);
+    }
+  }
 
   if (identityErrors.length === 0) {
     successes.push("✅ Author and committer identities are valid");

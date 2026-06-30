@@ -31,6 +31,9 @@ export const DEFAULT_CONFIG = {
 
   // Package Release Check features
   check_pkg_release: 'warning',
+
+  // Identity / Account linking Check features
+  require_linked_github_account: true,
 };
 
 export const LABEL_GUIDELINES = 'not following guidelines';
