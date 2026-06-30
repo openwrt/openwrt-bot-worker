@@ -471,6 +471,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     const files = getChangedFilesFromPatch(item.commitPatch);
     for (const file of files) {
       if (isHiddenOrSpecial(file)) continue;
+
+      // Ignore test files that serve only within CI/CD (e.g. test.sh, test-version.sh)
+      const filename = file.split('/').pop();
+      if (filename === 'test.sh' || filename === 'test-version.sh') {
+        continue;
+      }
+
       const pkgRoot = await findPkgRoot(file, fetchFileContentAtHead, pkgRootCache);
       if (pkgRoot) {
         pkgRoots.add(pkgRoot);

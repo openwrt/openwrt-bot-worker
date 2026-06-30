@@ -598,4 +598,32 @@ diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.ok(res.errors.some(e => e.includes('but PKG_RELEASE was not reset to 1')));
   });
+
+  test('skips checks when only test.sh or test-version.sh are modified', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/test.sh b/package/utils/bash/test.sh
++++ b/package/utils/bash/test.sh
++# add new tests
+diff --git a/package/utils/bash/test-version.sh b/package/utils/bash/test-version.sh
++++ b/package/utils/bash/test-version.sh
++# test script updates
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
 });
