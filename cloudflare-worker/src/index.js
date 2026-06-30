@@ -162,7 +162,12 @@ async function handleWebhook(request, env) {
     makefileOutputText += "\n";
 
     // 3. Patches
-    const reportPatches = validateEmbeddedPatches(commitPatch, CONFIG);
+    const fetchFileContent = async (patchFile) => {
+      const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
+      const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+      return res.code === 200 ? res.raw : null;
+    };
+    const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
     patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
     if (reportPatches.errors.length > 0) {

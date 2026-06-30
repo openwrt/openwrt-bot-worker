@@ -281,27 +281,78 @@ describe('validateMakefileContext', () => {
 // ─── Embedded Patches ────────────────────────────────────────────
 
 describe('validateEmbeddedPatches', () => {
-  test('catches patches missing From/Subject headers', () => {
+  test('catches patches missing From/Subject headers', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
 +++ b/package/utils/bash/patches/001-fix.patch
 +Some diff without from and subject headers
     `;
-    const res = validateEmbeddedPatches(patch, CONFIG);
+    const res = await validateEmbeddedPatches(patch, CONFIG);
     assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
   });
 
-  test('accepts patches with valid From/Subject headers', () => {
+  test('accepts patches with valid From/Subject headers', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
 +++ b/package/utils/bash/patches/001-fix.patch
 +From: John Doe <john@doe.com>
 +Subject: Fix compilation issue
 +
 +Details of the fix
     `;
-    const res = validateEmbeddedPatches(patch, CONFIG);
+    const res = await validateEmbeddedPatches(patch, CONFIG);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
     assert.ok(res.successes.length > 0);
+  });
+
+  test('skips validation for modified patches when fetch fails/not provided', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+    `;
+    const res = await validateEmbeddedPatches(patch, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('unable to fetch full file')));
+  });
+
+  test('accepts modified patches when fetched content has valid headers', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+    `;
+    const mockFetch = async (path) => {
+      return `From: John Doe <john@doe.com>\nSubject: Fix compilation issue\n\nCode content`;
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('contains valid Git compliance headers')));
+  });
+
+  test('catches missing headers in modified patches when fetched content lacks them', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+    `;
+    const mockFetch = async (path) => {
+      return `Some content without headers`;
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
+    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
   });
 });

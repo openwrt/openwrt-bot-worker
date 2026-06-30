@@ -316,7 +316,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   return { errors, successes };
 }
 
-export function validateEmbeddedPatches(commitPatch, CONFIG) {
+export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent) {
   const errors = [];
   const successes = [];
 
@@ -332,11 +332,36 @@ export function validateEmbeddedPatches(commitPatch, CONFIG) {
   }
 
   const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
-  fileChunks.forEach(chunk => {
-    patchFiles.forEach(patchFile => {
+  for (const chunk of fileChunks) {
+    for (const patchFile of patchFiles) {
       if (chunk.includes('b/' + patchFile)) {
-        const hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
-        const hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
+        let hasFrom = false;
+        let hasSubject = false;
+        let checked = false;
+
+        if (fetchFileContent) {
+          try {
+            const rawContent = await fetchFileContent(patchFile);
+            if (rawContent !== null) {
+              hasFrom = /^From:\s+.+/m.test(rawContent);
+              hasSubject = /^Subject:\s+.+/m.test(rawContent);
+              checked = true;
+            }
+          } catch (e) {
+            // Ignore fetch errors and fallback
+          }
+        }
+
+        if (!checked) {
+          // Fallback: only validate if it is a new file
+          const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
+          if (!isNewFile) {
+            successes.push(`✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)`);
+            continue;
+          }
+          hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
+          hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
+        }
 
         if (!hasFrom || !hasSubject) {
           errors.push(`- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From:' / 'Subject:') to ensure 'git am' application compatibility`);
@@ -344,8 +369,8 @@ export function validateEmbeddedPatches(commitPatch, CONFIG) {
           successes.push(`✅ Embedded patch '${patchFile}' contains valid Git compliance headers`);
         }
       }
-    });
-  });
+    }
+  }
 
   return { errors, successes };
 }
