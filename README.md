@@ -27,6 +27,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **Mandatory Metadata:** Enforces the inclusion of `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` variables whenever a new package is introduced.
 *   **Conffiles Tracker:** Mandates the definition of the `Package/.../conffiles` tracking macro whenever configuration file installations (`INSTALL_CONF`) are triggered.
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
+*   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled).
 
 ### 3. Patches Check
 Scans the contribution tree for nested downstream patch targets:
@@ -108,6 +109,7 @@ Here is a comprehensive example containing all available toggle options:
   "branch_labeling": true,
   "check_openwrt_meta": true,
   "check_conffiles": true,
-  "check_patch_headers": true
+  "check_patch_headers": true,
+  "check_pkg_release": "warning"
 }
 ```

@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps } from './validators.js';
 
 // --- WEBHOOK HANDLER ---
 async function handleWebhook(request, env) {
@@ -177,6 +177,39 @@ async function handleWebhook(request, env) {
     patchesOutputText += "\n";
   }
 
+  // 4. Package Release Bumps (PR-wide audit)
+  const headSha = data.pull_request.head.sha;
+  const baseSha = data.pull_request.base.sha;
+
+  const fetchFileContentAtHead = async (path) => {
+    const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${headSha}`;
+    const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+    return res.code === 200 ? res.raw : null;
+  };
+
+  const fetchFileContentAtBase = async (path) => {
+    const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${baseSha}`;
+    const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+    return res.code === 200 ? res.raw : null;
+  };
+
+  const reportRelease = await validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
+  if (reportRelease.successes.length > 0 || reportRelease.errors.length > 0) {
+    makefileOutputText += `#### Package Release Audit:\n`;
+    reportRelease.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    if (reportRelease.errors.length > 0) {
+      const isWarning = CONFIG.check_pkg_release === 'warning';
+      if (isWarning) {
+        allPrWarnings.push(`**Package Release Audit**:\n` + reportRelease.errors.map(e => `- ⚠️ ${e}`).join("\n"));
+        reportRelease.errors.forEach(err => { makefileOutputText += `  ⚠️ Warning: ${err}\n`; });
+      } else {
+        allMakefileErrors.push(`**Package Release Audit**:\n` + reportRelease.errors.map(e => `- ${e}`).join("\n"));
+        reportRelease.errors.forEach(err => { makefileOutputText += `  ❌ ${err}\n`; });
+      }
+    }
+    makefileOutputText += "\n";
+  }
+
   const formalityPassed = allFormalityErrors.length === 0;
   const makefilePassed = allMakefileErrors.length === 0;
   const patchesPassed = allPatchesErrors.length === 0;
@@ -302,7 +335,6 @@ async function handleWebhook(request, env) {
 
   // Publish Status to Checks API
   const checkRunsUrl = `https://api.github.com/repos/${repoFullname}/check-runs`;
-  const headSha = data.pull_request.head.sha;
 
   const checkRunsPromises = [
     githubApiCall(checkRunsUrl, token, 'POST', {

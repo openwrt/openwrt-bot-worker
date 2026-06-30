@@ -28,6 +28,9 @@ export const DEFAULT_CONFIG = {
 
   // Patches Check features
   check_patch_headers: true,
+
+  // Package Release Check features
+  check_pkg_release: 'warning',
 };
 
 export const LABEL_GUIDELINES = 'not following guidelines';

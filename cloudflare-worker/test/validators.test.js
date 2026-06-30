@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches } from '../src/validators.js';
+import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -354,5 +354,171 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
     };
     const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
     assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
+  });
+});
+
+// ─── Package Release Bump Validation ─────────────────────────────
+
+describe('validatePkgReleaseBumps', () => {
+  const defaultConf = { ...CONFIG, check_pkg_release: 'warning' };
+
+  test('skips checks when disabled', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
++++ b/package/utils/bash/files/bash.init
++# modified init script
+`
+    }];
+    const disabledConf = { ...defaultConf, check_pkg_release: false };
+    const res = await validatePkgReleaseBumps(commitDetails, disabledConf, () => null, () => null);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('passes for new package with release 1', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/newpkg/Makefile b/package/utils/newpkg/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/newpkg/Makefile
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/newpkg/Makefile') {
+        return 'PKG_NAME:=newpkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async () => null; // didn't exist
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('correctly initializes PKG_RELEASE to 1')));
+  });
+
+  test('fails for new package with release not 1', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/newpkg/Makefile b/package/utils/newpkg/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/newpkg/Makefile
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/newpkg/Makefile') {
+        return 'PKG_NAME:=newpkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+    const baseFetch = async () => null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('must start with PKG_RELEASE set to 1')));
+  });
+
+  test('passes when existing package modified and PKG_RELEASE bumped', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
++++ b/package/utils/bash/files/bash.init
++# tweak init
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('PKG_RELEASE bumped')));
+  });
+
+  test('fails when existing package files modified but PKG_RELEASE or version is not bumped', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
++++ b/package/utils/bash/files/bash.init
++# tweak init
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
+
+  test('passes when version updated and PKG_RELEASE reset to 1', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
+-PKG_VERSION:=5.2
++PKG_VERSION:=5.3
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.3\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=3\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('version updated to \'5.3\' and PKG_RELEASE correctly reset to 1')));
+  });
+
+  test('fails when version updated but PKG_RELEASE is not reset to 1', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
+-PKG_VERSION:=5.2
++PKG_VERSION:=5.3
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.3\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=3\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('but PKG_RELEASE was not reset to 1')));
   });
 });

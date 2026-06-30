@@ -381,3 +381,126 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
 
   return { errors, successes };
 }
+
+export function getChangedFilesFromPatch(patch) {
+  if (!patch) return [];
+  const files = [];
+  const lines = patch.split('\n');
+  for (const line of lines) {
+    if (line.startsWith('+++ b/')) {
+      files.push(line.slice(6).trim().replace(/\r$/, ''));
+    }
+  }
+  return files;
+}
+
+export function isHiddenOrSpecial(filePath) {
+  return filePath.split('/').some(part => part.startsWith('.'));
+}
+
+export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
+  let dir = filePath.split('/').slice(0, -1).join('/');
+  
+  while (dir && dir !== '.' && dir !== 'package') {
+    if (dir in cache) {
+      if (cache[dir]) return dir;
+    } else {
+      const makefilePath = `${dir}/Makefile`;
+      const content = await fetchFileContent(makefilePath);
+      if (content && /^PKG_NAME\s*(?::=|=)/m.test(content)) {
+        cache[dir] = true;
+        return dir;
+      }
+      cache[dir] = false;
+    }
+    
+    const parts = dir.split('/');
+    if (parts.length <= 1) break;
+    dir = parts.slice(0, -1).join('/');
+  }
+  return null;
+}
+
+function parseMakefileVar(content, varName) {
+  const regex = new RegExp(`^${varName}\\s*(?::=|=)\\s*([^\\s#]+)`, 'm');
+  const match = content.match(regex);
+  return match ? match[1].replace(/["']/g, "").trim() : null;
+}
+
+export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
+  const errors = [];
+  const warnings = [];
+  const successes = [];
+
+  if (CONFIG.check_pkg_release === false || CONFIG.check_pkg_release === 'disabled') {
+    return { errors, warnings, successes };
+  }
+
+  // 1. Collect all modified package roots
+  const pkgRoots = new Set();
+  const pkgRootCache = {};
+
+  for (const item of commitDetails) {
+    const files = getChangedFilesFromPatch(item.commitPatch);
+    for (const file of files) {
+      if (isHiddenOrSpecial(file)) continue;
+      const pkgRoot = await findPkgRoot(file, fetchFileContentAtHead, pkgRootCache);
+      if (pkgRoot) {
+        pkgRoots.add(pkgRoot);
+      }
+    }
+  }
+
+  // 2. Process each package root
+  for (const pkgRoot of pkgRoots) {
+    const headContent = await fetchFileContentAtHead(`${pkgRoot}/Makefile`);
+    if (headContent === null) {
+      // Package was deleted/dropped, skip checks
+      continue;
+    }
+
+    const baseContent = await fetchFileContentAtBase(`${pkgRoot}/Makefile`);
+    const isNew = (baseContent === null);
+
+    const headRelease = parseMakefileVar(headContent, 'PKG_RELEASE');
+
+    if (isNew) {
+      if (headRelease !== '1') {
+        errors.push(`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`);
+      } else {
+        successes.push(`✅ New package \`${pkgRoot}\` correctly initializes PKG_RELEASE to 1`);
+      }
+      continue;
+    }
+
+    // Existing package modified
+    const baseVersion = parseMakefileVar(baseContent, 'PKG_VERSION');
+    const headVersion = parseMakefileVar(headContent, 'PKG_VERSION');
+
+    const baseRelease = parseMakefileVar(baseContent, 'PKG_RELEASE');
+
+    const baseSourceVer = parseMakefileVar(baseContent, 'PKG_SOURCE_VERSION');
+    const headSourceVer = parseMakefileVar(headContent, 'PKG_SOURCE_VERSION');
+
+    const baseSourceDate = parseMakefileVar(baseContent, 'PKG_SOURCE_DATE');
+    const headSourceDate = parseMakefileVar(headContent, 'PKG_SOURCE_DATE');
+
+    const versionChanged = (baseVersion !== headVersion) || (baseSourceVer !== headSourceVer) || (baseSourceDate !== headSourceDate);
+    const releaseChanged = (baseRelease !== headRelease);
+    const bumped = versionChanged || releaseChanged;
+
+    if (!bumped) {
+      errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump`);
+    } else if (versionChanged) {
+      if (headRelease !== '1') {
+        errors.push(`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`);
+      } else {
+        successes.push(`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`);
+      }
+    } else {
+      successes.push(`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE bumped from '${baseRelease}' to '${headRelease}'`);
+    }
+  }
+
+  return { errors, warnings, successes };
+}
