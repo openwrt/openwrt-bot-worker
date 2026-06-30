@@ -105,6 +105,7 @@ Some configuration keys offer advanced options:
 *   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
+*   `show_force_push_tip`: Set to `true` (default) to append a helpful tip regarding how to correct validation errors using force-pushing. Set to `false` to disable.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 
 Here is a comprehensive example containing all available toggle options:
@@ -118,6 +119,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_signature": true,
   "allow_autosquash": true,
   "enable_comments": true,
+  "show_force_push_tip": true,
   "max_subject_len_soft": 60,
   "max_subject_len_hard": 80,
   "max_body_line_len": 100,

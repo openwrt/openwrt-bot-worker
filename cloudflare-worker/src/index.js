@@ -613,6 +613,11 @@ async function handleWebhook(request, env) {
           });
         }
 
+        if (!allPassed && CONFIG.show_force_push_tip) {
+          commentBody += "> [!TIP]\n";
+          commentBody += "> **Do not close this pull request** to make corrections. Instead, modify your existing commits (e.g. `git commit --amend`) and update the branch using `git push --force-with-lease --force-if-includes`. The checks will re-run automatically.\n\n";
+        }
+
         // Add feedback link & version footer
         let footerMd = `\n\n---\n<sub>Something broken? Consider [reporting an issue](https://github.com/openwrt/openwrt-bot-worker/issues/new).</sub>`;
 

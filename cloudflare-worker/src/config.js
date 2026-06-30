@@ -7,6 +7,7 @@ export const DEFAULT_CONFIG = {
   check_signature: true,
   allow_autosquash: true,
   enable_comments: true,
+  show_force_push_tip: true,
   max_subject_len_soft: 60,
   max_subject_len_hard: 80,
   max_body_line_len: 100,

@@ -1786,4 +1786,124 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
       fetchMock = null;
     }
   });
+
+  test('includes or excludes force push TIP based on CONFIG.show_force_push_tip', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: { ref: 'feature', sha: 'headsha123' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const runTestWithConfig = async (config) => {
+      let postedComments = [];
+      fetchMock = async (url, options) => {
+        if (url.includes('/access_tokens')) {
+          return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+        }
+        if (url.includes('/formalities.json')) {
+          return new Response(JSON.stringify({
+            check_branch: false,
+            enable_comments: true,
+            require_linked_github_account: false,
+            require_body: false,
+            ...config
+          }), { status: 200 });
+        }
+        if (url.includes('/labels')) {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url.includes('/pulls/123/commits')) {
+          return new Response(JSON.stringify([
+            {
+              sha: 'sha123',
+              html_url: 'https://github.com/test/repo/commit/sha123',
+              commit: {
+                message: 'INVALID COMMIT MESSAGE',
+                author: { name: 'John Doe', email: 'john@doe.com' },
+                committer: { name: 'John Doe', email: 'john@doe.com' }
+              }
+            }
+          ]), { status: 200 });
+        }
+        if (url.includes('/commits/sha123')) {
+          return new Response(JSON.stringify({
+            parents: [{ sha: 'parent-sha' }],
+            commit: {
+              message: 'INVALID COMMIT MESSAGE',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }), { status: 200 });
+        }
+        if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response('Mock patch', { status: 200 });
+        }
+        if (url.includes('/issues/123/comments')) {
+          if (options && (options.method === 'POST' || options.method === 'PATCH')) {
+            postedComments.push(JSON.parse(options.body).body);
+          }
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      };
+
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      return postedComments;
+    };
+
+    try {
+      // 1. With show_force_push_tip enabled (default behavior)
+      const commentsWithTip = await runTestWithConfig({ show_force_push_tip: true });
+      assert.ok(commentsWithTip.length > 0);
+      assert.ok(commentsWithTip[0].includes('git push --force-with-lease --force-if-includes'));
+
+      // 2. With show_force_push_tip disabled
+      const commentsWithoutTip = await runTestWithConfig({ show_force_push_tip: false });
+      assert.ok(commentsWithoutTip.length > 0);
+      assert.ok(!commentsWithoutTip[0].includes('git push --force-with-lease'));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
 });
