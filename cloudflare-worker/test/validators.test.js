@@ -271,6 +271,27 @@ describe('validateMakefileContext', () => {
     assert.ok(!res.errors.some(e => e.includes('PKG_VERSION')), 'PKG_VERSION should not be checked for new packages');
   });
 
+  test('supports custom metadata fields in check_openwrt_meta', () => {
+    const commit = { commit: { message: 'newpkg: add package' } };
+    const patch = `
+--- /dev/null
++++ b/package/newpkg/Makefile
+@@ -0,0 +1,10 @@
++PKG_NAME:=newpkg
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++PKG_MAINTAINER:=John Doe <john@doe.com>
+     `;
+    const customConfig = { ...CONFIG, check_openwrt_meta: ['PKG_MAINTAINER', 'PKG_LICENSE'] };
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, customConfig, state);
+    assert.strictEqual(state.isNewPackage, true);
+    // Should error for PKG_LICENSE (which is in the custom list but missing)
+    assert.ok(res.errors.some(e => e.includes('PKG_LICENSE')));
+    // Should NOT error for PKG_LICENSE_FILES (which is not in the custom list)
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE_FILES')));
+  });
+
   test('detects CRLF line endings', () => {
     const commit = { commit: { message: 'bash: test' } };
     const patch = `

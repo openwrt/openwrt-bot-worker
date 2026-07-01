@@ -298,7 +298,10 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   }
 
   if (CONFIG.check_openwrt_meta) {
-    const requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
+    let requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
+    if (Array.isArray(CONFIG.check_openwrt_meta)) {
+      requiredMeta = CONFIG.check_openwrt_meta;
+    }
     if (isNewPackageThisCommit) {
       requiredMeta.forEach(meta => {
         const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
