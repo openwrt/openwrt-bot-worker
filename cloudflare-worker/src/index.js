@@ -60,8 +60,21 @@ async function handleWebhook(request, env) {
     githubApiCall(commitsUrl, token)
   ]);
 
+  if (commitsRes.code !== 200) {
+    const cleanRaw = (commitsRes.raw || "").trim().slice(0, 200);
+    throw new Error(`GitHub API returned HTTP ${commitsRes.code} when fetching commits list: ${cleanRaw}`);
+  }
+  if (existingLabelsRes.code !== 200) {
+    const cleanRaw = (existingLabelsRes.raw || "").trim().slice(0, 200);
+    throw new Error(`GitHub API returned HTTP ${existingLabelsRes.code} when fetching repository labels: ${cleanRaw}`);
+  }
+
   const existingLabels = new Set((existingLabelsRes.data || []).map(l => l.name));
   const commits = commitsRes.data || [];
+
+  if (!Array.isArray(commits)) {
+    throw new Error(`Expected commits list to be an array, but received: ${typeof commits}`);
+  }
 
   const allFormalityErrors = [];
   const allPrWarnings = [];
@@ -91,9 +104,26 @@ async function handleWebhook(request, env) {
       githubApiCall(detailUrl, token),
       githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch')
     ]);
+
+    if (detailRes.code !== 200) {
+      const cleanRaw = (detailRes.raw || "").trim().slice(0, 200);
+      throw new Error(`Failed to fetch commit details for SHA ${sha} (HTTP ${detailRes.code}): ${cleanRaw}`);
+    }
+    if (patchRes.code !== 200) {
+      const cleanRaw = (patchRes.raw || "").trim().slice(0, 200);
+      throw new Error(`Failed to fetch commit patch for SHA ${sha} (HTTP ${patchRes.code}): ${cleanRaw}`);
+    }
+    if (!detailRes.data || typeof detailRes.data !== 'object') {
+      throw new Error(`Expected commit details for SHA ${sha} to be an object, but got: ${typeof detailRes.data}`);
+    }
+    if (!detailRes.data.commit) {
+      const cleanResp = JSON.stringify(detailRes.data).slice(0, 200);
+      throw new Error(`Commit object is missing '.commit' metadata for SHA ${sha}. Response: ${cleanResp}`);
+    }
+
     return {
       sha,
-      html_url: commitData.html_url || `https://github.com/repos/${repoFullname}/commit/${sha}`,
+      html_url: commitData.html_url || `https://github.com/${repoFullname}/commit/${sha}`,
       fullCommit: detailRes.data,
       commitPatch: patchRes.raw
     };
@@ -114,7 +144,6 @@ async function handleWebhook(request, env) {
   // RUN CHECKS ON COMMITS
   for (const item of commitDetails) {
     const { sha, html_url, fullCommit, commitPatch } = item;
-    if (!fullCommit) continue;
 
     const commitMsgLines = (fullCommit.commit.message || '').split("\n");
     const commitSubject = commitMsgLines[0].trim();
@@ -375,12 +404,42 @@ async function handleWebhook(request, env) {
 // --- FETCH ENTRYPOINT ---
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
-    if (request.method === "POST" && url.pathname === "/webhook") {
-      return handleWebhook(request, env);
+      if (request.method === "POST" && url.pathname === "/webhook") {
+        return await handleWebhook(request, env);
+      }
+
+      return new Response("Invalid Request", { status: 400 });
+    } catch (rawError) {
+      console.error("Webhook processing failed:", rawError);
+      let error;
+      if (rawError instanceof Error) {
+        error = rawError;
+      } else {
+        const msg = rawError && typeof rawError === 'object' && rawError.message
+          ? String(rawError.message)
+          : String(rawError);
+        error = new Error(msg);
+        if (rawError && typeof rawError === 'object') {
+          error.name = rawError.name || error.name;
+          error.stack = rawError.stack || error.stack;
+        }
+      }
+
+      const errorDetails = {
+        name: error.name || "Error",
+        message: error.message || String(error),
+        timestamp: Date.now()
+      };
+      return new Response(JSON.stringify({
+        exception: errorDetails,
+        message: errorDetails.message
+      }, null, 2), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
     }
-
-    return new Response("Invalid Request", { status: 400 });
   }
 };

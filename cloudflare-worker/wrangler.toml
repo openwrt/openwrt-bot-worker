@@ -7,6 +7,9 @@ preview_urls = false
 [observability]
 enabled = true
 
+[observability.logs]
+enabled = true
+
 [vars]
 DEPLOY_HASH = "unknown"
 DEPLOY_DATE = "unknown"
