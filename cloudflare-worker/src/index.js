@@ -3,6 +3,42 @@ import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps } from './validators.js';
 
+// --- GITHUB COMMENTS SCANNING AND SEARCH ---
+async function scanPrComments(repoFullname, prNumber, token) {
+  let page = 1;
+  let hasBypassComment = false;
+  let existingCommentId = null;
+
+  while (true) {
+    const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
+    const res = await githubApiCall(url, token);
+    if (res.code !== 200 || !Array.isArray(res.data)) {
+      return null;
+    }
+
+    for (const c of res.data) {
+      if (c.body?.startsWith('## Formality Check:')) {
+        existingCommentId = c.id;
+      }
+      const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association);
+      if (isCommentMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(c.body || '')) {
+        hasBypassComment = true;
+      }
+    }
+
+    if (hasBypassComment && existingCommentId !== null) {
+      break;
+    }
+
+    if (res.data.length < 100) {
+      break;
+    }
+    page++;
+  }
+
+  return { hasBypassComment, existingCommentId };
+}
+
 // --- WEBHOOK HANDLER ---
 async function handleWebhook(request, env) {
   const payloadText = await request.text();
@@ -72,6 +108,29 @@ async function handleWebhook(request, env) {
   const existingLabels = new Set((existingLabelsRes.data || []).map(l => l.name));
   const commits = commitsRes.data || [];
 
+  let fetchCommentsPromise = null;
+  let fetchCommentsRetried = false;
+  const getCommentsScan = () => {
+    if (fetchCommentsPromise === null) {
+      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token).catch(() => null);
+    }
+    return fetchCommentsPromise;
+  };
+
+  const getCommentsScanWithRetry = async () => {
+    const result = await getCommentsScan();
+    if (result !== null || fetchCommentsRetried) {
+      return result;
+    }
+    fetchCommentsRetried = true;
+    fetchCommentsPromise = null;
+    return getCommentsScan();
+  };
+
+  if (CONFIG.enable_comments || /^(stable|openwrt-)/.test(baseBranch)) {
+    void getCommentsScan();
+  }
+
   if (!Array.isArray(commits)) {
     throw new Error(`Expected commits list to be an array, but received: ${typeof commits}`);
   }
@@ -86,6 +145,10 @@ async function handleWebhook(request, env) {
   let patchesOutputText = `### Checking PR #${prNumber}: ${prTitle} (Embedded Patches Compliance)\n\n`;
 
   const state = { isNewPackage: false, isDroppedPackage: false };
+
+  const prBody = data.pull_request.body || '';
+  const association = data.pull_request.author_association || 'NONE';
+  const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
 
   if (CONFIG.check_branch) {
     if (['master', 'main', 'stable', 'openwrt-25.12', 'openwrt-24.10'].includes(headBranch)) {
@@ -172,8 +235,21 @@ async function handleWebhook(request, env) {
 
     if (/^(stable|openwrt-)/.test(baseBranch)) {
       if (!(fullCommit.commit.message || '').toLowerCase().includes('cherry picked from')) {
-        allFormalityErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n- Backports targeting stable branch (${baseBranch}) must contain the context line: '(cherry picked from commit ...)'`);
-        formalityOutputText += "  ❌ Commit to stable branch must be marked as cherry-picked\n";
+        const scanResult = await getCommentsScanWithRetry() || { hasBypassComment: false, existingCommentId: null };
+        const bypassCherryPickCheck = scanResult.hasBypassComment || (isMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(prBody));
+
+        if (bypassCherryPickCheck) {
+          formalityOutputText += "  ⚠️ Commit to stable branch bypasses cherry-pick requirement via override command\n";
+        } else {
+          let errorMsg = `**Commit [${sha.slice(0, 7)}](${html_url})**:\n- Backports targeting stable branch (${baseBranch}) must contain the context line: '(cherry picked from commit ...)'`;
+          if (isMaintainer) {
+            errorMsg += ` (Use \`[allow cherry-pick]\` in PR description or comment to override this check)`;
+          } else {
+            errorMsg += ` (A maintainer can override this check by commenting \`[allow cherry-pick]\` on this PR)`;
+          }
+          allFormalityErrors.push(errorMsg);
+          formalityOutputText += "  ❌ Commit to stable branch must be marked as cherry-picked\n";
+        }
       } else {
         formalityOutputText += "  ✅ Commit explicitly specifies cherry-pick origin context\n";
       }
@@ -291,73 +367,68 @@ async function handleWebhook(request, env) {
   // PR Comment Management
   const commentPromises = [];
   if (CONFIG.enable_comments) {
-    const commentsUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments`;
-    const resComments = await githubApiCall(commentsUrl, token);
-    const commentsList = resComments.data || [];
+    const scanResult = await getCommentsScanWithRetry();
+    const fetchSucceeded = scanResult !== null;
 
-    let existingCommentId = null;
-    commentsList.forEach(c => {
-      if (c.body?.startsWith('## Formality Check:')) {
-        existingCommentId = c.id;
-      }
-    });
+    if (fetchSucceeded) {
+      const commentsUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments`;
+      const existingCommentId = scanResult.existingCommentId;
 
-    if (!allPassed || allPrWarnings.length > 0) {
-      const titleStatus = !allPassed ? "Failed" : "Suggestions Available";
-      let commentBody = `## Formality Check: ${titleStatus}\n\n`;
-      commentBody += "We completed the verification flow. Please review the formatting overview logs below.\n\n";
+      if (!allPassed || allPrWarnings.length > 0) {
+        const titleStatus = !allPassed ? "Failed" : "Suggestions Available";
+        let commentBody = `## Formality Check: ${titleStatus}\n\n`;
+        commentBody += "We completed the verification flow. Please review the formatting overview logs below.\n\n";
 
-      if (!allPassed) {
-        commentBody += "### 🛑 CRITICAL ERRORS\n";
-        
-        if (!formalityPassed) {
-          allFormalityErrors.forEach(errorBlock => {
-            commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+        if (!allPassed) {
+          commentBody += "### 🛑 CRITICAL ERRORS\n";
+          
+          if (!formalityPassed) {
+            allFormalityErrors.forEach(errorBlock => {
+              commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+            });
+          }
+          if (!makefilePassed) {
+            allMakefileErrors.forEach(errorBlock => {
+              commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+            });
+          }
+          if (!patchesPassed) {
+            allPatchesErrors.forEach(errorBlock => {
+              commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
+            });
+          }
+        }
+
+        if (allPrWarnings.length > 0) {
+          commentBody += "### ⚠️ STYLISTIC WARNINGS & SUGGESTIONS\n";
+          allPrWarnings.forEach(warnBlock => {
+            commentBody += "> " + warnBlock.replace(/\n/g, "\n> ") + "\n>\n";
           });
         }
-        
-        if (!makefilePassed) {
-          allMakefileErrors.forEach(errorBlock => {
-            commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
-          });
+
+        // Add feedback link & version footer
+        let footerMd = `\n\n---\n<sub>Something broken? Consider [reporting an issue](https://github.com/openwrt/openwrt-bot-worker/issues/new).</sub>`;
+
+        if (env.DEPLOY_HASH && env.DEPLOY_HASH !== 'unknown') {
+          const shortHash = env.DEPLOY_HASH.slice(0, 7);
+          let versionInfo = `Running version [\`${shortHash}\`](https://github.com/openwrt/openwrt-bot-worker/commit/${env.DEPLOY_HASH})`;
+          if (env.DEPLOY_DATE && env.DEPLOY_DATE !== 'unknown') {
+            versionInfo += ` deployed on ${env.DEPLOY_DATE}`;
+          }
+          footerMd += `<br><sub>_${versionInfo}_</sub>`;
         }
-        
-        if (!patchesPassed) {
-          allPatchesErrors.forEach(errorBlock => {
-            commentBody += "> " + errorBlock.replace(/\n/g, "\n> ") + "\n>\n";
-          });
+
+        commentBody += footerMd;
+
+        if (existingCommentId) {
+          commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: commentBody }));
+        } else {
+          commentPromises.push(githubApiCall(commentsUrl, token, 'POST', { body: commentBody }));
         }
-      }
-
-      if (allPrWarnings.length > 0) {
-        commentBody += "### ⚠️ STYLISTIC WARNINGS & SUGGESTIONS\n";
-        allPrWarnings.forEach(warnBlock => {
-          commentBody += "> " + warnBlock.replace(/\n/g, "\n> ") + "\n>\n";
-        });
-      }
-
-      // Add feedback link & version footer
-      let footerMd = `\n\n---\n<sub>Something broken? Consider [reporting an issue](https://github.com/openwrt/openwrt-bot-worker/issues/new).</sub>`;
-
-      if (env.DEPLOY_HASH && env.DEPLOY_HASH !== 'unknown') {
-        const shortHash = env.DEPLOY_HASH.slice(0, 7);
-        let versionInfo = `Running version [\`${shortHash}\`](https://github.com/openwrt/openwrt-bot-worker/commit/${env.DEPLOY_HASH})`;
-        if (env.DEPLOY_DATE && env.DEPLOY_DATE !== 'unknown') {
-          versionInfo += ` deployed on ${env.DEPLOY_DATE}`;
-        }
-        footerMd += `<br><sub>_${versionInfo}_</sub>`;
-      }
-
-      commentBody += footerMd;
-
-      if (existingCommentId) {
-        commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: commentBody }));
       } else {
-        commentPromises.push(githubApiCall(commentsUrl, token, 'POST', { body: commentBody }));
-      }
-    } else {
-      if (existingCommentId) {
-        commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE'));
+        if (existingCommentId) {
+          commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE'));
+        }
       }
     }
   }
