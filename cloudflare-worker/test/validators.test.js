@@ -374,6 +374,101 @@ describe('validateMakefileContext', () => {
     const res = validateMakefileContext(commit, patch, CONFIG, state);
     assert.ok(res.errors.some(e => e.includes("should contain an email address inside angle brackets '<>'")));
   });
+
+  test('accepts valid conffiles block with no indentation or space', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/foo.json
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('conffiles block contains no spaces or indentation')));
+  });
+
+  test('rejects conffiles block with space indentation', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++    /etc/foo.json
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("must not contain any spaces or indentation")));
+  });
+
+  test('rejects conffiles block with tab indentation', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++\t/etc/foo.json
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("must not contain any spaces or indentation")));
+  });
+
+  test('rejects conffiles block with spaces inside a line', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/foo.json 
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("must not contain any spaces or indentation")));
+  });
+
+  test('ignores files that are not Makefiles even if they contain conffiles block definitions', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/README.md b/package/utils/foo/README.md
+--- a/package/utils/foo/README.md
++++ b/package/utils/foo/README.md
++define Package/foo/conffiles
++    /etc/foo.json
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('ignores deleted conffiles definitions when tracking state', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+-define Package/foo/conffiles
+-/etc/foo.json
+-endef
++define Package/foo/install
++	$(INSTALL_DIR) $(1)/usr/bin
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
 });
 
 // ─── Embedded Patches ────────────────────────────────────────────

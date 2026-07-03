@@ -342,6 +342,52 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  if (CONFIG.check_conffiles) {
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    let conffilesCheckRun = false;
+    let conffilesCheckErrors = 0;
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
+      if (!isMakefile) continue;
+
+      let inConffiles = false;
+      let currentPackage = '';
+      const lines = fileDiff.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('+') || line.startsWith(' ')) {
+          const contentLine = line.slice(1);
+          const defineMatch = contentLine.match(/^define\s+(Package\/[^\s]*conffiles)/);
+          if (defineMatch) {
+            inConffiles = true;
+            currentPackage = defineMatch[1];
+            continue;
+          }
+          if (contentLine.match(/^endef/)) {
+            inConffiles = false;
+            currentPackage = '';
+            continue;
+          }
+
+          if (inConffiles && line.startsWith('+')) {
+            conffilesCheckRun = true;
+            if (/[ \t]/.test(contentLine)) {
+              conffilesCheckErrors++;
+              errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
+            }
+          }
+        }
+      }
+    }
+
+    if (conffilesCheckRun && conffilesCheckErrors === 0) {
+      successes.push("✅ Makefile conffiles block contains no spaces or indentation");
+    }
+  }
+
   if (CONFIG.check_crlf) {
     if (/^\+.*\r$/m.test(commitPatch)) {
       errors.push("- Windows style line endings (CRLF) detected inside added source lines. Use UNIX (LF) formatting exclusively");
