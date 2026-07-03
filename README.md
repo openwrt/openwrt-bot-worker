@@ -26,6 +26,9 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Description Quality Warnings:** Inspects message bodies and issues non-blocking warnings for lazy/identical description text mirroring the subject or for completely missing reference links (changelogs/release notes).
 *   **Mandatory Description Body:** Rejects commits whose description body is empty or contains only trailers (e.g. `Signed-off-by:`). Every commit must include a meaningful explanation of what the change does and why.
 
+> [!NOTE]
+> To keep API/subrequest usage predictable on extreme PRs, commit-message auditing is intentionally capped to the first 300 commits. If a PR exceeds this size, the check output includes an explicit warning about the reduced commit audit scope.
+
 ### 2. Makefile Check
 Inspects file modification trees targeting OpenWrt build recipes:
 

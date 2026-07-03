@@ -129,17 +129,20 @@ async function handleWebhook(request, env) {
   const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels`;
   const commitsUrl = data.pull_request.commits_url;
 
-  // OPTIMIZATION: Fetch repository config, first page of repository labels, and commits list in parallel
-  const [CONFIG, firstLabelsRes, commitsRes] = await Promise.all([
+  const commitsCount = data.pull_request.commits || 1;
+  const pages = Math.ceil(commitsCount / 100);
+  const commitsPromises = [];
+  for (let p = 1; p <= Math.min(pages, 3); p++) {
+    commitsPromises.push(githubApiCall(`${commitsUrl}?per_page=100&page=${p}`, token));
+  }
+
+  // OPTIMIZATION: Fetch repository config, first page of repository labels, and commits list pages in parallel
+  const [CONFIG, firstLabelsRes, ...commitsResList] = await Promise.all([
     fetchRepositoryConfig(data, token, DEFAULT_CONFIG),
     githubApiCall(`${labelsUrl}?per_page=100&page=1`, token),
-    githubApiCall(commitsUrl, token)
+    ...commitsPromises
   ]);
 
-  if (commitsRes.code !== 200) {
-    const cleanRaw = (commitsRes.raw || "").trim().slice(0, 200);
-    throw new Error(`GitHub API returned HTTP ${commitsRes.code} when fetching commits list: ${cleanRaw}`);
-  }
   if (firstLabelsRes.code !== 200) {
     const cleanRaw = (firstLabelsRes.raw || "").trim().slice(0, 200);
     throw new Error(`GitHub API returned HTTP ${firstLabelsRes.code} when fetching repository labels: ${cleanRaw}`);
@@ -170,7 +173,16 @@ async function handleWebhook(request, env) {
   }
 
   const existingLabels = new Set(allLabels.map(l => l.name));
-  const commits = commitsRes.data || [];
+  
+  let commits = [];
+  for (let i = 0; i < commitsResList.length; i++) {
+    const res = commitsResList[i];
+    if (res.code !== 200) {
+      const cleanRaw = (res.raw || "").trim().slice(0, 200);
+      throw new Error(`GitHub API returned HTTP ${res.code} when fetching commits list page ${i + 1}: ${cleanRaw}`);
+    }
+    commits = commits.concat(res.data || []);
+  }
 
   let fetchCommentsPromise = null;
   let fetchCommentsRetried = false;
@@ -207,6 +219,12 @@ async function handleWebhook(request, env) {
   let formalityOutputText = `### Checking PR #${prNumber}: ${prTitle} (Formalities Audit)\n\n`;
   let makefileOutputText = `### Checking PR #${prNumber}: ${prTitle} (Makefile Audit Profile)\n\n`;
   let patchesOutputText = `### Checking PR #${prNumber}: ${prTitle} (Embedded Patches Compliance)\n\n`;
+
+  if (pages > 3) {
+    const cappedWarning = `Commit scan is capped at 300 commits for API safety. This PR has ${commitsCount} commits, so only the first 300 commit messages were audited.`;
+    formalityOutputText += `⚠️ Warning: ${cappedWarning}\n\n`;
+    allPrWarnings.push(`**Commit Audit Scope**:\n- ⚠️ ${cappedWarning}`);
+  }
 
   const state = { isNewPackage: false, isDroppedPackage: false };
 
@@ -434,9 +452,15 @@ async function handleWebhook(request, env) {
     : commitDetails;
 
   const reportRelease = await validatePkgReleaseBumps(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
-  if (reportRelease.successes.length > 0 || reportRelease.errors.length > 0) {
+  if (reportRelease.successes.length > 0 || reportRelease.errors.length > 0 || (reportRelease.warnings && reportRelease.warnings.length > 0)) {
     makefileOutputText += `#### Package Release Audit:\n`;
     reportRelease.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    if (reportRelease.warnings && reportRelease.warnings.length > 0) {
+      reportRelease.warnings.forEach(w => {
+        makefileOutputText += `  ⚠️ Warning: ${w}\n`;
+        allPrWarnings.push(`**Package Release Audit**:\n- ⚠️ ${w}`);
+      });
+    }
     if (reportRelease.errors.length > 0) {
       const isWarning = CONFIG.check_pkg_release === 'warning';
       if (isWarning) {

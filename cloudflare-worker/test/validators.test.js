@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps } from '../src/validators.js';
+import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -838,5 +838,73 @@ diff --git a/luci/libs/luci-lib-uqr/patches/001-fix.patch b/luci/libs/luci-lib-u
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
     assert.ok(res.successes.some(s => s.includes('version unchanged, but PKG_RELEASE bumped')));
+  });
+
+  test('skips checks when more than 15 package roots are modified', async () => {
+    let patch = '';
+    for (let i = 1; i <= 16; i++) {
+      patch += `
+diff --git a/package/utils/pkg${i}/Makefile b/package/utils/pkg${i}/Makefile
+index 123456..789012 100644
+--- a/package/utils/pkg${i}/Makefile
++++ b/package/utils/pkg${i}/Makefile
+`;
+    }
+    const commitDetails = [{ commitPatch: patch }];
+
+    let fetchCalled = false;
+    const fetchFn = async () => {
+      fetchCalled = true;
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, fetchFn, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.successes.length, 0);
+    assert.ok(res.warnings.some(w => w.includes('Package release bump audit skipped') && w.includes('16 packages')));
+    assert.strictEqual(fetchCalled, false);
+  });
+});
+
+describe('findPkgRoot', () => {
+  test('ignores category-level Makefiles and non-package paths but parses package paths correctly', async () => {
+    // Category level Makefiles should be ignored (return null)
+    assert.strictEqual(await findPkgRoot('package/utils/Makefile', null), null);
+    assert.strictEqual(await findPkgRoot('utils/Makefile', null), null);
+    assert.strictEqual(await findPkgRoot('package/Makefile', null), null);
+    assert.strictEqual(await findPkgRoot('Makefile', null), null);
+
+    // Standard package directories
+    assert.strictEqual(await findPkgRoot('package/utils/bash/Makefile', null), 'package/utils/bash');
+    assert.strictEqual(await findPkgRoot('package/utils/bash/src/main.c', null), 'package/utils/bash');
+    assert.strictEqual(await findPkgRoot('package/utils/bash/patches/001-fix.patch', null), 'package/utils/bash');
+
+    // Category-less package layout
+    assert.strictEqual(await findPkgRoot('package/iozone/Makefile', null), 'package/iozone');
+    assert.strictEqual(await findPkgRoot('package/iozone/files/iozone.init', null), 'package/iozone');
+
+    // Normal feed layout
+    assert.strictEqual(await findPkgRoot('utils/bash/Makefile', null), 'utils/bash');
+
+    // Deeply nested feed layouts (luci/libs/<pkg>)
+    assert.strictEqual(await findPkgRoot('luci/libs/luci-lib-uqr/Makefile', null), 'luci/libs/luci-lib-uqr');
+    assert.strictEqual(await findPkgRoot('luci/libs/luci-lib-uqr/patches/001-fix.patch', null), 'luci/libs/luci-lib-uqr');
+
+    // Hidden directories and special folders
+    assert.strictEqual(await findPkgRoot('.github/workflows/check.yml', null), null);
+  });
+
+  test('resolves uncommon package category layout via Makefile fallback', async () => {
+    const fetchFn = async (path) => {
+      if (path === 'package/security/openssl/Makefile') {
+        return 'PKG_NAME:=openssl\n';
+      }
+      return null;
+    };
+
+    assert.strictEqual(
+      await findPkgRoot('package/security/openssl/files/openssl.conf', fetchFn, {}),
+      'package/security/openssl'
+    );
   });
 });

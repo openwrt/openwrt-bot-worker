@@ -487,32 +487,103 @@ export function isHiddenOrSpecial(filePath) {
 }
 
 export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
-  let dir = filePath.split('/').slice(0, -1).join('/');
+  const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git']);
+  const CATEGORIES = new Set([
+    'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
+    'system', 'multimedia', 'mail', 'sound', 'network'
+  ]);
 
-  while (dir && dir !== '.' && dir !== 'package') {
-    if (dir in cache) {
-      if (cache[dir]) return dir;
+  const hasPkgName = async (dir) => {
+    if (!fetchFileContent) return false;
+    if (dir in cache) return cache[dir];
+
+    const makefilePath = `${dir}/Makefile`;
+    const content = await fetchFileContent(makefilePath);
+    const ok = !!(content && /^PKG_NAME\s*(?::=|=)/m.test(content));
+    cache[dir] = ok;
+    return ok;
+  };
+
+  const isCategoryLevel = (parts) => {
+    if (parts.length === 0) return true;
+    if (parts.length === 1 && CATEGORIES.has(parts[0])) return true;
+    if (parts[0] === 'package' && parts.length === 2 && CATEGORIES.has(parts[1])) return true;
+    if (parts.length === 2 && CATEGORIES.has(parts[1])) return true;
+    return false;
+  };
+
+  let parts = filePath.split('/');
+  if (parts.length > 0) {
+    // Remove filename
+    parts.pop();
+  }
+
+  // Traverse up skipping standard directories
+  while (parts.length > 0) {
+    const last = parts[parts.length - 1];
+    if (skipDirs.has(last) || last.startsWith('.')) {
+      parts.pop();
     } else {
-      const lastPart = dir.split('/').pop();
-      const skipDirs = ['patches', 'files', 'src', 'images', '.github', '.git'];
+      break;
+    }
+  }
 
-      if (skipDirs.includes(lastPart) || lastPart.startsWith('.')) {
-        cache[dir] = false;
-      } else {
-        const makefilePath = `${dir}/Makefile`;
-        const content = await fetchFileContent(makefilePath);
-        if (content && /^PKG_NAME\s*(?::=|=)/m.test(content)) {
-          cache[dir] = true;
-          return dir;
-        }
-        cache[dir] = false;
-      }
+  if (parts.length === 0 || parts.some(p => p.startsWith('.'))) {
+    return null;
+  }
+
+  // Fast path for common OpenWrt layouts: no network calls needed.
+  if (parts[0] === 'package') {
+    if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
+      return `package/${parts[1]}/${parts[2]}`;
+    }
+    if (parts.length === 2 && !CATEGORIES.has(parts[1])) {
+      return `package/${parts[1]}`;
+    }
+  }
+
+  if (parts.length >= 2 && CATEGORIES.has(parts[0])) {
+    return `${parts[0]}/${parts[1]}`;
+  }
+
+  if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
+    return `${parts[0]}/${parts[1]}/${parts[2]}`;
+  }
+
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (candidate) => {
+    if (!candidate) return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    candidates.push(candidate);
+  };
+
+  // Fallback candidates for uncommon feed/category layouts.
+  for (let i = parts.length; i >= 2; i--) {
+    pushCandidate(parts.slice(0, i).join('/'));
+  }
+
+  for (const candidate of candidates) {
+    const candidateParts = candidate.split('/');
+    const last = candidateParts[candidateParts.length - 1];
+    if (last === 'package' || last.startsWith('.') || skipDirs.has(last)) {
+      continue;
+    }
+    if (isCategoryLevel(candidateParts)) {
+      continue;
     }
 
-    const parts = dir.split('/');
-    if (parts.length <= 1) break;
-    dir = parts.slice(0, -1).join('/');
+    if (await hasPkgName(candidate)) {
+      return candidate;
+    }
+
+    // When fetching is unavailable (unit tests / dry mode), trust first viable heuristic candidate.
+    if (!fetchFileContent) {
+      return candidate;
+    }
   }
+
   return null;
 }
 
@@ -535,7 +606,8 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   const pkgRoots = new Set();
   const pkgRootCache = {};
 
-  for (const item of commitDetails) {
+  let exceededPkgLimit = false;
+  outer: for (const item of commitDetails) {
     const files = getChangedFilesFromPatch(item.commitPatch);
     for (const file of files) {
       if (isHiddenOrSpecial(file)) continue;
@@ -549,8 +621,17 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       const pkgRoot = await findPkgRoot(file, fetchFileContentAtHead, pkgRootCache);
       if (pkgRoot) {
         pkgRoots.add(pkgRoot);
+        if (pkgRoots.size > 15) {
+          exceededPkgLimit = true;
+          break outer;
+        }
       }
     }
+  }
+
+  if (exceededPkgLimit) {
+    warnings.push(`Package release bump audit skipped: PR modifies ${pkgRoots.size} packages. Batch updates of >15 packages are not automatically audited to prevent hitting API rate/subrequest limits.`);
+    return { errors, warnings, successes };
   }
 
   // 2. Process each package root

@@ -304,7 +304,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       if (url.includes('/labels')) {
         return new Response(JSON.stringify([]), { status: 200 });
       }
-      if (url.endsWith('/pulls/123/commits')) {
+      if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
       if (url.includes('/repos/test/repo/commits/')) {
@@ -364,6 +364,241 @@ index 123456..789012 100644
       const makefileCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
       assert.ok(makefileCheck);
       assert.strictEqual(makefileCheck.conclusion, 'success');
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('handles large PRs modifying > 15 packages by warning and skipping the release bump audit', async () => {
+    // Generate 17 commits
+    const commitsList = Array.from({ length: 17 }, (_, i) => ({
+      sha: `sha123456789${i}`,
+      html_url: `https://github.com/commit/sha123456789${i}`,
+      commit: {
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' },
+        message: `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+      }
+    }));
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'test pr: update many packages',
+        body: 'Large PR test',
+        base: { ref: 'main' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    let overallPrPatchFetched = false;
+    let checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commitsList), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/commits/')) {
+        throw new Error(`Unexpected per-commit patch fetch in PR-wide mode: ${url}`);
+      }
+      if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        overallPrPatchFetched = true;
+        let mockPatch = '';
+        for (let i = 1; i <= 16; i++) {
+          mockPatch += `diff --git a/package/utils/pkg${i}/Makefile b/package/utils/pkg${i}/Makefile
+index 123456..789012 100644
+--- a/package/utils/pkg${i}/Makefile
++++ b/package/utils/pkg${i}/Makefile
+`;
+        }
+        return new Response(mockPatch, { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      assert.ok(overallPrPatchFetched);
+      
+      const makefileCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+      assert.ok(makefileCheck);
+      assert.strictEqual(makefileCheck.conclusion, 'success');
+      assert.match(makefileCheck.output.text, /Package release bump audit skipped/);
+      assert.match(makefileCheck.output.text, /PR modifies 16 packages/);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('adds warning when PR has more than 300 commits and commit audit is capped', async () => {
+    const commitsList = Array.from({ length: 300 }, (_, i) => ({
+      sha: `sha300${i}`,
+      html_url: `https://github.com/commit/sha300${i}`,
+      commit: {
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' },
+        message: `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+      }
+    }));
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'test pr: huge commit set',
+        body: 'Large PR test',
+        base: { ref: 'main' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        commits: 350,
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    let checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        const parsedUrl = new URL(url);
+        const page = Number(parsedUrl.searchParams.get('page') || '1');
+        if (page > 3) {
+          throw new Error(`Unexpected commit page requested: ${page}`);
+        }
+        const start = (page - 1) * 100;
+        const end = page * 100;
+        return new Response(JSON.stringify(commitsList.slice(start, end)), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/commits/')) {
+        throw new Error(`Unexpected per-commit patch fetch in PR-wide mode: ${url}`);
+      }
+      if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        return new Response('', { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === 'RSASSA-PKCS1-v1_5') {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === 'RSASSA-PKCS1-v1_5') {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      const formalityCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+      assert.ok(formalityCheck);
+      assert.match(formalityCheck.output.text, /Commit scan is capped at 300 commits/);
+      assert.match(formalityCheck.output.text, /This PR has 350 commits/);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -917,7 +1152,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
             message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>'
           }
         };
-        if (url.endsWith('/commits')) {
+        if (url.includes('/commits?') || url.endsWith('/commits')) {
           return new Response(JSON.stringify([commitData]), { status: 200 });
         }
         return new Response(JSON.stringify(commitData), { status: 200 });
@@ -1018,7 +1253,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
             message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>'
           }
         };
-        if (url.endsWith('/commits')) {
+        if (url.includes('/commits?') || url.endsWith('/commits')) {
           return new Response(JSON.stringify([commitData]), { status: 200 });
         }
         return new Response(JSON.stringify(commitData), { status: 200 });
