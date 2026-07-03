@@ -96,35 +96,35 @@ async function handleWebhook(request, env) {
     }
   }
 
-  // OPTIMIZATION: Fetch details and patches for all commits concurrently using Promise.all
+  // OPTIMIZATION: Fetch patches for all commits concurrently using Promise.all
+  // We reuse the commit metadata (fullCommit) from the commits list response to save 1 subrequest per commit
   const commitDetails = await Promise.all(commits.map(async (commitData) => {
-    const sha = commitData.sha;
-    const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
-    const [detailRes, patchRes] = await Promise.all([
-      githubApiCall(detailUrl, token),
-      githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch')
-    ]);
-
-    if (detailRes.code !== 200) {
-      const cleanRaw = (detailRes.raw || "").trim().slice(0, 200);
-      throw new Error(`Failed to fetch commit details for SHA ${sha} (HTTP ${detailRes.code}): ${cleanRaw}`);
+    const commitItemType = (commitData === null) ? 'null' : typeof commitData;
+    if (!commitData || commitItemType !== 'object') {
+      throw new Error(`Expected commit item in PR commits list to be an object, but got: ${commitItemType}`);
     }
+    const sha = commitData.sha;
+    if (!sha) {
+      const cleanResp = JSON.stringify(commitData).slice(0, 200);
+      throw new Error(`Commit item is missing 'sha' property. Response: ${cleanResp}`);
+    }
+    if (!commitData.commit) {
+      const cleanResp = JSON.stringify(commitData).slice(0, 200);
+      throw new Error(`Commit object is missing '.commit' metadata for SHA ${sha}. Response: ${cleanResp}`);
+    }
+
+    const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
+    const patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
+
     if (patchRes.code !== 200) {
       const cleanRaw = (patchRes.raw || "").trim().slice(0, 200);
       throw new Error(`Failed to fetch commit patch for SHA ${sha} (HTTP ${patchRes.code}): ${cleanRaw}`);
-    }
-    if (!detailRes.data || typeof detailRes.data !== 'object') {
-      throw new Error(`Expected commit details for SHA ${sha} to be an object, but got: ${typeof detailRes.data}`);
-    }
-    if (!detailRes.data.commit) {
-      const cleanResp = JSON.stringify(detailRes.data).slice(0, 200);
-      throw new Error(`Commit object is missing '.commit' metadata for SHA ${sha}. Response: ${cleanResp}`);
     }
 
     return {
       sha,
       html_url: commitData.html_url || `https://github.com/${repoFullname}/commit/${sha}`,
-      fullCommit: detailRes.data,
+      fullCommit: commitData,
       commitPatch: patchRes.raw
     };
   }));
