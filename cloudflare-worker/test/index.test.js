@@ -227,6 +227,129 @@ describe('Cloudflare Worker Webhook & Error Handling', () => {
     assert.strictEqual(resJson.exception.message, 'Something went wrong');
     assert.strictEqual(resJson.message, 'Something went wrong');
   });
+
+  test('handles large PRs with > 15 commits by fetching overall PR patch and checking PR-wide', async () => {
+    // Generate 17 commits
+    const commitsList = Array.from({ length: 17 }, (_, i) => ({
+      sha: `sha123456789${i}`,
+      html_url: `https://github.com/commit/sha123456789${i}`,
+      commit: {
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' },
+        message: `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+      }
+    }));
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'test pr crun: update to 1.15',
+        body: 'Large PR test',
+        base: { ref: 'main' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    let overallPrPatchFetched = false;
+    let checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commitsList), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/commits/')) {
+        throw new Error(`Unexpected per-commit patch fetch in PR-wide mode: ${url}`);
+      }
+      if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        overallPrPatchFetched = true;
+        // Return a mock patch that introduces PKG_VERSION bump for crun to 1.15
+        const mockPatch = `diff --git a/utils/crun/Makefile b/utils/crun/Makefile
+index 123456..789012 100644
+--- a/utils/crun/Makefile
++++ b/utils/crun/Makefile
+@@ -1,5 +1,5 @@
+ PKG_NAME:=crun
+-PKG_VERSION:=1.14
++PKG_VERSION:=1.15
+ PKG_RELEASE:=1
+ PKG_MAINTAINER:=John Doe <john@doe.com>
+ PKG_LICENSE:=GPL-2.0-or-later
+`;
+        return new Response(mockPatch, { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      assert.ok(overallPrPatchFetched);
+      
+      const makefileCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+      assert.ok(makefileCheck);
+      assert.strictEqual(makefileCheck.conclusion, 'success');
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
 });
 
 describe('Backport Cherry-pick and Bypass Validation', () => {

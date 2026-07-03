@@ -159,10 +159,25 @@ async function handleWebhook(request, env) {
     }
   }
 
-  // OPTIMIZATION: Fetch patches for all commits concurrently using Promise.all
+  const usePrWidePatch = commits.length > 15;
+  let prPatch = null;
+
+  if (usePrWidePatch) {
+    const prPatchUrl = data.pull_request.url;
+    const prPatchRes = await githubApiCall(prPatchUrl, token, 'GET', null, 'application/vnd.github.patch');
+    if (prPatchRes.code !== 200) {
+      const cleanRaw = (prPatchRes.raw || "").trim().slice(0, 200);
+      throw new Error(`Failed to fetch overall PR patch (HTTP ${prPatchRes.code}): ${cleanRaw}`);
+    }
+    prPatch = prPatchRes.raw;
+  }
+
+  // OPTIMIZATION: Fetch patches for all commits concurrently using Promise.all (only if usePrWidePatch is false)
   // We reuse the commit metadata (fullCommit) from the commits list response to save 1 subrequest per commit
   const commitDetails = await Promise.all(commits.map(async (commitData) => {
-    const commitItemType = (commitData === null) ? 'null' : typeof commitData;
+    const commitItemType = (commitData === null)
+      ? 'null'
+      : (Array.isArray(commitData) ? 'array' : typeof commitData);
     if (!commitData || commitItemType !== 'object') {
       throw new Error(`Expected commit item in PR commits list to be an object, but got: ${commitItemType}`);
     }
@@ -176,29 +191,44 @@ async function handleWebhook(request, env) {
       throw new Error(`Commit object is missing '.commit' metadata for SHA ${sha}. Response: ${cleanResp}`);
     }
 
-    const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
-    const patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
+    let commitPatch = null;
+    if (!usePrWidePatch) {
+      const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
+      const patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
 
-    if (patchRes.code !== 200) {
-      const cleanRaw = (patchRes.raw || "").trim().slice(0, 200);
-      throw new Error(`Failed to fetch commit patch for SHA ${sha} (HTTP ${patchRes.code}): ${cleanRaw}`);
+      if (patchRes.code !== 200) {
+        const cleanRaw = (patchRes.raw || "").trim().slice(0, 200);
+        throw new Error(`Failed to fetch commit patch for SHA ${sha} (HTTP ${patchRes.code}): ${cleanRaw}`);
+      }
+      commitPatch = patchRes.raw;
     }
 
     return {
       sha,
       html_url: commitData.html_url || `https://github.com/${repoFullname}/commit/${sha}`,
       fullCommit: commitData,
-      commitPatch: patchRes.raw
+      commitPatch
     };
   }));
 
   // Pre-scan all commit patches to see if this PR introduces or drops any package Makefiles
-  for (const item of commitDetails) {
-    if (item.commitPatch) {
-      if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(item.commitPatch)) {
+  if (!usePrWidePatch) {
+    for (const item of commitDetails) {
+      if (item.commitPatch) {
+        if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(item.commitPatch)) {
+          state.isNewPackage = true;
+        }
+        if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(item.commitPatch)) {
+          state.isDroppedPackage = true;
+        }
+      }
+    }
+  } else {
+    if (prPatch) {
+      if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(prPatch)) {
         state.isNewPackage = true;
       }
-      if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(item.commitPatch)) {
+      if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(prPatch)) {
         state.isDroppedPackage = true;
       }
     }
@@ -257,26 +287,63 @@ async function handleWebhook(request, env) {
     formalityOutputText += "\n";
 
     // 2. Makefiles
-    const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
-    makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+    if (!usePrWidePatch) {
+      const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
+      makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+      reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+      if (reportMakefile.errors.length > 0) {
+        allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.errors.join("\n"));
+        reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+      }
+      makefileOutputText += "\n";
+    }
+
+    // 3. Patches
+    if (!usePrWidePatch) {
+      const fetchFileContent = async (patchFile) => {
+        const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
+        const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+        return res.code === 200 ? res.raw : null;
+      };
+      const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
+      patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+      reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+      if (reportPatches.errors.length > 0) {
+        allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
+        reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+      }
+      patchesOutputText += "\n";
+    }
+  }
+
+  if (usePrWidePatch && prPatch) {
+    const virtualCommit = {
+      commit: {
+        message: data.pull_request.title + "\n" + commits.map(c => c.commit.message || '').join("\n")
+      }
+    };
+
+    // 2. Makefiles (PR-Wide)
+    const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state);
+    makefileOutputText += `#### Pull Request Overall Diff:\n`;
     reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
     if (reportMakefile.errors.length > 0) {
-      allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.errors.join("\n"));
+      allMakefileErrors.push(`**Pull Request Overall Diff**:\n` + reportMakefile.errors.join("\n"));
       reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     makefileOutputText += "\n";
 
-    // 3. Patches
+    // 3. Patches (PR-Wide)
     const fetchFileContent = async (patchFile) => {
-      const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
+      const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${data.pull_request.head.sha}`;
       const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
       return res.code === 200 ? res.raw : null;
     };
-    const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
-    patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+    const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent);
+    patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
     if (reportPatches.errors.length > 0) {
-      allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
+      allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.join("\n"));
       reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     patchesOutputText += "\n";
@@ -298,7 +365,11 @@ async function handleWebhook(request, env) {
     return res.code === 200 ? res.raw : null;
   };
 
-  const reportRelease = await validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
+  const releaseDetails = usePrWidePatch 
+    ? [{ commitPatch: prPatch }] 
+    : commitDetails;
+
+  const reportRelease = await validatePkgReleaseBumps(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
   if (reportRelease.successes.length > 0 || reportRelease.errors.length > 0) {
     makefileOutputText += `#### Package Release Audit:\n`;
     reportRelease.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
