@@ -759,4 +759,120 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.strictEqual(response.status, 200);
     assert.strictEqual(callCount, 2);
   });
+
+  test('processes issue_comment created event on a pull request', async () => {
+    let prFetched = false;
+    postedCheckRuns = [];
+    
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123')) {
+        prFetched = true;
+        return new Response(JSON.stringify({
+          number: 123,
+          title: 'test pr',
+          body: 'Bypass cherry-pick please',
+          base: { ref: 'openwrt-25.12', sha: 'base-sha' },
+          head: { ref: 'feature-branch', sha: 'abcdef1234567890' },
+          author_association: 'NONE',
+          commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+          user: { login: 'somecontributor', type: 'User' }
+        }), { status: 200 });
+      }
+      if (url.includes('/commits/abcdef1234567890')) {
+        if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response('Mock patch content', { status: 200 });
+        }
+        return new Response(JSON.stringify({
+          parents: [{ sha: 'parent-sha' }],
+          commit: {
+            message: 'mypkg: update\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' },
+            verification: { verified: true, key_id: 'GPGKEYID' }
+          }
+        }), { status: 200 });
+      }
+      if (url.includes('/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'abcdef1234567890',
+            html_url: 'https://github.com/test/repo/commit/abcdef1234567890',
+            commit: {
+              message: 'mypkg: update\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' },
+              verification: { verified: true, key_id: 'GPGKEYID' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([
+          { body: '[allow cherry-pick]', author_association: 'MEMBER' }
+        ]), { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          const body = JSON.parse(options.body);
+          postedCheckRuns.push(body);
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const payload = JSON.stringify({
+      action: 'created',
+      issue: {
+        number: 123,
+        pull_request: {
+          url: 'https://api.github.com/repos/test/repo/pulls/123'
+        }
+      },
+      comment: {
+        body: '[allow cherry-pick]',
+        author_association: 'MEMBER'
+      },
+      repository: {
+        full_name: 'test/repo'
+      },
+      installation: { id: 456 }
+    });
+
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const response = await worker.fetch(new Request('http://localhost/webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-github-event': 'issue_comment',
+        'x-hub-signature-256': signature
+      },
+      body: payload
+    }), {
+      WEBHOOK_SECRET: secret,
+      APP_ID: '123',
+      PRIVATE_KEY: 'YW55Y29udGVudA=='
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.ok(prFetched);
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.strictEqual(commitCheck.conclusion, 'success');
+  });
 });

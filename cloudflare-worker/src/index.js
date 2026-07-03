@@ -20,7 +20,8 @@ async function scanPrComments(repoFullname, prNumber, token) {
       if (c.body?.startsWith('## Formality Check:')) {
         existingCommentId = c.id;
       }
-      const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association);
+      const assoc = (c.author_association || '').toUpperCase();
+      const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
       if (isCommentMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(c.body || '')) {
         hasBypassComment = true;
       }
@@ -49,13 +50,55 @@ async function handleWebhook(request, env) {
   }
 
   const data = JSON.parse(payloadText);
-  if (request.headers.get("x-github-event") !== "pull_request") {
-    return new Response("Not a pull request event", { status: 200 });
+  const event = request.headers.get("x-github-event");
+  if (event !== "pull_request" && event !== "issue_comment") {
+    return new Response("Not a pull request or issue comment event", { status: 200 });
   }
 
-  const action = data.action || '';
-  if (!['opened', 'synchronize', 'reopened'].includes(action)) {
-    return new Response("Ignored pull request action", { status: 200 });
+  if (event === "issue_comment") {
+    if (data.action !== "created") {
+      return new Response("Ignored issue comment action", { status: 200 });
+    }
+
+    const commentAssoc = (data.comment?.author_association || '').toUpperCase();
+    const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(commentAssoc);
+    if (!isCommentMaintainer) {
+      return new Response("Ignored non-maintainer issue comment", { status: 200 });
+    }
+
+    if (!data.issue?.pull_request) {
+      return new Response("Comment is not on a pull request", { status: 200 });
+    }
+  } else {
+    const action = data.action || '';
+    if (!['opened', 'synchronize', 'reopened'].includes(action)) {
+      return new Response("Ignored pull request action", { status: 200 });
+    }
+  }
+
+  const installationId = data.installation?.id;
+  if (!installationId) {
+    return new Response("Missing installation ID", { status: 400 });
+  }
+
+  const token = await getInstallationToken(installationId, env.APP_ID, env.PRIVATE_KEY);
+  if (!token) {
+    return new Response("Could not generate installation access token", { status: 500 });
+  }
+
+  if (event === "issue_comment") {
+    const repoFullnameFromPayload = data.repository?.full_name;
+    const prNumberFromIssue = data.issue?.number;
+    if (!repoFullnameFromPayload || !prNumberFromIssue) {
+      return new Response("Missing repository or pull request number", { status: 400 });
+    }
+
+    const prUrl = `https://api.github.com/repos/${repoFullnameFromPayload}/pulls/${prNumberFromIssue}`;
+    const prRes = await githubApiCall(prUrl, token);
+    if (prRes.code !== 200) {
+      throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes.code})`);
+    }
+    data.pull_request = prRes.data;
   }
 
   const IGNORED_USERS = [
@@ -70,15 +113,7 @@ async function handleWebhook(request, env) {
     return new Response(`Success: Ignored PR from bot/system user (@${prAuthor})`, { status: 200 });
   }
 
-  const installationId = data.installation?.id;
-  if (!installationId) {
-    return new Response("Missing installation ID", { status: 400 });
-  }
 
-  const token = await getInstallationToken(installationId, env.APP_ID, env.PRIVATE_KEY);
-  if (!token) {
-    return new Response("Could not generate installation access token", { status: 500 });
-  }
 
   const repoFullname = data.repository.full_name;
   const baseBranch = data.pull_request.base.ref;
@@ -147,7 +182,7 @@ async function handleWebhook(request, env) {
   const state = { isNewPackage: false, isDroppedPackage: false };
 
   const prBody = data.pull_request.body || '';
-  const association = data.pull_request.author_association || 'NONE';
+  const association = (data.pull_request.author_association || 'NONE').toUpperCase();
   const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
 
   if (CONFIG.check_branch) {
