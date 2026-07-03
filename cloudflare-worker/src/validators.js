@@ -194,8 +194,20 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   // Body lines width check
   const bodyErrors = [];
+  let inCodeBlock = false;
   lines.forEach((line, index) => {
     if (index === 0) return;
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      return;
+    }
+    if (inCodeBlock) {
+      return;
+    }
+    if (/[a-zA-Z]+:\/\/\S+/.test(line)) {
+      return;
+    }
     if (line.length > CONFIG.max_body_line_len) {
       bodyErrors.push(`Line ${index + 1} in commit body exceeds max width (${line.length}/${CONFIG.max_body_line_len} chars)`);
     }

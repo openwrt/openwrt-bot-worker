@@ -150,6 +150,51 @@ describe('validateFormalities', () => {
     assert.ok(resSoft.warnings.some(w => w.includes('exceeds soft limit')));
   });
 
+  test('enforces body line length limit but ignores code blocks and URLs', async () => {
+    // 1. Commit body line exceeds limit (CONFIG.max_body_line_len is 100)
+    const commitLongLine = {
+      commit: {
+        message: 'bash: fix build issue\n\n' + 'a'.repeat(105) + '\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resLongLine = await validateFormalities(commitLongLine, CONFIG);
+    assert.ok(resLongLine.errors.some(e => e.includes('exceeds max width')), 'Should reject too long line in body');
+
+    // 2. Commit body line exceeds limit but is inside a code block
+    const commitCodeBlock = {
+      commit: {
+        message: 'bash: fix build issue\n\nOtherwise we get\n```\n' + 'a'.repeat(105) + '\n```\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resCodeBlock = await validateFormalities(commitCodeBlock, CONFIG);
+    assert.ok(!resCodeBlock.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line in code block');
+
+    // 3. Commit body line exceeds limit but contains a URL (checking uppercase HTTPS and git protocols)
+    const commitWithUrl = {
+      commit: {
+        message: 'bash: fix build issue\n\nThis is a long line containing a URL: HTTPS://github.com/openwrt/openwrt-bot-worker/blob/4c90a2854344d1174d3c28a7b94c4ca324f13ce1/cloudflare-worker/src/validators.js#L1 which should be ignored\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resWithUrl = await validateFormalities(commitWithUrl, CONFIG);
+    assert.ok(!resWithUrl.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line containing an uppercase HTTPS URL');
+
+    const commitWithGitUrl = {
+      commit: {
+        message: 'bash: fix build issue\n\nThis is a long line containing a git URL: git://git.openwrt.org/feed/packages.git/some/path/which/is/very/long/and/exceeds/the/limit/completely\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resWithGitUrl = await validateFormalities(commitWithGitUrl, CONFIG);
+    assert.ok(!resWithGitUrl.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line containing a git:// URL');
+  });
+
   test('rejects commit with only Signed-off-by and no description', async () => {
     const commit = {
       commit: {
