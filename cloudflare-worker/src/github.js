@@ -18,6 +18,17 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
 
   const response = await fetch(url, options);
   const text = await response.text();
+
+  if (response.status < 200 || response.status >= 300) {
+    const isExpected404 = response.status === 404 && (
+      (method === 'GET' && url.includes('/.github/formalities.json')) ||
+      (method === 'DELETE' && url.includes('/labels/'))
+    );
+    if (!isExpected404) {
+      console.error(`GitHub API call failed: ${method} ${url} -> HTTP ${response.status}: ${text.trim().slice(0, 500)}`);
+    }
+  }
+
   let data = null;
   try {
     data = JSON.parse(text);

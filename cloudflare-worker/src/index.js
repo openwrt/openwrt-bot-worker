@@ -46,6 +46,7 @@ async function handleWebhook(request, env) {
   const signature = request.headers.get("x-hub-signature-256") || "";
 
   if (!await verifySignature(payloadText, signature, env.WEBHOOK_SECRET)) {
+    console.error("Webhook signature verification failed.");
     return new Response("Invalid signature", { status: 403 });
   }
 
@@ -78,11 +79,13 @@ async function handleWebhook(request, env) {
 
   const installationId = data.installation?.id;
   if (!installationId) {
+    console.error("Webhook processing failed: Missing installation ID in payload.");
     return new Response("Missing installation ID", { status: 400 });
   }
 
   const token = await getInstallationToken(installationId, env.APP_ID, env.PRIVATE_KEY);
   if (!token) {
+    console.error(`Webhook processing failed: Could not generate installation access token for installation ID ${installationId}.`);
     return new Response("Could not generate installation access token", { status: 500 });
   }
 
@@ -90,6 +93,7 @@ async function handleWebhook(request, env) {
     const repoFullnameFromPayload = data.repository?.full_name;
     const prNumberFromIssue = data.issue?.number;
     if (!repoFullnameFromPayload || !prNumberFromIssue) {
+      console.error(`Webhook processing failed: Missing repository (${repoFullnameFromPayload}) or PR number (${prNumberFromIssue}) in issue_comment payload.`);
       return new Response("Missing repository or pull request number", { status: 400 });
     }
 
@@ -588,6 +592,7 @@ export default {
         return await handleWebhook(request, env);
       }
 
+      console.error(`Webhook request invalid: Method: ${request.method}, URL: ${request.url}`);
       return new Response("Invalid Request", { status: 400 });
     } catch (rawError) {
       console.error("Webhook processing failed:", rawError);
