@@ -77,9 +77,10 @@ The GitHub App requires the following permissions and event subscriptions:
     *   **`APP_ID`**: Your GitHub App ID (e.g., `123456`).
     *   **`WEBHOOK_SECRET`**: The secret token used to verify GitHub webhook HMAC-SHA256 signatures.
     *   **`PRIVATE_KEY`**: The complete text of your GitHub App private key PEM file.
-        > [!IMPORTANT]
-        > The private key must be in **PKCS#8** format (starting with `-----BEGIN PRIVATE KEY-----`). If your downloaded key starts with `-----BEGIN RSA PRIVATE KEY-----` (PKCS#1), convert it using:
-        > `openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in rsa_key.pem -out pkcs8_key.pem`
+
+> [!IMPORTANT]
+> The private key must be in **PKCS#8** format (starting with `-----BEGIN PRIVATE KEY-----`). If your downloaded key starts with `-----BEGIN RSA PRIVATE KEY-----` (PKCS#1), convert it using:
+> `openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in rsa_key.pem -out pkcs8_key.pem`
 
 ### 3. CI/CD Pipeline (GitHub Actions)
 
