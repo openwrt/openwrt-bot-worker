@@ -592,7 +592,7 @@ export default {
         return await handleWebhook(request, env);
       }
 
-      console.error(`Webhook request invalid: Method: ${request.method}, URL: ${request.url}`);
+      console.error(`Webhook request invalid: Method: ${request.method}, Path: ${url.pathname}`);
       return new Response("Invalid Request", { status: 400 });
     } catch (rawError) {
       console.error("Webhook processing failed:", rawError);
