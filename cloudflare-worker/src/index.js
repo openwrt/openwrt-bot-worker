@@ -125,7 +125,7 @@ async function handleWebhook(request, env) {
   const prNumber = data.pull_request.number;
   const prTitle = data.pull_request.title;
 
-  const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels`;
+  const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels?per_page=100`;
   const commitsUrl = data.pull_request.commits_url;
 
   // OPTIMIZATION: Fetch repository config, repository labels, and commits list in parallel

@@ -22,9 +22,13 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   if (response.status >= 400) {
     const isExpected404 = response.status === 404 && (
       (method === 'GET' && url.includes('/.github/formalities.json')) ||
-      (method === 'DELETE' && url.includes('/labels/'))
+      (method === 'DELETE' && url.includes('/labels/')) ||
+      (method === 'GET' && url.includes('/contents/') && url.split('?')[0].endsWith('/Makefile'))
     );
-    if (!isExpected404) {
+    const isExpected422 = response.status === 422 && (
+      method === 'POST' && url.includes('/labels') && text.includes('already_exists')
+    );
+    if (!isExpected404 && !isExpected422) {
       console.error(`GitHub API call failed: ${method} ${url} -> HTTP ${response.status}: ${text.trim().slice(0, 500)}`);
     }
   }
