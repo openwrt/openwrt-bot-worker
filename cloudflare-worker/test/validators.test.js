@@ -787,4 +787,56 @@ diff --git a/package/utils/bash/test-version.sh b/package/utils/bash/test-versio
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
+
+  test('supports package/<pkg>/... layout directly without category prefix', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/iozone/files/iozone.init b/package/iozone/files/iozone.init
++++ b/package/iozone/files/iozone.init
++# modified config
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/iozone/Makefile') {
+        return 'PKG_NAME:=iozone\nPKG_VERSION:=4.0\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/iozone/Makefile') {
+        return 'PKG_NAME:=iozone\nPKG_VERSION:=4.0\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('version unchanged, but PKG_RELEASE bumped')));
+  });
+
+  test('supports deeply nested layouts like luci/libs/<pkg>/...', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/luci/libs/luci-lib-uqr/patches/001-fix.patch b/luci/libs/luci-lib-uqr/patches/001-fix.patch
++++ b/luci/libs/luci-lib-uqr/patches/001-fix.patch
++# patch file contents
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'luci/libs/luci-lib-uqr/Makefile') {
+        return 'PKG_NAME:=luci-lib-uqr\nPKG_VERSION:=1.0\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'luci/libs/luci-lib-uqr/Makefile') {
+        return 'PKG_NAME:=luci-lib-uqr\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('version unchanged, but PKG_RELEASE bumped')));
+  });
 });

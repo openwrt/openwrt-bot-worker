@@ -488,20 +488,27 @@ export function isHiddenOrSpecial(filePath) {
 
 export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   let dir = filePath.split('/').slice(0, -1).join('/');
-  
+
   while (dir && dir !== '.' && dir !== 'package') {
     if (dir in cache) {
       if (cache[dir]) return dir;
     } else {
-      const makefilePath = `${dir}/Makefile`;
-      const content = await fetchFileContent(makefilePath);
-      if (content && /^PKG_NAME\s*(?::=|=)/m.test(content)) {
-        cache[dir] = true;
-        return dir;
+      const lastPart = dir.split('/').pop();
+      const skipDirs = ['patches', 'files', 'src', 'images', '.github', '.git'];
+
+      if (skipDirs.includes(lastPart) || lastPart.startsWith('.')) {
+        cache[dir] = false;
+      } else {
+        const makefilePath = `${dir}/Makefile`;
+        const content = await fetchFileContent(makefilePath);
+        if (content && /^PKG_NAME\s*(?::=|=)/m.test(content)) {
+          cache[dir] = true;
+          return dir;
+        }
+        cache[dir] = false;
       }
-      cache[dir] = false;
     }
-    
+
     const parts = dir.split('/');
     if (parts.length <= 1) break;
     dir = parts.slice(0, -1).join('/');
