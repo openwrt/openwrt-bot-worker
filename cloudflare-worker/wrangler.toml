@@ -7,6 +7,9 @@ preview_urls = false
 [observability]
 enabled = true
 
+[observability.logs]
+destinations = [ "honeycomb-logs" ]
+
 [placement]
 hostname = "api.github.com"
 
