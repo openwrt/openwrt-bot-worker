@@ -41,6 +41,26 @@ async function scanPrComments(repoFullname, prNumber, token) {
   return { hasBypassComment, existingCommentId };
 }
 
+// --- UTILS ---
+function safeTruncate(text, limit = 65000) {
+  if (!text) return "";
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder("utf-8");
+  const bytes = encoder.encode(text);
+  if (bytes.length <= limit) return text;
+
+  const suffix = "\n\n... [Output truncated due to GitHub character limit] ...";
+  const suffixBytes = encoder.encode(suffix);
+  const maxContentBytes = limit - suffixBytes.length;
+
+  let truncatedBytes = bytes.slice(0, maxContentBytes);
+  let truncatedText = decoder.decode(truncatedBytes);
+  if (truncatedText.endsWith("\uFFFD")) {
+    truncatedText = truncatedText.slice(0, -1);
+  }
+  return truncatedText + suffix;
+}
+
 // --- WEBHOOK HANDLER ---
 async function handleWebhook(request, env) {
   const payloadText = await request.text();
@@ -580,9 +600,9 @@ async function handleWebhook(request, env) {
         commentBody += footerMd;
 
         if (existingCommentId) {
-          commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: commentBody }));
+          commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) }));
         } else {
-          commentPromises.push(githubApiCall(commentsUrl, token, 'POST', { body: commentBody }));
+          commentPromises.push(githubApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) }));
         }
       } else {
         if (existingCommentId) {
@@ -602,7 +622,7 @@ async function handleWebhook(request, env) {
       output: {
         title: formalityPassed ? 'Git & Commits: Passed' : 'Git & Commits: Failed',
         summary: formalityPassed ? 'Git formatting rules and structural boundaries validated successfully.' : 'Structural presentation issues detected.',
-        text: formalityOutputText
+        text: safeTruncate(formalityOutputText)
       }
     }),
     githubApiCall(checkRunsUrl, token, 'POST', {
@@ -611,7 +631,7 @@ async function handleWebhook(request, env) {
       output: {
         title: makefilePassed ? 'OpenWrt Makefiles: Passed' : 'OpenWrt Makefiles: Failed',
         summary: makefilePassed ? 'OpenWrt package guidelines and version criteria verified successfully.' : 'Discovered file validation issues in the changed tracking tree.',
-        text: makefileOutputText
+        text: safeTruncate(makefileOutputText)
       }
     }),
     githubApiCall(checkRunsUrl, token, 'POST', {
@@ -620,7 +640,7 @@ async function handleWebhook(request, env) {
       output: {
         title: patchesPassed ? 'Code Patches: Passed' : 'Code Patches: Failed',
         summary: patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Discovered malformed downstream patch objects.',
-        text: patchesOutputText
+        text: safeTruncate(patchesOutputText)
       }
     })
   ];

@@ -1430,4 +1430,296 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.ok(commitCheck);
     assert.strictEqual(commitCheck.conclusion, 'success');
   });
+
+  test('truncates check run output text if it exceeds GitHub limits', async () => {
+    // Generate a long list of commits with long messages to bloat the output text
+    const commitsList = Array.from({ length: 300 }, (_, i) => ({
+      sha: `sha${i}`.padEnd(40, 'x'),
+      html_url: `https://github.com/commit/sha${i}`,
+      commit: {
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' },
+        message: `mypkg: ` + 'a'.repeat(250) + ` ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+      }
+    }));
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'test pr: long output test',
+        body: 'Large PR test',
+        base: { ref: 'main' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    let checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commitsList), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/commits/')) {
+        throw new Error(`Unexpected per-commit patch fetch in PR-wide mode: ${url}`);
+      }
+      if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        return new Response('', { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      
+      const commitCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+      assert.ok(commitCheck);
+      const byteLength = new TextEncoder().encode(commitCheck.output.text).length;
+      assert.ok(byteLength <= 65000);
+      assert.ok(commitCheck.output.text.includes('[Output truncated due to GitHub character limit]'));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('does not append truncation marker when check run output stays below limit', async () => {
+    const commitsList = Array.from({ length: 20 }, (_, i) => ({
+      sha: `sha${i}`.padEnd(40, 'x'),
+      html_url: `https://github.com/commit/sha${i}`,
+      commit: {
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' },
+        message: `mypkg: short message ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+      }
+    }));
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'test pr: non-truncated output',
+        body: 'Small PR test',
+        base: { ref: 'main' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    let checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commitsList), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/commits/')) {
+        throw new Error(`Unexpected per-commit patch fetch in PR-wide mode: ${url}`);
+      }
+      if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        return new Response('', { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+      assert.ok(commitCheck);
+      const byteLength = new TextEncoder().encode(commitCheck.output.text).length;
+      assert.ok(byteLength < 65000);
+      assert.ok(!commitCheck.output.text.includes('[Output truncated due to GitHub character limit]'));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('caps truncated check run output at exactly 65000 characters', async () => {
+    const commitsList = Array.from({ length: 350 }, (_, i) => ({
+      sha: `sha${i}`.padEnd(40, 'x'),
+      html_url: `https://github.com/commit/sha${i}`,
+      commit: {
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' },
+        message: `mypkg: ` + 'b'.repeat(260) + ` ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+      }
+    }));
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'test pr: exact truncation cap',
+        body: 'Large PR test',
+        commits: 350,
+        base: { ref: 'main' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    let checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commitsList), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/commits/')) {
+        throw new Error(`Unexpected per-commit patch fetch in PR-wide mode: ${url}`);
+      }
+      if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        return new Response('', { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+      assert.ok(commitCheck);
+      const byteLength = new TextEncoder().encode(commitCheck.output.text).length;
+      assert.strictEqual(byteLength, 65000);
+      assert.ok(commitCheck.output.text.includes('[Output truncated due to GitHub character limit]'));
+    } finally {
+      fetchMock = null;
+    }
+  });
 });
