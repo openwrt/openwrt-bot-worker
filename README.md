@@ -11,7 +11,10 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 
 *   **Branch Target Enforcement:** Ensures pull requests originate from dedicated feature branches, blocking accidental direct PRs from `main`, `master`, or active stable branches.
 *   **Stable Branch Backports Enforcement:** Ensures that pull requests targeting active stable/backport branches (e.g., `openwrt-25.12`, `openwrt-24.10`) contain the context line `(cherry picked from commit ...)` in every commit message.
-    *   💡 **Tip:** Maintainers (`OWNER`, `MEMBER`, or `COLLABORATOR`) can bypass this check by posting a pull request comment containing `[allow cherry-pick]` (or `[allow-cherry-pick]`). Alternatively, if the PR author is a maintainer, they can also include `[allow cherry-pick]` in the PR description.
+
+> [!TIP]
+> Maintainers (`OWNER`, `MEMBER`, or `COLLABORATOR`) can bypass this check by posting a pull request comment containing `[allow cherry-pick]` (or `[allow-cherry-pick]`). Alternatively, if the PR author is a maintainer, they can also include `[allow cherry-pick]` in the PR description.
+
 *   **Merge Commit Elimination:** Rejects merge commits inside the PR tracking chain to preserve a clean linear history.
 *   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
 *   **Linked GitHub Account:** Verifies that the commit author email address is registered and verified on a GitHub account, linking the commit to a valid GitHub username.
