@@ -487,25 +487,36 @@ export function isHiddenOrSpecial(filePath) {
 }
 
 export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
-  let dir = filePath.split('/').slice(0, -1).join('/');
-  
-  while (dir && dir !== '.' && dir !== 'package') {
-    if (dir in cache) {
-      if (cache[dir]) return dir;
-    } else {
-      const makefilePath = `${dir}/Makefile`;
-      const content = await fetchFileContent(makefilePath);
-      if (content && /^PKG_NAME\s*(?::=|=)/m.test(content)) {
-        cache[dir] = true;
-        return dir;
-      }
-      cache[dir] = false;
+  const parts = filePath.split('/');
+  let candidate = null;
+  if (parts.length >= 3 && parts[0] === 'package') {
+    const category = parts[1];
+    const pkgName = parts[2];
+    if (!category.startsWith('.') && !pkgName.startsWith('.') && pkgName !== 'Makefile') {
+      candidate = `package/${category}/${pkgName}`;
     }
-    
-    const parts = dir.split('/');
-    if (parts.length <= 1) break;
-    dir = parts.slice(0, -1).join('/');
+  } else if (parts.length >= 2) {
+    const category = parts[0];
+    const pkgName = parts[1];
+    if (category !== 'package' && !category.startsWith('.') && !pkgName.startsWith('.') && pkgName !== 'Makefile') {
+      candidate = `${category}/${pkgName}`;
+    }
   }
+
+  if (!candidate) return null;
+
+  if (candidate in cache) {
+    return cache[candidate] ? candidate : null;
+  }
+
+  const makefilePath = `${candidate}/Makefile`;
+  const content = await fetchFileContent(makefilePath);
+  if (content && /^PKG_NAME\s*(?::=|=)/m.test(content)) {
+    cache[candidate] = true;
+    return candidate;
+  }
+
+  cache[candidate] = false;
   return null;
 }
 

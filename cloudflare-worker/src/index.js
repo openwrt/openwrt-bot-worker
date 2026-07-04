@@ -125,13 +125,13 @@ async function handleWebhook(request, env) {
   const prNumber = data.pull_request.number;
   const prTitle = data.pull_request.title;
 
-  const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels?per_page=100`;
+  const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels`;
   const commitsUrl = data.pull_request.commits_url;
 
-  // OPTIMIZATION: Fetch repository config, repository labels, and commits list in parallel
-  const [CONFIG, existingLabelsRes, commitsRes] = await Promise.all([
+  // OPTIMIZATION: Fetch repository config, first page of repository labels, and commits list in parallel
+  const [CONFIG, firstLabelsRes, commitsRes] = await Promise.all([
     fetchRepositoryConfig(data, token, DEFAULT_CONFIG),
-    githubApiCall(labelsUrl, token),
+    githubApiCall(`${labelsUrl}?per_page=100&page=1`, token),
     githubApiCall(commitsUrl, token)
   ]);
 
@@ -139,12 +139,28 @@ async function handleWebhook(request, env) {
     const cleanRaw = (commitsRes.raw || "").trim().slice(0, 200);
     throw new Error(`GitHub API returned HTTP ${commitsRes.code} when fetching commits list: ${cleanRaw}`);
   }
-  if (existingLabelsRes.code !== 200) {
-    const cleanRaw = (existingLabelsRes.raw || "").trim().slice(0, 200);
-    throw new Error(`GitHub API returned HTTP ${existingLabelsRes.code} when fetching repository labels: ${cleanRaw}`);
+  if (firstLabelsRes.code !== 200) {
+    const cleanRaw = (firstLabelsRes.raw || "").trim().slice(0, 200);
+    throw new Error(`GitHub API returned HTTP ${firstLabelsRes.code} when fetching repository labels: ${cleanRaw}`);
   }
 
-  const existingLabels = new Set((existingLabelsRes.data || []).map(l => l.name));
+  const allLabels = [...(firstLabelsRes.data || [])];
+  if (firstLabelsRes.data && firstLabelsRes.data.length === 100) {
+    let page = 2;
+    while (true) {
+      const res = await githubApiCall(`${labelsUrl}?per_page=100&page=${page}`, token);
+      if (res.code !== 200 || !Array.isArray(res.data)) {
+        break;
+      }
+      allLabels.push(...res.data);
+      if (res.data.length < 100) {
+        break;
+      }
+      page++;
+    }
+  }
+
+  const existingLabels = new Set(allLabels.map(l => l.name));
   const commits = commitsRes.data || [];
 
   let fetchCommentsPromise = null;
