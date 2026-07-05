@@ -864,6 +864,51 @@ index 123456..789012 100644
     assert.ok(res.warnings.some(w => w.includes('Package release bump audit skipped') && w.includes('16 packages')));
     assert.strictEqual(fetchCalled, false);
   });
+
+  test('skips baseFetch call completely for new packages (avoiding unnecessary subrequests/404s)', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/newpkg/Makefile b/package/utils/newpkg/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/newpkg/Makefile
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/newpkg/Makefile') {
+        return 'PKG_NAME:=newpkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async () => {
+      throw new Error('baseFetch should not be called for new packages!');
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('correctly initializes PKG_RELEASE to 1')));
+  });
+
+  test('skips headFetch call completely for deleted packages', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/oldpkg/Makefile b/package/utils/oldpkg/Makefile
+deleted file mode 100644
+--- a/package/utils/oldpkg/Makefile
++++ /dev/null
+`
+    }];
+    const headFetch = async () => {
+      throw new Error('headFetch should not be called for deleted packages!');
+    };
+    const baseFetch = async () => {
+      return 'PKG_NAME:=oldpkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    // Since it's deleted, it skips check, so no errors and no successes
+    assert.strictEqual(res.errors.length, 0);
+  });
 });
 
 describe('findPkgRoot', () => {

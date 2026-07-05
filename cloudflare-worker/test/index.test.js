@@ -1723,4 +1723,67 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
       fetchMock = null;
     }
   });
+
+  test('githubApiCall: does not log 404 error for GET requests to /contents/', async () => {
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => {
+      loggedError = msg;
+    };
+
+    try {
+      fetchMock = (url, options) => {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/contents/utils/cros-vboot/Makefile?ref=abc', 'token', 'GET');
+      assert.strictEqual(res.code, 404);
+      assert.strictEqual(loggedError, null);
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
+
+  test('githubApiCall: logs 404 error for GET requests to other endpoints', async () => {
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => {
+      loggedError = msg;
+    };
+
+    try {
+      fetchMock = (url, options) => {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/issues/1', 'token', 'GET');
+      assert.strictEqual(res.code, 404);
+      assert.match(loggedError, /GitHub API call failed: GET https:\/\/api.github.com\/repos\/openwrt\/packages\/issues\/1 -> HTTP 404:/);
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
+
+  test('githubApiCall: logs 404 error for POST requests to /contents/', async () => {
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => {
+      loggedError = msg;
+    };
+
+    try {
+      fetchMock = (url, options) => {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/contents/utils/cros-vboot/Makefile', 'token', 'POST', { message: 'test' });
+      assert.strictEqual(res.code, 404);
+      assert.match(loggedError, /GitHub API call failed: POST https:\/\/api.github.com\/repos\/openwrt\/packages\/contents\/utils\/cros-vboot\/Makefile -> HTTP 404:/);
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
 });

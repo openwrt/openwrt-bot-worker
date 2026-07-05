@@ -510,20 +510,26 @@ async function handleWebhook(request, env) {
     }
   }
 
+  const currentPrLabels = new Set((data.pull_request?.labels || []).map(l => l.name.toLowerCase()));
+
   if (!allPassed) {
-    labelOperations.push(ensureLabelExists(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
-    labelsToAdd.push(LABEL_GUIDELINES);
+    if (!currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
+      labelOperations.push(ensureLabelExists(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
+      labelsToAdd.push(LABEL_GUIDELINES);
+    }
   } else {
     // Delete validation failure label if present
-    labelOperations.push(githubApiCall(`${prLabelUrl}/${encodeURIComponent(LABEL_GUIDELINES)}`, token, 'DELETE'));
+    if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
+      labelOperations.push(githubApiCall(`${prLabelUrl}/${encodeURIComponent(LABEL_GUIDELINES)}`, token, 'DELETE'));
+    }
   }
 
-  if (CONFIG.add_package_label && state.isNewPackage) {
+  if (CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
     labelOperations.push(ensureLabelExists(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
     labelsToAdd.push(LABEL_ADD_PACKAGE);
   }
 
-  if (CONFIG.drop_package_label && state.isDroppedPackage) {
+  if (CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
     labelOperations.push(ensureLabelExists(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
     labelsToAdd.push(LABEL_DROP_PACKAGE);
   }
@@ -531,8 +537,10 @@ async function handleWebhook(request, env) {
   if (CONFIG.branch_labeling && /^openwrt-\d{2}\.\d{2}$/.test(baseBranch)) {
     const version = baseBranch.split('-')[1];
     const labelName = `release/${version}`;
-    labelOperations.push(ensureLabelExists(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
-    labelsToAdd.push(labelName);
+    if (!currentPrLabels.has(labelName.toLowerCase())) {
+      labelOperations.push(ensureLabelExists(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
+      labelsToAdd.push(labelName);
+    }
   }
 
   // Pre-create any missing repository labels in parallel

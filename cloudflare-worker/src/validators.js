@@ -482,6 +482,33 @@ export function getChangedFilesFromPatch(patch) {
   return files;
 }
 
+export function parseDiffFileStates(patch) {
+  const addedFiles = new Set();
+  const deletedFiles = new Set();
+  if (!patch) return { addedFiles, deletedFiles };
+
+  const lines = patch.split('\n');
+  let currentFile = null;
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      currentFile = null;
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      if (match) {
+        currentFile = match[2].trim().replace(/\r$/, '');
+      }
+    } else if (currentFile) {
+      if (line.startsWith('--- /dev/null')) {
+        addedFiles.add(currentFile);
+      } else if (line.startsWith('+++ /dev/null')) {
+        deletedFiles.add(currentFile);
+      }
+    }
+  }
+
+  return { addedFiles, deletedFiles };
+}
+
 export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
 }
@@ -606,8 +633,17 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   const pkgRoots = new Set();
   const pkgRootCache = {};
 
+  const addedFiles = new Set();
+  const deletedFiles = new Set();
+
   let exceededPkgLimit = false;
   outer: for (const item of commitDetails) {
+    if (item.commitPatch) {
+      const states = parseDiffFileStates(item.commitPatch);
+      states.addedFiles.forEach(f => addedFiles.add(f));
+      states.deletedFiles.forEach(f => deletedFiles.add(f));
+    }
+
     const files = getChangedFilesFromPatch(item.commitPatch);
     for (const file of files) {
       if (isHiddenOrSpecial(file)) continue;
@@ -636,14 +672,21 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
   // 2. Process each package root
   for (const pkgRoot of pkgRoots) {
-    const headContent = await fetchFileContentAtHead(`${pkgRoot}/Makefile`);
+    const makefilePath = `${pkgRoot}/Makefile`;
+
+    if (deletedFiles.has(makefilePath)) {
+      // Package was deleted/dropped, skip checks
+      continue;
+    }
+
+    const headContent = await fetchFileContentAtHead(makefilePath);
     if (headContent === null) {
       // Package was deleted/dropped, skip checks
       continue;
     }
 
-    const baseContent = await fetchFileContentAtBase(`${pkgRoot}/Makefile`);
-    const isNew = (baseContent === null);
+    const isNew = addedFiles.has(makefilePath);
+    const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
 
     const headRelease = parseMakefileVar(headContent, 'PKG_RELEASE');
 

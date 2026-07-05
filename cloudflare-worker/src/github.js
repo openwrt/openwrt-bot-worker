@@ -20,10 +20,8 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   const text = await response.text();
 
   if (response.status >= 400) {
-    const isExpected404 = response.status === 404 && (
-      (method === 'GET' && url.includes('/.github/formalities.json')) ||
-      (method === 'DELETE' && url.includes('/labels/'))
-    );
+    const isExpected404 = response.status === 404 &&
+      method === 'GET' && url.includes('/contents/');
     if (!isExpected404) {
       console.error(`GitHub API call failed: ${method} ${url} -> HTTP ${response.status}: ${text.trim().slice(0, 500)}`);
     }
