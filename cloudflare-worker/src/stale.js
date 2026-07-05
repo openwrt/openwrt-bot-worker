@@ -174,7 +174,7 @@ export async function handleScheduled(env) {
               break;
             }
             const list = resRepoLabels.data || [];
-            list.forEach(l => repoLabels.add(l.name));
+            list.forEach(l => repoLabels.add(l.name.toLowerCase()));
 
             // Optimizing: break out early if stale label exists
             if (repoLabels.has('stale')) {
@@ -272,8 +272,8 @@ export async function handleScheduled(env) {
           for (const pr of prs) {
             const prNumber = pr.number;
             const updatedAt = new Date(pr.updated_at);
-            const hasStaleLabel = pr.labels.some(l => l.name === 'stale');
-            const hasGuidelinesLabel = pr.labels.some(l => l.name === LABEL_GUIDELINES);
+            const hasStaleLabel = pr.labels.some(l => l.name.toLowerCase() === 'stale');
+            const hasGuidelinesLabel = pr.labels.some(l => l.name.toLowerCase() === LABEL_GUIDELINES.toLowerCase());
 
             console.log(`[Stale Bot] Processing PR #${prNumber} (Updated: ${pr.updated_at}, hasStaleLabel: ${hasStaleLabel}, hasGuidelinesLabel: ${hasGuidelinesLabel})`);
 

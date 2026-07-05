@@ -192,7 +192,7 @@ async function handleWebhook(request, env) {
     }
   }
 
-  const existingLabels = new Set(allLabels.map(l => l.name));
+  const existingLabels = new Set(allLabels.map(l => l.name.toLowerCase()));
   
   let commits = [];
   for (let i = 0; i < commitsResList.length; i++) {
@@ -505,7 +505,7 @@ async function handleWebhook(request, env) {
   const labelOperations = [];
 
   async function ensureLabelExists(name, color, description) {
-    if (!existingLabels.has(name)) {
+    if (!existingLabels.has(name.toLowerCase())) {
       await githubApiCall(labelsUrl, token, 'POST', { name, color, description });
     }
   }
