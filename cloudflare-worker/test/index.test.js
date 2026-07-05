@@ -2,6 +2,7 @@ import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import worker from '../src/index.js';
 import { handleScheduled } from '../src/stale.js';
+import { githubApiCall } from '../src/github.js';
 
 async function calculateHmac(secret, payload) {
   const encoder = new TextEncoder();
