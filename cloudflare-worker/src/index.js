@@ -411,8 +411,14 @@ async function handleWebhook(request, env) {
       patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
       reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
       if (reportPatches.errors.length > 0) {
-        allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
-        reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+        const isPatchWarning = CONFIG.check_patch_headers === 'warning';
+        if (isPatchWarning) {
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.map(e => `- ⚠️ ${e}`).join("\n"));
+          reportPatches.errors.forEach(err => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
+        } else {
+          allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
+          reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+        }
       }
       patchesOutputText += "\n";
     }
@@ -445,8 +451,14 @@ async function handleWebhook(request, env) {
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
     if (reportPatches.errors.length > 0) {
-      allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.join("\n"));
-      reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+      const isPatchWarning = CONFIG.check_patch_headers === 'warning';
+      if (isPatchWarning) {
+        allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.map(e => `- ⚠️ ${e}`).join("\n"));
+        reportPatches.errors.forEach(err => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
+      } else {
+        allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.join("\n"));
+        reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+      }
     }
     patchesOutputText += "\n";
   }

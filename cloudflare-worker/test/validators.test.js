@@ -593,6 +593,60 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
     const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
     assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
   });
+
+  test('skips validation entirely when check_patch_headers is false', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++Some diff without from and subject headers
+    `;
+    const disabledConf = { ...CONFIG, check_patch_headers: false };
+    const res = await validateEmbeddedPatches(patch, disabledConf);
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.successes.length, 0);
+  });
+
+  test('skips validation entirely when check_patch_headers is disabled string', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++Some diff without from and subject headers
+    `;
+    const disabledConf = { ...CONFIG, check_patch_headers: 'disabled' };
+    const res = await validateEmbeddedPatches(patch, disabledConf);
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.successes.length, 0);
+  });
+
+  test('returns errors normally when check_patch_headers is warning (caller handles severity)', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++Some diff without from and subject headers
+    `;
+    const warningConf = { ...CONFIG, check_patch_headers: 'warning' };
+    const res = await validateEmbeddedPatches(patch, warningConf);
+    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
+  });
+
+  test('returns errors normally when check_patch_headers is true', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++Some diff without from and subject headers
+    `;
+    const errorConf = { ...CONFIG, check_patch_headers: true };
+    const res = await validateEmbeddedPatches(patch, errorConf);
+    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
+  });
 });
 
 // ─── Package Release Bump Validation ─────────────────────────────

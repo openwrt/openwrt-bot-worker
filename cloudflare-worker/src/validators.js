@@ -415,8 +415,12 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   const errors = [];
   const successes = [];
 
-  if (!CONFIG.check_patch_headers || !commitPatch) {
-    return { errors: [], successes: ["✅ Patches validation skipped or no diff footprint present"] };
+  if (CONFIG.check_patch_headers === false || CONFIG.check_patch_headers === 'disabled') {
+    return { errors: [], successes: [] };
+  }
+
+  if (!commitPatch) {
+    return { errors: [], successes: ["✅ No diff footprint present for patches validation"] };
   }
 
   const patchMatch = commitPatch.match(/^\+\+\+\s+b\/(.*\.patch)/mg);
