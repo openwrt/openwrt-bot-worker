@@ -864,6 +864,82 @@ index 123456..789012 100644
     assert.ok(res.warnings.some(w => w.includes('Package release bump audit skipped') && w.includes('16 packages')));
     assert.strictEqual(fetchCalled, false);
   });
+
+  test('skips headFetch call completely for deleted packages', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/oldpkg/Makefile b/package/utils/oldpkg/Makefile
+deleted file mode 100644
+--- a/package/utils/oldpkg/Makefile
++++ /dev/null
+`
+    }];
+    const headFetch = async () => {
+      throw new Error('headFetch should not be called for deleted packages!');
+    };
+    const baseFetch = async () => {
+      return 'PKG_NAME:=oldpkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    // Since it's deleted, it skips check, so no errors and no successes
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('passes for dynamic PKG_VERSION (Makefile expression) when Makefile changed', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/devel/gcc/Makefile b/devel/gcc/Makefile
+--- a/devel/gcc/Makefile
++++ b/devel/gcc/Makefile
+-ifeq ($(PKG_VERSION),14.3.0)
++ifeq ($(PKG_VERSION),14.4.0)
+diff --git a/devel/gcc/patches-14.x/004-libcody.patch b/devel/gcc/patches-14.x/004-libcody.patch
+deleted file mode 100644
+--- a/devel/gcc/patches-14.x/004-libcody.patch
++++ /dev/null
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'devel/gcc/Makefile') {
+        return 'PKG_NAME:=gcc\nGCC_VERSION:=$(call qstrip,$(CONFIG_GCC_VERSION))\nPKG_VERSION:=$(firstword $(subst +, ,$(GCC_VERSION)))\nPKG_RELEASE:=7\n\nifeq ($(PKG_VERSION),14.4.0)\n  PKG_HASH:=newHash\nendif\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'devel/gcc/Makefile') {
+        return 'PKG_NAME:=gcc\nGCC_VERSION:=$(call qstrip,$(CONFIG_GCC_VERSION))\nPKG_VERSION:=$(firstword $(subst +, ,$(GCC_VERSION)))\nPKG_RELEASE:=7\n\nifeq ($(PKG_VERSION),14.3.0)\n  PKG_HASH:=oldHash\nendif\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('dynamic PKG_VERSION')));
+  });
+
+  test('fails for dynamic PKG_VERSION when only non-Makefile files changed without PKG_RELEASE bump', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/devel/gcc/patches-14.x/910-mbsd_multi.patch b/devel/gcc/patches-14.x/910-mbsd_multi.patch
+--- a/devel/gcc/patches-14.x/910-mbsd_multi.patch
++++ b/devel/gcc/patches-14.x/910-mbsd_multi.patch
++# modified patch
+`
+    }];
+    const makefileContent = 'PKG_NAME:=gcc\nGCC_VERSION:=$(call qstrip,$(CONFIG_GCC_VERSION))\nPKG_VERSION:=$(firstword $(subst +, ,$(GCC_VERSION)))\nPKG_RELEASE:=7\n';
+    const headFetch = async (path) => {
+      if (path === 'devel/gcc/Makefile') return makefileContent;
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'devel/gcc/Makefile') return makefileContent;
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
 });
 
 describe('findPkgRoot', () => {

@@ -659,8 +659,25 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     // Existing package modified
     const baseVersion = parseMakefileVar(baseContent, 'PKG_VERSION');
     const headVersion = parseMakefileVar(headContent, 'PKG_VERSION');
-
     const baseRelease = parseMakefileVar(baseContent, 'PKG_RELEASE');
+
+    // If PKG_VERSION is a dynamic Makefile expression (e.g. $(firstword ...)),
+    // we can't reliably compare versions. In that case, if the Makefile itself
+    // changed, treat it as a version bump (the version is likely embedded in
+    // conditional blocks like ifeq/PKG_HASH). If only non-Makefile files changed,
+    // still require a PKG_RELEASE bump.
+    const isDynamicVersion = (headVersion && headVersion.includes('$(')) ||
+                             (baseVersion && baseVersion.includes('$('));
+    if (isDynamicVersion) {
+      const makefileChanged = baseContent !== headContent;
+      const releaseChanged = (baseRelease !== headRelease);
+      if (makefileChanged || releaseChanged) {
+        successes.push(`✅ Package \`${pkgRoot}\` has dynamic PKG_VERSION — Makefile changed, audit skipped`);
+      } else {
+        errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump`);
+      }
+      continue;
+    }
 
     const baseSourceVer = parseMakefileVar(baseContent, 'PKG_SOURCE_VERSION');
     const headSourceVer = parseMakefileVar(headContent, 'PKG_SOURCE_VERSION');
