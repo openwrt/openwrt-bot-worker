@@ -848,23 +848,25 @@ export default {
       return new Response("Invalid Request", { status: 400 });
     } catch (rawError) {
       console.error("Webhook processing failed:", rawError);
-      let error;
+
+      let name = "Error";
+      let message;
+
       if (rawError instanceof Error) {
-        error = rawError;
+        name = rawError.name;
+        message = rawError.message;
+      } else if (rawError && typeof rawError === 'object') {
+        name = String(rawError.name || "Error");
+        message = String(rawError.message || rawError);
+      } else if (rawError !== undefined && rawError !== null) {
+        message = String(rawError);
       } else {
-        const msg = rawError && typeof rawError === 'object' && rawError.message
-          ? String(rawError.message)
-          : String(rawError);
-        error = new Error(msg);
-        if (rawError && typeof rawError === 'object') {
-          error.name = rawError.name || error.name;
-          error.stack = rawError.stack || error.stack;
-        }
+        message = "null";
       }
 
       const errorDetails = {
-        name: error.name || "Error",
-        message: error.message || String(error),
+        name,
+        message,
         timestamp: Date.now()
       };
       return new Response(JSON.stringify({

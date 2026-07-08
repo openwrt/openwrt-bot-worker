@@ -13,7 +13,7 @@ export function isNoreplyEmail(email) {
 export function getNormalizedText(str, pkgName) {
   let cleaned = str.toLowerCase();
   if (pkgName) {
-    cleaned = cleaned.replace(new RegExp(pkgName.toLowerCase(), 'g'), '');
+    cleaned = cleaned.replaceAll(pkgName.toLowerCase(), '');
   }
   // Remove common list bullet markers and generic words
   cleaned = cleaned.replace(/^[\s\-*+•#]+/, '');
