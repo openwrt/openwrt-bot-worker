@@ -36,6 +36,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **Mandatory Metadata (`check_openwrt_meta`):** Enforces the inclusion of `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` variables whenever a new package is introduced (fully configurable list).
 *   **Conffiles Tracker:** Mandates the definition of the `Package/.../conffiles` tracking macro whenever configuration file installations (`INSTALL_CONF`) are triggered.
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
+*   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
 *   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled).
 
 ### 3. Patches Check
@@ -102,6 +103,7 @@ If individual source repositories wish to tweak defaults or scale back rule rest
 Some configuration keys offer advanced options:
 *   `check_openwrt_meta`: Can be `true` (enforces standard `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` for new packages), `false` (disabled), or an array of custom required fields (e.g., `["PKG_MAINTAINER", "PKG_LICENSE"]`).
 *   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
+*   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 
@@ -125,6 +127,7 @@ Here is a comprehensive example containing all available toggle options:
   "require_body": true,
   "check_pkg_version": true,
   "check_crlf": true,
+  "check_trailing_newline": true,
   "add_package_label": true,
   "drop_package_label": true,
   "branch_labeling": true,

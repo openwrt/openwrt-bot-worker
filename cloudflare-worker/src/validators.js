@@ -280,10 +280,11 @@ export async function validateFormalities(fullCommit, CONFIG) {
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) {
   const errors = [];
   const successes = [];
+  const warnings = [];
   const subject = (fullCommit.commit.message || '').split("\n")[0].trim();
 
   if (!commitPatch) {
-    return { errors: [], successes: ["✅ No codebase text files changed to analyze"] };
+    return { errors: [], successes: ["✅ No codebase text files changed to analyze"], warnings: [] };
   }
 
   let isNewPackageThisCommit = false;
@@ -408,7 +409,45 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
-  return { errors, successes };
+  if (CONFIG.check_trailing_newline && CONFIG.check_trailing_newline !== 'disabled') {
+    let currentFile = null;
+    let prevLine = null;
+    const missingNewlineFiles = [];
+    const changedFiles = new Set();
+
+    const patchLines = commitPatch.split('\n');
+    for (const line of patchLines) {
+      if (line.startsWith('+++ b/')) {
+        currentFile = line.slice(6).trim().replace(/\r$/, '');
+        if (currentFile !== '/dev/null') {
+          changedFiles.add(currentFile);
+        }
+      } else if (line.startsWith('+++ /dev/null')) {
+        currentFile = null;
+      } else if (line.trim() === '\\ No newline at end of file') {
+        if (currentFile && prevLine && prevLine.startsWith('+')) {
+          missingNewlineFiles.push(currentFile);
+        }
+      }
+      prevLine = line;
+    }
+
+    if (missingNewlineFiles.length > 0) {
+      const isWarning = CONFIG.check_trailing_newline === 'warning';
+      missingNewlineFiles.forEach(file => {
+        const msg = `- File '${file}' is missing a trailing newline`;
+        if (isWarning) {
+          warnings.push(msg);
+        } else {
+          errors.push(msg);
+        }
+      });
+    } else if (changedFiles.size > 0) {
+      successes.push("✅ All modified files contain a trailing newline");
+    }
+  }
+
+  return { errors, successes, warnings };
 }
 
 export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent) {

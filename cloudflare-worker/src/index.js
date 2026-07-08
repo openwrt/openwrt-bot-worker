@@ -393,6 +393,10 @@ async function handleWebhook(request, env) {
       const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
       makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
       reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+      if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
+        allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.warnings.join("\n"));
+        reportMakefile.warnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+      }
       if (reportMakefile.errors.length > 0) {
         allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.errors.join("\n"));
         reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
@@ -435,6 +439,10 @@ async function handleWebhook(request, env) {
     const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state);
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
     reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportMakefile.warnings.join("\n"));
+      reportMakefile.warnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    }
     if (reportMakefile.errors.length > 0) {
       allMakefileErrors.push(`**Pull Request Overall Diff**:\n` + reportMakefile.errors.join("\n"));
       reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });

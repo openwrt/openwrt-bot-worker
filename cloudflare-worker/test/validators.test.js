@@ -20,6 +20,7 @@ const CONFIG = {
   require_body: true,
   check_pkg_version: true,
   check_crlf: true,
+  check_trailing_newline: true,
   add_package_label: true,
   drop_package_label: true,
   branch_labeling: true,
@@ -512,6 +513,128 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('catches missing trailing newline on new/modified file additions as error by default', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- /dev/null
++++ b/package/utils/foo/Makefile
+@@ -0,0 +1,1 @@
++PKG_NAME:=foo
+\\ No newline at end of file
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const newlineTestConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: true
+    };
+    const res = validateMakefileContext(commit, patch, newlineTestConfig, state);
+    assert.ok(res.errors.some(e => e.includes("missing a trailing newline")));
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('catches missing trailing newline as warning when check_trailing_newline is set to warning', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- /dev/null
++++ b/package/utils/foo/Makefile
+@@ -0,0 +1,1 @@
++PKG_NAME:=foo
+\\ No newline at end of file
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const newlineTestConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: 'warning'
+    };
+    const res = validateMakefileContext(commit, patch, newlineTestConfig, state);
+    assert.ok(res.warnings.some(w => w.includes("missing a trailing newline")));
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('does not report missing trailing newline when check_trailing_newline is disabled', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- /dev/null
++++ b/package/utils/foo/Makefile
+@@ -0,0 +1,1 @@
++PKG_NAME:=foo
+\\ No newline at end of file
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const newlineTestConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false
+    };
+    const res = validateMakefileContext(commit, patch, newlineTestConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('accepts files with trailing newline', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- /dev/null
++++ b/package/utils/foo/Makefile
+@@ -0,0 +1,1 @@
++PKG_NAME:=foo
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const newlineTestConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: true
+    };
+    const res = validateMakefileContext(commit, patch, newlineTestConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+    assert.ok(res.successes.some(s => s.includes("All modified files contain a trailing newline")));
+  });
+
+  test('ignores missing trailing newline in pre-image (old version) when not present in post-image', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -1,1 +1,2 @@
+-PKG_NAME:=foo
+\\ No newline at end of file
++PKG_NAME:=foo
++PKG_VERSION:=1.0
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const newlineTestConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: true
+    };
+    const res = validateMakefileContext(commit, patch, newlineTestConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
   });
 
 });
