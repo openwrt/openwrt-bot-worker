@@ -516,6 +516,117 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
+  test('rejects conffiles path that is not an absolute path', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++etc/foo.json
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("must be an absolute path starting with '/'")));
+  });
+
+  test('rejects conffiles path for known directory missing trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("is a directory and must end with a trailing slash '/'")));
+  });
+
+  test('rejects conffiles path for individual file ending with trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config/foo/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("is an individual file and must not end with a trailing slash")));
+  });
+
+  test('rejects conffiles path for individual file with extension ending with trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/foo.conf/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("is an individual file and must not end with a trailing slash")));
+  });
+
+  test('rejects package that installs config files but is missing conffiles section', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/install
++	$(INSTALL_DIR) $(1)/etc/config
++	$(INSTALL_DATA) ./files/foo.config $(1)/etc/config/foo
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section")));
+  });
+
+  test('accepts package that installs config files and has conffiles section', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config/foo
++endef
++define Package/foo/install
++	$(INSTALL_DIR) $(1)/etc/config
++	$(INSTALL_CONF) ./files/foo.config $(1)/etc/config/foo
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts conffiles directory with trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config/
++/etc/ssl/certs/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
   test('catches missing trailing newline on new/modified file additions as error by default', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `

@@ -347,14 +347,6 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
-  if (CONFIG.check_conffiles && /INSTALL_CONF/m.test(commitPatch)) {
-    if (!/define\s+Package\/[a-zA-Z0-9_.-]+\/conffiles/m.test(commitPatch)) {
-      errors.push("- Makefile triggers 'INSTALL_CONF', but is missing the required 'conffiles' tracking macro configuration block");
-    } else {
-      successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
-    }
-  }
-
   if (CONFIG.check_conffiles) {
     const fileDiffs = commitPatch.split(/^diff --git /m);
     let conffilesCheckRun = false;
@@ -367,6 +359,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
       const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
       if (!isMakefile) continue;
 
+      let MakefileInstallsConfig = false;
+      let MakefileHasConffiles = false;
       let inConffiles = false;
       let currentPackage = '';
       const lines = fileDiff.split('\n');
@@ -377,6 +371,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
           if (defineMatch) {
             inConffiles = true;
             currentPackage = defineMatch[1];
+            MakefileHasConffiles = true;
             continue;
           }
           if (contentLine.match(/^endef/)) {
@@ -385,19 +380,77 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
             continue;
           }
 
-          if (inConffiles && line.startsWith('+')) {
-            conffilesCheckRun = true;
-            if (/[ \t]/.test(contentLine)) {
-              conffilesCheckErrors++;
-              errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
+          if (line.startsWith('+')) {
+            // Check if the added line installs configuration files
+            const isInstallLine = contentLine.includes('INSTALL_CONF') ||
+              (contentLine.includes('$(1)/etc') &&
+               !contentLine.includes('/etc/init.d') &&
+               !contentLine.includes('/etc/uci-defaults') &&
+               !contentLine.includes('/etc/hotplug.d'));
+            if (isInstallLine) {
+              MakefileInstallsConfig = true;
+            }
+
+            if (inConffiles) {
+              conffilesCheckRun = true;
+              
+              // No indentation/spaces
+              if (/[ \t]/.test(contentLine)) {
+                conffilesCheckErrors++;
+                errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
+              }
+
+              const trimmedLine = contentLine.trim();
+              if (trimmedLine.length > 0) {
+                // Absolute paths must start with '/'
+                if (!trimmedLine.startsWith('/')) {
+                  conffilesCheckErrors++;
+                  errors.push(`- ${currentPackage} line '${trimmedLine}' must be an absolute path starting with '/'`);
+                }
+
+                // Directories must end with a trailing slash '/'
+                // Individual files must NOT end with a trailing slash.
+                if (trimmedLine.endsWith('/')) {
+                  // If it has a file extension or is a file ending in '/', it's an error
+                  if (/\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine)) {
+                    conffilesCheckErrors++;
+                    errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
+                  } else if (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length) {
+                    // Files under /etc/config/ cannot end with / because there are no subdirectories in /etc/config
+                    conffilesCheckErrors++;
+                    errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
+                  }
+                } else {
+                  // If it is a known directory but does not end with '/'
+                  const knownDirs = [
+                    '/etc',
+                    '/etc/config',
+                    '/etc/ssl/certs',
+                    '/etc/nginx',
+                    '/etc/collectd.d',
+                    '/etc/strongswan.d',
+                    '/etc/docker'
+                  ];
+                  if (knownDirs.includes(trimmedLine)) {
+                    conffilesCheckErrors++;
+                    errors.push(`- ${currentPackage} line '${trimmedLine}' is a directory and must end with a trailing slash '/'`);
+                  }
+                }
+              }
             }
           }
         }
       }
+
+      if (MakefileInstallsConfig && !MakefileHasConffiles) {
+        errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section");
+      } else if (MakefileInstallsConfig && MakefileHasConffiles) {
+        successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
+      }
     }
 
     if (conffilesCheckRun && conffilesCheckErrors === 0) {
-      successes.push("✅ Makefile conffiles block contains no spaces or indentation");
+      successes.push("✅ Makefile conffiles block contains no spaces or indentation and paths are correctly formatted");
     }
   }
 
