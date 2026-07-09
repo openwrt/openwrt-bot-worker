@@ -614,7 +614,7 @@ async function handleWebhook(request, env) {
         }
 
         if (!allPassed && CONFIG.show_force_push_tip) {
-          commentBody += "> [!TIP]\n";
+          commentBody += "\n> [!TIP]\n";
           commentBody += "> **Do not close this pull request** to make corrections. Instead, modify your existing commits (e.g. `git commit --amend`) and update the branch using `git push --force-with-lease --force-if-includes`. The checks will re-run automatically.\n\n";
         }
 
