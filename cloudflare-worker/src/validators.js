@@ -643,6 +643,44 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  if (CONFIG.check_pkg_name_reuse) {
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    let pkgNameCheckRun = false;
+    let pkgNameCheckErrors = 0;
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
+      if (!isMakefile) continue;
+
+      const lines = fileDiff.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('+')) {
+          const contentLine = line.slice(1);
+          if (contentLine.trim().startsWith('#')) {
+            continue;
+          }
+          if (/\$(?:\(PKG_NAME\)|{PKG_NAME})/.test(contentLine)) {
+            const hasDefine = /\bdefine\b/.test(contentLine);
+            const hasCall = /\bcall\b/.test(contentLine);
+            const hasEval = /\beval\b/.test(contentLine);
+            if (hasDefine || hasCall || hasEval) {
+              pkgNameCheckErrors++;
+              errors.push(`- Makefile line '${contentLine.trim()}' reuses PKG_NAME in a call, define, or eval. Use the literal package name instead.`);
+            }
+          }
+        }
+      }
+      pkgNameCheckRun = true;
+    }
+
+    if (pkgNameCheckRun && pkgNameCheckErrors === 0) {
+      successes.push("✅ Makefile does not reuse PKG_NAME in call, define, or eval lines");
+    }
+  }
+
   if (CONFIG.check_crlf) {
     if (/^\+.*\r$/m.test(commitPatch)) {
       errors.push("- Windows style line endings (CRLF) detected inside added source lines. Use UNIX (LF) formatting exclusively");

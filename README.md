@@ -40,6 +40,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
 *   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled).
 *   **UCI Config Validation:** Ensures that any configuration files destined to be installed into `/etc/config/` conform to the standard OpenWrt UCI format (consisting of only `package`, `config`, `option`, `list` statements, comments, and empty lines).
+*   **PKG_NAME Reuse Prevention:** Ensures `PKG_NAME` is not reused inside `call`, `define`, and `eval` Makefile lines, requiring the literal package name instead to keep recipes readable and searchable (default true).
 
 ### 3. Patches Check
 Scans the contribution tree for nested downstream patch targets:
@@ -111,6 +112,7 @@ Some configuration keys offer advanced options:
 *   `check_space_after_assignment`: Set to `true` (default) to detect and reject spaces/indentation immediately after the `:=` assignment operator in Makefiles, or `false` to disable.
 *   `check_missing_colon`: Set to `true` (default) to detect and reject the use of `=` instead of `:=` for standard variables (e.g. `PKG_NAME`, `TITLE`, `URL`, etc.) in Makefiles, or `false` to disable.
 *   `check_makefile_indentation`: Set to `true` (default) to validate package metadata/description blocks are indented with 2 spaces and install/build blocks are indented with tabs in Makefiles, or `false` to disable.
+*   `check_pkg_name_reuse`: Set to `true` (default) to detect and reject reuse of the `PKG_NAME` variable in `call`, `define`, and `eval` lines, or `false` to disable.
 *   `show_force_push_tip`: Set to `true` (default) to append a helpful tip regarding how to correct validation errors using force-pushing. Set to `false` to disable.
 *   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
@@ -146,6 +148,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_space_after_assignment": true,
   "check_missing_colon": true,
   "check_makefile_indentation": true,
+  "check_pkg_name_reuse": true,
   "check_patch_headers": true,
   "check_pkg_release": "warning",
   "require_linked_github_account": true,

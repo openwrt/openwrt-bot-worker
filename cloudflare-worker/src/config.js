@@ -32,6 +32,7 @@ export const DEFAULT_CONFIG = {
   check_space_after_assignment: true,
   check_missing_colon: true,
   check_makefile_indentation: true,
+  check_pkg_name_reuse: true,
 
   // Patches Check features
   check_patch_headers: true,

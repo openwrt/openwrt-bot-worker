@@ -27,6 +27,7 @@ const CONFIG = {
   branch_labeling: true,
   check_openwrt_meta: true,
   check_conffiles: true,
+  check_pkg_name_reuse: true,
   check_patch_headers: true,
   require_linked_github_account: false,
   check_openwrt_spelling: true
@@ -1153,6 +1154,95 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
       check_pkg_version: false,
       check_trailing_newline: false,
       check_makefile_indentation: false
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('rejects reuse of PKG_NAME in call, define, and eval lines', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/$(PKG_NAME)
++$(eval $(call BuildPackage,$(PKG_NAME)))
++define Package/\${PKG_NAME}/description
++\$(call BuildPackage,\${PKG_NAME})
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 4);
+    assert.ok(res.errors[0].includes("reuses PKG_NAME in a call, define, or eval"));
+    assert.ok(res.errors[1].includes("reuses PKG_NAME in a call, define, or eval"));
+    assert.ok(res.errors[2].includes("reuses PKG_NAME in a call, define, or eval"));
+    assert.ok(res.errors[3].includes("reuses PKG_NAME in a call, define, or eval"));
+  });
+
+  test('accepts literal package name in call, define, and eval lines', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo
++\$(eval \$(call BuildPackage,foo))
++define Package/foo/description
++\$(call BuildPackage,foo)
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false
+    };
+    const resClean = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(resClean.errors.length, 0);
+    assert.ok(resClean.successes.some(s => s.includes("does not reuse PKG_NAME in call, define, or eval")));
+  });
+
+  test('allows PKG_NAME outside of call, define, and eval lines', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++PKG_BUILD_DIR:=\$(BUILD_DIR)/\$(PKG_NAME)-\$(PKG_VERSION)
++URL:=https://github.com/foo/\$(PKG_NAME)
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('ignores comments containing PKG_NAME inside eval/call/define patterns', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++# \$(eval \$(call BuildPackage,\$(PKG_NAME)))
++# define Package/\$(PKG_NAME)
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false
     };
     const res = validateMakefileContext(commit, patch, testConfig, state);
     assert.strictEqual(res.errors.length, 0);
