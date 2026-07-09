@@ -498,6 +498,60 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  if (CONFIG.check_missing_colon || CONFIG.check_space_after_assignment) {
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    let assignmentCheckRun = false;
+    let assignmentErrors = 0;
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
+      if (!isMakefile) continue;
+
+      const lines = fileDiff.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('+')) {
+          const contentLine = line.slice(1);
+          if (contentLine.trim().startsWith('#') || contentLine.startsWith('\t')) {
+            continue;
+          }
+          const match = contentLine.match(/^\s*([^\s:=?+]+)\s*(:=|\+=|\?=|=)(.*)$/);
+          if (match) {
+            const varName = match[1].trim();
+            const op = match[2];
+            const varValue = match[3];
+
+            if (CONFIG.check_missing_colon && op === '=') {
+              const standardVars = ['TITLE', 'URL', 'SECTION', 'CATEGORY', 'SUBMENU', 'DEPENDS', 'USERID', 'PROVIDES', 'MAINTAINER', 'LICENSE', 'LICENSE_FILES'];
+              if (varName.startsWith('PKG_') || standardVars.includes(varName)) {
+                assignmentErrors++;
+                errors.push(`- Makefile line '${contentLine.trim()}' uses '=' instead of ':=' for assignment. Use '${varName}:=${varValue.trim()}' to ensure simple expansion.`);
+              }
+            } else if (CONFIG.check_space_after_assignment && op === ':=') {
+              if (/^[\t ]/.test(varValue)) {
+                assignmentErrors++;
+                errors.push(`- Makefile line '${contentLine.trim()}' has a space after ':='. Use '${varName}:=${varValue.trim()}' without leading spaces.`);
+              }
+            }
+          }
+        }
+      }
+      assignmentCheckRun = true;
+    }
+
+    if (assignmentCheckRun && assignmentErrors === 0) {
+      if (CONFIG.check_missing_colon && CONFIG.check_space_after_assignment) {
+        successes.push("✅ Makefile contains valid assignment operators and no spaces after ':='");
+      } else if (CONFIG.check_missing_colon) {
+        successes.push("✅ Makefile contains valid assignment operators");
+      } else if (CONFIG.check_space_after_assignment) {
+        successes.push("✅ Makefile does not contain spaces after ':=' assignment operator");
+      }
+    }
+  }
+
   if (CONFIG.check_crlf) {
     if (/^\+.*\r$/m.test(commitPatch)) {
       errors.push("- Windows style line endings (CRLF) detected inside added source lines. Use UNIX (LF) formatting exclusively");

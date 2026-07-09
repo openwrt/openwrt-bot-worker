@@ -819,6 +819,157 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.warnings.length, 0);
   });
 
+  test('flags spaces immediately after the := operator in Makefiles', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++TITLE:= Simple WireGuard proxy
++URL:= https://github.com/foo/bar
++PKG_NAME :=  foo
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_space_after_assignment: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 3);
+    assert.ok(res.errors[0].includes("Makefile line 'TITLE:= Simple WireGuard proxy' has a space after ':='"));
+    assert.ok(res.errors[1].includes("Makefile line 'URL:= https://github.com/foo/bar' has a space after ':='"));
+    assert.ok(res.errors[2].includes("Makefile line 'PKG_NAME :=  foo' has a space after ':='"));
+  });
+
+  test('accepts clean assignments without space after :=', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++TITLE:=Simple WireGuard proxy
++URL:=https://github.com/foo/bar
++PKG_NAME:=foo
++VAR:=
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_space_after_assignment: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes("does not contain spaces after ':='")));
+  });
+
+  test('ignores comments and recipe lines containing spaces after :=', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++# TITLE:= Simple WireGuard proxy
++	$(SH) -c "var := value"
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_space_after_assignment: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('respects check_space_after_assignment: false configuration option', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++TITLE:= Simple WireGuard proxy
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_space_after_assignment: false
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('flags `=` instead of `:=` for standard variables (missing colon)', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++PKG_SOURCE_URL= \\
++TITLE = Simple WireGuard proxy
++PKG_VERSION= 1.0.0
++CUSTOM_VAR = helper
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_missing_colon: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 3);
+    assert.ok(res.errors[0].includes("uses '=' instead of ':='"));
+    assert.ok(res.errors[0].includes("PKG_SOURCE_URL"));
+    assert.ok(res.errors[1].includes("uses '=' instead of ':='"));
+    assert.ok(res.errors[1].includes("TITLE"));
+    assert.ok(res.errors[2].includes("uses '=' instead of ':='"));
+    assert.ok(res.errors[2].includes("PKG_VERSION"));
+  });
+
+  test('respects check_missing_colon: false configuration option', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++PKG_SOURCE_URL= \\
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_missing_colon: false
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
 });
 
 // ─── Embedded Patches ────────────────────────────────────────────
