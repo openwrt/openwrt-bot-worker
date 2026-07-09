@@ -1432,6 +1432,184 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.strictEqual(commitCheck.conclusion, 'success');
   });
 
+  async function sendBackportWebhookPR(prTitle, baseBranch, commitMessage, prPatchContent, upstreamPatchContent = null) {
+    postedCheckRuns = [];
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/issues/123/comments') && (!options || options.method === 'GET')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          const body = JSON.parse(options.body);
+          postedCheckRuns.push(body);
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      if (url.includes('/commits/abcdef1234567890')) {
+        if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response(prPatchContent, { status: 200 });
+        }
+        return new Response(JSON.stringify({
+          parents: [{ sha: 'parent-sha' }],
+          commit: {
+            message: commitMessage,
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' },
+            verification: { verified: true, key_id: 'GPGKEYID' }
+          }
+        }), { status: 200 });
+      }
+      if (url.includes('/commits/a1b2c3d4e5f61111222233334444555566667777')) {
+        if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response(upstreamPatchContent, { status: 200 });
+        }
+      }
+      if (url.includes('/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'abcdef1234567890',
+            html_url: 'https://github.com/test/repo/commit/abcdef1234567890',
+            commit: {
+              message: commitMessage,
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' },
+              verification: { verified: true, key_id: 'GPGKEYID' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: prTitle,
+        body: '',
+        base: { ref: baseBranch },
+        head: { ref: 'feature-branch', sha: 'abcdef1234567890' },
+        author_association: 'NONE',
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: {
+        'x-hub-signature-256': signature,
+        'x-github-event': 'pull_request'
+      }
+    });
+
+    return worker.fetch(request, {
+      WEBHOOK_SECRET: secret,
+      APP_ID: '12345',
+      PRIVATE_KEY: 'YW55Y29udGVudA=='
+    }, {});
+  }
+
+  test('backport PR by title fails if commit lacks cherry-picked context line', async () => {
+    const response = await sendBackportWebhookPR(
+      '[24.10] mypkg: update to 1.2.3',
+      'master',
+      'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+      'diff --git a/Makefile b/Makefile'
+    );
+    assert.strictEqual(response.status, 200);
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.strictEqual(commitCheck.conclusion, 'failure');
+    assert.match(commitCheck.output.text, /Commit to stable branch must be marked as cherry-picked/);
+  });
+
+  test('verbatim backport by title skips style validation errors', async () => {
+    const prPatchContent = `From: John Doe <john@doe.com>
+Subject: mypkg: update to 1.2.3
+
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+index 123456..789012 100644
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,5 +1,5 @@
++define Package/mypkg/conffiles
++ /etc/config/foo
++endef
+`;
+    const response = await sendBackportWebhookPR(
+      '[24.10] mypkg: update to 1.2.3',
+      'master',
+      'mypkg: update to 1.2.3\n\ncherry-picked from commit a1b2c3d4e5f61111222233334444555566667777\n\nSigned-off-by: John Doe <john@doe.com>',
+      prPatchContent,
+      prPatchContent
+    );
+    assert.strictEqual(response.status, 200);
+    const checkRun = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.ok(checkRun);
+    assert.strictEqual(checkRun.conclusion, 'success');
+    assert.match(checkRun.output.text, /Backport matches upstream commit verbatim/);
+  });
+
+  test('backport by title with deviations filters upstream errors but flags new deviations', async () => {
+    const upstreamPatchContent = `From: John Doe <john@doe.com>
+Subject: mypkg: update to 1.2.3
+
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+index 123456..789012 100644
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,5 +1,5 @@
++define Package/mypkg/conffiles
++ /etc/config/foo
++endef
+`;
+    const prPatchContent = `From: John Doe <john@doe.com>
+Subject: mypkg: update to 1.2.3
+
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+index 123456..789012 100644
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,7 +1,7 @@
++define Package/mypkg/conffiles
++ /etc/config/foo
++ /etc/config/bar
++endef
+`;
+    const response = await sendBackportWebhookPR(
+      '[24.10] mypkg: update to 1.2.3',
+      'master',
+      'mypkg: update to 1.2.3\n\ncherry-picked from commit a1b2c3d4e5f61111222233334444555566667777\n\nSigned-off-by: John Doe <john@doe.com>',
+      prPatchContent,
+      upstreamPatchContent
+    );
+    assert.strictEqual(response.status, 200);
+    const checkRun = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.ok(checkRun);
+    assert.strictEqual(checkRun.conclusion, 'failure');
+    assert.match(checkRun.output.text, /bar.*must not contain any spaces/);
+    assert.doesNotMatch(checkRun.output.text, /foo.*must not contain any spaces/);
+  });
+
   test('truncates check run output text if it exceeds GitHub limits', async () => {
     // Generate a long list of commits with long messages to bloat the output text
     const commitsList = Array.from({ length: 300 }, (_, i) => ({

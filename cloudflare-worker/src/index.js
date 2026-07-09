@@ -61,6 +61,60 @@ function safeTruncate(text, limit = 65000) {
   return truncatedText + suffix;
 }
 
+// --- UTILS FOR BACKPORTS ---
+function getDiffFromPatch(patchText) {
+  if (!patchText) return '';
+  const idx = patchText.indexOf('diff --git ');
+  return idx === -1 ? '' : patchText.slice(idx);
+}
+
+function normalizeDiff(diffText) {
+  return (diffText || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+}
+
+function getCommitMessageFromPatch(patch) {
+  if (!patch) return '';
+  const lines = patch.split('\n');
+  let subject = '';
+  const bodyLines = [];
+  let foundSubject = false;
+  let inBody = false;
+  
+  for (const line of lines) {
+    if (line.startsWith('Subject: ')) {
+      subject = line.slice(9).replace(/^\[PATCH\]\s*/i, '');
+      foundSubject = true;
+      inBody = true;
+      continue;
+    }
+    if (foundSubject) {
+      if (line.startsWith('---')) {
+        break;
+      }
+      if (inBody) {
+        bodyLines.push(line);
+      }
+    }
+  }
+  return (subject + '\n' + bodyLines.join('\n')).trim();
+}
+
+function getChangedFilesFromPatch(patch) {
+  if (!patch) return [];
+  const files = [];
+  const lines = patch.split('\n');
+  for (const line of lines) {
+    if (line.startsWith('+++ b/')) {
+      files.push(line.slice(6).trim().replace(/\r$/, ''));
+    }
+  }
+  return files;
+}
+
+
 // --- WEBHOOK HANDLER ---
 async function handleWebhook(request, env) {
   const payloadText = await request.text();
@@ -145,6 +199,7 @@ async function handleWebhook(request, env) {
   const headBranch = data.pull_request.head.ref;
   const prNumber = data.pull_request.number;
   const prTitle = data.pull_request.title;
+  const isBackportPr = /^(stable|openwrt-)/.test(baseBranch) || /^\[\d{2}\.\d{2}\]/.test(prTitle || '');
 
   const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels`;
   const commitsUrl = data.pull_request.commits_url;
@@ -223,7 +278,7 @@ async function handleWebhook(request, env) {
     return getCommentsScan();
   };
 
-  if (CONFIG.enable_comments || /^(stable|openwrt-)/.test(baseBranch)) {
+  if (CONFIG.enable_comments || isBackportPr) {
     void getCommentsScan();
   }
 
@@ -305,11 +360,38 @@ async function handleWebhook(request, env) {
       commitPatch = patchRes.raw;
     }
 
+    let isVerbatim = false;
+    let upstreamPatch = null;
+    let upstreamSha = null;
+    let upstreamFetchError = null;
+
+    if (isBackportPr) {
+      const commitMsg = commitData.commit?.message || '';
+      const match = commitMsg.match(/cherry-picked from commit ([0-9a-fA-F]{7,40})/i) || commitMsg.match(/cherry picked from commit ([0-9a-fA-F]{7,40})/i);
+      if (match) {
+        upstreamSha = match[1];
+        const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${upstreamSha}`;
+        const upstreamRes = await githubApiCall(upstreamUrl, token, 'GET', null, 'application/vnd.github.patch');
+        if (upstreamRes.code === 200) {
+          upstreamPatch = upstreamRes.raw;
+          if (commitPatch) {
+            isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
+          }
+        } else {
+          upstreamFetchError = `Could not fetch upstream commit ${upstreamSha.slice(0, 7)} from GitHub API (HTTP ${upstreamRes.code})`;
+        }
+      }
+    }
+
     return {
       sha,
       html_url: commitData.html_url || `https://github.com/${repoFullname}/commit/${sha}`,
       fullCommit: commitData,
-      commitPatch
+      commitPatch,
+      isVerbatim,
+      upstreamPatch,
+      upstreamSha,
+      upstreamFetchError
     };
   }));
 
@@ -365,7 +447,7 @@ async function handleWebhook(request, env) {
       reportFormality.errors.forEach(err => { formalityOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
 
-    if (/^(stable|openwrt-)/.test(baseBranch)) {
+    if (isBackportPr) {
       if (!(fullCommit.commit.message || '').toLowerCase().includes('cherry picked from')) {
         const scanResult = await getCommentsScanWithRetry() || { hasBypassComment: false, existingCommentId: null };
         const bypassCherryPickCheck = scanResult.hasBypassComment || (isMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(prBody));
@@ -384,47 +466,84 @@ async function handleWebhook(request, env) {
         }
       } else {
         formalityOutputText += "  ✅ Commit explicitly specifies cherry-pick origin context\n";
+        if (item.isVerbatim) {
+          formalityOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n";
+        } else if (item.upstreamFetchError) {
+          formalityOutputText += `  ⚠️ ${item.upstreamFetchError}\n`;
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n- ⚠️ ${item.upstreamFetchError}`);
+        } else if (item.upstreamSha) {
+          formalityOutputText += "  ⚠️ Backport diff deviates from upstream commit. Running validations on deviations only.\n";
+        }
       }
     }
     formalityOutputText += "\n";
 
     // 2. Makefiles
     if (!usePrWidePatch) {
-      const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
-      makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
-      reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
-      if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
-        allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.warnings.join("\n"));
-        reportMakefile.warnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+      if (item.isVerbatim) {
+        makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+        makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
+      } else {
+        const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
+        if (isBackportPr && item.upstreamPatch) {
+          const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
+          const reportUpstreamMakefile = validateMakefileContext(upstreamCommit, item.upstreamPatch, CONFIG, { isNewPackage: false, isDroppedPackage: false });
+          reportMakefile.errors = reportMakefile.errors.filter(err => !reportUpstreamMakefile.errors.includes(err));
+          reportMakefile.warnings = reportMakefile.warnings.filter(warn => !reportUpstreamMakefile.warnings.includes(warn));
+          reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
+        }
+        makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+        reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+        if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.warnings.join("\n"));
+          reportMakefile.warnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+        }
+        if (reportMakefile.errors.length > 0) {
+          allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.errors.join("\n"));
+          reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+        }
+        makefileOutputText += "\n";
       }
-      if (reportMakefile.errors.length > 0) {
-        allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.errors.join("\n"));
-        reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
-      }
-      makefileOutputText += "\n";
     }
 
     // 3. Patches
     if (!usePrWidePatch) {
-      const fetchFileContent = async (patchFile) => {
-        const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
-        const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-        return res.code === 200 ? res.raw : null;
-      };
-      const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
-      patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
-      reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
-      if (reportPatches.errors.length > 0) {
-        const isPatchWarning = CONFIG.check_patch_headers === 'warning';
-        if (isPatchWarning) {
-          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.map(e => `- ⚠️ ${e}`).join("\n"));
-          reportPatches.errors.forEach(err => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
-        } else {
-          allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
-          reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+      if (item.isVerbatim) {
+        patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+        patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
+      } else {
+        const fetchFileContent = async (patchFile) => {
+          const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
+          const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+          return res.code === 200 ? res.raw : null;
+        };
+        const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
+        
+        if (isBackportPr && item.upstreamPatch) {
+          const fetchFileContentForUpstream = async (patchFile) => {
+            const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${item.upstreamSha}`;
+            const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+            return res.code === 200 ? res.raw : null;
+          };
+          const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+          reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
+          reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
+
+        patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
+        reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+        if (reportPatches.errors.length > 0) {
+          const isPatchWarning = CONFIG.check_patch_headers === 'warning';
+          if (isPatchWarning) {
+            allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.map(e => `- ⚠️ ${e}`).join("\n"));
+            reportPatches.errors.forEach(err => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
+          } else {
+            allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
+            reportPatches.errors.forEach(err => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+          }
+        }
+        patchesOutputText += "\n";
       }
-      patchesOutputText += "\n";
     }
   }
 
@@ -487,11 +606,43 @@ async function handleWebhook(request, env) {
     return res.code === 200 ? res.raw : null;
   };
 
-  const releaseDetails = usePrWidePatch 
+  let releaseDetails = usePrWidePatch 
     ? [{ commitPatch: prPatch }] 
     : commitDetails;
 
+  if (isBackportPr) {
+    releaseDetails = releaseDetails.filter(item => !item.isVerbatim);
+  }
+
   const reportRelease = await validatePkgReleaseBumps(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
+  if (isBackportPr && reportRelease.errors.length > 0) {
+    reportRelease.errors = reportRelease.errors.filter(err => {
+      const match = err.match(/Package \`([^\`]+)\` content changed without a PKG_RELEASE or version bump/);
+      if (match) {
+        const pkgRoot = match[1];
+        const preExisting = commitDetails.some(item => {
+          if (!item.upstreamPatch) return false;
+          const files = getChangedFilesFromPatch(item.upstreamPatch);
+          const modifiesPkg = files.some(file => file.startsWith(pkgRoot + '/'));
+          if (!modifiesPkg) return false;
+
+          const hasBump = [
+            /^\+\s*PKG_VERSION\s*(?::=|=)/m,
+            /^\+\s*PKG_RELEASE\s*(?::=|=)/m,
+            /^\+\s*PKG_SOURCE_VERSION\s*(?::=|=)/m,
+            /^\+\s*PKG_SOURCE_DATE\s*(?::=|=)/m
+          ].some(regex => regex.test(item.upstreamPatch));
+
+          return !hasBump;
+        });
+        if (preExisting) {
+          reportRelease.successes.push(`✅ Package \`${pkgRoot}\` release audit: skipped warning/error for pre-existing lack of release bump on master`);
+          return false;
+        }
+      }
+      return true;
+    });
+  }
   if (reportRelease.successes.length > 0 || reportRelease.errors.length > 0 || (reportRelease.warnings && reportRelease.warnings.length > 0)) {
     makefileOutputText += `#### Package Release Audit:\n`;
     reportRelease.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
