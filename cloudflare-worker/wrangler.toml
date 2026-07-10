@@ -10,6 +10,10 @@ enabled = true
 [observability.logs]
 destinations = [ "honeycomb-logs" ]
 
+[observability.traces]
+enabled = true
+destinations = [ "honeycomb-traces" ]
+
 [placement]
 hostname = "api.github.com"
 
