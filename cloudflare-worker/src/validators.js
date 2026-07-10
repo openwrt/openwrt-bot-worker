@@ -552,6 +552,97 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  if (CONFIG.check_makefile_indentation) {
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    let indentationCheckRun = false;
+    let indentationErrors = 0;
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
+      if (!isMakefile) continue;
+
+      let inBlock = null; // 'metadata', 'description', 'recipe'
+      let blockName = '';
+      let isContinuation = false;
+
+      const lines = fileDiff.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('+') || line.startsWith(' ')) {
+          const contentLine = line.slice(1);
+
+          const metadataMatch = contentLine.match(/^define\s+(Package\/[^\s/]+(?:\/Default)?)$/);
+          const descriptionMatch = contentLine.match(/^define\s+(Package\/[^\s/]+\/description)$/);
+          const recipeMatch = contentLine.match(/^define\s+(Package\/[^\s/]+\/install|Build\/[^\s]+|Host\/[^\s]+)$/);
+
+          if (metadataMatch) {
+            inBlock = 'metadata';
+            blockName = metadataMatch[1];
+            isContinuation = false;
+            indentationCheckRun = true;
+            continue;
+          } else if (descriptionMatch) {
+            inBlock = 'description';
+            blockName = descriptionMatch[1];
+            isContinuation = false;
+            indentationCheckRun = true;
+            continue;
+          } else if (recipeMatch) {
+            inBlock = 'recipe';
+            blockName = recipeMatch[1];
+            isContinuation = false;
+            indentationCheckRun = true;
+            continue;
+          } else if (contentLine.trim() === 'endef') {
+            inBlock = null;
+            blockName = '';
+            isContinuation = false;
+            continue;
+          } else if (contentLine.startsWith('define ')) {
+            inBlock = null;
+            blockName = '';
+            isContinuation = false;
+            continue;
+          }
+
+          if (line.startsWith('+') && inBlock) {
+            const trimmed = contentLine.trim();
+            const isEmpty = trimmed === '';
+            const isComment = trimmed.startsWith('#');
+            const isConditional = /^(ifeq|ifneq|else|endif)\b/.test(trimmed);
+
+            if (!isEmpty && !isComment && !isContinuation && !isConditional) {
+              if (inBlock === 'metadata') {
+                if (!/^ {2}[^ \t]/.test(contentLine)) {
+                  indentationErrors++;
+                  errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with exactly 2 spaces`);
+                }
+              } else if (inBlock === 'description') {
+                if (!/^ {2}/.test(contentLine) || contentLine.startsWith('\t')) {
+                  indentationErrors++;
+                  errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with at least 2 spaces`);
+                }
+              } else if (inBlock === 'recipe') {
+                if (!contentLine.startsWith('\t')) {
+                  indentationErrors++;
+                  errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with a tab`);
+                }
+              }
+            }
+          }
+
+          isContinuation = contentLine.endsWith('\\');
+        }
+      }
+    }
+
+    if (indentationCheckRun && indentationErrors === 0) {
+      successes.push("✅ Makefile blocks contain valid indentation (spaces for metadata/description, tabs for build/install recipes)");
+    }
+  }
+
   if (CONFIG.check_crlf) {
     if (/^\+.*\r$/m.test(commitPatch)) {
       errors.push("- Windows style line endings (CRLF) detected inside added source lines. Use UNIX (LF) formatting exclusively");

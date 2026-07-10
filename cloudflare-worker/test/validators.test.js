@@ -970,6 +970,194 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0);
   });
 
+  test('passes valid Makefile block indentation', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo
++  SECTION:=utils
++  CATEGORY:=Utilities
++  TITLE:=Example package
++  DEPENDS:=+libstdcpp \\
++    +libpthread
++endef
++
++define Package/foo/description
++  This is a package description.
++    - bullet 1
++    - bullet 2
++endef
++
++define Package/foo/install
++	$(INSTALL_DIR) $(1)/usr/bin
++	$(INSTALL_BIN) $(PKG_BUILD_DIR)/foo $(1)/usr/bin/
++endef
++
++define Build/Compile
++	$(MAKE) -C $(PKG_BUILD_DIR)
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes("Makefile blocks contain valid indentation")));
+  });
+
+  test('flags invalid indentation in Package metadata blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo
++ SECTION:=utils
++	CATEGORY:=Utilities
++   TITLE:=Example package
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 3);
+    assert.ok(res.errors[0].includes("line 'SECTION:=utils' inside 'Package/foo' must be indented with exactly 2 spaces"));
+    assert.ok(res.errors[1].includes("line 'CATEGORY:=Utilities' inside 'Package/foo' must be indented with exactly 2 spaces"));
+    assert.ok(res.errors[2].includes("line 'TITLE:=Example package' inside 'Package/foo' must be indented with exactly 2 spaces"));
+  });
+
+  test('flags invalid indentation in description blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/description
++ This description starts with 1 space
++	This line starts with a tab
++No spaces at all
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 3);
+    assert.ok(res.errors[0].includes("line 'This description starts with 1 space' inside 'Package/foo/description' must be indented with at least 2 spaces"));
+    assert.ok(res.errors[1].includes("line 'This line starts with a tab' inside 'Package/foo/description' must be indented with at least 2 spaces"));
+    assert.ok(res.errors[2].includes("line 'No spaces at all' inside 'Package/foo/description' must be indented with at least 2 spaces"));
+  });
+
+  test('flags invalid indentation in recipe blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/install
++  $(INSTALL_DIR) $(1)/usr/bin
++	$(INSTALL_BIN) $(PKG_BUILD_DIR)/foo $(1)/usr/bin/
++endef
++
++define Build/Compile
++  $(MAKE) -C $(PKG_BUILD_DIR)
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 2);
+    assert.ok(res.errors[0].includes("line '$(INSTALL_DIR) $(1)/usr/bin' inside 'Package/foo/install' must be indented with a tab"));
+    assert.ok(res.errors[1].includes("line '$(MAKE) -C $(PKG_BUILD_DIR)' inside 'Build/Compile' must be indented with a tab"));
+  });
+
+  test('ignores comments, empty lines, and conditionals in blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo
++  SECTION:=utils
++
++  # This is a comment inside metadata
++ifeq ($(CONFIG_FOO),y)
++  TITLE:=Foo Enabled
++else
++  TITLE:=Foo Disabled
++endif
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('respects check_makefile_indentation: false configuration option', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo
++ SECTION:=utils
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
 });
 
 // ─── Embedded Patches ────────────────────────────────────────────

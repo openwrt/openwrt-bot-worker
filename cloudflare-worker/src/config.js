@@ -31,6 +31,7 @@ export const DEFAULT_CONFIG = {
   check_uci_config: true,
   check_space_after_assignment: true,
   check_missing_colon: true,
+  check_makefile_indentation: true,
 
   // Patches Check features
   check_patch_headers: true,
