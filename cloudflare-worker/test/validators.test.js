@@ -1505,6 +1505,8 @@ new file mode 100644
 diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
 +++ b/package/utils/bash/files/bash.init
 +# tweak init
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
 `
     }];
     const headFetch = async (path) => {
@@ -1696,6 +1698,8 @@ diff --git a/package/utils/bash/test-version.sh b/package/utils/bash/test-versio
 diff --git a/package/iozone/files/iozone.init b/package/iozone/files/iozone.init
 +++ b/package/iozone/files/iozone.init
 +# modified config
+diff --git a/package/iozone/Makefile b/package/iozone/Makefile
++++ b/package/iozone/Makefile
 `
     }];
     const headFetch = async (path) => {
@@ -1722,6 +1726,8 @@ diff --git a/package/iozone/files/iozone.init b/package/iozone/files/iozone.init
 diff --git a/luci/libs/luci-lib-uqr/patches/001-fix.patch b/luci/libs/luci-lib-uqr/patches/001-fix.patch
 +++ b/luci/libs/luci-lib-uqr/patches/001-fix.patch
 +# patch file contents
+diff --git a/luci/libs/luci-lib-uqr/Makefile b/luci/libs/luci-lib-uqr/Makefile
++++ b/luci/libs/luci-lib-uqr/Makefile
 `
     }];
     const headFetch = async (path) => {
@@ -1810,6 +1816,23 @@ deleted file mode 100644
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     // Since it's deleted, it skips check, so no errors and no successes
     assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('handles null content for fetch base / head safely without crash', async () => {
+    const commitDetails = [{
+      commitPatch: `diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile
+--- a/utils/mypkg/Makefile
++++ b/utils/mypkg/Makefile
+@@ -1,1 +1,2 @@
++PKG_VERSION:=2.0
++PKG_RELEASE:=2
+`
+    }];
+    const headFetch = async () => 'PKG_VERSION:=2.0\nPKG_RELEASE:=2\n';
+    const baseFetch = async () => null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res);
   });
 });
 

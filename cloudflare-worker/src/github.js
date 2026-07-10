@@ -53,6 +53,9 @@ export async function fetchRepositoryConfig(data, token, defaultConfig) {
         return { ...defaultConfig, ...repoConfig };
       }
     } catch (e) {}
+  } else if (res.code !== 404) {
+    const cleanRaw = (res.raw || "").trim().slice(0, 200);
+    throw new Error(`Failed to fetch repository config from ${configUrl} (HTTP ${res.code}): ${cleanRaw}`);
   }
   return defaultConfig;
 }

@@ -487,7 +487,10 @@ async function handleWebhook(request, env) {
         const fetchFileContent = async (path) => {
           const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${sha}`;
           const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-          return res.code === 200 ? res.raw : null;
+          if (res.code === 200) return res.raw;
+          if (res.code === 404) return null;
+          const cleanRaw = (res.raw || "").trim().slice(0, 200);
+          throw new Error(`Failed to fetch file content for '${path}' at ref ${sha} (HTTP ${res.code}): ${cleanRaw}`);
         };
 
         const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
@@ -504,7 +507,10 @@ async function handleWebhook(request, env) {
           const fetchFileContentForUpstream = async (path) => {
             const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${item.upstreamSha}`;
             const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-            return res.code === 200 ? res.raw : null;
+            if (res.code === 200) return res.raw;
+            if (res.code === 404) return null;
+            const cleanRaw = (res.raw || "").trim().slice(0, 200);
+            throw new Error(`Failed to fetch upstream file content for '${path}' at ref ${item.upstreamSha} (HTTP ${res.code}): ${cleanRaw}`);
           };
           const reportUpstreamUci = await validateUciConfigs(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
           reportUci.errors = reportUci.errors.filter(err => !reportUpstreamUci.errors.includes(err));
@@ -536,7 +542,10 @@ async function handleWebhook(request, env) {
         const fetchFileContent = async (patchFile) => {
           const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
           const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-          return res.code === 200 ? res.raw : null;
+          if (res.code === 200) return res.raw;
+          if (res.code === 404) return null;
+          const cleanRaw = (res.raw || "").trim().slice(0, 200);
+          throw new Error(`Failed to fetch patch file '${patchFile}' at ref ${sha} (HTTP ${res.code}): ${cleanRaw}`);
         };
         const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
         
@@ -544,7 +553,10 @@ async function handleWebhook(request, env) {
           const fetchFileContentForUpstream = async (patchFile) => {
             const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${item.upstreamSha}`;
             const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-            return res.code === 200 ? res.raw : null;
+            if (res.code === 200) return res.raw;
+            if (res.code === 404) return null;
+            const cleanRaw = (res.raw || "").trim().slice(0, 200);
+            throw new Error(`Failed to fetch upstream patch file '${patchFile}' at ref ${item.upstreamSha} (HTTP ${res.code}): ${cleanRaw}`);
           };
           const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
@@ -579,7 +591,10 @@ async function handleWebhook(request, env) {
     const fetchFileContent = async (path) => {
       const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${data.pull_request.head.sha}`;
       const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-      return res.code === 200 ? res.raw : null;
+      if (res.code === 200) return res.raw;
+      if (res.code === 404) return null;
+      const cleanRaw = (res.raw || "").trim().slice(0, 200);
+      throw new Error(`Failed to fetch file content for '${path}' at ref ${data.pull_request.head.sha} (HTTP ${res.code}): ${cleanRaw}`);
     };
 
     const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state);
@@ -623,13 +638,19 @@ async function handleWebhook(request, env) {
   const fetchFileContentAtHead = async (path) => {
     const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${headSha}`;
     const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-    return res.code === 200 ? res.raw : null;
+    if (res.code === 200) return res.raw;
+    if (res.code === 404) return null;
+    const cleanRaw = (res.raw || "").trim().slice(0, 200);
+    throw new Error(`Failed to fetch file content for '${path}' at ref ${headSha} (HTTP ${res.code}): ${cleanRaw}`);
   };
 
   const fetchFileContentAtBase = async (path) => {
     const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${baseSha}`;
     const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-    return res.code === 200 ? res.raw : null;
+    if (res.code === 200) return res.raw;
+    if (res.code === 404) return null;
+    const cleanRaw = (res.raw || "").trim().slice(0, 200);
+    throw new Error(`Failed to fetch file content for '${path}' at ref ${baseSha} (HTTP ${res.code}): ${cleanRaw}`);
   };
 
   let releaseDetails = usePrWidePatch 

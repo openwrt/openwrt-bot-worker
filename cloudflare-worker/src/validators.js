@@ -947,6 +947,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
 }
 
 function parseMakefileVar(content, varName) {
+  if (!content) return null;
   const regex = new RegExp(`^${varName}\\s*(?::=|=)\\s*([^\\s#]+)`, 'm');
   const match = content.match(regex);
   return match ? match[1].replace(/["']/g, "").trim() : null;
@@ -1026,6 +1027,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
   const addedFiles = new Set();
   const deletedFiles = new Set();
+  const modifiedFiles = new Set();
   const fileChanges = {}; // filePath -> { added: [], deleted: [] }
 
   let exceededPkgLimit = false;
@@ -1066,6 +1068,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
     const files = getChangedFilesFromPatch(item.commitPatch);
     for (const file of files) {
+      modifiedFiles.add(file);
       if (isHiddenOrSpecial(file)) continue;
 
       // Ignore test files that serve only within CI/CD (e.g. test.sh, test-version.sh)
@@ -1099,41 +1102,58 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       continue;
     }
 
-    const headContent = await fetchFileContentAtHead(makefilePath);
-    if (headContent === null) {
-      // Package was deleted/dropped, skip checks
-      continue;
-    }
+    // OPTIMIZATION: If the Makefile itself was not modified in the PR,
+    // then the version and release cannot have changed (bumped = false).
+    // We can skip fetching the Makefile contents entirely!
+    let bumped = false;
+    let versionChanged = false;
+    let releaseChanged = false;
+    let headRelease = null;
+    let baseRelease = null;
+    let headVersion = null;
+    let baseVersion = null;
+    let headSourceVer = null;
+    let baseSourceVer = null;
+    let headSourceDate = null;
+    let baseSourceDate = null;
 
-    const isNew = addedFiles.has(makefilePath);
-    const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
-
-    const headRelease = parseMakefileVar(headContent, 'PKG_RELEASE');
-
-    if (isNew) {
-      if (headRelease !== '1') {
-        errors.push(`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`);
-      } else {
-        successes.push(`✅ New package \`${pkgRoot}\` correctly initializes PKG_RELEASE to 1`);
+    if (modifiedFiles.has(makefilePath)) {
+      const headContent = await fetchFileContentAtHead(makefilePath);
+      if (headContent === null) {
+        // Package was deleted/dropped, skip checks
+        continue;
       }
-      continue;
+
+      const isNew = addedFiles.has(makefilePath);
+      const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
+
+      headRelease = parseMakefileVar(headContent, 'PKG_RELEASE');
+
+      if (isNew) {
+        if (headRelease !== '1') {
+          errors.push(`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`);
+        } else {
+          successes.push(`✅ New package \`${pkgRoot}\` correctly initializes PKG_RELEASE to 1`);
+        }
+        continue;
+      }
+
+      // Existing package modified
+      baseVersion = parseMakefileVar(baseContent, 'PKG_VERSION');
+      headVersion = parseMakefileVar(headContent, 'PKG_VERSION');
+
+      baseRelease = parseMakefileVar(baseContent, 'PKG_RELEASE');
+
+      baseSourceVer = parseMakefileVar(baseContent, 'PKG_SOURCE_VERSION');
+      headSourceVer = parseMakefileVar(headContent, 'PKG_SOURCE_VERSION');
+
+      baseSourceDate = parseMakefileVar(baseContent, 'PKG_SOURCE_DATE');
+      headSourceDate = parseMakefileVar(headContent, 'PKG_SOURCE_DATE');
+
+      versionChanged = (baseVersion !== headVersion) || (baseSourceVer !== headSourceVer) || (baseSourceDate !== headSourceDate);
+      releaseChanged = (baseRelease !== headRelease);
+      bumped = versionChanged || releaseChanged;
     }
-
-    // Existing package modified
-    const baseVersion = parseMakefileVar(baseContent, 'PKG_VERSION');
-    const headVersion = parseMakefileVar(headContent, 'PKG_VERSION');
-
-    const baseRelease = parseMakefileVar(baseContent, 'PKG_RELEASE');
-
-    const baseSourceVer = parseMakefileVar(baseContent, 'PKG_SOURCE_VERSION');
-    const headSourceVer = parseMakefileVar(headContent, 'PKG_SOURCE_VERSION');
-
-    const baseSourceDate = parseMakefileVar(baseContent, 'PKG_SOURCE_DATE');
-    const headSourceDate = parseMakefileVar(headContent, 'PKG_SOURCE_DATE');
-
-    const versionChanged = (baseVersion !== headVersion) || (baseSourceVer !== headSourceVer) || (baseSourceDate !== headSourceDate);
-    const releaseChanged = (baseRelease !== headRelease);
-    const bumped = versionChanged || releaseChanged;
 
     if (!bumped) {
       // Check if package changes are minor
