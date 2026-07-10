@@ -760,6 +760,65 @@ function parseMakefileVar(content, varName) {
   return match ? match[1].replace(/["']/g, "").trim() : null;
 }
 
+function isFileChangeMinor(filePath, added, deleted) {
+  // Helper to check if a line is a comment
+  const isComment = (l) => {
+    const trimmed = l.trim();
+    return trimmed.startsWith('#') || 
+           trimmed.startsWith('//') || 
+           trimmed.startsWith('/*') || 
+           trimmed.startsWith('*') || 
+           trimmed.startsWith('--') || 
+           trimmed.endsWith('*/');
+  };
+
+  // Helper to check if a line is a minor Makefile variable definition
+  const isMinorVar = (l) => {
+    const trimmed = l.trim();
+    return /^(PKG_MAINTAINER|PKG_SOURCE_URL|PKG_HASH)\s*(?::=|=)/.test(trimmed);
+  };
+
+  const isMakefile = filePath.endsWith('/Makefile');
+
+  // Filter out comments, minor vars, and pure whitespace
+  const remainingAdded = added.filter(l => {
+    if (l.trim() === '') return false;
+    if (isComment(l)) return false;
+    if (isMakefile && isMinorVar(l)) return false;
+    return true;
+  });
+
+  const remainingDeleted = deleted.filter(l => {
+    if (l.trim() === '') return false;
+    if (isComment(l)) return false;
+    if (isMakefile && isMinorVar(l)) return false;
+    return true;
+  });
+
+  // If nothing is left, then all changes are comments, minor variables, or blank lines!
+  if (remainingAdded.length === 0 && remainingDeleted.length === 0) {
+    return true;
+  }
+
+  // Now check if the remaining changes are just whitespace/formatting edits of the same lines.
+  // We strip all whitespace characters and see if the resulting lines match.
+  const stripWs = (l) => l.replace(/\s+/g, '');
+  const strippedAdded = remainingAdded.map(stripWs).sort();
+  const strippedDeleted = remainingDeleted.map(stripWs).sort();
+
+  if (strippedAdded.length !== strippedDeleted.length) {
+    return false;
+  }
+
+  for (let i = 0; i < strippedAdded.length; i++) {
+    if (strippedAdded[i] !== strippedDeleted[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
@@ -769,12 +828,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     return { errors, warnings, successes };
   }
 
-  // 1. Collect all modified package roots
+  // 1. Collect all modified package roots and file changes
   const pkgRoots = new Set();
   const pkgRootCache = {};
 
   const addedFiles = new Set();
   const deletedFiles = new Set();
+  const fileChanges = {}; // filePath -> { added: [], deleted: [] }
 
   let exceededPkgLimit = false;
   outer: for (const item of commitDetails) {
@@ -782,6 +842,34 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       const states = parseDiffFileStates(item.commitPatch);
       states.addedFiles.forEach(f => addedFiles.add(f));
       states.deletedFiles.forEach(f => deletedFiles.add(f));
+
+      // Parse changes per file in this commit patch
+      const lines = item.commitPatch.split('\n');
+      let currentFile = null;
+      for (const line of lines) {
+        if (line.startsWith('diff --git ')) {
+          currentFile = null;
+          const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+          if (match) {
+            currentFile = match[2].trim().replace(/\r$/, '');
+          }
+        } else if (currentFile) {
+          if (line.startsWith('+++ b/') || line.startsWith('--- a/') || line.startsWith('+++ /dev/null') || line.startsWith('--- /dev/null')) {
+            continue;
+          }
+          if (line.startsWith('+')) {
+            if (!fileChanges[currentFile]) {
+              fileChanges[currentFile] = { added: [], deleted: [] };
+            }
+            fileChanges[currentFile].added.push(line.slice(1));
+          } else if (line.startsWith('-')) {
+            if (!fileChanges[currentFile]) {
+              fileChanges[currentFile] = { added: [], deleted: [] };
+            }
+            fileChanges[currentFile].deleted.push(line.slice(1));
+          }
+        }
+      }
     }
 
     const files = getChangedFilesFromPatch(item.commitPatch);
@@ -856,7 +944,44 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     const bumped = versionChanged || releaseChanged;
 
     if (!bumped) {
-      errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump`);
+      // Check if package changes are minor
+      let packageHasOnlyMinorChanges = true;
+      let packageModifiedFilesCount = 0;
+
+      for (const file in fileChanges) {
+        if (file === pkgRoot || file.startsWith(pkgRoot + '/')) {
+          // Ignore test files that serve only within CI/CD (e.g. test.sh, test-version.sh)
+          const filename = file.split('/').pop();
+          if (filename === 'test.sh' || filename === 'test-version.sh') {
+            continue;
+          }
+
+          packageModifiedFilesCount++;
+
+          // If file is newly added or deleted, it's not a minor change
+          if (addedFiles.has(file) || deletedFiles.has(file)) {
+            packageHasOnlyMinorChanges = false;
+            break;
+          }
+
+          const changes = fileChanges[file];
+          if (!isFileChangeMinor(file, changes.added, changes.deleted)) {
+            packageHasOnlyMinorChanges = false;
+            break;
+          }
+        }
+      }
+
+      if (packageModifiedFilesCount === 0) {
+        packageHasOnlyMinorChanges = false;
+      }
+
+      if (packageHasOnlyMinorChanges) {
+        successes.push(`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`);
+      } else {
+        errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump
+- **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`);
+      }
     } else if (versionChanged) {
       if (headRelease !== '1') {
         errors.push(`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`);

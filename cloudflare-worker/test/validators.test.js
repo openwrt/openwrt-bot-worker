@@ -1046,7 +1046,7 @@ diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.
       commitPatch: `
 diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
 +++ b/package/utils/bash/files/bash.init
-+# tweak init
++exec bash
 `
     }];
     const headFetch = async (path) => {
@@ -1064,6 +1064,65 @@ diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.
 
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
+
+  test('passes when existing package files modified with only cosmetic changes', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
++++ b/package/utils/bash/files/bash.init
++# just a comment edit
++
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('only minor/cosmetic updates')));
+  });
+
+  test('passes when Makefile modified with only minor metadata and download updates', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
+-PKG_MAINTAINER:=Old Maintainer
++PKG_MAINTAINER:=New Maintainer
+-PKG_SOURCE_URL:=http://oldurl
++PKG_SOURCE_URL:=https://newurl
+-PKG_HASH:=1234
++PKG_HASH:=5678
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('only minor/cosmetic updates')));
   });
 
   test('passes when version updated and PKG_RELEASE reset to 1', async () => {
