@@ -2084,4 +2084,140 @@ index 123456..789012 100644
       fetchMock = null;
     }
   });
+
+  test('caches file content requests during handler execution to minimize subrequests', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: { ref: 'feature', sha: 'headsha123' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let fetchCounts = {};
+    fetchMock = async (url, options) => {
+      const cleanedUrl = url.split('?')[0];
+      fetchCounts[cleanedUrl] = (fetchCounts[cleanedUrl] || 0) + 1;
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: true,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: true
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.includes('/commits/sha123')) {
+        if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response(
+            'diff --git a/net/mypkg/files/etc/config/mypkg b/net/mypkg/files/etc/config/mypkg\n' +
+            '--- a/net/mypkg/files/etc/config/mypkg\n' +
+            '+++ b/net/mypkg/files/etc/config/mypkg\n' +
+            '+config mypkg global\n' +
+            '+option enabled 1\n',
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({
+          parents: [{ sha: 'parent-sha' }],
+          commit: {
+            message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }), { status: 200 });
+      }
+      if (url.includes('/contents/net/mypkg/Makefile')) {
+        return new Response(
+          'PKG_NAME:=mypkg\n' +
+          'define Package/mypkg/conffiles\n' +
+          '/etc/config/mypkg\n' +
+          'endef\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/contents/net/mypkg/files/etc/config/mypkg')) {
+        return new Response(
+          'config mypkg global\n' +
+          'option enabled 1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      const makefileFetchKey = Object.keys(fetchCounts).find(k => k.includes('/contents/net/mypkg/Makefile'));
+      assert.ok(makefileFetchKey);
+      assert.strictEqual(fetchCounts[makefileFetchKey], 1);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
 });
+

@@ -201,6 +201,22 @@ async function handleWebhook(request, env) {
   const prTitle = data.pull_request.title;
   const isBackportPr = /^(stable|openwrt-)/.test(baseBranch) || /^\[\d{2}\.\d{2}\]/.test(prTitle || '');
 
+  const fileCache = new Map();
+  const fetchFileContentCached = (path, ref) => {
+    const key = `${ref}:${path}`;
+    if (!fileCache.has(key)) {
+      fileCache.set(key, (async () => {
+        const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${ref}`;
+        const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+        if (res.code === 200) return res.raw;
+        if (res.code === 404) return null;
+        const cleanRaw = (res.raw || "").trim().slice(0, 200);
+        throw new Error(`Failed to fetch file content for '${path}' at ref ${ref} (HTTP ${res.code}): ${cleanRaw}`);
+      })());
+    }
+    return fileCache.get(key);
+  };
+
   const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels`;
   const commitsUrl = data.pull_request.commits_url;
 
@@ -484,14 +500,7 @@ async function handleWebhook(request, env) {
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = async (path) => {
-          const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${sha}`;
-          const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-          if (res.code === 200) return res.raw;
-          if (res.code === 404) return null;
-          const cleanRaw = (res.raw || "").trim().slice(0, 200);
-          throw new Error(`Failed to fetch file content for '${path}' at ref ${sha} (HTTP ${res.code}): ${cleanRaw}`);
-        };
+        const fetchFileContent = (path) => fetchFileContentCached(path, sha);
 
         const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
         if (isBackportPr && item.upstreamPatch) {
@@ -504,14 +513,7 @@ async function handleWebhook(request, env) {
 
         const reportUci = await validateUciConfigs(commitPatch, CONFIG, fetchFileContent);
         if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = async (path) => {
-            const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${item.upstreamSha}`;
-            const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-            if (res.code === 200) return res.raw;
-            if (res.code === 404) return null;
-            const cleanRaw = (res.raw || "").trim().slice(0, 200);
-            throw new Error(`Failed to fetch upstream file content for '${path}' at ref ${item.upstreamSha} (HTTP ${res.code}): ${cleanRaw}`);
-          };
+          const fetchFileContentForUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
           const reportUpstreamUci = await validateUciConfigs(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
           reportUci.errors = reportUci.errors.filter(err => !reportUpstreamUci.errors.includes(err));
           reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
@@ -539,25 +541,11 @@ async function handleWebhook(request, env) {
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = async (patchFile) => {
-          const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${sha}`;
-          const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-          if (res.code === 200) return res.raw;
-          if (res.code === 404) return null;
-          const cleanRaw = (res.raw || "").trim().slice(0, 200);
-          throw new Error(`Failed to fetch patch file '${patchFile}' at ref ${sha} (HTTP ${res.code}): ${cleanRaw}`);
-        };
+        const fetchFileContent = (patchFile) => fetchFileContentCached(patchFile, sha);
         const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
         
         if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = async (patchFile) => {
-            const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${item.upstreamSha}`;
-            const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-            if (res.code === 200) return res.raw;
-            if (res.code === 404) return null;
-            const cleanRaw = (res.raw || "").trim().slice(0, 200);
-            throw new Error(`Failed to fetch upstream patch file '${patchFile}' at ref ${item.upstreamSha} (HTTP ${res.code}): ${cleanRaw}`);
-          };
+          const fetchFileContentForUpstream = (patchFile) => fetchFileContentCached(patchFile, item.upstreamSha);
           const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
@@ -588,14 +576,7 @@ async function handleWebhook(request, env) {
     };
 
     // 2. Makefiles (PR-Wide)
-    const fetchFileContent = async (path) => {
-      const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${data.pull_request.head.sha}`;
-      const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-      if (res.code === 200) return res.raw;
-      if (res.code === 404) return null;
-      const cleanRaw = (res.raw || "").trim().slice(0, 200);
-      throw new Error(`Failed to fetch file content for '${path}' at ref ${data.pull_request.head.sha} (HTTP ${res.code}): ${cleanRaw}`);
-    };
+    const fetchFileContent = (path) => fetchFileContentCached(path, data.pull_request.head.sha);
 
     const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state);
     const reportUci = await validateUciConfigs(prPatch, CONFIG, fetchFileContent);
@@ -635,23 +616,8 @@ async function handleWebhook(request, env) {
   const headSha = data.pull_request.head.sha;
   const baseSha = data.pull_request.base.sha;
 
-  const fetchFileContentAtHead = async (path) => {
-    const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${headSha}`;
-    const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-    if (res.code === 200) return res.raw;
-    if (res.code === 404) return null;
-    const cleanRaw = (res.raw || "").trim().slice(0, 200);
-    throw new Error(`Failed to fetch file content for '${path}' at ref ${headSha} (HTTP ${res.code}): ${cleanRaw}`);
-  };
-
-  const fetchFileContentAtBase = async (path) => {
-    const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${baseSha}`;
-    const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-    if (res.code === 200) return res.raw;
-    if (res.code === 404) return null;
-    const cleanRaw = (res.raw || "").trim().slice(0, 200);
-    throw new Error(`Failed to fetch file content for '${path}' at ref ${baseSha} (HTTP ${res.code}): ${cleanRaw}`);
-  };
+  const fetchFileContentAtHead = (path) => fetchFileContentCached(path, headSha);
+  const fetchFileContentAtBase = (path) => fetchFileContentCached(path, baseSha);
 
   let releaseDetails = usePrWidePatch 
     ? [{ commitPatch: prPatch }] 
