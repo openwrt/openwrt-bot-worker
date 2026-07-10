@@ -1860,6 +1860,21 @@ describe('findPkgRoot', () => {
     assert.strictEqual(await findPkgRoot('luci/libs/luci-lib-uqr/Makefile', null), 'luci/libs/luci-lib-uqr');
     assert.strictEqual(await findPkgRoot('luci/libs/luci-lib-uqr/patches/001-fix.patch', null), 'luci/libs/luci-lib-uqr');
 
+    // Nested python, perl, php, ruby packages under lang/
+    assert.strictEqual(await findPkgRoot('lang/python/python-selinux/Makefile', null), 'lang/python/python-selinux');
+    assert.strictEqual(await findPkgRoot('lang/python/python-selinux/patches/001-fix.patch', null), 'lang/python/python-selinux');
+    assert.strictEqual(await findPkgRoot('lang/python/python-selinux/src/subfolder/file.c', null), 'lang/python/python-selinux');
+    assert.strictEqual(await findPkgRoot('package/lang/python/python-selinux/Makefile', null), 'package/lang/python/python-selinux');
+    assert.strictEqual(await findPkgRoot('lang/python/Makefile', null), 'lang/python');
+
+    assert.strictEqual(await findPkgRoot('lang/perl/perl-libxml/Makefile', null), 'lang/perl/perl-libxml');
+    assert.strictEqual(await findPkgRoot('lang/php/php8-pecl-redis/Makefile', null), 'lang/php/php8-pecl-redis');
+    assert.strictEqual(await findPkgRoot('lang/ruby/ruby-sass-listen/Makefile', null), 'lang/ruby/ruby-sass-listen');
+
+    // Non-nested languages (e.g. golang)
+    assert.strictEqual(await findPkgRoot('lang/golang/Makefile', null), 'lang/golang');
+    assert.strictEqual(await findPkgRoot('lang/golang/src/subfolder/file.c', null), 'lang/golang');
+
     // Hidden directories and special folders
     assert.strictEqual(await findPkgRoot('.github/workflows/check.yml', null), null);
   });

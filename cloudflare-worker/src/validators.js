@@ -851,6 +851,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
     'system', 'multimedia', 'mail', 'sound', 'network'
   ]);
+  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby']);
 
   const hasPkgName = async (dir) => {
     if (!fetchFileContent) return false;
@@ -894,6 +895,12 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   // Fast path for common OpenWrt layouts: no network calls needed.
   if (parts[0] === 'package') {
     if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
+      if (parts[1] === 'lang' && NESTED_LANGS.has(parts[2])) {
+        if (parts.length >= 4) {
+          return `package/lang/${parts[2]}/${parts[3]}`;
+        }
+        return `package/lang/${parts[2]}`;
+      }
       return `package/${parts[1]}/${parts[2]}`;
     }
     if (parts.length === 2 && !CATEGORIES.has(parts[1])) {
@@ -902,10 +909,22 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   }
 
   if (parts.length >= 2 && CATEGORIES.has(parts[0])) {
+    if (parts[0] === 'lang' && NESTED_LANGS.has(parts[1])) {
+      if (parts.length >= 3) {
+        return `lang/${parts[1]}/${parts[2]}`;
+      }
+      return `lang/${parts[1]}`;
+    }
     return `${parts[0]}/${parts[1]}`;
   }
 
   if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
+    if (parts[1] === 'lang' && NESTED_LANGS.has(parts[2])) {
+      if (parts.length >= 4) {
+        return `${parts[0]}/lang/${parts[2]}/${parts[3]}`;
+      }
+      return `${parts[0]}/lang/${parts[2]}`;
+    }
     return `${parts[0]}/${parts[1]}/${parts[2]}`;
   }
 
