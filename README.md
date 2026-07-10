@@ -25,6 +25,7 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Signature Verification:** Validates cryptographic GPG/SSH commit signatures if present.
 *   **Description Quality Warnings:** Inspects message bodies and issues non-blocking warnings for lazy/identical description text mirroring the subject or for completely missing reference links (changelogs/release notes).
 *   **Mandatory Description Body:** Rejects commits whose description body is empty or contains only trailers (e.g. `Signed-off-by:`). Every commit must include a meaningful explanation of what the change does and why.
+*   **OpenWrt Spelling Verification (`check_openwrt_spelling`):** Inspects both the subject line and description body to ensure the correct casing of "OpenWrt" is used, issuing warnings for incorrect capitalizations like "OpenWRT" or "Openwrt" (ignoring URLs, code blocks, and trailers).
 
 > [!NOTE]
 > To keep API/subrequest usage predictable on extreme PRs, commit-message auditing is intentionally capped to the first 300 commits. If a PR exceeds this size, the check output includes an explicit warning about the reduced commit audit scope.
@@ -108,6 +109,7 @@ Some configuration keys offer advanced options:
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
 *   `check_uci_config`: Set to `true` (default) to validate UCI configurations. Set to `false` or `"disabled"` to disable.
 *   `show_force_push_tip`: Set to `true` (default) to append a helpful tip regarding how to correct validation errors using force-pushing. Set to `false` to disable.
+*   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 
 Here is a comprehensive example containing all available toggle options:
@@ -141,6 +143,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_patch_headers": true,
   "check_pkg_release": "warning",
   "require_linked_github_account": true,
+  "check_openwrt_spelling": true,
   "enable_stale_bot": false
 }
 ```

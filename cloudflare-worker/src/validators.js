@@ -192,6 +192,50 @@ export async function validateFormalities(fullCommit, CONFIG) {
     }
   }
 
+  // OpenWrt spelling capitalization check
+  if (CONFIG.check_openwrt_spelling) {
+    const incorrectCasingPattern = /\bopenwrt\b/gi;
+    let foundIncorrect = null;
+    let spellingInCodeBlock = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      if (i > 0) {
+        if (trimmed.startsWith('```')) {
+          spellingInCodeBlock = !spellingInCodeBlock;
+          continue;
+        }
+        if (spellingInCodeBlock) {
+          continue;
+        }
+        if (/^(signed-off-by:|cherry picked from)/i.test(trimmed)) {
+          continue;
+        }
+      }
+
+      // Remove URLs to avoid false positives inside links
+      const lineWithoutUrls = line.replace(/[a-zA-Z]+:\/\/\S+/g, '');
+
+      let match;
+      while ((match = incorrectCasingPattern.exec(lineWithoutUrls)) !== null) {
+        const word = match[0];
+        if (word !== 'OpenWrt' && word !== 'openwrt') {
+          foundIncorrect = word;
+          break;
+        }
+      }
+      if (foundIncorrect) {
+        break;
+      }
+    }
+
+    if (foundIncorrect) {
+      warnings.push(`Incorrect capitalization of 'OpenWrt' detected: '${foundIncorrect}'. Please use the correct spelling 'OpenWrt' (or lowercase 'openwrt' where appropriate).`);
+    }
+  }
+
   // Body lines width check
   const bodyErrors = [];
   let inCodeBlock = false;

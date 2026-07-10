@@ -17,6 +17,7 @@ export const DEFAULT_CONFIG = {
   warn_generic_subjects: true,
   require_release_notes: true,
   require_body: true,
+  check_openwrt_spelling: true,
 
   // Makefile Check features
   check_pkg_version: true,

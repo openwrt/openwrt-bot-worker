@@ -28,7 +28,8 @@ const CONFIG = {
   check_openwrt_meta: true,
   check_conffiles: true,
   check_patch_headers: true,
-  require_linked_github_account: false
+  require_linked_github_account: false,
+  check_openwrt_spelling: true
 };
 
 // ─── Name Validation ─────────────────────────────────────────────
@@ -269,6 +270,75 @@ describe('validateFormalities', () => {
     const customConfig = { ...CONFIG, require_linked_github_account: true };
     const res = await validateFormalities(commit, customConfig);
     assert.ok(res.errors.some(e => e.includes('is not linked to any registered GitHub account')));
+  });
+
+  test('passes spelling check when OpenWrt or openwrt is used correctly', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: support OpenWrt properly\n\nWe love OpenWrt. Make sure it runs well under openwrt.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
+  });
+
+  test('warns on incorrect casing of OpenWrt (e.g. OpenWRT, Openwrt, OPENWRT)', async () => {
+    const commit1 = {
+      commit: {
+        message: 'mypkg: support OpenWRT\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res1 = await validateFormalities(commit1, CONFIG);
+    assert.ok(res1.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\' detected: \'OpenWRT\'')));
+
+    const commit2 = {
+      commit: {
+        message: 'mypkg: fix compatibility\n\nThis is an Openwrt package.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res2 = await validateFormalities(commit2, CONFIG);
+    assert.ok(res2.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\' detected: \'Openwrt\'')));
+
+    const commit3 = {
+      commit: {
+        message: 'mypkg: fix compatibility\n\nThis is for OPENWRT.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res3 = await validateFormalities(commit3, CONFIG);
+    assert.ok(res3.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\' detected: \'OPENWRT\'')));
+  });
+
+  test('ignores spelling check inside code blocks and URLs', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: fix spelling in code blocks\n\nLook at this error:\n```\nOpenWRT compiler error: Openwrt is missing\n```\nAlso check out https://github.com/OpenWRT/packages\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
+  });
+
+  test('does not perform spelling check when disabled in config', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: support OpenWRT\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const customConfig = { ...CONFIG, check_openwrt_spelling: false };
+    const res = await validateFormalities(commit, customConfig);
+    assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
   });
 });
 
