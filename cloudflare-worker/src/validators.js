@@ -517,22 +517,31 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
           if (contentLine.trim().startsWith('#') || contentLine.startsWith('\t')) {
             continue;
           }
-          const match = contentLine.match(/^\s*([^\s:=?+]+)\s*(:=|\+=|\?=|=)(.*)$/);
+          const match = contentLine.match(/^(\s*)([^\s:=?+]+)\s*(:=|\+=|\?=|=)(.*)$/);
           if (match) {
-            const varName = match[1].trim();
-            const op = match[2];
-            const varValue = match[3];
+            const indent = match[1];
+            const varName = match[2].trim();
+            const op = match[3];
+            const varValue = match[4];
 
             if (CONFIG.check_missing_colon && op === '=') {
               const standardVars = ['TITLE', 'URL', 'SECTION', 'CATEGORY', 'SUBMENU', 'DEPENDS', 'USERID', 'PROVIDES', 'MAINTAINER', 'LICENSE', 'LICENSE_FILES'];
               if (varName.startsWith('PKG_') || standardVars.includes(varName)) {
                 assignmentErrors++;
-                errors.push(`- Makefile line '${contentLine.trim()}' uses '=' instead of ':=' for assignment. Use '${varName}:=${varValue.trim()}' to ensure simple expansion.`);
+                errors.push(`- Makefile line '${contentLine.trim()}' uses '=' instead of ':=' for assignment. Use '${varName}:=${varValue.trim()}' to ensure simple expansion.\n` +
+                            `  \`\`\`diff\n` +
+                            `  - ${contentLine}\n` +
+                            `  + ${indent}${varName}:=${varValue.trim()}\n` +
+                            `  \`\`\``);
               }
             } else if (CONFIG.check_space_after_assignment && op === ':=') {
-              if (/^[\t ]/.test(varValue)) {
+              if (/^[\t ]/.test(varValue) && varValue.trim() !== '\\') {
                 assignmentErrors++;
-                errors.push(`- Makefile line '${contentLine.trim()}' has a space after ':='. Use '${varName}:=${varValue.trim()}' without leading spaces.`);
+                errors.push(`- Makefile line '${contentLine.trim()}' has a space after ':='. Use '${varName}:=${varValue.trim()}' without leading spaces.\n` +
+                            `  \`\`\`diff\n` +
+                            `  - ${contentLine}\n` +
+                            `  + ${indent}${varName}:=${varValue.trim()}\n` +
+                            `  \`\`\``);
               }
             }
           }

@@ -971,6 +971,61 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0);
   });
 
+  test('accepts space after := when followed by line continuation backslash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++ DEPENDS:= \\
++	+libpcre2 \\
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_space_after_assignment: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('formats assignment error suggestions as diff block preserving indentation', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++  PKG_SOURCE_URL=https://github.com/foo/bar
++  TITLE:= Simple WireGuard proxy
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_missing_colon: true,
+      check_space_after_assignment: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 2);
+    
+    // Check that missing colon error includes diff block with correct indentation
+    assert.ok(res.errors[0].includes("  -   PKG_SOURCE_URL=https://github.com/foo/bar"));
+    assert.ok(res.errors[0].includes("  +   PKG_SOURCE_URL:=https://github.com/foo/bar"));
+    
+    // Check that space after assignment error includes diff block with correct indentation
+    assert.ok(res.errors[1].includes("  -   TITLE:= Simple WireGuard proxy"));
+    assert.ok(res.errors[1].includes("  +   TITLE:=Simple WireGuard proxy"));
+  });
+
   test('passes valid Makefile block indentation', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
