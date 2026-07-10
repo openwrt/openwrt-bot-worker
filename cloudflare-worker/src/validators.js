@@ -826,3 +826,117 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
   return { errors, warnings, successes };
 }
+
+export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {
+  const errors = [];
+  const successes = [];
+
+  if (CONFIG.check_uci_config === false || CONFIG.check_uci_config === 'disabled') {
+    return { errors, successes };
+  }
+
+  if (!commitPatch) {
+    return { errors, successes };
+  }
+
+  const { deletedFiles } = parseDiffFileStates(commitPatch);
+  const changedFiles = getChangedFilesFromPatch(commitPatch);
+
+  for (const file of changedFiles) {
+    if (deletedFiles.has(file)) continue;
+    if (isHiddenOrSpecial(file)) continue;
+
+    // A file could be destined for /etc/config/ if its path contains /etc/config/
+    // or if it's in a files/ directory.
+    const isCandidate = file.includes('/etc/config/') || file.includes('/files/');
+    if (!isCandidate) continue;
+
+    const pkgRoot = await findPkgRoot(file, fetchFileContent);
+    if (!pkgRoot) continue;
+
+    let makefileContent = null;
+    try {
+      makefileContent = await fetchFileContent(`${pkgRoot}/Makefile`);
+    } catch (e) {
+      // Ignore errors fetching the Makefile
+    }
+
+    const filename = file.split('/').pop();
+    const ext = filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
+    const skipExtensions = new Set(['init', 'sh', 'hotplug', 'py', 'pl', 'lua', 'cron', 'md', 'patch']);
+    if (skipExtensions.has(ext)) continue;
+
+    let isDestinedForEtcConfig = false;
+    if (file.includes('/etc/config/')) {
+      isDestinedForEtcConfig = true;
+    } else if (makefileContent) {
+      const nameWithoutExt = filename.includes('.') ? filename.substring(0, filename.lastIndexOf('.')) : filename;
+      const lines = makefileContent.split('\n');
+      let inConffiles = false;
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('#')) continue;
+
+        // Parse conffiles section boundaries
+        if (trimmed.match(/^define\s+(Package\/[^\s]*conffiles)/)) {
+          inConffiles = true;
+          continue;
+        }
+        if (trimmed.match(/^endef/)) {
+          inConffiles = false;
+          continue;
+        }
+
+        if (inConffiles) {
+          if (trimmed.startsWith('/etc/config/')) {
+            const conffilePart = trimmed.substring('/etc/config/'.length);
+            if (conffilePart === filename || conffilePart === nameWithoutExt) {
+              isDestinedForEtcConfig = true;
+              break;
+            }
+          }
+        } else {
+          // Look for install/cp commands
+          if (trimmed.includes('etc/config') &&
+              (trimmed.includes(filename) || trimmed.includes(nameWithoutExt) || trimmed.includes('files/*'))) {
+            isDestinedForEtcConfig = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (isDestinedForEtcConfig) {
+      const content = await fetchFileContent(file);
+      if (content !== null) {
+        const uciLines = content.split('\n');
+        let isValidUci = true;
+        let invalidLine = '';
+        let invalidLineNum = 0;
+
+        for (let i = 0; i < uciLines.length; i++) {
+          const trimmedLine = uciLines[i].trim();
+          if (trimmedLine === '' || trimmedLine.startsWith('#')) {
+            continue;
+          }
+          if (!/^(?:package|config|option|list)[ \t]/.test(trimmedLine)) {
+            isValidUci = false;
+            invalidLine = uciLines[i];
+            invalidLineNum = i + 1;
+            break;
+          }
+        }
+
+        if (!isValidUci) {
+          errors.push(`- File '${file}' is destined for '/etc/config/' but is not a valid UCI configuration file. In OpenWrt, '/etc/config/' is reserved for UCI-formatted configuration files. Raw files (such as TOML, JSON, or YAML) are not allowed at this path. Invalid line ${invalidLineNum}: '${invalidLine}'`);
+        } else {
+          successes.push(`✅ Configuration file '${file}' destined for '/etc/config/' is a valid UCI configuration file`);
+        }
+      }
+    }
+  }
+
+  return { errors, successes };
+}
+

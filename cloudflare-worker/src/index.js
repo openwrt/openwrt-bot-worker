@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
 import { handleScheduled } from './stale.js';
 
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
@@ -484,6 +484,12 @@ async function handleWebhook(request, env) {
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
+        const fetchFileContent = async (path) => {
+          const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${sha}`;
+          const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+          return res.code === 200 ? res.raw : null;
+        };
+
         const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
@@ -492,15 +498,30 @@ async function handleWebhook(request, env) {
           reportMakefile.warnings = reportMakefile.warnings.filter(warn => !reportUpstreamMakefile.warnings.includes(warn));
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
         }
+
+        const reportUci = await validateUciConfigs(commitPatch, CONFIG, fetchFileContent);
+        if (isBackportPr && item.upstreamPatch) {
+          const fetchFileContentForUpstream = async (path) => {
+            const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${item.upstreamSha}`;
+            const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+            return res.code === 200 ? res.raw : null;
+          };
+          const reportUpstreamUci = await validateUciConfigs(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+          reportUci.errors = reportUci.errors.filter(err => !reportUpstreamUci.errors.includes(err));
+          reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
+        }
+
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+        reportUci.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
         if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
           allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.warnings.join("\n"));
           reportMakefile.warnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
         }
-        if (reportMakefile.errors.length > 0) {
-          allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.errors.join("\n"));
-          reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+        if (reportMakefile.errors.length > 0 || reportUci.errors.length > 0) {
+          const combinedErrors = [...reportMakefile.errors, ...reportUci.errors];
+          allMakefileErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + combinedErrors.join("\n"));
+          combinedErrors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
         }
         makefileOutputText += "\n";
       }
@@ -555,25 +576,30 @@ async function handleWebhook(request, env) {
     };
 
     // 2. Makefiles (PR-Wide)
+    const fetchFileContent = async (path) => {
+      const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${data.pull_request.head.sha}`;
+      const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+      return res.code === 200 ? res.raw : null;
+    };
+
     const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state);
+    const reportUci = await validateUciConfigs(prPatch, CONFIG, fetchFileContent);
+
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
     reportMakefile.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    reportUci.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
     if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
       allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportMakefile.warnings.join("\n"));
       reportMakefile.warnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
     }
-    if (reportMakefile.errors.length > 0) {
-      allMakefileErrors.push(`**Pull Request Overall Diff**:\n` + reportMakefile.errors.join("\n"));
-      reportMakefile.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+    if (reportMakefile.errors.length > 0 || reportUci.errors.length > 0) {
+      const combinedErrors = [...reportMakefile.errors, ...reportUci.errors];
+      allMakefileErrors.push(`**Pull Request Overall Diff**:\n` + combinedErrors.join("\n"));
+      combinedErrors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     makefileOutputText += "\n";
 
     // 3. Patches (PR-Wide)
-    const fetchFileContent = async (patchFile) => {
-      const url = `https://api.github.com/repos/${repoFullname}/contents/${patchFile}?ref=${data.pull_request.head.sha}`;
-      const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-      return res.code === 200 ? res.raw : null;
-    };
     const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent);
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });

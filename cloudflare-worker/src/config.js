@@ -27,6 +27,7 @@ export const DEFAULT_CONFIG = {
   branch_labeling: true,
   check_openwrt_meta: true,
   check_conffiles: true,
+  check_uci_config: true,
 
   // Patches Check features
   check_patch_headers: true,

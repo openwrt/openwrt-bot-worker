@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot } from '../src/validators.js';
+import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -1240,5 +1240,211 @@ describe('findPkgRoot', () => {
       await findPkgRoot('package/security/openssl/files/openssl.conf', fetchFn, {}),
       'package/security/openssl'
     );
+  });
+});
+
+// ─── UCI Config Validation ────────────────────────────────────────
+
+describe('validateUciConfigs', () => {
+  test('accepts valid UCI configurations (sections, options, lists, comments, empty lines)', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/foo.config b/package/utils/foo/files/foo.config
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.config
+@@ -0,0 +1,10 @@
++# This is a comment
++package 'foo'
++
++config system 'main'
++\toption hostname 'OpenWrt'
++
++config timeserver 'ntp'
++\tlist server '0.openwrt.pool.ntp.org'
++\tlist server '1.openwrt.pool.ntp.org'
++    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return `
+define Package/foo/install
+\t$(INSTALL_CONF) ./files/foo.config $(1)/etc/config/foo
+endef
+        `;
+      }
+      if (path === 'package/utils/foo/files/foo.config') {
+        return `
+# This is a comment
+package 'foo'
+
+config system 'main'
+\toption hostname 'OpenWrt'
+
+config timeserver 'ntp'
+\tlist server '0.openwrt.pool.ntp.org'
+\tlist server '1.openwrt.pool.ntp.org'
+        `;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('is a valid UCI configuration file')));
+  });
+
+  test('rejects raw TOML at etc/config path', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/foo.toml b/package/utils/foo/files/foo.toml
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.toml
+@@ -0,0 +1,5 @@
++[foo]
++enabled = true
++hostname = "OpenWrt"
++    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return `
+define Package/foo/install
+\t$(INSTALL_CONF) ./files/foo.toml $(1)/etc/config/foo
+endef
+        `;
+      }
+      if (path === 'package/utils/foo/files/foo.toml') {
+        return `
+[foo]
+enabled = true
+hostname = "OpenWrt"
+        `;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.ok(res.errors.some(e => e.includes('not a valid UCI configuration file')), `Expected error, got: ${JSON.stringify(res.errors)}`);
+  });
+
+  test('identifies etc/config file via conffiles block', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/foo.conf b/package/utils/foo/files/foo.conf
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.conf
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return `
+define Package/foo/conffiles
+/etc/config/foo
+endef
+        `;
+      }
+      if (path === 'package/utils/foo/files/foo.conf') {
+        // Not valid UCI
+        return `invalid_key = "value"`;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.ok(res.errors.some(e => e.includes("destined for '/etc/config/' but is not a valid UCI")), `Expected error, got: ${JSON.stringify(res.errors)}`);
+  });
+
+  test('ignores shell scripts and init scripts', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/foo.init b/package/utils/foo/files/foo.init
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.init
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return `
+define Package/foo/install
+\t$(INSTALL_BIN) ./files/foo.init $(1)/etc/init.d/foo
+endef
+        `;
+      }
+      if (path === 'package/utils/foo/files/foo.init') {
+        return `#!/bin/sh\n/etc/rc.common\n`;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('ignores configuration files installed to other locations (e.g. /etc/foo/)', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/foo.conf b/package/utils/foo/files/foo.conf
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.conf
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return `
+define Package/foo/install
+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo/foo.conf
+endef
+        `;
+      }
+      if (path === 'package/utils/foo/files/foo.conf') {
+        return `raw_config_key: raw_value\n`;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('directly recognizes files with /etc/config/ in path', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/etc/config/foo b/package/utils/foo/files/etc/config/foo
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/etc/config/foo
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return 'PKG_NAME:=foo\n';
+      }
+      if (path === 'package/utils/foo/files/etc/config/foo') {
+        return 'invalid_line';
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.ok(res.errors.some(e => e.includes("destined for '/etc/config/' but is not a valid UCI")));
+  });
+
+  test('skips checks when check_uci_config is false', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/etc/config/foo b/package/utils/foo/files/etc/config/foo
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/etc/config/foo
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/files/etc/config/foo') {
+        return 'invalid_line';
+      }
+      return null;
+    };
+
+    const disabledConfig = { ...CONFIG, check_uci_config: false };
+    const res = await validateUciConfigs(patch, disabledConfig, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
   });
 });
