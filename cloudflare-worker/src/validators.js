@@ -1222,6 +1222,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
 
   const { deletedFiles } = parseDiffFileStates(commitPatch);
   const changedFiles = getChangedFilesFromPatch(commitPatch);
+  const pkgRootCache = {};
 
   for (const file of changedFiles) {
     if (deletedFiles.has(file)) continue;
@@ -1232,7 +1233,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
     const isCandidate = file.includes('/etc/config/') || file.includes('/files/');
     if (!isCandidate) continue;
 
-    const pkgRoot = await findPkgRoot(file, fetchFileContent);
+    const pkgRoot = await findPkgRoot(file, fetchFileContent, pkgRootCache);
     if (!pkgRoot) continue;
 
     let makefileContent = null;
