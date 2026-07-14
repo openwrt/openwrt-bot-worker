@@ -207,7 +207,15 @@ async function handleWebhook(request, env) {
     if (!fileCache.has(key)) {
       fileCache.set(key, (async () => {
         const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${ref}`;
-        const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+        let res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+
+        const headRepoFullname = data.pull_request?.head?.repo?.full_name;
+        if ((res.code === 404 || res.code >= 500) && headRepoFullname && headRepoFullname !== repoFullname) {
+          console.warn(`Failed to fetch file content for '${path}' at ref ${ref} under base repo ${repoFullname} (HTTP ${res.code}). Retrying under head repo ${headRepoFullname}...`);
+          const forkUrl = `https://api.github.com/repos/${headRepoFullname}/contents/${path}?ref=${ref}`;
+          res = await githubApiCall(forkUrl, token, 'GET', null, 'application/vnd.github.raw');
+        }
+
         if (res.code === 200) return res.raw;
         if (res.code === 404) return null;
         const cleanRaw = (res.raw || "").trim().slice(0, 200);
@@ -332,22 +340,24 @@ async function handleWebhook(request, env) {
     }
   }
 
-  const usePrWidePatch = commits.length > 15;
+  let usePrWidePatch = commits.length > 15;
   let prPatch = null;
 
-  if (usePrWidePatch) {
+  const fetchPrWidePatch = async () => {
     const prPatchUrl = data.pull_request.url;
     const prPatchRes = await githubApiCall(prPatchUrl, token, 'GET', null, 'application/vnd.github.patch');
     if (prPatchRes.code !== 200) {
       const cleanRaw = (prPatchRes.raw || "").trim().slice(0, 200);
       throw new Error(`Failed to fetch overall PR patch (HTTP ${prPatchRes.code}): ${cleanRaw}`);
     }
-    prPatch = prPatchRes.raw;
+    return prPatchRes.raw;
+  };
+
+  if (usePrWidePatch) {
+    prPatch = await fetchPrWidePatch();
   }
 
-  // OPTIMIZATION: Fetch patches for all commits concurrently using Promise.all (only if usePrWidePatch is false)
-  // We reuse the commit metadata (fullCommit) from the commits list response to save 1 subrequest per commit
-  const commitDetails = await Promise.all(commits.map(async (commitData) => {
+  const mapCommitData = async (commitData, fetchPatch) => {
     const commitItemType = (commitData === null)
       ? 'null'
       : (Array.isArray(commitData) ? 'array' : typeof commitData);
@@ -365,9 +375,16 @@ async function handleWebhook(request, env) {
     }
 
     let commitPatch = null;
-    if (!usePrWidePatch) {
+    if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
-      const patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
+      let patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
+
+      const headRepoFullname = data.pull_request.head.repo?.full_name;
+      if (patchRes.code === 404 && headRepoFullname && headRepoFullname !== repoFullname) {
+        console.warn(`Commit ${sha} not found in base repo ${repoFullname}. Retrying fetch from head repo ${headRepoFullname}...`);
+        const forkDetailUrl = `https://api.github.com/repos/${headRepoFullname}/commits/${sha}`;
+        patchRes = await githubApiCall(forkDetailUrl, token, 'GET', null, 'application/vnd.github.patch');
+      }
 
       if (patchRes.code !== 200) {
         const cleanRaw = (patchRes.raw || "").trim().slice(0, 200);
@@ -409,7 +426,22 @@ async function handleWebhook(request, env) {
       upstreamSha,
       upstreamFetchError
     };
-  }));
+  };
+
+  let commitDetails = [];
+  if (!usePrWidePatch) {
+    try {
+      commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, true)));
+    } catch (e) {
+      console.warn(`Failed to fetch individual commit patches, falling back to PR-wide patch: ${e.message}`);
+      usePrWidePatch = true;
+      prPatch = await fetchPrWidePatch();
+    }
+  }
+
+  if (usePrWidePatch) {
+    commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false)));
+  }
 
   // Pre-scan all commit patches to see if this PR introduces or drops any package Makefiles
   if (!usePrWidePatch) {
@@ -627,7 +659,13 @@ async function handleWebhook(request, env) {
     releaseDetails = releaseDetails.filter(item => !item.isVerbatim);
   }
 
-  const reportRelease = await validatePkgReleaseBumps(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
+  let reportRelease = { successes: [], errors: [], warnings: [] };
+  try {
+    reportRelease = await validatePkgReleaseBumps(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
+  } catch (e) {
+    console.error(`Failed to audit package release bumps: ${e.message}`);
+    reportRelease.warnings = [`Could not complete package release audit because of an error fetching file content: ${e.message}`];
+  }
   if (isBackportPr && reportRelease.errors.length > 0) {
     reportRelease.errors = reportRelease.errors.filter(err => {
       const match = err.match(/Package \`([^\`]+)\` content changed without a PKG_RELEASE or version bump/);

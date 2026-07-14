@@ -1965,6 +1965,89 @@ index 123456..789012 100644
     }
   });
 
+  test('githubApiCall: retries on 5xx status codes for GET requests and succeeds', async () => {
+    let callCount = 0;
+    try {
+      fetchMock = (url, options) => {
+        callCount++;
+        if (callCount === 1) {
+          return new Response('Gateway Error', { status: 502 });
+        }
+        return new Response(JSON.stringify({ content: "ok" }), { status: 200 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/contents/utils/foo', 'token', 'GET');
+      assert.strictEqual(res.code, 200);
+      assert.strictEqual(callCount, 2);
+      assert.strictEqual(res.raw, '{"content":"ok"}');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('githubApiCall: retries on 5xx status codes for GET requests and fails after max attempts', async () => {
+    let callCount = 0;
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => { loggedError = msg; };
+
+    try {
+      fetchMock = (url, options) => {
+        callCount++;
+        return new Response('Gateway Error', { status: 502 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/contents/utils/foo', 'token', 'GET');
+      assert.strictEqual(res.code, 502);
+      assert.strictEqual(callCount, 3);
+      assert.match(loggedError, /GitHub API call failed: GET https:\/\/api.github.com\/repos\/openwrt\/packages\/contents\/utils\/foo -> HTTP 502:/);
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
+
+  test('githubApiCall: retries on 5xx status codes for POST requests', async () => {
+    let callCount = 0;
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => { loggedError = msg; };
+
+    try {
+      fetchMock = (url, options) => {
+        callCount++;
+        return new Response('Gateway Error', { status: 502 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/contents/utils/foo', 'token', 'POST', { data: 'test' });
+      assert.strictEqual(res.code, 502);
+      assert.strictEqual(callCount, 3);
+      assert.match(loggedError, /GitHub API call failed: POST https:\/\/api.github.com\/repos\/openwrt\/packages\/contents\/utils\/foo -> HTTP 502:/);
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
+
+  test('githubApiCall: retries on network error for GET requests', async () => {
+    let callCount = 0;
+    try {
+      fetchMock = (url, options) => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('Connection failed');
+        }
+        return new Response('{"content":"ok"}', { status: 200 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/contents/utils/foo', 'token', 'GET');
+      assert.strictEqual(res.code, 200);
+      assert.strictEqual(callCount, 2);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   test('includes or excludes force push TIP based on CONFIG.show_force_push_tip', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
@@ -2213,6 +2296,261 @@ index 123456..789012 100644
       const makefileFetchKey = Object.keys(fetchCounts).find(k => k.includes('/contents/net/mypkg/Makefile'));
       assert.ok(makefileFetchKey);
       assert.strictEqual(fetchCounts[makefileFetchKey], 1);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('falls back to PR-wide patch when individual commit patch fetch returns 404', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: {
+          ref: 'feature',
+          sha: 'headsha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let baseRepoCommitFetchCount = 0;
+    let headRepoCommitFetchCount = 0;
+    let prWidePatchFetchCount = 0;
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        baseRepoCommitFetchCount++;
+        return new Response('Not Found', { status: 404 });
+      }
+      if (url.match(/\/repos\/forked\/repo\/commits\/sha123/)) {
+        headRepoCommitFetchCount++;
+        return new Response('Not Found', { status: 404 });
+      }
+      if (url.match(/\/repos\/test\/repo\/pulls\/123/) && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+        prWidePatchFetchCount++;
+        return new Response(
+          'diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile\n' +
+          '--- a/package/utils/bash/Makefile\n' +
+          '+++ b/package/utils/bash/Makefile\n' +
+          '+PKG_VERSION:=2.0\n' +
+          '+PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/contents/package/utils/bash/Makefile')) {
+        return new Response(
+          'PKG_NAME:=bash\n' +
+          'PKG_VERSION:=2.0\n' +
+          'PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(baseRepoCommitFetchCount, 1);
+      assert.strictEqual(headRepoCommitFetchCount, 1);
+      assert.strictEqual(prWidePatchFetchCount, 1);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('fetchFileContentCached: falls back to head repo when base repo content fetch returns 404 or 5xx', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: {
+          ref: 'feature',
+          sha: 'headsha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let baseRepoContentFetchCount = 0;
+    let headRepoContentFetchCount = 0;
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: true
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          'diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile\n' +
+          '--- a/package/utils/bash/Makefile\n' +
+          '+++ b/package/utils/bash/Makefile\n' +
+          '+PKG_VERSION:=2.0\n' +
+          '+PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      // Content fetch under base repo returns 502 Bad Gateway
+      if (url.match(/\/repos\/test\/repo\/contents\/package\/utils\/bash\/Makefile/)) {
+        baseRepoContentFetchCount++;
+        return new Response('Gateway Timeout', { status: 502 });
+      }
+      // Content fetch under head repo returns 200 OK
+      if (url.match(/\/repos\/forked\/repo\/contents\/package\/utils\/bash\/Makefile/)) {
+        headRepoContentFetchCount++;
+        return new Response(
+          'PKG_NAME:=bash\n' +
+          'PKG_VERSION:=2.0\n' +
+          'PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(baseRepoContentFetchCount, 6);
+      assert.strictEqual(headRepoContentFetchCount, 2);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
