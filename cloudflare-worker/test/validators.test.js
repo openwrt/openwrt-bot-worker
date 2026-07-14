@@ -225,6 +225,45 @@ describe('validateFormalities', () => {
       `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
   });
 
+  test('warns when subject and body are virtually identical (e.g. my-agent bump version to 2026.27)', async () => {
+    const commit = {
+      commit: {
+        message: 'my-agent: bump version to 2026.27\n\nUpgrade my-agent to the newest version\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
+  test('warns when subject and body are virtually identical (e.g. my-cli update to 29.6.1)', async () => {
+    const commit = {
+      commit: {
+        message: 'my-cli: update to 29.6.1\n\nBump my-cli CLI from 29.4.1 to 29.6.1.\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
+  test('does not warn when body has meaningful context beyond subject', async () => {
+    const commit = {
+      commit: {
+        message: 'my-cli: update to 29.6.1\n\nBump my-cli CLI to 29.6.1.\nThis release fixes a CVE in the CLI implementation.\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(!res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Did not expect duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
   test('correctly extracts SSH key signature fingerprint without the footer tag', async () => {
     const commit = {
       commit: {
@@ -1326,14 +1365,30 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
 new file mode 100644
 --- /dev/null
 +++ b/package/utils/bash/patches/001-fix.patch
++From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
 +From: John Doe <john@doe.com>
-+Subject: Fix compilation issue
++Date: Tue, 7 Jul 2026 20:09:55 +0300
++Subject: [PATCH] Fix compilation issue
 +
 +Details of the fix
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
     assert.ok(res.successes.length > 0);
+  });
+
+  test('rejects patches missing From hash or Date headers (user example)', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++From: Name <someone@domain.tld>
++Subject: [PATCH] commit
+    `;
+    const res = await validateEmbeddedPatches(patch, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('Missing required Git header')),
+      `Expected error for missing headers, got: ${JSON.stringify(res.errors)}`);
   });
 
   test('skips validation for modified patches when fetch fails/not provided', async () => {
@@ -1360,7 +1415,7 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
 +new_code
     `;
     const mockFetch = async (path) => {
-      return `From: John Doe <john@doe.com>\nSubject: Fix compilation issue\n\nCode content`;
+      return `From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix compilation issue\n\nCode content`;
     };
     const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);

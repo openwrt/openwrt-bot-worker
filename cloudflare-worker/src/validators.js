@@ -23,6 +23,63 @@ export function getNormalizedText(str, pkgName) {
   return cleaned.replace(/[^a-z0-9]/g, '');
 }
 
+export function isVirtuallyIdentical(subject, body, pkgName) {
+  const normSubject = getNormalizedText(subject, pkgName);
+  const normBody = getNormalizedText(body, pkgName);
+
+  // 1. Direct or substring matching
+  if (normSubject === normBody || 
+      (normBody.includes(normSubject) && normBody.length < normSubject.length + 20) || 
+      (normSubject.includes(normBody) && normSubject.length < normBody.length + 20)) {
+    return true;
+  }
+
+  // 2. Token-based synonym/meaningless body check
+  const genericWords = new Set([
+    'bump', 'bumps', 'bumped',
+    'update', 'updates', 'updated',
+    'upgrade', 'upgrades', 'upgraded',
+    'newest', 'latest', 'new', 'old',
+    'from', 'to', 'the', 'a', 'an', 'and', 'or', 'in', 'of', 'for', 'with', 'by', 'on', 'at', 'it', 'its',
+    'version', 'versions', 'v', 'cli', 'package', 'packages', 'release', 'releases', 'revision', 'revisions',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+    'about', 'again', 'all', 'any', 'both', 'each', 'few', 'more', 'other', 'some', 'such', 'than', 'too', 'very',
+    'just', 'only', 'then', 'here', 'there', 'when', 'where', 'why', 'how', 'this'
+  ]);
+
+  const pkgWords = new Set();
+  if (pkgName) {
+    pkgWords.add(pkgName.toLowerCase());
+    pkgName.toLowerCase().split(/[-_]/).forEach(w => {
+      if (w) pkgWords.add(w);
+    });
+  }
+
+  // Split body into lowercase alphanumeric tokens
+  const bodyTokens = body.toLowerCase()
+    .replace(/[^a-z0-9\s.-]/g, '') // Keep dots and hyphens/dashes for version numbers or compound words
+    .split(/\s+/);
+
+  let hasMeaningfulWord = false;
+  for (let token of bodyTokens) {
+    token = token.trim();
+    if (!token) continue;
+    // Strip trailing period or comma from token
+    token = token.replace(/[.,]$/, '');
+    
+    if (pkgWords.has(token)) continue;
+    if (genericWords.has(token)) continue;
+    // Check if version number (e.g. 29.6.1, v2.0, 2026.27, etc.)
+    if (/^v?\d+(?:[.-]\d+)*$/.test(token)) continue;
+
+    // If it is any other word, it is considered meaningful
+    hasMeaningfulWord = true;
+    break;
+  }
+
+  return !hasMeaningfulWord;
+}
+
 async function getSshKeyFingerprint(sigText) {
   try {
     let cleanSig = sigText.replace(/-----[a-zA-Z0-9\s]+-----/g, '');
@@ -180,10 +237,8 @@ export async function validateFormalities(fullCommit, CONFIG) {
     if (CONFIG.warn_duplicate_body) {
       const pkgPrefixMatch = lines[0].match(/^([a-zA-Z0-9_-]+):/);
       const pkgName = pkgPrefixMatch ? pkgPrefixMatch[1] : '';
-      const normSubject = getNormalizedText(lines[0], pkgName);
-      const normBody = getNormalizedText(fullCleanBody, pkgName);
 
-      if (normSubject === normBody || (normBody.includes(normSubject) && normBody.length < normSubject.length + 20) || (normSubject.includes(normBody) && normSubject.length < normBody.length + 20)) {
+      if (isVirtuallyIdentical(lines[0], fullCleanBody, pkgName)) {
         warnings.push("Commit subject and description body are identical or virtually identical. Avoid repeating the subject line in the body; provide context instead.");
       }
     }
@@ -762,7 +817,9 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   for (const chunk of fileChunks) {
     for (const patchFile of patchFiles) {
       if (chunk.includes('b/' + patchFile)) {
+        let hasFromHash = false;
         let hasFrom = false;
+        let hasDate = false;
         let hasSubject = false;
         let checked = false;
 
@@ -770,7 +827,9 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
           try {
             const rawContent = await fetchFileContent(patchFile);
             if (rawContent !== null) {
+              hasFromHash = /^From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(rawContent);
               hasFrom = /^From:\s+.+/m.test(rawContent);
+              hasDate = /^Date:\s+.+/m.test(rawContent);
               hasSubject = /^Subject:\s+.+/m.test(rawContent);
               checked = true;
             }
@@ -786,12 +845,14 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
             successes.push(`✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)`);
             continue;
           }
+          hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
           hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
+          hasDate = /^\+\s*Date:\s+.+/m.test(chunk);
           hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
         }
 
-        if (!hasFrom || !hasSubject) {
-          errors.push(`- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From:' / 'Subject:') to ensure 'git am' application compatibility`);
+        if (!hasFromHash || !hasFrom || !hasDate || !hasSubject) {
+          errors.push(`- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From <hash> Mon Sep 17 00:00:00 2001' / 'From:' / 'Date:' / 'Subject:') to ensure 'git am' application compatibility`);
         } else {
           successes.push(`✅ Embedded patch '${patchFile}' contains valid Git compliance headers`);
         }
