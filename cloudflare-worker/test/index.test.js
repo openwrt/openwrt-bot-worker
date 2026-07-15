@@ -122,11 +122,8 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
 
     assert.strictEqual(response.status, 500);
     const resJson = await response.json();
-    assert.ok(resJson.exception);
-    assert.ok(resJson.exception.message);
-    assert.strictEqual(resJson.exception.stack, undefined);
-    assert.ok(resJson.exception.timestamp);
-    assert.strictEqual(resJson.message, resJson.exception.message);
+    assert.strictEqual(resJson.message, 'Internal Server Error');
+    assert.strictEqual(resJson.exception, undefined);
   });
 
   test('throws and catches explicit error when GitHub API returns non-200 status for commits list', async () => {
@@ -195,8 +192,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
 
       assert.strictEqual(response.status, 500);
       const resJson = await response.json();
-      assert.ok(resJson.exception);
-      assert.match(resJson.exception.message, /GitHub API returned HTTP 403/);
+      assert.strictEqual(resJson.message, 'Internal Server Error');
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -221,9 +217,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
     const response = await worker.fetch(badRequest, {}, {});
     assert.strictEqual(response.status, 500);
     const resJson = await response.json();
-    assert.ok(resJson.exception);
-    assert.strictEqual(resJson.exception.message, 'null');
-    assert.strictEqual(resJson.message, 'null');
+    assert.strictEqual(resJson.message, 'Internal Server Error');
   });
 
   test('handles thrown custom object in catch block gracefully without secondary TypeError', async () => {
@@ -243,10 +237,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
     const response = await worker.fetch(badRequest, {}, {});
     assert.strictEqual(response.status, 500);
     const resJson = await response.json();
-    assert.ok(resJson.exception);
-    assert.strictEqual(resJson.exception.name, 'CustomError');
-    assert.strictEqual(resJson.exception.message, 'Something went wrong');
-    assert.strictEqual(resJson.message, 'Something went wrong');
+    assert.strictEqual(resJson.message, 'Internal Server Error');
   });
 
   test('handles large PRs with > 15 commits by fetching overall PR patch and checking PR-wide', async () => {

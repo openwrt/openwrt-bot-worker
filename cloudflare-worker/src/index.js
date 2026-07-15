@@ -900,29 +900,8 @@ export default {
     } catch (rawError) {
       console.error("Webhook processing failed:", rawError);
 
-      let name = "Error";
-      let message;
-
-      if (rawError instanceof Error) {
-        name = rawError.name;
-        message = rawError.message;
-      } else if (rawError && typeof rawError === 'object') {
-        name = String(rawError.name || "Error");
-        message = String(rawError.message || rawError);
-      } else if (rawError !== undefined && rawError !== null) {
-        message = String(rawError);
-      } else {
-        message = "null";
-      }
-
-      const errorDetails = {
-        name,
-        message,
-        timestamp: Date.now()
-      };
       return new Response(JSON.stringify({
-        exception: errorDetails,
-        message: errorDetails.message
+        message: "Internal Server Error"
       }, null, 2), {
         status: 500,
         headers: { "Content-Type": "application/json" }
