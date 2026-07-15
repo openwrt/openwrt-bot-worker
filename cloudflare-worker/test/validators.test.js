@@ -409,6 +409,18 @@ describe('validateMakefileContext', () => {
     assert.ok(res.errors.some(e => e.includes('PKG_VERSION')));
   });
 
+  test('skips subject validation for dynamic/templated PKG_VERSION', () => {
+    const commit = { commit: { message: 'apk: update to 2.14.0' } };
+    const patch = `
+--- a/package/utils/apk/Makefile
++++ b/package/utils/apk/Makefile
++PKG_VERSION:=$(subst -,.,$(PKG_SOURCE_VERSION))
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
   test('requires metadata fields for new packages', () => {
     const commit = { commit: { message: 'newpkg: add package' } };
     const patch = `
@@ -1888,6 +1900,113 @@ deleted file mode 100644
 
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.ok(res);
+  });
+
+  test('passes when nested version variable (e.g. GO_VERSION_PATCH) is bumped', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/golang/Makefile b/package/utils/golang/Makefile
++++ b/package/utils/golang/Makefile
+-GO_VERSION_PATCH:=3
++GO_VERSION_PATCH:=4
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/golang/Makefile') {
+        return 'PKG_NAME:=golang\nGO_VERSION_MAJOR_MINOR:=1.22\nGO_VERSION_PATCH:=4\nPKG_VERSION:=$(GO_VERSION_MAJOR_MINOR)$(if $(GO_VERSION_PATCH),.$(GO_VERSION_PATCH))\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/golang/Makefile') {
+        return 'PKG_NAME:=golang\nGO_VERSION_MAJOR_MINOR:=1.22\nGO_VERSION_PATCH:=3\nPKG_VERSION:=$(GO_VERSION_MAJOR_MINOR)$(if $(GO_VERSION_PATCH),.$(GO_VERSION_PATCH))\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('version updated')));
+  });
+
+  test('resolves deeply nested variable references in PKG_VERSION', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/nestedpkg/Makefile b/package/utils/nestedpkg/Makefile
++++ b/package/utils/nestedpkg/Makefile
+-VAR3:=old
++VAR3:=new
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/nestedpkg/Makefile') {
+        return 'PKG_NAME:=nestedpkg\nVAR3:=new\nVAR2:=$(VAR3)\nVAR1:=$(VAR2)\nPKG_VERSION:=$(VAR1)\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/nestedpkg/Makefile') {
+        return 'PKG_NAME:=nestedpkg\nVAR3:=old\nVAR2:=$(VAR3)\nVAR1:=$(VAR2)\nPKG_VERSION:=$(VAR1)\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('version updated')));
+  });
+
+  test('circular references do not cause infinite recursion', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/circularpkg/Makefile b/package/utils/circularpkg/Makefile
++++ b/package/utils/circularpkg/Makefile
+-VAR2:=val
++VAR2:=val2
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/circularpkg/Makefile') {
+        return 'PKG_NAME:=circularpkg\nVAR1:=$(VAR2)\nVAR2:=$(VAR1)\nPKG_VERSION:=$(VAR1)\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/circularpkg/Makefile') {
+        return 'PKG_NAME:=circularpkg\nVAR1:=$(VAR2)\nVAR2:=$(VAR1)\nPKG_VERSION:=$(VAR1)\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res);
+  });
+
+  test('passes when python micro version variable is bumped', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/lang/python/Makefile b/package/lang/python/Makefile
++++ b/package/lang/python/Makefile
+-PYTHON3_VERSION_MICRO:=4
++PYTHON3_VERSION_MICRO:=5
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/lang/python/Makefile') {
+        return 'PKG_NAME:=python3\nPYTHON3_VERSION_MAJOR:=3\nPYTHON3_VERSION_MINOR:=14\nPYTHON3_VERSION_MICRO:=5\nPKG_VERSION:=$(PYTHON3_VERSION_MAJOR).$(PYTHON3_VERSION_MINOR).$(PYTHON3_VERSION_MICRO)\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/lang/python/Makefile') {
+        return 'PKG_NAME:=python3\nPYTHON3_VERSION_MAJOR:=3\nPYTHON3_VERSION_MINOR:=14\nPYTHON3_VERSION_MICRO:=4\nPKG_VERSION:=$(PYTHON3_VERSION_MAJOR).$(PYTHON3_VERSION_MINOR).$(PYTHON3_VERSION_MICRO)\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('version updated')));
   });
 });
 

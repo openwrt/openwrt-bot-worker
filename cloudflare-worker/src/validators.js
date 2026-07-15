@@ -400,11 +400,15 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     const versionMatch = commitPatch.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
     if (versionMatch) {
       const newVersion = versionMatch[1].replace(/["']/g, "").trim();
-      const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
-      if (!cleanSubject.includes(newVersion)) {
-        errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line`);
+      if (newVersion.includes('$')) {
+        successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
       } else {
-        successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
+        const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
+        if (!cleanSubject.includes(newVersion)) {
+          errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line`);
+        } else {
+          successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
+        }
       }
     }
   }
@@ -1028,9 +1032,32 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
 
 function parseMakefileVar(content, varName) {
   if (!content) return null;
-  const regex = new RegExp(`^${varName}\\s*(?::=|=)\\s*([^\\s#]+)`, 'm');
+  const regex = new RegExp(`^${varName}\\s*(?::=|=)\\s*([^#\\r\\n]+)`, 'm');
   const match = content.match(regex);
   return match ? match[1].replace(/["']/g, "").trim() : null;
+}
+
+export function resolveMakefileVar(content, varName, seen = new Set()) {
+  if (!content || !varName) return null;
+  if (seen.has(varName)) {
+    return '';
+  }
+
+  const rawValue = parseMakefileVar(content, varName);
+  if (rawValue === null) {
+    return null;
+  }
+
+  const newSeen = new Set(seen);
+  newSeen.add(varName);
+
+  // Find and replace variable references like $(VAR) or ${VAR}
+  const varRegex = /\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g;
+  return rawValue.replace(varRegex, (match, p1, p2) => {
+    const refVarName = (p1 || p2).trim();
+    const resolved = resolveMakefileVar(content, refVarName, newSeen);
+    return resolved !== null ? resolved : '';
+  });
 }
 
 function isFileChangeMinor(filePath, added, deleted) {
@@ -1207,7 +1234,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       const isNew = addedFiles.has(makefilePath);
       const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
 
-      headRelease = parseMakefileVar(headContent, 'PKG_RELEASE');
+      headRelease = resolveMakefileVar(headContent, 'PKG_RELEASE');
 
       if (isNew) {
         if (headRelease !== '1') {
@@ -1219,16 +1246,16 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       }
 
       // Existing package modified
-      baseVersion = parseMakefileVar(baseContent, 'PKG_VERSION');
-      headVersion = parseMakefileVar(headContent, 'PKG_VERSION');
+      baseVersion = resolveMakefileVar(baseContent, 'PKG_VERSION');
+      headVersion = resolveMakefileVar(headContent, 'PKG_VERSION');
 
-      baseRelease = parseMakefileVar(baseContent, 'PKG_RELEASE');
+      baseRelease = resolveMakefileVar(baseContent, 'PKG_RELEASE');
 
-      baseSourceVer = parseMakefileVar(baseContent, 'PKG_SOURCE_VERSION');
-      headSourceVer = parseMakefileVar(headContent, 'PKG_SOURCE_VERSION');
+      baseSourceVer = resolveMakefileVar(baseContent, 'PKG_SOURCE_VERSION');
+      headSourceVer = resolveMakefileVar(headContent, 'PKG_SOURCE_VERSION');
 
-      baseSourceDate = parseMakefileVar(baseContent, 'PKG_SOURCE_DATE');
-      headSourceDate = parseMakefileVar(headContent, 'PKG_SOURCE_DATE');
+      baseSourceDate = resolveMakefileVar(baseContent, 'PKG_SOURCE_DATE');
+      headSourceDate = resolveMakefileVar(headContent, 'PKG_SOURCE_DATE');
 
       versionChanged = (baseVersion !== headVersion) || (baseSourceVer !== headSourceVer) || (baseSourceDate !== headSourceDate);
       releaseChanged = (baseRelease !== headRelease);
