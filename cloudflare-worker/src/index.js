@@ -1,4 +1,5 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
+import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
@@ -235,10 +236,13 @@ async function handleWebhook(request, env) {
     commitsPromises.push(githubApiCall(`${commitsUrl}?per_page=100&page=${p}`, token));
   }
 
-  // OPTIMIZATION: Fetch repository config, first page of repository labels, and commits list pages in parallel
-  const [CONFIG, firstLabelsRes, ...commitsResList] = await Promise.all([
+  const labelerUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/labeler.yml?ref=${encodeURIComponent(baseBranch)}`;
+
+  // OPTIMIZATION: Fetch repository config, first page of repository labels, labeler config, and commits list pages in parallel
+  const [CONFIG, firstLabelsRes, labelerRes, ...commitsResList] = await Promise.all([
     fetchRepositoryConfig(data, token, DEFAULT_CONFIG),
     githubApiCall(`${labelsUrl}?per_page=100&page=1`, token),
+    githubApiCall(labelerUrl, token, 'GET', null, 'application/vnd.github.raw'),
     ...commitsPromises
   ]);
 
@@ -762,6 +766,37 @@ async function handleWebhook(request, env) {
     if (!currentPrLabels.has(labelName.toLowerCase())) {
       labelOperations.push(ensureLabelExists(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
       labelsToAdd.push(labelName);
+    }
+  }
+
+  if (CONFIG.enable_labeler_yml && labelerRes && labelerRes.code === 200) {
+    let changedFiles = [];
+    if (usePrWidePatch) {
+      changedFiles = getAllChangedFiles(prPatch);
+    } else {
+      const filesSet = new Set();
+      for (const item of commitDetails) {
+        if (item.commitPatch) {
+          const files = getAllChangedFiles(item.commitPatch);
+          for (const f of files) {
+            filesSet.add(f);
+          }
+        }
+      }
+      changedFiles = Array.from(filesSet);
+    }
+
+    try {
+      const parsedLabeler = parseYaml(labelerRes.raw);
+      const matchedLabels = getLabelsForChangedFiles(changedFiles, parsedLabeler);
+      for (const label of matchedLabels) {
+        if (!currentPrLabels.has(label.toLowerCase())) {
+          labelOperations.push(ensureLabelExists(label, 'bfd4f2', ''));
+          labelsToAdd.push(label);
+        }
+      }
+    } catch (e) {
+      console.error(`Failed to parse or process labeler.yml: ${e.message}`);
     }
   }
 

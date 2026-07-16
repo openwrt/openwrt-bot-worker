@@ -26,6 +26,7 @@ export const DEFAULT_CONFIG = {
   add_package_label: true,
   drop_package_label: true,
   branch_labeling: true,
+  enable_labeler_yml: false,
   check_openwrt_meta: true,
   check_conffiles: true,
   check_uci_config: true,

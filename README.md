@@ -116,6 +116,7 @@ Some configuration keys offer advanced options:
 *   `show_force_push_tip`: Set to `true` (default) to append a helpful tip regarding how to correct validation errors using force-pushing. Set to `false` to disable.
 *   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
+*   `enable_labeler_yml`: Set to `true` to enable dynamic pull request labeling based on matching files in the `.github/labeler.yml` configuration file. Defaults to `false` (opt-in).
 
 Here is a comprehensive example containing all available toggle options:
 
@@ -153,6 +154,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_pkg_release": "warning",
   "require_linked_github_account": true,
   "check_openwrt_spelling": true,
-  "enable_stale_bot": false
+  "enable_stale_bot": false,
+  "enable_labeler_yml": false
 }
 ```

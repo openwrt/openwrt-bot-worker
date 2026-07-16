@@ -2557,5 +2557,370 @@ index 123456..789012 100644
       fetchMock = null;
     }
   });
+
+  test('labeler.yml integration: applies matching labels from .github/labeler.yml', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: {
+          ref: 'feature',
+          sha: 'headsha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const apiCalls = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      apiCalls.push({ url, method, body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          enable_labeler_yml: true
+        }), { status: 200 });
+      }
+      if (url.includes('/labeler.yml')) {
+        const labelerYaml = `
+"target/airoha":
+- changed-files:
+  - any-glob-to-any-file:
+    - "target/linux/airoha/**"
+"target/at91":
+- changed-files:
+  - any-glob-to-any-file:
+    - "target/linux/at91/**"
+`;
+        return new Response(labelerYaml, { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          'diff --git a/target/linux/airoha/Makefile b/target/linux/airoha/Makefile\n' +
+          '--- a/target/linux/airoha/Makefile\n' +
+          '+++ b/target/linux/airoha/Makefile\n' +
+          '+PKG_VERSION:=2.0\n' +
+          '+PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      // Verify labels added
+      const labelPostCalls = apiCalls.filter(c => c.url.includes('/issues/123/labels') && c.method === 'POST');
+      assert.ok(labelPostCalls.some(c => c.body?.labels?.includes('target/airoha')));
+      assert.ok(!labelPostCalls.some(c => c.body?.labels?.includes('target/at91')));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: {
+          ref: 'feature',
+          sha: 'headsha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          enable_labeler_yml: true
+        }), { status: 200 });
+      }
+      if (url.includes('/labeler.yml')) {
+        return new Response('Not Found', { status: 404 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          'diff --git a/target/linux/airoha/Makefile b/target/linux/airoha/Makefile\n' +
+          '--- a/target/linux/airoha/Makefile\n' +
+          '+++ b/target/linux/airoha/Makefile\n' +
+          '+PKG_VERSION:=2.0\n' +
+          '+PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('labeler.yml integration: respects enable_labeler_yml: false config', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: {
+          ref: 'feature',
+          sha: 'headsha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const apiCalls = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      apiCalls.push({ url, method, body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          enable_labeler_yml: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labeler.yml')) {
+        const labelerYaml = `
+"target/airoha":
+- changed-files:
+  - any-glob-to-any-file:
+    - "target/linux/airoha/**"
+`;
+        return new Response(labelerYaml, { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          'diff --git a/target/linux/airoha/Makefile b/target/linux/airoha/Makefile\n' +
+          '--- a/target/linux/airoha/Makefile\n' +
+          '+++ b/target/linux/airoha/Makefile\n' +
+          '+PKG_VERSION:=2.0\n' +
+          '+PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      // Verify that the labeler label was NOT added since the config flag was disabled
+      const labelPostCalls = apiCalls.filter(c => c.url.includes('/issues/123/labels') && c.method === 'POST');
+      assert.ok(!labelPostCalls.some(c => c.body?.labels?.includes('target/airoha')));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
 });
 
