@@ -2229,6 +2229,41 @@ endef
     assert.strictEqual(res.errors.length, 0);
   });
 
+  test('ignores sed scripts and defaults files', async () => {
+    const patch = `
+diff --git a/package/utils/foo/files/foo.conf.sed b/package/utils/foo/files/foo.conf.sed
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.conf.sed
+diff --git a/package/utils/foo/files/foo.defaults b/package/utils/foo/files/foo.defaults
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/files/foo.defaults
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/foo/Makefile') {
+        return `
+define Package/foo/install
+\t$(INSTALL_DATA) ./files/foo.conf.sed $(1)/usr/share/foo/foo.conf.sed
+\t$(INSTALL_DATA) ./files/foo.defaults $(1)/etc/uci-defaults/foo
+\t$(INSTALL_DATA) ./files/foo.conf $(1)/etc/config/foo
+endef
+        `;
+      }
+      if (path === 'package/utils/foo/files/foo.conf.sed') {
+        return `s/a/b/\n`;
+      }
+      if (path === 'package/utils/foo/files/foo.defaults') {
+        return `chown foo:foo /etc/foo.conf\n`;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
   test('ignores configuration files installed to other locations (e.g. /etc/foo/)', async () => {
     const patch = `
 diff --git a/package/utils/foo/files/foo.conf b/package/utils/foo/files/foo.conf

@@ -1373,7 +1373,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
 
     const filename = file.split('/').pop();
     const ext = filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
-    const skipExtensions = new Set(['init', 'sh', 'hotplug', 'py', 'pl', 'lua', 'cron', 'md', 'patch']);
+    const skipExtensions = new Set(['init', 'sh', 'hotplug', 'py', 'pl', 'lua', 'cron', 'md', 'patch', 'sed', 'defaults']);
     if (skipExtensions.has(ext)) continue;
 
     let isDestinedForEtcConfig = false;
