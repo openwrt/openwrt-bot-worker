@@ -376,6 +376,27 @@ export async function validateFormalities(fullCommit, CONFIG) {
   return { errors, successes, warnings };
 }
 
+export function matchVersionString(subject, version) {
+  if (subject.includes(version)) return true;
+
+  try {
+    const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const parts = version.split(/([0-9]+)/);
+    const pattern = parts.map(part => {
+      if (/^[0-9]+$/.test(part)) {
+        return `0*${parseInt(part, 10)}`;
+      } else {
+        return escapeRegExp(part);
+      }
+    }).join('');
+
+    const regex = new RegExp(`(?<![0-9])${pattern}(?![0-9])`);
+    return regex.test(subject);
+  } catch (e) {
+    return false;
+  }
+}
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) {
   const errors = [];
   const successes = [];
@@ -404,7 +425,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
         successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
       } else {
         const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
-        if (!cleanSubject.includes(newVersion)) {
+        if (!matchVersionString(cleanSubject, newVersion)) {
           errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line`);
         } else {
           successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);

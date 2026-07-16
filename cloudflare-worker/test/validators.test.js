@@ -397,6 +397,30 @@ describe('validateMakefileContext', () => {
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
+  test('accepts version bump with leading zero difference (subject has zero, Makefile does not)', () => {
+    const commit = { commit: { message: 'mypkg: update to 2026.07.04' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_VERSION:=2026.7.4
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts version bump with leading zero difference (Makefile has zero, subject does not)', () => {
+    const commit = { commit: { message: 'mypkg: update to 2026.7.4' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_VERSION:=2026.07.04
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
   test('catches version mismatch with commit subject', () => {
     const commit = { commit: { message: 'bash: update to 5.3' } };
     const patch = `
