@@ -568,17 +568,29 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
         // Also check diff hunk headers (lines starting with @@) for endef/define
         // since they may contain context lines that close or open blocks
         if (/^@@/.test(line)) {
-          const hunkEndefMatch = line.match(/@@.*\bendef\b/);
-          if (hunkEndefMatch && inConffiles) {
+          // Git shows the nearest preceding function-like context line after
+          // the second '@@'. If that context names a *different* define
+          // block (e.g. "define Package/foo/install"), the diff hunk lives
+          // outside any conffiles block seen in an earlier hunk, so state
+          // must not leak across hunks.
+          const hunkContextMatch = line.match(/^@@[^@]*@@\s*(.*)$/);
+          const hunkContext = hunkContextMatch ? hunkContextMatch[1] : '';
+
+          if (/\bendef\b/.test(hunkContext)) {
             inConffiles = false;
             currentPackage = '';
-          }
-          // Check if hunk header opens a conffiles block
-          const hunkDefineMatch = line.match(/@@.*\bdefine\s+(Package\/[^\s]*conffiles)/);
-          if (hunkDefineMatch) {
-            inConffiles = true;
-            currentPackage = hunkDefineMatch[1];
-            MakefileHasConffiles = true;
+          } else {
+            const hunkDefineMatch = hunkContext.match(/^define\s+(Package\/\S+)/);
+            if (hunkDefineMatch) {
+              if (/conffiles$/.test(hunkDefineMatch[1])) {
+                inConffiles = true;
+                currentPackage = hunkDefineMatch[1];
+                MakefileHasConffiles = true;
+              } else {
+                inConffiles = false;
+                currentPackage = '';
+              }
+            }
           }
           continue;
         }

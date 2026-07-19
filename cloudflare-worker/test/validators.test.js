@@ -909,6 +909,36 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.ok(!res.errors.some(e => e.includes("must not contain any spaces or indentation") && e.includes("INSTALL")), `Should not flag install lines as indentation errors: ${res.errors.join(', ')}`);
   });
 
+  test('does not leak conffiles block into a later install hunk when endef is never shown in the diff (odhcp6c PR#22751 regression)', () => {
+    const commit = { commit: { message: 'odhcp6c: test' } };
+    const patch = `
+diff --git a/package/network/ipv6/odhcp6c/Makefile b/package/network/ipv6/odhcp6c/Makefile
+--- a/package/network/ipv6/odhcp6c/Makefile
++++ b/package/network/ipv6/odhcp6c/Makefile
+@@ -28,7 +28,7 @@ define Package/odhcp6c
+   SECTION:=net
+   CATEGORY:=Network
+   TITLE:=Embedded DHCPv6-client for OpenWrt
+-  DEPENDS:=@IPV6 +libubox +libubus
++  DEPENDS:=@IPV6 +libubox +libubus +ucode
+ endef
+
+ define Package/odhcp6c/conffiles
+@@ -40,7 +40,7 @@ define Package/odhcp6c/install
+ 	$(INSTALL_DIR) $(1)/usr/sbin/
+ 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/odhcp6c $(1)/usr/sbin/
+ 	$(INSTALL_DIR) $(1)/lib/netifd/proto
+-	$(INSTALL_BIN) ./files/dhcpv6.sh $(1)/lib/netifd/proto/dhcpv6.sh
++	$(INSTALL_BIN) ./files/dhcpv6.uc $(1)/lib/netifd/proto/dhcpv6.uc
+ 	$(INSTALL_BIN) ./files/dhcpv6.script $(1)/lib/netifd/
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(!res.errors.some(e => e.includes('INSTALL_BIN')), `Should not flag install line as conffiles error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes('must not contain any spaces or indentation')), `Should not flag spaces error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes("must be an absolute path")), `Should not flag absolute path error: ${res.errors.join(', ')}`);
+  });
+
   test('rejects conffiles path for individual file ending with trailing slash', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
