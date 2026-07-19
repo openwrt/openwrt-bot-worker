@@ -176,16 +176,28 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   if (!isAutosquash) {
     if (/^\s/.test(lines[0])) subjectErrors.push("Commit subject must not start with whitespace");
-    if (!/^[a-zA-Z0-9_-]+: /.test(subject)) {
-      subjectErrors.push("Commit subject must start with \`<package name or prefix>: \`");
+    
+    // Special case for tools/* prefix (e.g., tools/cmake: backport bootstrap fix)
+    // These use a subdirectory naming convention like tools/cmake, tools/bison, etc.
+    const toolsPrefixMatch = subject.match(/^(tools\/[a-zA-Z0-9_-]+): /);
+    if (toolsPrefixMatch) {
+      const afterPrefix = subject.replace(/^(tools\/[a-zA-Z0-9_-]+): \s*/, '');
+      if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
+        subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
+      }
+      if (subject.endsWith('.')) {
+        subjectErrors.push("Commit subject must not end with a period");
+      }
+    } else if (!/^[a-zA-Z0-9_-]+: /.test(subject)) {
+      subjectErrors.push("Commit subject must start with `<package name or prefix>: `");
     } else {
       const afterPrefix = subject.replace(/^[a-zA-Z0-9_-]+: \s*/, '');
       if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
         subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
       }
-    }
-    if (subject.endsWith('.')) {
-      subjectErrors.push("Commit subject must not end with a period");
+      if (subject.endsWith('.')) {
+        subjectErrors.push("Commit subject must not end with a period");
+      }
     }
   }
 

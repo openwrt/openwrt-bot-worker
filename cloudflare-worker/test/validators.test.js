@@ -380,6 +380,56 @@ describe('validateFormalities', () => {
     const res = await validateFormalities(commit, customConfig);
     assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
   });
+
+  test('accepts tools/cmake prefix format for build tool commits', async () => {
+    const commit = {
+      commit: {
+        message: 'tools/cmake: backport bootstrap fix for GCC 16\n\nApply upstream fix for bootstrap with GCC 16.\nhttps://cmake.org/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid')));
+  });
+
+  test('accepts tools/bison prefix format for build tool commits', async () => {
+    const commit = {
+      commit: {
+        message: 'tools/bison: update to 3.8.2\n\nUpdate bison to latest stable release.\nhttps://ftp.gnu.org/gnu/bison/\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid')));
+  });
+
+  test('rejects tools/cmake with uppercase after prefix', async () => {
+    const commit = {
+      commit: {
+        message: 'tools/cmake: Backport bootstrap fix for GCC 16\n\nApply upstream fix.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('lower-case word after the prefix')));
+  });
+
+  test('rejects tools/cmake with period at end of subject', async () => {
+    const commit = {
+      commit: {
+        message: 'tools/cmake: backport bootstrap fix for GCC 16.\n\nApply upstream fix.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('must not end with a period')));
+  });
 });
 
 // ─── Makefile Context ────────────────────────────────────────────
