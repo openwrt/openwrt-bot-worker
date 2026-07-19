@@ -203,18 +203,46 @@ async function handleWebhook(request, env) {
   const isBackportPr = /^(stable|openwrt-)/.test(baseBranch) || /^\[\d{2}\.\d{2}\]/.test(prTitle || '');
 
   const fileCache = new Map();
+  // Tracks where each ref is resolvable: 'base' means the base repo serves the
+  // ref, so a 404 for a path there is authoritative — the fork holds the
+  // identical tree for that commit, and the fork fallback would only burn a
+  // second subrequest to get the same 404 (this matters for speculative
+  // Makefile probes in findPkgRoot). 'fork' means the base repo cannot resolve
+  // the ref at all, so lookups skip the base repo entirely.
+  const refSource = new Map();
+  // The base branch tip is by definition resolvable in the base repo.
+  if (data.pull_request.base?.sha) {
+    refSource.set(data.pull_request.base.sha, 'base');
+  }
   const fetchFileContentCached = (path, ref) => {
     const key = `${ref}:${path}`;
     if (!fileCache.has(key)) {
       fileCache.set(key, (async () => {
-        const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${ref}`;
-        let res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-
         const headRepoFullname = data.pull_request?.head?.repo?.full_name;
-        if ((res.code === 404 || res.code >= 500) && headRepoFullname && headRepoFullname !== repoFullname) {
-          console.warn(`Failed to fetch file content for '${path}' at ref ${ref} under base repo ${repoFullname} (HTTP ${res.code}). Retrying under head repo ${headRepoFullname}...`);
-          const forkUrl = `https://api.github.com/repos/${headRepoFullname}/contents/${path}?ref=${ref}`;
+        const hasForkRepo = headRepoFullname && headRepoFullname !== repoFullname;
+        const forkUrl = `https://api.github.com/repos/${headRepoFullname}/contents/${path}?ref=${ref}`;
+
+        let res;
+        if (hasForkRepo && refSource.get(ref) === 'fork') {
           res = await githubApiCall(forkUrl, token, 'GET', null, 'application/vnd.github.raw');
+        } else {
+          const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${ref}`;
+          res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
+          if (res.code === 200 && !refSource.has(ref)) {
+            refSource.set(ref, 'base');
+          }
+
+          const authoritative404 = res.code === 404 && refSource.get(ref) === 'base';
+          if ((res.code === 404 || res.code >= 500) && hasForkRepo && !authoritative404) {
+            console.warn(`Failed to fetch file content for '${path}' at ref ${ref} under base repo ${repoFullname} (HTTP ${res.code}). Retrying under head repo ${headRepoFullname}...`);
+            const was404 = res.code === 404;
+            res = await githubApiCall(forkUrl, token, 'GET', null, 'application/vnd.github.raw');
+            // Base 404 + fork 200 for the same SHA can only mean the base repo
+            // cannot resolve the ref (identical trees otherwise).
+            if (was404 && res.code === 200 && !refSource.has(ref)) {
+              refSource.set(ref, 'fork');
+            }
+          }
         }
 
         if (res.code === 200) return res.raw;
@@ -382,12 +410,25 @@ async function handleWebhook(request, env) {
     if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
       let patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
+      if (patchRes.code === 200 && !refSource.has(sha)) {
+        // The base repo resolves this SHA, so later /contents/ lookups at this
+        // ref never need the fork fallback.
+        refSource.set(sha, 'base');
+      }
 
+      // 422 can occur for force-pushed / rebased commits that have been
+      // replaced by a newer commit with a different SHA. Fall through to
+      // the fork fallback below (the head repo will have the canonical SHA).
       const headRepoFullname = data.pull_request.head.repo?.full_name;
-      if (patchRes.code === 404 && headRepoFullname && headRepoFullname !== repoFullname) {
-        console.warn(`Commit ${sha} not found in base repo ${repoFullname}. Retrying fetch from head repo ${headRepoFullname}...`);
+      if ((patchRes.code === 404 || patchRes.code === 422) && headRepoFullname && headRepoFullname !== repoFullname) {
+        console.warn(`Commit ${sha} not found in base repo ${repoFullname} (HTTP ${patchRes.code}). Retrying fetch from head repo ${headRepoFullname}...`);
         const forkDetailUrl = `https://api.github.com/repos/${headRepoFullname}/commits/${sha}`;
-        patchRes = await githubApiCall(forkDetailUrl, token, 'GET', null, 'application/vnd.github.patch');
+        // Use silent: true so 404/422 on the fork is not logged as an error
+        // (the fork may not have the commit either if it was force-pushed).
+        patchRes = await githubApiCall(forkDetailUrl, token, 'GET', null, 'application/vnd.github.patch', { silent: true });
+        if (patchRes.code === 200 && !refSource.has(sha)) {
+          refSource.set(sha, 'fork');
+        }
       }
 
       if (patchRes.code !== 200) {

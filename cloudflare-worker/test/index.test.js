@@ -1923,6 +1923,52 @@ index 123456..789012 100644
     }
   });
 
+  test('githubApiCall: does not log 404/422 error for GET requests to /commits/ when silent: true', async () => {
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => {
+      loggedError = msg;
+    };
+
+    try {
+      for (const status of [404, 422]) {
+        loggedError = null;
+        fetchMock = (url, options) => {
+          return new Response(JSON.stringify({ message: "No commit found for SHA" }), { status });
+        };
+
+        const res = await githubApiCall('https://api.github.com/repos/forkuser/packages/commits/abcdef1', 'token', 'GET', null, 'application/vnd.github.patch', { silent: true });
+        assert.strictEqual(res.code, status);
+        assert.strictEqual(loggedError, null);
+      }
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
+
+  test('githubApiCall: logs 422 error for GET requests to /commits/ without silent option', async () => {
+    let loggedError = null;
+    const originalConsoleError = console.error;
+    console.error = (msg) => {
+      loggedError = msg;
+    };
+
+    try {
+      fetchMock = (url, options) => {
+        return new Response(JSON.stringify({ message: "No commit found for SHA" }), { status: 422 });
+      };
+
+      const res = await githubApiCall('https://api.github.com/repos/openwrt/packages/commits/abcdef1', 'token', 'GET', null, 'application/vnd.github.patch');
+      assert.strictEqual(res.code, 422);
+      assert.ok(loggedError);
+      assert.match(loggedError, /HTTP 422/);
+    } finally {
+      console.error = originalConsoleError;
+      fetchMock = null;
+    }
+  });
+
   test('githubApiCall: logs 404 error for GET requests to other endpoints', async () => {
     let loggedError = null;
     const originalConsoleError = console.error;
@@ -2551,6 +2597,263 @@ index 123456..789012 100644
       assert.strictEqual(response.status, 200);
       assert.strictEqual(baseRepoContentFetchCount, 6);
       assert.strictEqual(headRepoContentFetchCount, 2);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('fetchFileContentCached: skips fork fallback for 404 when the base repo already resolved the ref', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main', sha: 'basesha456' },
+        head: {
+          ref: 'feature',
+          sha: 'sha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let baseRepoContentFetchCount = 0;
+    let headRepoContentFetchCount = 0;
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      // The base repo resolves the commit SHA, marking the ref as base-resolvable
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          'diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile\n' +
+          '--- a/package/utils/bash/Makefile\n' +
+          '+++ b/package/utils/bash/Makefile\n' +
+          '+PKG_VERSION:=2.0\n' +
+          '+PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.match(/\/repos\/test\/repo\/contents\//)) {
+        baseRepoContentFetchCount++;
+        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+      }
+      if (url.match(/\/repos\/forked\/repo\/contents\//)) {
+        headRepoContentFetchCount++;
+        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      // The Makefile lookup 404s under the base repo, but since the base repo
+      // resolved the commit SHA, the 404 is authoritative and the fork must
+      // not be queried at all.
+      assert.ok(baseRepoContentFetchCount >= 1);
+      assert.strictEqual(headRepoContentFetchCount, 0);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('fetchFileContentCached: goes straight to the fork once the ref is known to be fork-only', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        url: 'https://api.github.com/repos/test/repo/pulls/123',
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main', sha: 'basesha456' },
+        head: {
+          ref: 'feature',
+          sha: 'sha123',
+          repo: { full_name: 'forked/repo' }
+        },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const baseContentFetchesByRef = new Map();
+    const forkContentFetchesByRef = new Map();
+    const countByRef = (map, url) => {
+      const ref = new URL(url).searchParams.get('ref') || 'none';
+      map.set(ref, (map.get(ref) || 0) + 1);
+    };
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      const commitPatch =
+        'diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile\n' +
+        '--- a/package/utils/bash/Makefile\n' +
+        '+++ b/package/utils/bash/Makefile\n' +
+        '+PKG_VERSION:=2.0\n' +
+        '+PKG_RELEASE:=1\n';
+      // The base repo cannot resolve the commit SHA (force-pushed fork commit)
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(JSON.stringify({ message: 'No commit found for SHA: sha123' }), { status: 422 });
+      }
+      if (url.match(/\/repos\/forked\/repo\/commits\/sha123/)) {
+        return new Response(commitPatch, { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/contents\//)) {
+        countByRef(baseContentFetchesByRef, url);
+        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+      }
+      if (url.match(/\/repos\/forked\/repo\/contents\//)) {
+        countByRef(forkContentFetchesByRef, url);
+        return new Response(
+          'PKG_NAME:=bash\n' +
+          'PKG_VERSION:=2.0\n' +
+          'PKG_RELEASE:=1\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      // The commit SHA only resolved under the fork, so content lookups at
+      // that ref must skip the base repo entirely.
+      assert.strictEqual(baseContentFetchesByRef.get('sha123') || 0, 0);
+      assert.ok((forkContentFetchesByRef.get('sha123') || 0) >= 1);
+      // The base branch tip is pre-marked as base-resolvable, so its 404s
+      // must never trigger the fork fallback.
+      assert.strictEqual(forkContentFetchesByRef.get('basesha456') || 0, 0);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;

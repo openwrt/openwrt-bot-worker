@@ -1,18 +1,18 @@
 // --- GITHUB API HELPER ---
-export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json') {
+export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json', options = {}) {
   const headers = {
     'Authorization': `Bearer ${token}`,
     'Accept': customAccept,
     'User-Agent': 'FormalityCheck-Bot'
   };
 
-  const options = {
+  const fetchOptions = {
     method,
     headers
   };
 
   if (payload && (method === 'POST' || method === 'PATCH')) {
-    options.body = JSON.stringify(payload);
+    fetchOptions.body = JSON.stringify(payload);
     headers['Content-Type'] = 'application/json';
   }
 
@@ -21,7 +21,7 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, fetchOptions);
       const text = await response.text();
 
       // Retry on 5xx status codes for all requests (transient GitHub issues)
@@ -34,9 +34,17 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
       }
 
       if (response.status >= 400) {
+        // 404 on GET /contents/ is always expected noise: file lookups routinely
+        // probe paths that may not exist (e.g. Makefile discovery in findPkgRoot).
         const isExpected404 = response.status === 404 &&
           method === 'GET' && url.includes('/contents/');
-        if (!isExpected404) {
+        // 404/422 on GET /commits/ is expected only for opt-in callers
+        // (options.silent), e.g. the fork fallback when a commit SHA vanished
+        // after a force-push / rebase.
+        const isSilencedCommitMiss = options.silent === true &&
+          (response.status === 404 || response.status === 422) &&
+          method === 'GET' && url.includes('/commits/');
+        if (!isExpected404 && !isSilencedCommitMiss) {
           console.error(`GitHub API call failed: ${method} ${url} -> HTTP ${response.status}: ${text.trim().slice(0, 500)}`);
         }
       }

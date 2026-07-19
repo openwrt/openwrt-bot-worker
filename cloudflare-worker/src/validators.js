@@ -1038,6 +1038,15 @@ export function isHiddenOrSpecial(filePath) {
 
 export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git']);
+  // OpenWrt uses versioned kernel patch dirs such as `target/linux/<subtarget>/patches-6.18/`
+  // for kernel-version-specific patches. They must be skipped just like the plain `patches` dir
+  // so we don't fall into the expensive candidate fallback and blow past Cloudflare's per-Worker
+  // subrequest limit when a PR touches many such files.
+  const isSkippableDir = (name) =>
+    skipDirs.has(name) ||
+    name.startsWith('.') ||
+    name.startsWith('patches-') ||
+    name.startsWith('files-');
   const CATEGORIES = new Set([
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
     'system', 'multimedia', 'mail', 'sound', 'network'
@@ -1069,10 +1078,11 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     parts.pop();
   }
 
-  // Traverse up skipping standard directories
+  // Traverse up skipping standard directories (including versioned
+  // `patches-X.Y` / `files-X.Y` dirs used by `target/linux/<subtarget>/`).
   while (parts.length > 0) {
     const last = parts[parts.length - 1];
-    if (skipDirs.has(last) || last.startsWith('.')) {
+    if (isSkippableDir(last)) {
       parts.pop();
     } else {
       break;
@@ -1144,7 +1154,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   for (const candidate of candidates) {
     const candidateParts = candidate.split('/');
     const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || last.startsWith('.') || skipDirs.has(last)) {
+    if (last === 'package' || isSkippableDir(last)) {
       continue;
     }
     if (isCategoryLevel(candidateParts)) {
