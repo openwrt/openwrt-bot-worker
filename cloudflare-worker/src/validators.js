@@ -349,21 +349,22 @@ export async function validateFormalities(fullCommit, CONFIG) {
       );
 
       // Check that at least one Signed-off-by matches the commit committer
-      // Only required when committer differs from author (e.g., after a rebase)
-      const isAuthorCommitterSame =
-        authorName.toLowerCase() === committerName.toLowerCase() &&
-        authorEmail.toLowerCase() === committerEmail.toLowerCase();
-
       const committerMatch = signoffEntries.some(entry =>
         entry.name.toLowerCase() === committerName.toLowerCase() &&
         entry.email.toLowerCase() === committerEmail.toLowerCase()
       );
 
-      if (!authorMatch) {
-        signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`)`);
-      }
-      if (!isAuthorCommitterSame && !committerMatch) {
-        signoffErrors.push(`No Signed-off-by matches commit committer (\`${committerName} <${committerEmail}>\`)`);
+      // After a rebase, the committer changes but the original author's SOB
+      // remains valid. Require at least one SOB matching author OR committer.
+      if (!authorMatch && !committerMatch) {
+        const isAuthorCommitterSame =
+          authorName.toLowerCase() === committerName.toLowerCase() &&
+          authorEmail.toLowerCase() === committerEmail.toLowerCase();
+        if (isAuthorCommitterSame) {
+          signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`)`);
+        } else {
+          signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`) or committer (\`${committerName} <${committerEmail}>\`)`);
+        }
       }
 
       // Add noreply errors
@@ -378,7 +379,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
       if (signoffErrors.length > 0) {
         signoffErrors.forEach(err => errors.push("- " + err));
       } else {
-        successes.push("✅ Commit contains consistent and valid 'Signed-off-by:' lines matching author and committer");
+        successes.push("✅ Commit contains a valid 'Signed-off-by:' line matching author or committer");
       }
     }
   }
