@@ -485,6 +485,97 @@ describe('validateMakefileContext', () => {
     assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE_FILES')));
   });
 
+  test('skips PKG_LICENSE/PKG_LICENSE_FILES when package includes trusted-firmware-a.mk', () => {
+    const commit = { commit: { message: 'packages/boot: add arm-trusted-firmware-airoha' } };
+    const patch = `
+--- /dev/null
++++ b/package/boot/arm-trusted-firmware-airoha/Makefile
+@@ -0,0 +1,15 @@
++#
++# Copyright (C) 2024 OpenWrt.org
++#
++include $(TOPDIR)/rules.mk
++include $(INCLUDE_DIR)/trusted-firmware-a.mk
++
++PKG_NAME:=arm-trusted-firmware-airoha
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++PKG_MAINTAINER:=John Doe <john@example.com>
++
++define Package/arm-trusted-firmware-airoha
++  TITLE:=Airoha ARM Trusted Firmware
++endef
++    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, true);
+    // Should NOT error for PKG_LICENSE or PKG_LICENSE_FILES since trusted-firmware-a.mk defines them
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE')), 'PKG_LICENSE should not be required when trusted-firmware-a.mk is included');
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE_FILES')), 'PKG_LICENSE_FILES should not be required when trusted-firmware-a.mk is included');
+    // But should still require PKG_MAINTAINER
+    assert.ok(!res.errors.some(e => e.includes('PKG_MAINTAINER')), 'PKG_MAINTAINER should still be required');
+  });
+
+  test('skips PKG_LICENSE/PKG_LICENSE_FILES when package includes u-boot.mk', () => {
+    const commit = { commit: { message: 'uboot: add new board support' } };
+    const patch = `
+--- /dev/null
++++ b/package/boot/uboot-someboard/Makefile
+@@ -0,0 +1,15 @@
++#
++# Copyright (C) 2024 OpenWrt.org
++#
++include $(TOPDIR)/rules.mk
++include $(INCLUDE_DIR)/u-boot.mk
++
++PKG_NAME:=uboot-someboard
++PKG_VERSION:=2024.01
++PKG_RELEASE:=1
++PKG_MAINTAINER:=Jane Doe <jane@example.com>
++
++define Package/uboot-someboard
++  TITLE:=U-Boot for SomeBoard
++endef
++    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, true);
+    // Should NOT error for PKG_LICENSE or PKG_LICENSE_FILES since u-boot.mk defines them
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE')), 'PKG_LICENSE should not be required when u-boot.mk is included');
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE_FILES')), 'PKG_LICENSE_FILES should not be required when u-boot.mk is included');
+    // But should still require PKG_MAINTAINER
+    assert.ok(!res.errors.some(e => e.includes('PKG_MAINTAINER')), 'PKG_MAINTAINER should still be required');
+  });
+
+  test('still requires PKG_LICENSE/PKG_LICENSE_FILES when no known license include is present', () => {
+    const commit = { commit: { message: 'newpkg: add package' } };
+    const patch = `
+--- /dev/null
++++ b/package/newpkg/Makefile
+@@ -0,0 +1,12 @@
++#
++# Copyright (C) 2024 OpenWrt.org
++#
++include $(TOPDIR)/rules.mk
++include $(INCLUDE_DIR)/package.mk
++
++PKG_NAME:=newpkg
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++PKG_MAINTAINER:=John Doe <john@example.com>
++
++define Package/newpkg
++  TITLE:=New Package
++endef
++    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, true);
+    // Should still error for PKG_LICENSE and PKG_LICENSE_FILES since no known license .mk is included
+    assert.ok(res.errors.some(e => e.includes('PKG_LICENSE')), 'PKG_LICENSE should still be required when no known license include present');
+    assert.ok(res.errors.some(e => e.includes('PKG_LICENSE_FILES')), 'PKG_LICENSE_FILES should still be required when no known license include present');
+  });
+
   test('detects CRLF line endings', () => {
     const commit = { commit: { message: 'bash: test' } };
     const patch = `

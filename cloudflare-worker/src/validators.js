@@ -477,6 +477,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
       requiredMeta = CONFIG.check_openwrt_meta;
     }
     if (isNewPackageThisCommit) {
+      // Detect if the Makefile includes a known .mk file that defines PKG_LICENSE
+      // and PKG_LICENSE_FILES centrally (e.g. trusted-firmware-a.mk, u-boot.mk).
+      // In those cases, we should not require PKG_LICENSE / PKG_LICENSE_FILES directly.
+      const knownLicenseIncludeFiles = ['trusted-firmware-a.mk', 'u-boot.mk'];
+      const hasLicenseInclude = knownLicenseIncludeFiles.some(mkFile =>
+        new RegExp(`^\\+.*include.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(commitPatch)
+      );
+      if (hasLicenseInclude) {
+        requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
+      }
       requiredMeta.forEach(meta => {
         const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
         if (!metaRegex.test(commitPatch)) {
