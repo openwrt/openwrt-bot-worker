@@ -780,7 +780,83 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("is a directory and must end with a trailing slash '/'")));
+    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
+  });
+
+  test('rejects conffiles path for .d directory missing trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/foo.conf
++/etc/foo.d
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
+    assert.ok(res.errors.some(e => e.includes("/etc/foo.d")));
+  });
+
+  test('accepts conffiles .d directory with trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/foo.conf
++/etc/foo.d/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('rejects conffiles path for INSTALL_DIR directory missing trailing slash', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/foo.d
++endef
++define Package/foo/install
++	$(INSTALL_DIR) $(1)/etc/foo.d
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
+  });
+
+  test('does not leak conffiles block into install block when endef is in diff hunk header', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -50,6 +50,8 @@ endef
+ define Package/foo/conffiles
+ /etc/foo.conf
++/etc/foo.d/
+ endef
+ 
+ define Package/foo/install
++	$(INSTALL_DIR) $(1)/etc/foo.d
++	$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
+ endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    // Should NOT flag INSTALL_DIR or INSTALL_CONF lines as conffiles errors
+    assert.ok(!res.errors.some(e => e.includes("INSTALL_DIR")), `Should not flag INSTALL_DIR as conffiles error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes("INSTALL_CONF")), `Should not flag INSTALL_CONF as conffiles error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes("must not contain any spaces or indentation") && e.includes("INSTALL")), `Should not flag install lines as indentation errors: ${res.errors.join(', ')}`);
   });
 
   test('rejects conffiles path for individual file ending with trailing slash', () => {

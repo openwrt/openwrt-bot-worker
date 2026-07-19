@@ -531,12 +531,46 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
       const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
       if (!isMakefile) continue;
 
+      const lines = fileDiff.split('\n');
+
+      // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
+      // since install blocks can appear after conffiles blocks in the diff)
+      const installedDirs = new Set();
+      for (const line of lines) {
+        if (line.startsWith('+')) {
+          const contentLine = line.slice(1);
+          const installDirMatch = contentLine.match(/\$\(INSTALL_DIR\)\s+\$\(1\)(\/[^\s]*)/);
+          if (installDirMatch) {
+            installedDirs.add(installDirMatch[1]);
+          }
+        }
+      }
+
+      // Pass 2: Validate conffiles and detect config installations
       let MakefileInstallsConfig = false;
       let MakefileHasConffiles = false;
       let inConffiles = false;
       let currentPackage = '';
-      const lines = fileDiff.split('\n');
+
       for (const line of lines) {
+        // Also check diff hunk headers (lines starting with @@) for endef/define
+        // since they may contain context lines that close or open blocks
+        if (/^@@/.test(line)) {
+          const hunkEndefMatch = line.match(/@@.*\bendef\b/);
+          if (hunkEndefMatch && inConffiles) {
+            inConffiles = false;
+            currentPackage = '';
+          }
+          // Check if hunk header opens a conffiles block
+          const hunkDefineMatch = line.match(/@@.*\bdefine\s+(Package\/[^\s]*conffiles)/);
+          if (hunkDefineMatch) {
+            inConffiles = true;
+            currentPackage = hunkDefineMatch[1];
+            MakefileHasConffiles = true;
+          }
+          continue;
+        }
+
         if (line.startsWith('+') || line.startsWith(' ')) {
           const contentLine = line.slice(1);
           const defineMatch = contentLine.match(/^define\s+(Package\/[^\s]*conffiles)/);
@@ -593,19 +627,18 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
                     errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
                   }
                 } else {
-                  // If it is a known directory but does not end with '/'
-                  const knownDirs = [
-                    '/etc',
-                    '/etc/config',
-                    '/etc/ssl/certs',
-                    '/etc/nginx',
-                    '/etc/collectd.d',
-                    '/etc/strongswan.d',
-                    '/etc/docker'
-                  ];
-                  if (knownDirs.includes(trimmedLine)) {
+                  // Determine if the path is a directory that should end with '/'
+                  // 1. Paths created by INSTALL_DIR in this Makefile are directories
+                  const isInstalledDir = installedDirs.has(trimmedLine);
+                  // 2. Paths ending with '.d' are directories by Unix convention
+                  //    (e.g., conf.d, init.d, cron.d, zabbix_agentd.conf.d, sudoers.d)
+                  const isDotDDir = /\.d$/.test(trimmedLine);
+                  // 3. Well-known top-level directory paths
+                  const isKnownDir = trimmedLine === '/etc' || trimmedLine === '/etc/config';
+
+                  if (isInstalledDir || isDotDDir || isKnownDir) {
                     conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' is a directory and must end with a trailing slash '/'`);
+                    errors.push(`- ${currentPackage} line '${trimmedLine}' must end with a trailing slash '/' (e.g., '${trimmedLine}/')`);
                   }
                 }
               }
