@@ -1373,7 +1373,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
 
     const filename = file.split('/').pop();
     const ext = filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
-    const skipExtensions = new Set(['init', 'sh', 'hotplug', 'py', 'pl', 'lua', 'cron', 'md', 'patch', 'sed', 'defaults']);
+    const skipExtensions = new Set(['init', 'sh', 'hotplug', 'py', 'pl', 'lua', 'cron', 'md', 'patch', 'sed', 'defaults', 'uc']);
     if (skipExtensions.has(ext)) continue;
 
     let isDestinedForEtcConfig = false;
@@ -1400,6 +1400,18 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
 
         if (inConffiles) {
           if (trimmed.startsWith('/etc/config/')) {
+            // If the file is under a files/ subdirectory like files/etc/init.d/,
+            // skip matching against /etc/config/ conffiles entries to avoid false
+            // positives (e.g., an init script named 'foo' matching conffile /etc/config/foo).
+            // But if the file is not under an etc/ subdirectory at all (e.g., files/lib/foo.uc),
+            // still allow matching via install commands.
+            const filesIndex = file.indexOf('/files/');
+            if (filesIndex !== -1) {
+              const relativePath = file.substring(filesIndex + 7);
+              if (relativePath.startsWith('etc/') && !relativePath.startsWith('etc/config/')) {
+                continue;
+              }
+            }
             const conffilePart = trimmed.substring('/etc/config/'.length);
             if (conffilePart === filename || conffilePart === nameWithoutExt) {
               isDestinedForEtcConfig = true;
@@ -1408,8 +1420,20 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
           }
         } else {
           // Look for install/cp commands
-          if (trimmed.includes('etc/config') &&
-              (trimmed.includes(filename) || trimmed.includes(nameWithoutExt) || trimmed.includes('files/*'))) {
+          const filesIndex = file.indexOf('/files/');
+          const relativePath = filesIndex !== -1 ? file.substring(filesIndex + 7) : '';
+
+          // If the file is under a files/ subdirectory that is clearly not
+          // files/etc/config/ (e.g., files/etc/init.d/), skip matching against
+          // /etc/config/ install commands to avoid false positives.
+          const isUnderFilesButNotEtcConfig = filesIndex !== -1 && relativePath.startsWith('etc/') && !relativePath.startsWith('etc/config/');
+
+          // When matching 'files/*' wildcard, verify the file is actually under files/etc/config/
+          // to avoid false positives for files destined for other paths (e.g., files/etc/init.d/)
+          const isDestinedForEtcConfigViaFiles = !isUnderFilesButNotEtcConfig && trimmed.includes('files/*') && relativePath.startsWith('etc/config/');
+
+          if (!isUnderFilesButNotEtcConfig && trimmed.includes('etc/config') &&
+              (trimmed.includes(filename) || trimmed.includes(nameWithoutExt) || isDestinedForEtcConfigViaFiles)) {
             isDestinedForEtcConfig = true;
             break;
           }

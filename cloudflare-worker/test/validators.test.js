@@ -2229,6 +2229,81 @@ endef
     assert.strictEqual(res.errors.length, 0);
   });
 
+  test('ignores init scripts under files/etc/init.d/ even when conffiles has a matching /etc/config/ entry', async () => {
+    // Simulates a package where an init script at files/etc/init.d/foo
+    // should NOT be flagged as a UCI config file even though the
+    // Makefile conffiles block has /etc/config/foo.
+    const patch = `
+diff --git a/net/foo/files/etc/init.d/foo b/net/foo/files/etc/init.d/foo
+new file mode 100644
+--- /dev/null
++++ b/net/foo/files/etc/init.d/foo
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'net/foo/Makefile') {
+        return `
+define Package/foo/conffiles
+/etc/config/foo
+endef
+
+define Package/foo/install
+\t$(INSTALL_BIN) ./files/etc/init.d/foo $(1)/etc/init.d/foo
+\t$(INSTALL_CONF) ./files/etc/config/foo $(1)/etc/config/foo
+endef
+        `;
+      }
+      if (path === 'net/foo/files/etc/init.d/foo') {
+        return `#!/bin/sh /etc/rc.common\n\nSTART=20\n`;
+      }
+      if (path === 'net/foo/files/etc/config/foo') {
+        return `config foo 'global'\n\toption enabled '1'\n`;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('ignores ucode scripts under files/ that are not under files/etc/config/', async () => {
+    // Simulates a package where a ucode library script at files/lib/foo/foo.uc
+    // should NOT be flagged as a UCI config file even though the
+    // Makefile conffiles block has /etc/config/foo.
+    const patch = `
+diff --git a/net/foo/files/lib/foo/foo.uc b/net/foo/files/lib/foo/foo.uc
+new file mode 100644
+--- /dev/null
++++ b/net/foo/files/lib/foo/foo.uc
+    `;
+
+    const fetchFn = async (path) => {
+      if (path === 'net/foo/Makefile') {
+        return `
+define Package/foo/conffiles
+/etc/config/foo
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/usr/lib/foo
+\t$(INSTALL_DATA) ./files/lib/foo/foo.uc $(1)/usr/lib/foo/foo.uc
+\t$(INSTALL_CONF) ./files/etc/config/foo $(1)/etc/config/foo
+endef
+        `;
+      }
+      if (path === 'net/foo/files/lib/foo/foo.uc') {
+        return `'use strict';\n\n// helper functions\n`;
+      }
+      if (path === 'net/foo/files/etc/config/foo') {
+        return `config foo 'global'\n\toption enabled '1'\n`;
+      }
+      return null;
+    };
+
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0);
+  });
+
   test('ignores sed scripts and defaults files', async () => {
     const patch = `
 diff --git a/package/utils/foo/files/foo.conf.sed b/package/utils/foo/files/foo.conf.sed
