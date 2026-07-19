@@ -1357,9 +1357,11 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let baseSourceVer = null;
     let headSourceDate = null;
     let baseSourceDate = null;
+    let headMakefileContent = null;
 
     if (modifiedFiles.has(makefilePath)) {
       const headContent = await fetchFileContentAtHead(makefilePath);
+      headMakefileContent = headContent;
       if (headContent === null) {
         // Package was deleted/dropped, skip checks
         continue;
@@ -1429,8 +1431,20 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         packageHasOnlyMinorChanges = false;
       }
 
+      // Some package families (e.g. u-boot, ARM Trusted Firmware) build on top of a
+      // shared .mk helper that never establishes a PKG_RELEASE convention for them -
+      // PKG_VERSION/PKG_SOURCE_VERSION tracks the upstream revision instead, and
+      // PKG_RELEASE is simply never defined. Don't demand a bump that has no
+      // precedent for these packages.
+      const knownReleaseExemptIncludeFiles = ['u-boot.mk', 'trusted-firmware-a.mk'];
+      const hasReleaseExemptInclude = headRelease === null && headMakefileContent && knownReleaseExemptIncludeFiles.some(mkFile =>
+        new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(headMakefileContent)
+      );
+
       if (packageHasOnlyMinorChanges) {
         successes.push(`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`);
+      } else if (hasReleaseExemptInclude) {
+        successes.push(`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`);
       } else {
         errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump
 - **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`);

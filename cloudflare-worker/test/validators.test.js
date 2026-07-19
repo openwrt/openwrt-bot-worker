@@ -1890,6 +1890,59 @@ diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.
     assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
   });
 
+  test('passes when u-boot.mk based package Makefile changes non-cosmetically without PKG_RELEASE', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/boot/uboot-testboard/Makefile b/package/boot/uboot-testboard/Makefile
+--- a/package/boot/uboot-testboard/Makefile
++++ b/package/boot/uboot-testboard/Makefile
++  HIDDEN:=1
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/boot/uboot-testboard/Makefile') {
+        return 'PKG_NAME:=uboot-testboard\nPKG_VERSION:=2026.07\ninclude $(INCLUDE_DIR)/u-boot.mk\n\ndefine U-Boot/Default\n  HIDDEN:=1\nendef\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/boot/uboot-testboard/Makefile') {
+        return 'PKG_NAME:=uboot-testboard\nPKG_VERSION:=2026.07\ninclude $(INCLUDE_DIR)/u-boot.mk\n\ndefine U-Boot/Default\nendef\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('shared build helper')));
+  });
+
+  test('still fails for non-u-boot package with no PKG_RELEASE and non-cosmetic changes', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++SOME_NEW_BUILD_FLAG:=1
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nSOME_NEW_BUILD_FLAG:=1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'package/utils/bash/Makefile') {
+        return 'PKG_NAME:=bash\nPKG_VERSION:=5.2\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
+
   test('passes when existing package files modified with only cosmetic changes', async () => {
     const commitDetails = [{
       commitPatch: `
