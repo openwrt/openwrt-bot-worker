@@ -1015,7 +1015,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return null;
   }
 
-  // Fast path for common OpenWrt layouts: no network calls needed.
+      // Fast path for common OpenWrt layouts: no network calls needed.
   if (parts[0] === 'package') {
     if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
       if (parts[1] === 'lang' && NESTED_LANGS.has(parts[2])) {
@@ -1024,7 +1024,11 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
         }
         return `package/lang/${parts[2]}`;
       }
-      return `package/${parts[1]}/${parts[2]}`;
+      // Only use fast path for exact 3-level depth (package/<category>/<pkgname>)
+      // Deeper paths (e.g. package/network/utils/mosdns) need fallback resolution
+      if (parts.length === 3) {
+        return `package/${parts[1]}/${parts[2]}`;
+      }
     }
     if (parts.length === 2 && !CATEGORIES.has(parts[1])) {
       return `package/${parts[1]}`;
@@ -1048,7 +1052,11 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
       }
       return `${parts[0]}/lang/${parts[2]}`;
     }
-    return `${parts[0]}/${parts[1]}/${parts[2]}`;
+    // Only use fast path for exact 3-level depth (feed/<category>/<pkgname>)
+    // Deeper paths (e.g. package/network/utils/mosdns) need fallback resolution
+    if (parts.length === 3) {
+      return `${parts[0]}/${parts[1]}/${parts[2]}`;
+    }
   }
 
   const candidates = [];
