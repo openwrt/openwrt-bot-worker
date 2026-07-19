@@ -321,28 +321,65 @@ export async function validateFormalities(fullCommit, CONFIG) {
   if (CONFIG.check_signoff) {
     const signoffPattern = /Signed-off-by:\s*([^<]+)\s*<([^>]+)>/i;
     let hasSignoff = false;
-    const signoffErrors = [];
+    const signoffEntries = [];
+    const noreplyErrors = [];
     lines.forEach(line => {
       const matches = line.match(signoffPattern);
       if (matches) {
         hasSignoff = true;
-        const sobName = matches[1].trim();
-        const sobEmail = matches[2].trim();
-
-        if (sobName.toLowerCase() !== authorName.toLowerCase() || sobEmail.toLowerCase() !== authorEmail.toLowerCase()) {
-          signoffErrors.push(`Signed-off-by value (\`${sobName} <${sobEmail}>\`) does not match commit author (\`${authorName} <${authorEmail}>\`)`);
-        }
-        if (isNoreplyEmail(sobEmail)) {
-          signoffErrors.push("Signed-off-by email must not be a GitHub noreply address");
+        const entry = {
+          name: matches[1].trim(),
+          email: matches[2].trim()
+        };
+        signoffEntries.push(entry);
+        if (isNoreplyEmail(entry.email)) {
+          noreplyErrors.push("Signed-off-by email must not be a GitHub noreply address");
         }
       }
     });
     if (!hasSignoff) {
       errors.push("- Missing 'Signed-off-by:' line");
-    } else if (signoffErrors.length > 0) {
-      signoffErrors.forEach(err => errors.push("- " + err));
     } else {
-      successes.push("✅ Commit contains a consistent and valid 'Signed-off-by:' line");
+      const signoffErrors = [];
+
+      // Check that at least one Signed-off-by matches the commit author
+      const authorMatch = signoffEntries.some(entry =>
+        entry.name.toLowerCase() === authorName.toLowerCase() &&
+        entry.email.toLowerCase() === authorEmail.toLowerCase()
+      );
+
+      // Check that at least one Signed-off-by matches the commit committer
+      // Only required when committer differs from author (e.g., after a rebase)
+      const isAuthorCommitterSame =
+        authorName.toLowerCase() === committerName.toLowerCase() &&
+        authorEmail.toLowerCase() === committerEmail.toLowerCase();
+
+      const committerMatch = signoffEntries.some(entry =>
+        entry.name.toLowerCase() === committerName.toLowerCase() &&
+        entry.email.toLowerCase() === committerEmail.toLowerCase()
+      );
+
+      if (!authorMatch) {
+        signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`)`);
+      }
+      if (!isAuthorCommitterSame && !committerMatch) {
+        signoffErrors.push(`No Signed-off-by matches commit committer (\`${committerName} <${committerEmail}>\`)`);
+      }
+
+      // Add noreply errors
+      noreplyErrors.forEach(err => signoffErrors.push(err));
+
+      // If there are multiple SOB entries but none matched, provide a helpful hint
+      if (signoffEntries.length > 1 && !authorMatch && !committerMatch) {
+        const sobList = signoffEntries.map(e => `\`${e.name} <${e.email}>\``).join(', ');
+        signoffErrors.push(`Found Signed-off-by entries: ${sobList}`);
+      }
+
+      if (signoffErrors.length > 0) {
+        signoffErrors.forEach(err => errors.push("- " + err));
+      } else {
+        successes.push("✅ Commit contains consistent and valid 'Signed-off-by:' lines matching author and committer");
+      }
     }
   }
 
