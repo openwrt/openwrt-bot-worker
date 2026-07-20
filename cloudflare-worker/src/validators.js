@@ -764,6 +764,38 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
 
       const lines = fileDiff.split('\n');
       for (const line of lines) {
+        // Diff hunk headers (@@ ... @@ <context>) carry the nearest preceding
+        // define/endef line as context. A block opened in an earlier hunk may
+        // be closed between hunks, so state must not leak across them:
+        // reset on every hunk boundary and re-derive from the header context.
+        if (/^@@/.test(line)) {
+          inBlock = null;
+          blockName = '';
+          isContinuation = false;
+
+          const hunkContextMatch = line.match(/^@@[^@]*@@\s*(.*)$/);
+          const hunkContext = hunkContextMatch ? hunkContextMatch[1] : '';
+          if (!/\bendef\b/.test(hunkContext)) {
+            const hunkMetadataMatch = hunkContext.match(/^define\s+(Package\/[^\s/]+(?:\/Default)?)$/);
+            const hunkDescriptionMatch = hunkContext.match(/^define\s+(Package\/[^\s/]+\/description)$/);
+            const hunkRecipeMatch = hunkContext.match(/^define\s+(Package\/[^\s/]+\/install|Build\/[^\s]+|Host\/[^\s]+)$/);
+            if (hunkMetadataMatch) {
+              inBlock = 'metadata';
+              blockName = hunkMetadataMatch[1];
+              indentationCheckRun = true;
+            } else if (hunkDescriptionMatch) {
+              inBlock = 'description';
+              blockName = hunkDescriptionMatch[1];
+              indentationCheckRun = true;
+            } else if (hunkRecipeMatch) {
+              inBlock = 'recipe';
+              blockName = hunkRecipeMatch[1];
+              indentationCheckRun = true;
+            }
+          }
+          continue;
+        }
+
         if (line.startsWith('+') || line.startsWith(' ')) {
           const contentLine = line.slice(1);
 

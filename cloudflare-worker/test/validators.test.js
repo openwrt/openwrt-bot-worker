@@ -1481,6 +1481,82 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.ok(res.errors[1].includes("line '$(MAKE) -C $(PKG_BUILD_DIR)' inside 'Build/Compile' must be indented with a tab"));
   });
 
+  test('does not leak block state across diff hunks (issue #44)', () => {
+    const commit = { commit: { message: 'prometheus-node-exporter-lua: add dhcp-leases exporter' } };
+    const patch = `
+diff --git a/utils/prometheus-node-exporter-lua/Makefile b/utils/prometheus-node-exporter-lua/Makefile
+--- a/utils/prometheus-node-exporter-lua/Makefile
++++ b/utils/prometheus-node-exporter-lua/Makefile
+@@ -81,6 +81,17 @@ define Package/prometheus-node-exporter-lua-dawn/install
+ 	$(INSTALL_DATA) ./files/dawn.lua $(1)/usr/lib/lua/prometheus-collectors/
+ endef
+
++define Package/prometheus-node-exporter-lua-dhcp-leases
++  $(call Package/prometheus-node-exporter-lua/Default)
++  TITLE+= (dhcp-leases collector)
++  DEPENDS:=prometheus-node-exporter-lua
++endef
++
++define Package/prometheus-node-exporter-lua-dhcp-leases/install
++	$(INSTALL_DIR) $(1)/usr/lib/lua/prometheus-collectors
++	$(INSTALL_DATA) ./files/dhcp-leases.lua $(1)/usr/lib/lua/prometheus-collectors/
++endef
++
+ define Package/prometheus-node-exporter-lua-filesystem
+   $(call Package/prometheus-node-exporter-lua/Default)
+   TITLE+= (filesystem collector)
+@@ -320,6 +331,7 @@ endef
+ $(eval $(call BuildPackage,prometheus-node-exporter-lua))
+ $(eval $(call BuildPackage,prometheus-node-exporter-lua-dawn))
++$(eval $(call BuildPackage,prometheus-node-exporter-lua-dhcp-leases))
+ $(eval $(call BuildPackage,prometheus-node-exporter-lua-filesystem))
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 0, `Expected no errors, got: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes("Makefile blocks contain valid indentation")));
+  });
+
+  test('re-enters block from hunk header context and validates added lines', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -10,3 +10,4 @@ define Package/foo
+   SECTION:=utils
++ TITLE:=Badly indented
+ endef
+@@ -30,3 +31,4 @@ define Package/foo/install
+ 	$(INSTALL_DIR) $(1)/usr/bin
++  $(INSTALL_BIN) $(PKG_BUILD_DIR)/foo $(1)/usr/bin/
+ endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state);
+    assert.strictEqual(res.errors.length, 2, `Expected 2 errors, got: ${res.errors.join(', ')}`);
+    assert.ok(res.errors[0].includes("line 'TITLE:=Badly indented' inside 'Package/foo' must be indented with exactly 2 spaces"));
+    assert.ok(res.errors[1].includes("line '$(INSTALL_BIN) $(PKG_BUILD_DIR)/foo $(1)/usr/bin/' inside 'Package/foo/install' must be indented with a tab"));
+  });
+
   test('ignores comments, empty lines, and conditionals in blocks', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
