@@ -6,9 +6,13 @@ import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, 
 import { handleScheduled } from './stale.js';
 
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
+// Head branches that must not be used as the origin of a pull request.
+const PROTECTED_HEAD_BRANCHES = ['master', 'main', 'stable', 'openwrt-25.12', 'openwrt-24.10'];
+
 async function scanPrComments(repoFullname, prNumber, token) {
   let page = 1;
-  let hasBypassComment = false;
+  let hasCherryPickBypassComment = false;
+  let hasBranchBypassComment = false;
   let existingCommentId = null;
 
   while (true) {
@@ -24,12 +28,18 @@ async function scanPrComments(repoFullname, prNumber, token) {
       }
       const assoc = (c.author_association || '').toUpperCase();
       const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
-      if (isCommentMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(c.body || '')) {
-        hasBypassComment = true;
+      if (isCommentMaintainer) {
+        const body = c.body || '';
+        if (/\[allow[ -]cherry[ -]pick\]/i.test(body)) {
+          hasCherryPickBypassComment = true;
+        }
+        if (/\[allow[ -]branch\]/i.test(body)) {
+          hasBranchBypassComment = true;
+        }
       }
     }
 
-    if (hasBypassComment && existingCommentId !== null) {
+    if (hasCherryPickBypassComment && hasBranchBypassComment && existingCommentId !== null) {
       break;
     }
 
@@ -39,7 +49,7 @@ async function scanPrComments(repoFullname, prNumber, token) {
     page++;
   }
 
-  return { hasBypassComment, existingCommentId };
+  return { hasCherryPickBypassComment, hasBranchBypassComment, existingCommentId };
 }
 
 // --- UTILS ---
@@ -334,7 +344,11 @@ async function handleWebhook(request, env) {
     return getCommentsScan();
   };
 
-  if (CONFIG.enable_comments || isBackportPr) {
+  // Prefetch the comment scan only when something downstream will need it:
+  // comment management, cherry-pick bypass lookups on backport PRs, or the
+  // branch-check bypass when the head branch actually violates the rule.
+  const branchCheckViolated = CONFIG.check_branch && PROTECTED_HEAD_BRANCHES.includes(headBranch);
+  if (CONFIG.enable_comments || isBackportPr || branchCheckViolated) {
     void getCommentsScan();
   }
 
@@ -364,9 +378,22 @@ async function handleWebhook(request, env) {
   const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
 
   if (CONFIG.check_branch) {
-    if (['master', 'main', 'stable', 'openwrt-25.12', 'openwrt-24.10'].includes(headBranch)) {
-      allFormalityErrors.push(`### PR Targeting Violation\n- Pull requests must originate from a dedicated feature branch. Cannot use \`${headBranch}\` directly.`);
-      formalityOutputText += `❌ Pull request must originate from a feature branch\n       Reason: Target branch \`${headBranch}\` used as origin.\n\n`;
+    if (PROTECTED_HEAD_BRANCHES.includes(headBranch)) {
+      const scanResult = await getCommentsScanWithRetry() || { hasBranchBypassComment: false, existingCommentId: null };
+      const bypassBranchCheck = scanResult.hasBranchBypassComment || (isMaintainer && /\[allow[ -]branch\]/i.test(prBody));
+
+      if (bypassBranchCheck) {
+        formalityOutputText += `⚠️ Pull request originates from protected branch \`${headBranch}\` but was allowed via override command\n\n`;
+      } else {
+        let errorMsg = `### PR Targeting Violation\n- Pull requests must originate from a dedicated feature branch. Cannot use \`${headBranch}\` directly.`;
+        if (isMaintainer) {
+          errorMsg += ` (Use \`[allow branch]\` in PR description or comment to override this check)`;
+        } else {
+          errorMsg += ` (A maintainer can override this check by commenting \`[allow branch]\` on this PR)`;
+        }
+        allFormalityErrors.push(errorMsg);
+        formalityOutputText += `❌ Pull request must originate from a feature branch\n       Reason: Target branch \`${headBranch}\` used as origin.\n\n`;
+      }
     } else {
       formalityOutputText += `✅ Pull request originates from a dedicated feature branch (\`${headBranch}\`)\n\n`;
     }
@@ -542,8 +569,8 @@ async function handleWebhook(request, env) {
 
     if (isBackportPr) {
       if (!(fullCommit.commit.message || '').toLowerCase().includes('cherry picked from')) {
-        const scanResult = await getCommentsScanWithRetry() || { hasBypassComment: false, existingCommentId: null };
-        const bypassCherryPickCheck = scanResult.hasBypassComment || (isMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(prBody));
+        const scanResult = await getCommentsScanWithRetry() || { hasCherryPickBypassComment: false, existingCommentId: null };
+        const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (isMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(prBody));
 
         if (bypassCherryPickCheck) {
           formalityOutputText += "  ⚠️ Commit to stable branch bypasses cherry-pick requirement via override command\n";

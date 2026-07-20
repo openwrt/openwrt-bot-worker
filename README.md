@@ -10,6 +10,10 @@ The validation engine splits checks into three distinct asynchronous status stre
 Focuses on Git history hygiene, developer metadata constraints, and layout standards:
 
 *   **Branch Target Enforcement:** Ensures pull requests originate from dedicated feature branches, blocking accidental direct PRs from `main`, `master`, or active stable branches.
+
+> [!TIP]
+> Maintainers (`OWNER`, `MEMBER`, or `COLLABORATOR`) can bypass this check by posting a pull request comment containing `[allow branch]` (or `[allow-branch]`). Alternatively, if the PR author is a maintainer, they can also include `[allow branch]` in the PR description.
+
 *   **Stable Branch Backports Enforcement:** Ensures that pull requests targeting active stable/backport branches (e.g., `openwrt-25.12`, `openwrt-24.10`) contain the context line `(cherry picked from commit ...)` in every commit message.
 
 > [!TIP]

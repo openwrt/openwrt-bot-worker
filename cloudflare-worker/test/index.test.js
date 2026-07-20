@@ -947,7 +947,8 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     crypto.subtle.sign = originalSign;
   });
 
-  async function sendWebhookPR(prBody, baseBranch, authorAssociation, commitMessage, comments = []) {
+  async function sendWebhookPR(prBody, baseBranch, authorAssociation, commitMessage, comments = [], prOptions = {}) {
+    const { headBranch = 'feature-branch', checkBranch = false } = prOptions;
     postedCheckRuns = [];
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
@@ -955,7 +956,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
       }
       if (url.includes('/formalities.json')) {
         return new Response(JSON.stringify({
-          check_branch: false,
+          check_branch: checkBranch,
           require_linked_github_account: false,
           require_body: false
         }), { status: 200 });
@@ -988,7 +989,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         title: 'test pr',
         body: prBody,
         base: { ref: baseBranch },
-        head: { ref: 'feature-branch', sha: 'abcdef1234567890' },
+        head: { ref: headBranch, sha: 'abcdef1234567890' },
         author_association: authorAssociation,
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
       },
@@ -1117,6 +1118,94 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.ok(commitCheck);
     assert.strictEqual(commitCheck.conclusion, 'success');
     assert.match(commitCheck.output.text, /bypasses cherry-pick requirement via override command/);
+  });
+
+  describe('Target Branch Bypass via [allow branch]', () => {
+    const validCommit = 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>';
+    const findCommitCheck = () => postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+
+    test('fails on protected head branch if no bypass override exists', async () => {
+      const response = await sendWebhookPR('', 'main', 'NONE', validCommit, [], { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
+
+    test('passes on protected head branch with warning if PR description contains [allow branch] and author is a maintainer', async () => {
+      const response = await sendWebhookPR('Intentional PR from stable.\n\n[allow branch]', 'main', 'MEMBER', validCommit, [], { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('fails on protected head branch if PR description contains [allow branch] but author is a contributor', async () => {
+      const response = await sendWebhookPR('Please [allow branch]', 'main', 'NONE', validCommit, [], { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
+
+    test('passes on protected head branch with warning if a maintainer posted an [allow branch] comment', async () => {
+      const comments = [
+        { body: 'Contributor comment', author_association: 'NONE' },
+        { body: 'Looks intentional, [allow branch]', author_association: 'MEMBER' }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('fails on protected head branch if a non-maintainer posted an [allow branch] comment', async () => {
+      const comments = [
+        { body: 'Can someone [allow branch] please?', author_association: 'NONE' }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
+
+    test('passes on protected head branch with warning if PR comment contains hyphenated [allow-branch]', async () => {
+      const comments = [
+        { body: 'Please [allow-branch]', author_association: 'OWNER' }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('does not bypass branch check via [allow cherry-pick] comment (commands are independent)', async () => {
+      const comments = [
+        { body: '[allow cherry-pick]', author_association: 'OWNER' }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
   });
 
   test('successfully paginates to find bypass comment on page 2 when page 1 is full of other comments', async () => {
