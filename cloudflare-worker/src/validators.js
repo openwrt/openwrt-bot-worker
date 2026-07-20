@@ -139,11 +139,11 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   // Identity Check
   const identityErrors = [];
-  if (!isValidName(authorName)) identityErrors.push(`Author name format is invalid ('${authorName}')`);
-  if (!isValidName(committerName)) identityErrors.push(`Committer name format is invalid ('${committerName}')`);
+  if (!isValidName(authorName)) identityErrors.push(`Author name format is invalid ('${authorName}'). Please set your full name (first and last, e.g. 'Jane Doe').`);
+  if (!isValidName(committerName)) identityErrors.push(`Committer name format is invalid ('${committerName}'). Please set your full name (first and last, e.g. 'Jane Doe').`);
   if (CONFIG.check_noreply_email) {
-    if (isNoreplyEmail(authorEmail)) identityErrors.push("Author email must not be a GitHub noreply address");
-    if (isNoreplyEmail(committerEmail)) identityErrors.push("Committer email must not be a GitHub noreply address");
+    if (isNoreplyEmail(authorEmail)) identityErrors.push(`Author email must not be a GitHub noreply address ('${authorEmail}'). Please use a real email address that is linked to your GitHub account.`);
+    if (isNoreplyEmail(committerEmail)) identityErrors.push(`Committer email must not be a GitHub noreply address ('${committerEmail}'). Please use a real email address that is linked to your GitHub account.`);
   }
   if (CONFIG.require_linked_github_account && CONFIG.require_linked_github_account !== 'disabled') {
     if (!fullCommit.author || !fullCommit.author.login) {
@@ -350,12 +350,12 @@ export async function validateFormalities(fullCommit, CONFIG) {
         };
         signoffEntries.push(entry);
         if (isNoreplyEmail(entry.email)) {
-          noreplyErrors.push("Signed-off-by email must not be a GitHub noreply address");
+          noreplyErrors.push(`Signed-off-by email must not be a GitHub noreply address ('${entry.email}'). Please use a real email address that is linked to your GitHub account.`);
         }
       }
     });
     if (!hasSignoff) {
-      errors.push("- Missing 'Signed-off-by:' line");
+      errors.push("- Missing 'Signed-off-by:' line. Please add a line at the end of the commit message in the format 'Signed-off-by: Your Name <your@email.com>', matching your commit author or committer identity.");
     } else {
       const signoffErrors = [];
 
@@ -378,9 +378,9 @@ export async function validateFormalities(fullCommit, CONFIG) {
           authorName.toLowerCase() === committerName.toLowerCase() &&
           authorEmail.toLowerCase() === committerEmail.toLowerCase();
         if (isAuthorCommitterSame) {
-          signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`)`);
+          signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`). Please add a 'Signed-off-by: ${authorName} <${authorEmail}>' line that matches this name and email exactly.`);
         } else {
-          signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`) or committer (\`${committerName} <${committerEmail}>\`)`);
+          signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`) or committer (\`${committerName} <${committerEmail}>\`). Please add a 'Signed-off-by:' line matching either identity exactly (name and email).`);
         }
       }
 
@@ -481,7 +481,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
       } else {
         const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
         if (!matchVersionString(cleanSubject, newVersion)) {
-          errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line`);
+          errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
         } else {
           successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
         }
@@ -677,7 +677,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
       }
 
       if (MakefileInstallsConfig && !MakefileHasConffiles) {
-        errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section");
+        errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
       } else if (MakefileInstallsConfig && MakefileHasConffiles) {
         successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
       }
@@ -1571,7 +1571,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       } else if (isNewSubPackageAddition) {
         successes.push(`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`);
       } else {
-        errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump
+        errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump. Please increment \`PKG_RELEASE\` by 1 (or bump \`PKG_VERSION\`/\`PKG_SOURCE_DATE\` and reset \`PKG_RELEASE\` to 1) so users receive the update.
 - **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`);
       }
     } else if (versionChanged) {
