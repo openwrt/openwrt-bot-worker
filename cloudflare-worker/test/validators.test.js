@@ -2423,6 +2423,96 @@ diff --git a/package/lang/python/Makefile b/package/lang/python/Makefile
     assert.strictEqual(res.errors.length, 0);
     assert.ok(res.successes.some(s => s.includes('version updated')));
   });
+
+  test('passes when a new collector sub-package is registered via an established template macro', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/utils/prometheus-node-exporter-ucode/Makefile b/utils/prometheus-node-exporter-ucode/Makefile
+--- a/utils/prometheus-node-exporter-ucode/Makefile
++++ b/utils/prometheus-node-exporter-ucode/Makefile
++$(eval $(call Collector,mdadm,RAID status via /proc/mdstat,))
+diff --git a/utils/prometheus-node-exporter-ucode/files/extra/mdadm.uc b/utils/prometheus-node-exporter-ucode/files/extra/mdadm.uc
+new file mode 100644
+--- /dev/null
++++ b/utils/prometheus-node-exporter-ucode/files/extra/mdadm.uc
++// mdadm collector
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'utils/prometheus-node-exporter-ucode/Makefile') {
+        return 'PKG_NAME:=prometheus-node-exporter-ucode\nPKG_VERSION:=2024.02.07\nPKG_RELEASE:=3\n\n$(eval $(call Collector,dnsmasq,Dnsmasq collector,))\n$(eval $(call Collector,wifi,Wi-Fi collector,+ucode-mod-nl80211))\n$(eval $(call Collector,mdadm,RAID status via /proc/mdstat,))\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'utils/prometheus-node-exporter-ucode/Makefile') {
+        return 'PKG_NAME:=prometheus-node-exporter-ucode\nPKG_VERSION:=2024.02.07\nPKG_RELEASE:=3\n\n$(eval $(call Collector,dnsmasq,Dnsmasq collector,))\n$(eval $(call Collector,wifi,Wi-Fi collector,+ucode-mod-nl80211))\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('new sub-package via an existing template')));
+  });
+
+  test('still fails when the only template invocation is the package\'s sole/primary definition', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/utils/singlepkg/Makefile b/utils/singlepkg/Makefile
+--- a/utils/singlepkg/Makefile
++++ b/utils/singlepkg/Makefile
++$(eval $(call BuildPackage,singlepkg))
+diff --git a/utils/singlepkg/files/extra.uc b/utils/singlepkg/files/extra.uc
+new file mode 100644
+--- /dev/null
++++ b/utils/singlepkg/files/extra.uc
++// extra file
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'utils/singlepkg/Makefile') {
+        return 'PKG_NAME:=singlepkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n\n$(eval $(call BuildPackage,singlepkg))\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'utils/singlepkg/Makefile') {
+        return 'PKG_NAME:=singlepkg\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
+
+  test('still fails when an existing template invocation is modified rather than a new one added', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/utils/prometheus-node-exporter-ucode/Makefile b/utils/prometheus-node-exporter-ucode/Makefile
+--- a/utils/prometheus-node-exporter-ucode/Makefile
++++ b/utils/prometheus-node-exporter-ucode/Makefile
+-$(eval $(call Collector,wifi,Wi-Fi collector,+ucode-mod-nl80211))
++$(eval $(call Collector,wifi,Wi-Fi collector,+ucode-mod-nl80211 +ucode-mod-uci))
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'utils/prometheus-node-exporter-ucode/Makefile') {
+        return 'PKG_NAME:=prometheus-node-exporter-ucode\nPKG_VERSION:=2024.02.07\nPKG_RELEASE:=3\n\n$(eval $(call Collector,dnsmasq,Dnsmasq collector,))\n$(eval $(call Collector,wifi,Wi-Fi collector,+ucode-mod-nl80211 +ucode-mod-uci))\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'utils/prometheus-node-exporter-ucode/Makefile') {
+        return 'PKG_NAME:=prometheus-node-exporter-ucode\nPKG_VERSION:=2024.02.07\nPKG_RELEASE:=3\n\n$(eval $(call Collector,dnsmasq,Dnsmasq collector,))\n$(eval $(call Collector,wifi,Wi-Fi collector,+ucode-mod-nl80211))\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
 });
 
 describe('findPkgRoot', () => {
