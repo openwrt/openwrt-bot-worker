@@ -1295,6 +1295,57 @@ function isFileChangeMinor(filePath, added, deleted) {
   return true;
 }
 
+// Many Makefiles define a repeatable per-item template (e.g. optional Prometheus
+// exporter collectors, kmod sub-packages, LuCI theme variants) that is invoked via
+// `$(eval $(call SomeMacro,name,...))` once per item, several times over. Adding one
+// more invocation of an already-established template - without touching any existing
+// invocation or other already-shipped file - only introduces a brand-new sub-package
+// that has never been released before, so there is nothing installed for existing
+// users to be out of sync with. This mirrors the exemption already granted to
+// brand-new packages (see the `isNew` branch above), just scoped to one new
+// sub-package inside an existing Makefile instead of a whole new package directory.
+function isNewSubPackageMakefileAddition(added, deleted, headMakefileContent) {
+  const isBlankOrComment = (l) => {
+    const trimmed = l.trim();
+    return trimmed === '' || trimmed.startsWith('#');
+  };
+
+  const meaningfulDeleted = deleted.filter(l => !isBlankOrComment(l));
+  if (meaningfulDeleted.length > 0) {
+    // Existing directives were touched or removed - not a pure addition.
+    return false;
+  }
+
+  const meaningfulAdded = added.filter(l => !isBlankOrComment(l));
+  if (meaningfulAdded.length === 0) {
+    return false;
+  }
+
+  const callRegex = /\$\(eval\s+\$\(call\s+([A-Za-z0-9_]+)\s*,/;
+  const macroNames = new Set();
+  for (const line of meaningfulAdded) {
+    const match = line.match(callRegex);
+    if (!match) {
+      // Some added line isn't a template macro invocation, e.g. it tweaks
+      // shared build logic that affects already-shipped sub-packages too.
+      return false;
+    }
+    macroNames.add(match[1]);
+  }
+
+  for (const macroName of macroNames) {
+    const escaped = macroName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const occurrences = (headMakefileContent.match(new RegExp(`\\$\\(eval\\s+\\$\\(call\\s+${escaped}\\s*,`, 'g')) || []).length;
+    if (occurrences < 2) {
+      // The macro is only invoked once - it's the package's primary/sole
+      // definition, not an established repeatable per-item template.
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
@@ -1444,6 +1495,9 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       // Check if package changes are minor
       let packageHasOnlyMinorChanges = true;
       let packageModifiedFilesCount = 0;
+      let hasDisqualifyingChange = false;
+      let hasQualifyingSubPackageMakefileEdit = false;
+      let hasNewFileAdded = false;
 
       for (const file in fileChanges) {
         if (file === pkgRoot || file.startsWith(pkgRoot + '/')) {
@@ -1454,23 +1508,40 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
           }
 
           packageModifiedFilesCount++;
-
-          // If file is newly added or deleted, it's not a minor change
-          if (addedFiles.has(file) || deletedFiles.has(file)) {
-            packageHasOnlyMinorChanges = false;
-            break;
-          }
-
           const changes = fileChanges[file];
-          if (!isFileChangeMinor(file, changes.added, changes.deleted)) {
+
+          if (deletedFiles.has(file)) {
+            // Removing an already-shipped file changes what's installed.
             packageHasOnlyMinorChanges = false;
+            hasDisqualifyingChange = true;
             break;
           }
+
+          if (addedFiles.has(file)) {
+            packageHasOnlyMinorChanges = false;
+            hasNewFileAdded = true;
+            continue;
+          }
+
+          if (isFileChangeMinor(file, changes.added, changes.deleted)) {
+            continue;
+          }
+
+          if (file === makefilePath && isNewSubPackageMakefileAddition(changes.added, changes.deleted, headMakefileContent)) {
+            packageHasOnlyMinorChanges = false;
+            hasQualifyingSubPackageMakefileEdit = true;
+            continue;
+          }
+
+          packageHasOnlyMinorChanges = false;
+          hasDisqualifyingChange = true;
+          break;
         }
       }
 
       if (packageModifiedFilesCount === 0) {
         packageHasOnlyMinorChanges = false;
+        hasDisqualifyingChange = true;
       }
 
       // Some package families (e.g. u-boot, ARM Trusted Firmware) build on top of a
@@ -1483,10 +1554,17 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(headMakefileContent)
       );
 
+      // A new sub-package registered via an already-established per-item template
+      // (see isNewSubPackageMakefileAddition) has no prior release for existing
+      // users to be out of sync with, as long as nothing else already shipped changed.
+      const isNewSubPackageAddition = !hasDisqualifyingChange && hasQualifyingSubPackageMakefileEdit && hasNewFileAdded;
+
       if (packageHasOnlyMinorChanges) {
         successes.push(`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`);
       } else if (hasReleaseExemptInclude) {
         successes.push(`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`);
+      } else if (isNewSubPackageAddition) {
+        successes.push(`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`);
       } else {
         errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump
 - **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`);
