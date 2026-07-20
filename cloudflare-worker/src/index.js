@@ -606,10 +606,10 @@ async function handleWebhook(request, env) {
       } else {
         const fetchFileContent = (path) => fetchFileContentCached(path, sha);
 
-        const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state);
+        const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname);
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
-          const reportUpstreamMakefile = validateMakefileContext(upstreamCommit, item.upstreamPatch, CONFIG, { isNewPackage: false, isDroppedPackage: false });
+          const reportUpstreamMakefile = validateMakefileContext(upstreamCommit, item.upstreamPatch, CONFIG, { isNewPackage: false, isDroppedPackage: false }, repoFullname);
           reportMakefile.errors = reportMakefile.errors.filter(err => !reportUpstreamMakefile.errors.includes(err));
           reportMakefile.warnings = reportMakefile.warnings.filter(warn => !reportUpstreamMakefile.warnings.includes(warn));
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
@@ -682,7 +682,7 @@ async function handleWebhook(request, env) {
     // 2. Makefiles (PR-Wide)
     const fetchFileContent = (path) => fetchFileContentCached(path, data.pull_request.head.sha);
 
-    const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state);
+    const reportMakefile = validateMakefileContext(virtualCommit, prPatch, CONFIG, state, repoFullname);
     const reportUci = await validateUciConfigs(prPatch, CONFIG, fetchFileContent);
 
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
