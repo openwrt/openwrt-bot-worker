@@ -21,7 +21,7 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 
 *   **Merge Commit Elimination:** Rejects merge commits inside the PR tracking chain to preserve a clean linear history.
 *   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
-*   **Linked GitHub Account:** Verifies that the commit author email address is registered and verified on a GitHub account, linking the commit to a valid GitHub username.
+*   **Linked GitHub Account:** Verifies that the commit author email address is registered and verified on a GitHub account, linking the commit to a valid GitHub username. Can be downgraded to a non-blocking warning or disabled entirely, see `require_linked_github_account` below.
 *   **Autosquash Compliance:** Automatically bypasses style constraints for development-phase `fixup!` and `squash!` syntax blocks.
 *   **Subject String Hygiene:** Enforces `<package name or prefix>: ` prefix headers, checks lowercase starting strings post-prefix, and rejects trailing periods.
 *   **Length Constraints:** Implements dual-layered (soft and hard) line width boundaries for both subject lines and description body text blocks.
@@ -112,6 +112,7 @@ Some configuration keys offer advanced options:
 *   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
+*   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
 *   `check_uci_config`: Set to `true` (default) to validate UCI configurations. Set to `false` or `"disabled"` to disable.
 *   `check_space_after_assignment`: Set to `true` (default) to detect and reject spaces/indentation immediately after the `:=` assignment operator in Makefiles, or `false` to disable.
 *   `check_missing_colon`: Set to `true` (default) to detect and reject the use of `=` instead of `:=` for standard variables (e.g. `PKG_NAME`, `TITLE`, `URL`, etc.) in Makefiles, or `false` to disable.

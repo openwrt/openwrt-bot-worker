@@ -312,6 +312,21 @@ describe('validateFormalities', () => {
     assert.ok(res.errors.some(e => e.includes('is not linked to any registered GitHub account')));
   });
 
+  test('warns instead of failing when require_linked_github_account is "warning" and author is not linked', async () => {
+    const commit = {
+      author: null, // not linked to GitHub account
+      commit: {
+        message: 'mypkg: fix bug\n\nSome description text\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const customConfig = { ...CONFIG, require_linked_github_account: 'warning' };
+    const res = await validateFormalities(commit, customConfig);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.warnings.some(w => w.includes('is not linked to any registered GitHub account')));
+  });
+
   test('passes spelling check when OpenWrt or openwrt is used correctly', async () => {
     const commit = {
       commit: {
