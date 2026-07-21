@@ -980,50 +980,68 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
   }
 
+  // Collect (chunk, patchFile) matches upfront rather than checking each
+  // patch file's header inline in the loop: this lets every needed
+  // fetchFileContent(patchFile) call fire together (via Promise.all below)
+  // instead of one-at-a-time, so a batching loader upstream (see
+  // fetchFileContentCached in index.js) can combine them into a single
+  // GraphQL request instead of one HTTP call per patch file.
   const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
+  const matches = [];
   for (const chunk of fileChunks) {
     for (const patchFile of patchFiles) {
       if (chunk.includes('b/' + patchFile)) {
-        let hasFromHash = false;
-        let hasFrom = false;
-        let hasDate = false;
-        let hasSubject = false;
-        let checked = false;
-
-        if (fetchFileContent) {
-          try {
-            const rawContent = await fetchFileContent(patchFile);
-            if (rawContent !== null) {
-              hasFromHash = /^From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(rawContent);
-              hasFrom = /^From:\s+.+/m.test(rawContent);
-              hasDate = /^Date:\s+.+/m.test(rawContent);
-              hasSubject = /^Subject:\s+.+/m.test(rawContent);
-              checked = true;
-            }
-          } catch (e) {
-            // Ignore fetch errors and fallback
-          }
-        }
-
-        if (!checked) {
-          // Fallback: only validate if it is a new file
-          const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
-          if (!isNewFile) {
-            successes.push(`✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)`);
-            continue;
-          }
-          hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
-          hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
-          hasDate = /^\+\s*Date:\s+.+/m.test(chunk);
-          hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
-        }
-
-        if (!hasFromHash || !hasFrom || !hasDate || !hasSubject) {
-          errors.push(`- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From <hash> Mon Sep 17 00:00:00 2001' / 'From:' / 'Date:' / 'Subject:') to ensure 'git am' application compatibility`);
-        } else {
-          successes.push(`✅ Embedded patch '${patchFile}' contains valid Git compliance headers`);
-        }
+        matches.push({ chunk, patchFile });
       }
+    }
+  }
+
+  async function checkPatchHeader({ chunk, patchFile }) {
+    let hasFromHash = false;
+    let hasFrom = false;
+    let hasDate = false;
+    let hasSubject = false;
+    let checked = false;
+
+    if (fetchFileContent) {
+      try {
+        const rawContent = await fetchFileContent(patchFile);
+        if (rawContent !== null) {
+          hasFromHash = /^From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(rawContent);
+          hasFrom = /^From:\s+.+/m.test(rawContent);
+          hasDate = /^Date:\s+.+/m.test(rawContent);
+          hasSubject = /^Subject:\s+.+/m.test(rawContent);
+          checked = true;
+        }
+      } catch (e) {
+        // Ignore fetch errors and fallback
+      }
+    }
+
+    if (!checked) {
+      // Fallback: only validate if it is a new file
+      const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
+      if (!isNewFile) {
+        return { success: `✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)` };
+      }
+      hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
+      hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
+      hasDate = /^\+\s*Date:\s+.+/m.test(chunk);
+      hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
+    }
+
+    if (!hasFromHash || !hasFrom || !hasDate || !hasSubject) {
+      return { error: `- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From <hash> Mon Sep 17 00:00:00 2001' / 'From:' / 'Date:' / 'Subject:') to ensure 'git am' application compatibility` };
+    }
+    return { success: `✅ Embedded patch '${patchFile}' contains valid Git compliance headers` };
+  }
+
+  const results = await Promise.all(matches.map(checkPatchHeader));
+  for (const result of results) {
+    if (result.error) {
+      errors.push(result.error);
+    } else if (result.success) {
+      successes.push(result.success);
     }
   }
 
@@ -1188,23 +1206,30 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     pushCandidate(parts.slice(0, i).join('/'));
   }
 
-  for (const candidate of candidates) {
+  const viableCandidates = candidates.filter(candidate => {
     const candidateParts = candidate.split('/');
     const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || isSkippableDir(last)) {
-      continue;
-    }
-    if (isCategoryLevel(candidateParts)) {
-      continue;
-    }
+    if (last === 'package' || isSkippableDir(last)) return false;
+    if (isCategoryLevel(candidateParts)) return false;
+    return true;
+  });
 
-    if (await hasPkgName(candidate)) {
-      return candidate;
-    }
+  if (!fetchFileContent) {
+    // Dry mode (unit tests / no fetch available): trust the first viable
+    // heuristic candidate without probing anything.
+    return viableCandidates.length > 0 ? viableCandidates[0] : null;
+  }
 
-    // When fetching is unavailable (unit tests / dry mode), trust first viable heuristic candidate.
-    if (!fetchFileContent) {
-      return candidate;
+  // Probe every viable candidate's Makefile in one shot instead of walking
+  // up the tree one fetch at a time: still resolves to the same deepest-
+  // first match (first `true` in original candidate order), but lets a
+  // batching loader upstream (see fetchFileContentCached in index.js)
+  // combine all these lookups into a single GraphQL request instead of N
+  // sequential HTTP calls.
+  const hasPkgNameResults = await Promise.all(viableCandidates.map(candidate => hasPkgName(candidate)));
+  for (let i = 0; i < viableCandidates.length; i++) {
+    if (hasPkgNameResults[i]) {
+      return viableCandidates[i];
     }
   }
 
@@ -1361,16 +1386,15 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   }
 
   // 1. Collect all modified package roots and file changes
-  const pkgRoots = new Set();
   const pkgRootCache = {};
 
   const addedFiles = new Set();
   const deletedFiles = new Set();
   const modifiedFiles = new Set();
   const fileChanges = {}; // filePath -> { added: [], deleted: [] }
+  const candidateFiles = [];
 
-  let exceededPkgLimit = false;
-  outer: for (const item of commitDetails) {
+  for (const item of commitDetails) {
     if (item.commitPatch) {
       const states = parseDiffFileStates(item.commitPatch);
       states.addedFiles.forEach(f => addedFiles.add(f));
@@ -1416,29 +1440,41 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         continue;
       }
 
-      const pkgRoot = await findPkgRoot(file, fetchFileContentAtHead, pkgRootCache);
-      if (pkgRoot) {
-        pkgRoots.add(pkgRoot);
-        if (pkgRoots.size > 15) {
-          exceededPkgLimit = true;
-          break outer;
-        }
-      }
+      candidateFiles.push(file);
     }
   }
 
-  if (exceededPkgLimit) {
+  // Resolve every candidate file's package root together instead of one
+  // sequential findPkgRoot call at a time, so a batching loader upstream
+  // (see fetchFileContentCached in index.js) can combine the underlying
+  // Makefile probes into far fewer GraphQL requests. The >15-package cap
+  // below is checked against the full, precomputed set rather than bailing
+  // out mid-scan, so the reported count is now always the true total.
+  const resolvedRoots = await Promise.all(candidateFiles.map(file => findPkgRoot(file, fetchFileContentAtHead, pkgRootCache)));
+  const pkgRoots = new Set();
+  for (const pkgRoot of resolvedRoots) {
+    if (pkgRoot) pkgRoots.add(pkgRoot);
+  }
+
+  if (pkgRoots.size > 15) {
     warnings.push(`Package release bump audit skipped: PR modifies ${pkgRoots.size} packages. Batch updates of >15 packages are not automatically audited to prevent hitting API rate/subrequest limits.`);
     return { errors, warnings, successes };
   }
 
-  // 2. Process each package root
-  for (const pkgRoot of pkgRoots) {
+  // 2. Process each package root — each root's Makefile-diff analysis runs
+  // in its own async function returning { errors, successes } instead of
+  // pushing into shared arrays directly, so every root can be processed via
+  // Promise.all below. This lets multiple roots' head/base Makefile fetches
+  // land in the same microtask tick, which a batching loader upstream (see
+  // fetchFileContentCached in index.js) can combine into far fewer GraphQL
+  // requests than one pair of HTTP calls per package.
+  async function processPkgRoot(pkgRoot) {
+    const empty = { errors: [], successes: [] };
     const makefilePath = `${pkgRoot}/Makefile`;
 
     if (deletedFiles.has(makefilePath)) {
       // Package was deleted/dropped, skip checks
-      continue;
+      return empty;
     }
 
     // OPTIMIZATION: If the Makefile itself was not modified in the PR,
@@ -1446,7 +1482,6 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     // We can skip fetching the Makefile contents entirely!
     let bumped = false;
     let versionChanged = false;
-    let releaseChanged = false;
     let headRelease = null;
     let baseRelease = null;
     let headVersion = null;
@@ -1462,7 +1497,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       headMakefileContent = headContent;
       if (headContent === null) {
         // Package was deleted/dropped, skip checks
-        continue;
+        return empty;
       }
 
       const isNew = addedFiles.has(makefilePath);
@@ -1472,11 +1507,9 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
       if (isNew) {
         if (headRelease !== '1') {
-          errors.push(`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`);
-        } else {
-          successes.push(`✅ New package \`${pkgRoot}\` correctly initializes PKG_RELEASE to 1`);
+          return { errors: [`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
         }
-        continue;
+        return { errors: [], successes: [`✅ New package \`${pkgRoot}\` correctly initializes PKG_RELEASE to 1`] };
       }
 
       // Existing package modified
@@ -1492,7 +1525,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       headSourceDate = resolveMakefileVar(headContent, 'PKG_SOURCE_DATE');
 
       versionChanged = (baseVersion !== headVersion) || (baseSourceVer !== headSourceVer) || (baseSourceDate !== headSourceDate);
-      releaseChanged = (baseRelease !== headRelease);
+      const releaseChanged = (baseRelease !== headRelease);
       bumped = versionChanged || releaseChanged;
     }
 
@@ -1565,24 +1598,35 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       const isNewSubPackageAddition = !hasDisqualifyingChange && hasQualifyingSubPackageMakefileEdit && hasNewFileAdded;
 
       if (packageHasOnlyMinorChanges) {
-        successes.push(`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`);
-      } else if (hasReleaseExemptInclude) {
-        successes.push(`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`);
-      } else if (isNewSubPackageAddition) {
-        successes.push(`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`);
-      } else {
-        errors.push(`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump. Please increment \`PKG_RELEASE\` by 1 (or bump \`PKG_VERSION\`/\`PKG_SOURCE_DATE\` and reset \`PKG_RELEASE\` to 1) so users receive the update.
-- **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`);
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`] };
       }
-    } else if (versionChanged) {
-      if (headRelease !== '1') {
-        errors.push(`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`);
-      } else {
-        successes.push(`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`);
+      if (hasReleaseExemptInclude) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
       }
-    } else {
-      successes.push(`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE bumped from '${baseRelease}' to '${headRelease}'`);
+      if (isNewSubPackageAddition) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`] };
+      }
+      return {
+        errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump. Please increment \`PKG_RELEASE\` by 1 (or bump \`PKG_VERSION\`/\`PKG_SOURCE_DATE\` and reset \`PKG_RELEASE\` to 1) so users receive the update.
+- **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`],
+        successes: []
+      };
     }
+
+    if (versionChanged) {
+      if (headRelease !== '1') {
+        return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
+      }
+      return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`] };
+    }
+
+    return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE bumped from '${baseRelease}' to '${headRelease}'`] };
+  }
+
+  const pkgResults = await Promise.all([...pkgRoots].map(processPkgRoot));
+  for (const result of pkgResults) {
+    errors.push(...result.errors);
+    successes.push(...result.successes);
   }
 
   return { errors, warnings, successes };
@@ -1604,17 +1648,25 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
   const changedFiles = getChangedFilesFromPatch(commitPatch);
   const pkgRootCache = {};
 
-  for (const file of changedFiles) {
-    if (deletedFiles.has(file)) continue;
-    if (isHiddenOrSpecial(file)) continue;
+  // Each file's check chain runs in its own async function returning
+  // { errors, successes } instead of pushing into shared arrays directly,
+  // so all files can be processed via Promise.all below. This lets multiple
+  // files' findPkgRoot/Makefile/content lookups land in the same microtask
+  // tick, which a batching loader upstream (see fetchFileContentCached in
+  // index.js) can combine into far fewer GraphQL requests than one HTTP
+  // call per file.
+  async function processFile(file) {
+    const empty = { errors: [], successes: [] };
+    if (deletedFiles.has(file)) return empty;
+    if (isHiddenOrSpecial(file)) return empty;
 
     // A file could be destined for /etc/config/ if its path contains /etc/config/
     // or if it's in a files/ directory.
     const isCandidate = file.includes('/etc/config/') || file.includes('/files/');
-    if (!isCandidate) continue;
+    if (!isCandidate) return empty;
 
     const pkgRoot = await findPkgRoot(file, fetchFileContent, pkgRootCache);
-    if (!pkgRoot) continue;
+    if (!pkgRoot) return empty;
 
     let makefileContent = null;
     try {
@@ -1626,7 +1678,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
     const filename = file.split('/').pop();
     const ext = filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
     const skipExtensions = new Set(['init', 'sh', 'hotplug', 'py', 'pl', 'lua', 'cron', 'md', 'patch', 'sed', 'defaults', 'uc']);
-    if (skipExtensions.has(ext)) continue;
+    if (skipExtensions.has(ext)) return empty;
 
     let isDestinedForEtcConfig = false;
     if (file.includes('/etc/config/')) {
@@ -1715,12 +1767,19 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
         }
 
         if (!isValidUci) {
-          errors.push(`- File '${file}' is destined for '/etc/config/' but is not a valid UCI configuration file. In OpenWrt, '/etc/config/' is reserved for UCI-formatted configuration files. Raw files (such as TOML, JSON, or YAML) are not allowed at this path. Invalid line ${invalidLineNum}: '${invalidLine}'`);
-        } else {
-          successes.push(`✅ Configuration file '${file}' destined for '/etc/config/' is a valid UCI configuration file`);
+          return { errors: [`- File '${file}' is destined for '/etc/config/' but is not a valid UCI configuration file. In OpenWrt, '/etc/config/' is reserved for UCI-formatted configuration files. Raw files (such as TOML, JSON, or YAML) are not allowed at this path. Invalid line ${invalidLineNum}: '${invalidLine}'`], successes: [] };
         }
+        return { errors: [], successes: [`✅ Configuration file '${file}' destined for '/etc/config/' is a valid UCI configuration file`] };
       }
     }
+
+    return empty;
+  }
+
+  const results = await Promise.all(changedFiles.map(processFile));
+  for (const result of results) {
+    errors.push(...result.errors);
+    successes.push(...result.successes);
   }
 
   return { errors, successes };

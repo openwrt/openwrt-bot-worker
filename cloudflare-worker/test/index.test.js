@@ -19,6 +19,62 @@ async function calculateHmac(secret, payload) {
   return `sha256=${hashHex}`;
 }
 
+// --- GRAPHQL MOCKING HELPERS ---
+// The file-content batching loader (fetchFileContentCached in src/index.js)
+// sends one POST per batch to /graphql with aliased repository()/object()
+// selections instead of one GET per file to the REST Contents API. These
+// helpers decode that request and build a matching response so tests can
+// assert on which (owner, name, ref, path) triples were actually requested.
+function parseGraphqlRequest(options) {
+  const body = JSON.parse(options.body);
+  const variables = body.variables || {};
+  const groups = [];
+  let i = 0;
+  while (variables[`o${i}`] !== undefined) {
+    const probes = [];
+    let j = 0;
+    while (variables[`e${i}_${j}`] !== undefined) {
+      const expression = variables[`e${i}_${j}`];
+      const sepIndex = expression.indexOf(':');
+      // A bare-ref expression (no ':') is a ref-existence probe: the loader
+      // asks whether the repo can resolve the ref at all, with no file path.
+      probes.push({
+        fieldAlias: `f${j}`,
+        ref: sepIndex === -1 ? expression : expression.slice(0, sepIndex),
+        path: sepIndex === -1 ? null : expression.slice(sepIndex + 1)
+      });
+      j++;
+    }
+    groups.push({ repoAlias: `repo${i}`, owner: variables[`o${i}`], name: variables[`n${i}`], probes });
+    i++;
+  }
+  return { query: body.query, variables, groups };
+}
+
+// resolver(owner, name, ref, path) => string (found) | null (not found) |
+// undefined (omit the field, simulating a partial GraphQL error). For
+// ref-existence probes (path === null) a string return means "the repo
+// resolves this ref" — the value itself is not used as file content.
+function graphqlResponse(groups, resolver) {
+  const data = {};
+  for (const group of groups) {
+    data[group.repoAlias] = {};
+    for (const probe of group.probes) {
+      const value = resolver(group.owner, group.name, probe.ref, probe.path);
+      if (value === undefined) continue;
+      if (value === null) {
+        data[group.repoAlias][probe.fieldAlias] = null;
+      } else if (probe.path === null) {
+        // Ref probes resolve to a commit object — oid only, no Blob fields.
+        data[group.repoAlias][probe.fieldAlias] = { oid: 'mock-oid' };
+      } else {
+        data[group.repoAlias][probe.fieldAlias] = { oid: 'mock-oid', text: value, isBinary: false };
+      }
+    }
+  }
+  return new Response(JSON.stringify({ data }), { status: 200 });
+}
+
 async function generateTestPrivateKeyPEM() {
   const keyPair = await crypto.subtle.generateKey(
     {
@@ -2336,11 +2392,15 @@ index 123456..789012 100644
     const secret = 'mysecret';
     const signature = await calculateHmac(secret, payload);
 
-    let fetchCounts = {};
-    fetchMock = async (url, options) => {
-      const cleanedUrl = url.split('?')[0];
-      fetchCounts[cleanedUrl] = (fetchCounts[cleanedUrl] || 0) + 1;
+    // Two files under two different packages, so that both files' Makefile
+    // lookups (and separately their two content lookups) genuinely land in
+    // the same batching window and combine into far fewer GraphQL requests
+    // than one HTTP call per file — this is the whole point of the
+    // batching loader in fetchFileContentCached.
+    const expressionRequestCounts = {}; // "ref:path" -> times requested across all /graphql calls
+    let graphqlCallCount = 0;
 
+    fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
         return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
       }
@@ -2362,7 +2422,7 @@ index 123456..789012 100644
             sha: 'sha123',
             html_url: 'https://github.com/test/repo/commit/sha123',
             commit: {
-              message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+              message: 'mypkg, otherpkg: update configs\n\nSigned-off-by: John Doe <john@doe.com>',
               author: { name: 'John Doe', email: 'john@doe.com' },
               committer: { name: 'John Doe', email: 'john@doe.com' }
             }
@@ -2376,6 +2436,11 @@ index 123456..789012 100644
             '--- a/net/mypkg/files/etc/config/mypkg\n' +
             '+++ b/net/mypkg/files/etc/config/mypkg\n' +
             '+config mypkg global\n' +
+            '+option enabled 1\n' +
+            'diff --git a/net/otherpkg/files/etc/config/otherpkg b/net/otherpkg/files/etc/config/otherpkg\n' +
+            '--- a/net/otherpkg/files/etc/config/otherpkg\n' +
+            '+++ b/net/otherpkg/files/etc/config/otherpkg\n' +
+            '+config otherpkg global\n' +
             '+option enabled 1\n',
             { status: 200 }
           );
@@ -2383,27 +2448,28 @@ index 123456..789012 100644
         return new Response(JSON.stringify({
           parents: [{ sha: 'parent-sha' }],
           commit: {
-            message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+            message: 'mypkg, otherpkg: update configs\n\nSigned-off-by: John Doe <john@doe.com>',
             author: { name: 'John Doe', email: 'john@doe.com' },
             committer: { name: 'John Doe', email: 'john@doe.com' }
           }
         }), { status: 200 });
       }
-      if (url.includes('/contents/net/mypkg/Makefile')) {
-        return new Response(
-          'PKG_NAME:=mypkg\n' +
-          'define Package/mypkg/conffiles\n' +
-          '/etc/config/mypkg\n' +
-          'endef\n',
-          { status: 200 }
-        );
-      }
-      if (url.includes('/contents/net/mypkg/files/etc/config/mypkg')) {
-        return new Response(
-          'config mypkg global\n' +
-          'option enabled 1\n',
-          { status: 200 }
-        );
+      if (url.includes('/graphql')) {
+        graphqlCallCount++;
+        const { groups } = parseGraphqlRequest(options);
+        for (const group of groups) {
+          for (const probe of group.probes) {
+            const key = `${probe.ref}:${probe.path}`;
+            expressionRequestCounts[key] = (expressionRequestCounts[key] || 0) + 1;
+          }
+        }
+        return graphqlResponse(groups, (owner, name, ref, path) => {
+          if (path === 'net/mypkg/Makefile') return 'PKG_NAME:=mypkg\ndefine Package/mypkg/conffiles\n/etc/config/mypkg\nendef\n';
+          if (path === 'net/mypkg/files/etc/config/mypkg') return 'config mypkg global\noption enabled 1\n';
+          if (path === 'net/otherpkg/Makefile') return 'PKG_NAME:=otherpkg\n';
+          if (path === 'net/otherpkg/files/etc/config/otherpkg') return 'config otherpkg global\noption enabled 1\n';
+          return null;
+        });
       }
       if (url.includes('/issues/123/comments')) {
         return new Response(JSON.stringify([]), { status: 200 });
@@ -2428,9 +2494,20 @@ index 123456..789012 100644
 
       assert.strictEqual(response.status, 200);
 
-      const makefileFetchKey = Object.keys(fetchCounts).find(k => k.includes('/contents/net/mypkg/Makefile'));
-      assert.ok(makefileFetchKey);
-      assert.strictEqual(fetchCounts[makefileFetchKey], 1);
+      // Each distinct (ref, path) pair is requested at most once, even
+      // though both files' Makefile lookups target the same ref.
+      for (const [key, count] of Object.entries(expressionRequestCounts)) {
+        assert.strictEqual(count, 1, `expected '${key}' to be requested exactly once, saw ${count}`);
+      }
+      assert.ok(expressionRequestCounts['sha123:net/mypkg/Makefile'] >= 1);
+      assert.ok(expressionRequestCounts['sha123:net/otherpkg/Makefile'] >= 1);
+      assert.ok(expressionRequestCounts['sha123:net/mypkg/files/etc/config/mypkg'] >= 1);
+      assert.ok(expressionRequestCounts['sha123:net/otherpkg/files/etc/config/otherpkg'] >= 1);
+
+      // Four distinct file lookups across two packages should combine into
+      // far fewer than 4 GraphQL calls (one REST call per file would have
+      // been the pre-batching baseline).
+      assert.ok(graphqlCallCount < 4, `expected file content lookups to batch, but saw ${graphqlCallCount} separate GraphQL calls`);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -2567,7 +2644,7 @@ index 123456..789012 100644
     }
   });
 
-  test('fetchFileContentCached: falls back to head repo when base repo content fetch returns 404 or 5xx', async () => {
+  test('fetchFileContentCached: probes base and fork repo together in one GraphQL call when a ref is unresolved, and uses the fork content when base has none', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
       if (algorithm.name === "RSASSA-PKCS1-v1_5") {
@@ -2605,8 +2682,13 @@ index 123456..789012 100644
     const secret = 'mysecret';
     const signature = await calculateHmac(secret, payload);
 
-    let baseRepoContentFetchCount = 0;
-    let headRepoContentFetchCount = 0;
+    // Neither 'headsha123' (the PR head sha, distinct from the commit sha
+    // below) nor the base sha (intentionally omitted from the payload, so
+    // it stays 'undefined' and therefore unresolved) are known-resolvable
+    // ahead of time, so each lookup at these refs should proactively probe
+    // base AND fork together in a single GraphQL call.
+    let graphqlCallCount = 0;
+    const callsByRef = {}; // ref -> array of { hasBaseGroup, hasForkGroup }
 
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
@@ -2647,20 +2729,29 @@ index 123456..789012 100644
           { status: 200 }
         );
       }
-      // Content fetch under base repo returns 502 Bad Gateway
-      if (url.match(/\/repos\/test\/repo\/contents\/package\/utils\/bash\/Makefile/)) {
-        baseRepoContentFetchCount++;
-        return new Response('Gateway Timeout', { status: 502 });
-      }
-      // Content fetch under head repo returns 200 OK
-      if (url.match(/\/repos\/forked\/repo\/contents\/package\/utils\/bash\/Makefile/)) {
-        headRepoContentFetchCount++;
-        return new Response(
-          'PKG_NAME:=bash\n' +
-          'PKG_VERSION:=2.0\n' +
-          'PKG_RELEASE:=1\n',
-          { status: 200 }
-        );
+      if (url.includes('/graphql')) {
+        graphqlCallCount++;
+        const { groups } = parseGraphqlRequest(options);
+        const hasBaseGroup = groups.some(g => g.owner === 'test' && g.name === 'repo');
+        const hasForkGroup = groups.some(g => g.owner === 'forked' && g.name === 'repo');
+        // A single call probes base+fork together for the same ref, so
+        // count distinct refs touched by this call once each (not once per
+        // probe) when tallying "how many calls touched this ref".
+        const refsInThisCall = new Set();
+        for (const group of groups) {
+          for (const probe of group.probes) {
+            refsInThisCall.add(probe.ref);
+          }
+        }
+        for (const ref of refsInThisCall) {
+          if (!callsByRef[ref]) callsByRef[ref] = [];
+          callsByRef[ref].push({ hasBaseGroup, hasForkGroup });
+        }
+        // Base repo has no content at either unresolved ref; the fork does.
+        return graphqlResponse(groups, (owner, name) => {
+          if (owner === 'test' && name === 'repo') return null;
+          return 'PKG_NAME:=bash\nPKG_VERSION:=2.0\nPKG_RELEASE:=1\n';
+        });
       }
       if (url.includes('/issues/123/comments')) {
         return new Response(JSON.stringify([]), { status: 200 });
@@ -2684,8 +2775,17 @@ index 123456..789012 100644
       }, {});
 
       assert.strictEqual(response.status, 200);
-      assert.strictEqual(baseRepoContentFetchCount, 6);
-      assert.strictEqual(headRepoContentFetchCount, 2);
+
+      // Exactly one GraphQL call per unresolved ref (head sha + base sha),
+      // not one call per repo — proving base and fork are queried together
+      // instead of the old reactive fetch -> 404 -> retry-under-fork.
+      assert.strictEqual(graphqlCallCount, 2);
+      assert.strictEqual(Object.keys(callsByRef).length, 2);
+      for (const calls of Object.values(callsByRef)) {
+        assert.strictEqual(calls.length, 1, 'expected exactly one GraphQL call for this ref');
+        assert.strictEqual(calls[0].hasBaseGroup, true);
+        assert.strictEqual(calls[0].hasForkGroup, true);
+      }
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -2731,8 +2831,13 @@ index 123456..789012 100644
     const secret = 'mysecret';
     const signature = await calculateHmac(secret, payload);
 
-    let baseRepoContentFetchCount = 0;
-    let headRepoContentFetchCount = 0;
+    // Both the head sha ('sha123', resolved via the 200 commit-patch fetch
+    // below) and the base sha ('basesha456', pre-seeded as base-resolvable
+    // because it's the PR's base branch tip) are already known-resolvable
+    // before any file content lookup happens, so every GraphQL call for
+    // this PR should probe the base repo only — never the fork.
+    let graphqlCallCount = 0;
+    let sawForkGroup = false;
 
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
@@ -2773,13 +2878,14 @@ index 123456..789012 100644
           { status: 200 }
         );
       }
-      if (url.match(/\/repos\/test\/repo\/contents\//)) {
-        baseRepoContentFetchCount++;
-        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
-      }
-      if (url.match(/\/repos\/forked\/repo\/contents\//)) {
-        headRepoContentFetchCount++;
-        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+      if (url.includes('/graphql')) {
+        graphqlCallCount++;
+        const { groups } = parseGraphqlRequest(options);
+        if (groups.some(g => g.owner === 'forked' && g.name === 'repo')) {
+          sawForkGroup = true;
+        }
+        // Base repo has nothing at this path for either ref (e.g. package dropped).
+        return graphqlResponse(groups, () => null);
       }
       if (url.includes('/issues/123/comments')) {
         return new Response(JSON.stringify([]), { status: 200 });
@@ -2803,11 +2909,11 @@ index 123456..789012 100644
       }, {});
 
       assert.strictEqual(response.status, 200);
-      // The Makefile lookup 404s under the base repo, but since the base repo
-      // resolved the commit SHA, the 404 is authoritative and the fork must
-      // not be queried at all.
-      assert.ok(baseRepoContentFetchCount >= 1);
-      assert.strictEqual(headRepoContentFetchCount, 0);
+      // The Makefile lookup resolves to null under the base repo, but since
+      // the base repo already resolved both refs, that's authoritative and
+      // the fork must never be queried at all.
+      assert.ok(graphqlCallCount >= 1);
+      assert.strictEqual(sawForkGroup, false);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -2853,12 +2959,9 @@ index 123456..789012 100644
     const secret = 'mysecret';
     const signature = await calculateHmac(secret, payload);
 
-    const baseContentFetchesByRef = new Map();
-    const forkContentFetchesByRef = new Map();
-    const countByRef = (map, url) => {
-      const ref = new URL(url).searchParams.get('ref') || 'none';
-      map.set(ref, (map.get(ref) || 0) + 1);
-    };
+    // groupsByRef[ref] records, for every GraphQL call that touched that
+    // ref, which repos (base 'test/repo', fork 'forked/repo') were probed.
+    const groupsByRef = {};
 
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
@@ -2901,18 +3004,15 @@ index 123456..789012 100644
       if (url.match(/\/repos\/forked\/repo\/commits\/sha123/)) {
         return new Response(commitPatch, { status: 200 });
       }
-      if (url.match(/\/repos\/test\/repo\/contents\//)) {
-        countByRef(baseContentFetchesByRef, url);
-        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
-      }
-      if (url.match(/\/repos\/forked\/repo\/contents\//)) {
-        countByRef(forkContentFetchesByRef, url);
-        return new Response(
-          'PKG_NAME:=bash\n' +
-          'PKG_VERSION:=2.0\n' +
-          'PKG_RELEASE:=1\n',
-          { status: 200 }
-        );
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        for (const group of groups) {
+          for (const probe of group.probes) {
+            if (!groupsByRef[probe.ref]) groupsByRef[probe.ref] = new Set();
+            groupsByRef[probe.ref].add(`${group.owner}/${group.name}`);
+          }
+        }
+        return graphqlResponse(groups, (owner) => owner === 'forked' ? 'PKG_NAME:=bash\nPKG_VERSION:=2.0\nPKG_RELEASE:=1\n' : null);
       }
       if (url.includes('/issues/123/comments')) {
         return new Response(JSON.stringify([]), { status: 200 });
@@ -2937,12 +3037,297 @@ index 123456..789012 100644
 
       assert.strictEqual(response.status, 200);
       // The commit SHA only resolved under the fork, so content lookups at
-      // that ref must skip the base repo entirely.
-      assert.strictEqual(baseContentFetchesByRef.get('sha123') || 0, 0);
-      assert.ok((forkContentFetchesByRef.get('sha123') || 0) >= 1);
-      // The base branch tip is pre-marked as base-resolvable, so its 404s
-      // must never trigger the fork fallback.
-      assert.strictEqual(forkContentFetchesByRef.get('basesha456') || 0, 0);
+      // that ref must go straight to the fork — the base repo is never
+      // probed for it at all.
+      assert.deepStrictEqual(groupsByRef['sha123'], new Set(['forked/repo']));
+      // The base branch tip is pre-marked as base-resolvable, so lookups at
+      // that ref must never include the fork.
+      assert.deepStrictEqual(groupsByRef['basesha456'], new Set(['test/repo']));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('subrequest budget guard: still posts check-runs and a PR comment (with a friendly warning) when the file-content budget is exhausted', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: { ref: 'feature', sha: 'headsha123' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let graphqlCallCount = 0;
+    let commentBody = null;
+    const checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: true,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: true
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update config\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.includes('/commits/sha123')) {
+        if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response(
+            'diff --git a/net/mypkg/files/etc/config/mypkg b/net/mypkg/files/etc/config/mypkg\n' +
+            '--- a/net/mypkg/files/etc/config/mypkg\n' +
+            '+++ b/net/mypkg/files/etc/config/mypkg\n' +
+            '+config mypkg global\n' +
+            '+option enabled 1\n',
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({
+          parents: [{ sha: 'parent-sha' }],
+          commit: {
+            message: 'mypkg: update config\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }), { status: 200 });
+      }
+      // The budget is forced to zero below, so this must never be hit.
+      if (url.includes('/graphql')) {
+        graphqlCallCount++;
+        return new Response(JSON.stringify({ data: {} }), { status: 200 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        if (options && options.method === 'POST') {
+          commentBody = JSON.parse(options.body).body;
+        }
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          checkRunsPosted.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA==',
+        // Force the file-content budget to be exhausted before any lookup,
+        // so every optional deep-validation fetch must be skipped rather
+        // than attempted.
+        SUBREQUEST_BUDGET_LIMIT: '0',
+        SUBREQUEST_RESERVE_HEADROOM: '0'
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      // No GraphQL call was even attempted once the budget was exhausted.
+      assert.strictEqual(graphqlCallCount, 0);
+
+      // The terminal writes still happened despite the exhausted budget —
+      // this is the core fix: a PR too large to fully audit still gets a
+      // clear status instead of no response at all.
+      assert.strictEqual(checkRunsPosted.length, 3);
+      const makefileCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+      assert.ok(makefileCheck);
+      // Content simply being unavailable must not be reported as a false
+      // validation failure.
+      assert.strictEqual(makefileCheck.conclusion, 'success');
+
+      assert.ok(commentBody);
+      assert.ok(commentBody.includes('Deep file-content validation skipped'));
+      assert.ok(commentBody.includes('file lookup(s)'));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('subrequest budget guard: does not warn or skip anything when the budget is not exhausted', async () => {
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'main' },
+        head: { ref: 'feature', sha: 'headsha123' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let graphqlCallCount = 0;
+    let commentBody = null;
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: true,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: true
+        }), { status: 200 });
+      }
+      if (url.includes('/labels')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([
+          {
+            sha: 'sha123',
+            html_url: 'https://github.com/test/repo/commit/sha123',
+            commit: {
+              message: 'mypkg: update config\n\nSigned-off-by: John Doe <john@doe.com>',
+              author: { name: 'John Doe', email: 'john@doe.com' },
+              committer: { name: 'John Doe', email: 'john@doe.com' }
+            }
+          }
+        ]), { status: 200 });
+      }
+      if (url.includes('/commits/sha123')) {
+        if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
+          return new Response(
+            'diff --git a/net/mypkg/files/etc/config/mypkg b/net/mypkg/files/etc/config/mypkg\n' +
+            '--- a/net/mypkg/files/etc/config/mypkg\n' +
+            '+++ b/net/mypkg/files/etc/config/mypkg\n' +
+            '+config mypkg global\n' +
+            '+option enabled 1\n',
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({
+          parents: [{ sha: 'parent-sha' }],
+          commit: {
+            message: 'mypkg: update config\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }), { status: 200 });
+      }
+      if (url.includes('/graphql')) {
+        graphqlCallCount++;
+        const { groups } = parseGraphqlRequest(options);
+        return graphqlResponse(groups, (owner, name, ref, path) => {
+          if (path === 'net/mypkg/Makefile') return 'PKG_NAME:=mypkg\n';
+          if (path === 'net/mypkg/files/etc/config/mypkg') return 'config mypkg global\noption enabled 1\n';
+          return null;
+        });
+      }
+      if (url.includes('/issues/123/comments')) {
+        if (options && options.method === 'POST') {
+          commentBody = JSON.parse(options.body).body;
+        }
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      // The lookups actually happened this time (default budget is ample).
+      assert.ok(graphqlCallCount >= 1);
+      // Whether or not this fixture's PR comment fires for unrelated
+      // business-logic reasons (e.g. a package-release-bump finding), it
+      // must never carry the budget-skip warning when the budget wasn't
+      // actually exhausted.
+      if (commentBody) {
+        assert.ok(!commentBody.includes('Deep file-content validation skipped'));
+      }
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;

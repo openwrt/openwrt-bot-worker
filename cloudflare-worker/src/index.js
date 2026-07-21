@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
-import { githubApiCall, fetchRepositoryConfig } from './github.js';
+import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
 import { handleScheduled } from './stale.js';
 
@@ -9,7 +9,17 @@ import { handleScheduled } from './stale.js';
 // Head branches that must not be used as the origin of a pull request.
 const PROTECTED_HEAD_BRANCHES = ['master', 'main', 'stable', 'openwrt-25.12', 'openwrt-24.10'];
 
-async function scanPrComments(repoFullname, prNumber, token) {
+// Parses an env var as an integer, falling back to `fallback` only when the
+// value is unset/unparseable — unlike `parseInt(x, 10) || fallback`, this
+// correctly honors an explicitly configured 0 instead of treating it the
+// same as "not set".
+function parseEnvInt(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+async function scanPrComments(repoFullname, prNumber, token, onCall) {
   let page = 1;
   let hasCherryPickBypassComment = false;
   let hasBranchBypassComment = false;
@@ -17,6 +27,7 @@ async function scanPrComments(repoFullname, prNumber, token) {
 
   while (true) {
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
+    onCall?.();
     const res = await githubApiCall(url, token);
     if (res.code !== 200 || !Array.isArray(res.data)) {
       return null;
@@ -175,6 +186,26 @@ async function handleWebhook(request, env) {
     return new Response("Could not generate installation access token", { status: 500 });
   }
 
+  // Cloudflare Workers cap outgoing fetch() calls per invocation (50 on Free,
+  // 1000 on Paid). Large PRs (e.g. kernel bumps touching hundreds of patch
+  // files) can burn through that budget on file-content lookups alone,
+  // starving the essential terminal writes (check-runs, PR comment) at the
+  // end of this handler — which is a silent total failure, not a degraded
+  // one. `subrequestBudget` tracks logical GitHub API calls made so far;
+  // `reserve` keeps enough headroom for those terminal writes to always run.
+  // This under-counts slightly (it doesn't count retry attempts inside
+  // githubApiCall's own internal 3x retry loop), which is why `limit`
+  // defaults a few requests under the Free plan's actual ceiling.
+  const subrequestBudget = {
+    limit: parseEnvInt(env.SUBREQUEST_BUDGET_LIMIT, 45),
+    reserve: parseEnvInt(env.SUBREQUEST_RESERVE_HEADROOM, 15),
+    used: 0
+  };
+  const trackedApiCall = (...args) => {
+    subrequestBudget.used++;
+    return githubApiCall(...args);
+  };
+
   if (event === "issue_comment") {
     const repoFullnameFromPayload = data.repository?.full_name;
     const prNumberFromIssue = data.issue?.number;
@@ -184,7 +215,7 @@ async function handleWebhook(request, env) {
     }
 
     const prUrl = `https://api.github.com/repos/${repoFullnameFromPayload}/pulls/${prNumberFromIssue}`;
-    const prRes = await githubApiCall(prUrl, token);
+    const prRes = await trackedApiCall(prUrl, token);
     if (prRes.code !== 200) {
       throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes.code})`);
     }
@@ -214,52 +245,182 @@ async function handleWebhook(request, env) {
 
   const fileCache = new Map();
   // Tracks where each ref is resolvable: 'base' means the base repo serves the
-  // ref, so a 404 for a path there is authoritative — the fork holds the
-  // identical tree for that commit, and the fork fallback would only burn a
-  // second subrequest to get the same 404 (this matters for speculative
-  // Makefile probes in findPkgRoot). 'fork' means the base repo cannot resolve
-  // the ref at all, so lookups skip the base repo entirely.
+  // ref, so a null (not-found) result for a path there is authoritative — the
+  // fork holds the identical tree for that commit, and probing the fork too
+  // would only burn a second subrequest to confirm the same absence (this
+  // matters for speculative Makefile probes in findPkgRoot). 'fork' means the
+  // base repo cannot resolve the ref at all, so lookups skip the base repo
+  // entirely.
   const refSource = new Map();
   // The base branch tip is by definition resolvable in the base repo.
   if (data.pull_request.base?.sha) {
     refSource.set(data.pull_request.base.sha, 'base');
   }
+
+  // Batching loader for file content: rather than firing one REST Contents-
+  // API call per (path, ref) — which is what blows through Cloudflare's
+  // per-invocation subrequest cap on PRs touching hundreds of files — calls
+  // are queued and flushed together on the next microtask tick via a single
+  // batched GraphQL query (see graphqlBatchFetchFiles in github.js). This is
+  // a classic DataLoader pattern: as long as callers fire off multiple
+  // fetchFileContentCached(...) calls without awaiting each one first (e.g.
+  // via Promise.all), they land in the same queue and go out together.
+  const pendingQueue = new Map(); // key -> { key, path, ref, resolve, reject }
+  let flushScheduled = false;
+  const GRAPHQL_CHUNK_SIZE = parseEnvInt(env.GRAPHQL_CHUNK_SIZE, 50);
+  // Counts (path, ref) lookups that came back empty purely because the
+  // subrequest budget ran out before they could be queried — surfaced later
+  // as one friendly PR-facing warning instead of silently under-reporting.
+  let budgetSkipCount = 0;
+
+  function scheduleFlush() {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    queueMicrotask(() => {
+      flushQueue().catch(err => console.error(`Unexpected error flushing file content queue: ${err.message}`));
+    });
+  }
+
+  async function flushQueue() {
+    flushScheduled = false;
+    if (pendingQueue.size === 0) return;
+    const batch = [...pendingQueue.values()];
+    pendingQueue.clear();
+
+    const headRepoFullname = data.pull_request?.head?.repo?.full_name;
+    const hasForkRepo = headRepoFullname && headRepoFullname !== repoFullname;
+
+    // Build probes: a ref whose resolvability is already known needs only
+    // one probe (base-only or fork-only); a ref that's still unknown is
+    // proactively probed in base AND fork within the same batched query —
+    // replacing the old reactive fetch -> 404 -> retry-under-fork pattern
+    // with a single round trip.
+    const probes = [];
+    const itemProbeKeys = new Map(); // item.key -> { baseKey, forkKey }
+    const unknownRefs = new Set();
+    for (const item of batch) {
+      const source = refSource.get(item.ref);
+      const keys = { baseKey: null, forkKey: null };
+      if (!hasForkRepo || source === 'base') {
+        keys.baseKey = `${item.key}|b`;
+        probes.push({ key: keys.baseKey, repoFullname, ref: item.ref, path: item.path });
+      } else if (source === 'fork') {
+        keys.forkKey = `${item.key}|f`;
+        probes.push({ key: keys.forkKey, repoFullname: headRepoFullname, ref: item.ref, path: item.path });
+      } else {
+        unknownRefs.add(item.ref);
+        keys.baseKey = `${item.key}|b`;
+        keys.forkKey = `${item.key}|f`;
+        probes.push({ key: keys.baseKey, repoFullname, ref: item.ref, path: item.path });
+        probes.push({ key: keys.forkKey, repoFullname: headRepoFullname, ref: item.ref, path: item.path });
+      }
+      itemProbeKeys.set(item.key, keys);
+    }
+
+    // For each still-unknown ref, piggyback a pair of ref-existence probes
+    // (bare-ref expression, no path) into the same batched query. A null
+    // file lookup can't distinguish "path missing at this ref" from "repo
+    // doesn't know this ref at all", so a flush where every speculative
+    // lookup misses (common when findPkgRoot walks up the directory tree)
+    // would otherwise leave the ref unknown forever — and every subsequent
+    // flush would keep dual-probing base and fork, doubling alias usage.
+    // The ' ' prefix keeps these keys collision-free from item keys,
+    // which are '<sha>:<path>|b' shaped.
+    const refProbeKeys = new Map(); // ref -> { baseKey, forkKey }
+    if (hasForkRepo) {
+      for (const ref of unknownRefs) {
+        const keys = { baseKey: ` ref:${ref}|b`, forkKey: ` ref:${ref}|f` };
+        probes.push({ key: keys.baseKey, repoFullname, ref, path: null });
+        probes.push({ key: keys.forkKey, repoFullname: headRepoFullname, ref, path: null });
+        refProbeKeys.set(ref, keys);
+      }
+    }
+
+    // Chunk to stay under the per-query alias cap, and check the shared
+    // subrequest budget before firing each chunk so the guaranteed terminal
+    // writes (labels, PR comment, check-runs) always keep enough headroom.
+    const resultsByProbeKey = new Map();
+    const fires = [];
+    for (let i = 0; i < probes.length; i += GRAPHQL_CHUNK_SIZE) {
+      const chunk = probes.slice(i, i + GRAPHQL_CHUNK_SIZE);
+      const available = subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used;
+      if (available <= 0) {
+        for (const p of chunk) resultsByProbeKey.set(p.key, { content: null, skipped: true });
+        continue;
+      }
+      subrequestBudget.used++;
+      fires.push(
+        graphqlBatchFetchFiles(token, chunk)
+          .then(map => { for (const [k, v] of map) resultsByProbeKey.set(k, v); })
+          .catch(err => { for (const p of chunk) resultsByProbeKey.set(p.key, { error: err }); })
+      );
+    }
+    await Promise.all(fires);
+
+    // Settle ref resolvability from the ref-existence probes first, so
+    // subsequent flushes probe only the repo that actually serves each ref.
+    for (const [ref, keys] of refProbeKeys) {
+      if (refSource.has(ref)) continue;
+      const baseRef = resultsByProbeKey.get(keys.baseKey);
+      const forkRef = resultsByProbeKey.get(keys.forkKey);
+      if (baseRef && !baseRef.error && baseRef.exists) {
+        refSource.set(ref, 'base');
+      } else if (baseRef && !baseRef.error && !baseRef.skipped && forkRef && !forkRef.error && forkRef.exists) {
+        // Base answered cleanly that it cannot resolve the ref, and the
+        // fork can — authoritative, unlike inferring from file misses.
+        refSource.set(ref, 'fork');
+        console.warn(`Ref ${ref} only resolves under head repo ${headRepoFullname}; subsequent file lookups at this ref will go straight to the fork.`);
+      }
+    }
+
+    for (const item of batch) {
+      const keys = itemProbeKeys.get(item.key);
+      const baseRes = keys.baseKey ? resultsByProbeKey.get(keys.baseKey) : null;
+      const forkRes = keys.forkKey ? resultsByProbeKey.get(keys.forkKey) : null;
+      const baseOk = baseRes && !baseRes.error;
+      const forkOk = forkRes && !forkRes.error;
+
+      if (baseOk && baseRes.content !== null) {
+        if (!refSource.has(item.ref)) refSource.set(item.ref, 'base');
+        item.resolve(baseRes.content);
+      } else if (baseOk && baseRes.exists) {
+        // The path exists in the base repo but has no readable text (binary
+        // or oversized blob). That's an authoritative answer — the fork
+        // holds the identical tree for this ref — and it also proves the
+        // base repo resolves the ref.
+        if (!refSource.has(item.ref)) refSource.set(item.ref, 'base');
+        item.resolve(null);
+      } else if (forkOk && forkRes.content !== null) {
+        // Base resolved cleanly (200-equivalent) but had nothing at this
+        // path/ref, while the fork does — the base repo simply cannot
+        // resolve this ref (identical trees otherwise). A budget-skipped
+        // base probe is not a clean miss, so it must not feed this
+        // inference.
+        if (baseOk && !baseRes.skipped && !refSource.has(item.ref)) {
+          refSource.set(item.ref, 'fork');
+          console.warn(`Ref ${item.ref} only resolves under head repo ${headRepoFullname}; subsequent file lookups at this ref will go straight to the fork.`);
+        }
+        item.resolve(forkRes.content);
+      } else if (baseOk || forkOk) {
+        // Every source we probed responded cleanly, and none had the file —
+        // a genuine "not found", not a transport error.
+        if (baseRes?.skipped || forkRes?.skipped) budgetSkipCount++;
+        item.resolve(null);
+      } else {
+        const err = (forkRes && forkRes.error) || (baseRes && baseRes.error) ||
+          new Error(`Failed to fetch file content for '${item.path}' at ref ${item.ref}: no data returned from GraphQL batch`);
+        item.reject(err);
+      }
+    }
+  }
+
   const fetchFileContentCached = (path, ref) => {
     const key = `${ref}:${path}`;
     if (!fileCache.has(key)) {
-      fileCache.set(key, (async () => {
-        const headRepoFullname = data.pull_request?.head?.repo?.full_name;
-        const hasForkRepo = headRepoFullname && headRepoFullname !== repoFullname;
-        const forkUrl = `https://api.github.com/repos/${headRepoFullname}/contents/${path}?ref=${ref}`;
-
-        let res;
-        if (hasForkRepo && refSource.get(ref) === 'fork') {
-          res = await githubApiCall(forkUrl, token, 'GET', null, 'application/vnd.github.raw');
-        } else {
-          const url = `https://api.github.com/repos/${repoFullname}/contents/${path}?ref=${ref}`;
-          res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github.raw');
-          if (res.code === 200 && !refSource.has(ref)) {
-            refSource.set(ref, 'base');
-          }
-
-          const authoritative404 = res.code === 404 && refSource.get(ref) === 'base';
-          if ((res.code === 404 || res.code >= 500) && hasForkRepo && !authoritative404) {
-            console.warn(`Failed to fetch file content for '${path}' at ref ${ref} under base repo ${repoFullname} (HTTP ${res.code}). Retrying under head repo ${headRepoFullname}...`);
-            const was404 = res.code === 404;
-            res = await githubApiCall(forkUrl, token, 'GET', null, 'application/vnd.github.raw');
-            // Base 404 + fork 200 for the same SHA can only mean the base repo
-            // cannot resolve the ref (identical trees otherwise).
-            if (was404 && res.code === 200 && !refSource.has(ref)) {
-              refSource.set(ref, 'fork');
-            }
-          }
-        }
-
-        if (res.code === 200) return res.raw;
-        if (res.code === 404) return null;
-        const cleanRaw = (res.raw || "").trim().slice(0, 200);
-        throw new Error(`Failed to fetch file content for '${path}' at ref ${ref} (HTTP ${res.code}): ${cleanRaw}`);
-      })());
+      fileCache.set(key, new Promise((resolve, reject) => {
+        pendingQueue.set(key, { key, path, ref, resolve, reject });
+        scheduleFlush();
+      }));
     }
     return fileCache.get(key);
   };
@@ -271,16 +432,16 @@ async function handleWebhook(request, env) {
   const pages = Math.ceil(commitsCount / 100);
   const commitsPromises = [];
   for (let p = 1; p <= Math.min(pages, 3); p++) {
-    commitsPromises.push(githubApiCall(`${commitsUrl}?per_page=100&page=${p}`, token));
+    commitsPromises.push(trackedApiCall(`${commitsUrl}?per_page=100&page=${p}`, token));
   }
 
   const labelerUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/labeler.yml?ref=${encodeURIComponent(baseBranch)}`;
 
   // OPTIMIZATION: Fetch repository config, first page of repository labels, labeler config, and commits list pages in parallel
   const [CONFIG, firstLabelsRes, labelerRes, ...commitsResList] = await Promise.all([
-    fetchRepositoryConfig(data, token, DEFAULT_CONFIG),
-    githubApiCall(`${labelsUrl}?per_page=100&page=1`, token),
-    githubApiCall(labelerUrl, token, 'GET', null, 'application/vnd.github.raw'),
+    fetchRepositoryConfig(data, token, DEFAULT_CONFIG, () => { subrequestBudget.used++; }),
+    trackedApiCall(`${labelsUrl}?per_page=100&page=1`, token),
+    trackedApiCall(labelerUrl, token, 'GET', null, 'application/vnd.github.raw'),
     ...commitsPromises
   ]);
 
@@ -297,7 +458,7 @@ async function handleWebhook(request, env) {
   if (firstPageLabels.length === 100) {
     let page = 2;
     while (true) {
-      const res = await githubApiCall(`${labelsUrl}?per_page=100&page=${page}`, token);
+      const res = await trackedApiCall(`${labelsUrl}?per_page=100&page=${page}`, token);
       if (res.code !== 200) {
         const cleanRaw = (res.raw || "").trim().slice(0, 200);
         throw new Error(`GitHub API returned HTTP ${res.code} when fetching repository labels (page ${page}): ${cleanRaw}`);
@@ -329,7 +490,7 @@ async function handleWebhook(request, env) {
   let fetchCommentsRetried = false;
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token).catch(() => null);
+      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }).catch(() => null);
     }
     return fetchCommentsPromise;
   };
@@ -404,7 +565,7 @@ async function handleWebhook(request, env) {
 
   const fetchPrWidePatch = async () => {
     const prPatchUrl = data.pull_request.url;
-    const prPatchRes = await githubApiCall(prPatchUrl, token, 'GET', null, 'application/vnd.github.patch');
+    const prPatchRes = await trackedApiCall(prPatchUrl, token, 'GET', null, 'application/vnd.github.patch');
     if (prPatchRes.code !== 200) {
       const cleanRaw = (prPatchRes.raw || "").trim().slice(0, 200);
       throw new Error(`Failed to fetch overall PR patch (HTTP ${prPatchRes.code}): ${cleanRaw}`);
@@ -436,7 +597,7 @@ async function handleWebhook(request, env) {
     let commitPatch = null;
     if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
-      let patchRes = await githubApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
+      let patchRes = await trackedApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
       if (patchRes.code === 200 && !refSource.has(sha)) {
         // The base repo resolves this SHA, so later /contents/ lookups at this
         // ref never need the fork fallback.
@@ -452,7 +613,7 @@ async function handleWebhook(request, env) {
         const forkDetailUrl = `https://api.github.com/repos/${headRepoFullname}/commits/${sha}`;
         // Use silent: true so 404/422 on the fork is not logged as an error
         // (the fork may not have the commit either if it was force-pushed).
-        patchRes = await githubApiCall(forkDetailUrl, token, 'GET', null, 'application/vnd.github.patch', { silent: true });
+        patchRes = await trackedApiCall(forkDetailUrl, token, 'GET', null, 'application/vnd.github.patch', { silent: true });
         if (patchRes.code === 200 && !refSource.has(sha)) {
           refSource.set(sha, 'fork');
         }
@@ -476,8 +637,14 @@ async function handleWebhook(request, env) {
       if (match) {
         upstreamSha = match[1];
         const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${upstreamSha}`;
-        const upstreamRes = await githubApiCall(upstreamUrl, token, 'GET', null, 'application/vnd.github.patch');
+        const upstreamRes = await trackedApiCall(upstreamUrl, token, 'GET', null, 'application/vnd.github.patch');
         if (upstreamRes.code === 200) {
+          // The base repo just served this commit, so later file lookups at
+          // this ref (upstream-diff filtering on backports) never need the
+          // fork fallback probes.
+          if (!refSource.has(upstreamSha)) {
+            refSource.set(upstreamSha, 'base');
+          }
           upstreamPatch = upstreamRes.raw;
           if (commitPatch) {
             isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
@@ -788,6 +955,20 @@ async function handleWebhook(request, env) {
     makefileOutputText += "\n";
   }
 
+  // If the subrequest budget ran out before every file-content lookup could
+  // be made, some deep validation (patch headers, UCI configs, package
+  // release bumps) may be incomplete for this PR — surface that plainly
+  // rather than silently under-reporting. This never blocks the terminal
+  // writes below (labels, comment, check-runs), which is the whole point:
+  // a PR too large to fully audit still gets a clear status instead of no
+  // response at all.
+  if (budgetSkipCount > 0) {
+    const budgetWarning = `Deep file-content validation skipped for ${budgetSkipCount} file lookup(s): PR too large for the available API subrequest budget (used ${subrequestBudget.used}/${subrequestBudget.limit}, ${subrequestBudget.reserve} reserved for status reporting). Some patch header, UCI config, or package-release checks may be incomplete.`;
+    allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${budgetWarning}`);
+    makefileOutputText += `⚠️ Warning: ${budgetWarning}\n\n`;
+    patchesOutputText += `⚠️ Warning: ${budgetWarning}\n\n`;
+  }
+
   const formalityPassed = allFormalityErrors.length === 0;
   const makefilePassed = allMakefileErrors.length === 0;
   const patchesPassed = allPatchesErrors.length === 0;
@@ -800,7 +981,7 @@ async function handleWebhook(request, env) {
 
   async function ensureLabelExists(name, color, description) {
     if (!existingLabels.has(name.toLowerCase())) {
-      await githubApiCall(labelsUrl, token, 'POST', { name, color, description });
+      await trackedApiCall(labelsUrl, token, 'POST', { name, color, description });
     }
   }
 
@@ -814,7 +995,7 @@ async function handleWebhook(request, env) {
   } else {
     // Delete validation failure label if present
     if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(githubApiCall(`${prLabelUrl}/${encodeURIComponent(LABEL_GUIDELINES)}`, token, 'DELETE'));
+      labelOperations.push(trackedApiCall(`${prLabelUrl}/${encodeURIComponent(LABEL_GUIDELINES)}`, token, 'DELETE'));
     }
   }
 
@@ -873,7 +1054,7 @@ async function handleWebhook(request, env) {
 
   // Apply all relevant labels to the PR in one API call
   if (labelsToAdd.length > 0) {
-    await githubApiCall(prLabelUrl, token, 'POST', { labels: labelsToAdd });
+    await trackedApiCall(prLabelUrl, token, 'POST', { labels: labelsToAdd });
   }
 
   // PR Comment Management
@@ -938,13 +1119,13 @@ async function handleWebhook(request, env) {
         commentBody += footerMd;
 
         if (existingCommentId) {
-          commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) }));
+          commentPromises.push(trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) }));
         } else {
-          commentPromises.push(githubApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) }));
+          commentPromises.push(trackedApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) }));
         }
       } else {
         if (existingCommentId) {
-          commentPromises.push(githubApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE'));
+          commentPromises.push(trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE'));
         }
       }
     }
@@ -954,7 +1135,7 @@ async function handleWebhook(request, env) {
   const checkRunsUrl = `https://api.github.com/repos/${repoFullname}/check-runs`;
 
   const checkRunsPromises = [
-    githubApiCall(checkRunsUrl, token, 'POST', {
+    trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Git & Commits', head_sha: headSha, status: 'completed',
       conclusion: formalityPassed ? 'success' : 'failure',
       output: {
@@ -963,7 +1144,7 @@ async function handleWebhook(request, env) {
         text: safeTruncate(formalityOutputText)
       }
     }),
-    githubApiCall(checkRunsUrl, token, 'POST', {
+    trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / OpenWrt Makefiles', head_sha: headSha, status: 'completed',
       conclusion: makefilePassed ? 'success' : 'failure',
       output: {
@@ -972,7 +1153,7 @@ async function handleWebhook(request, env) {
         text: safeTruncate(makefileOutputText)
       }
     }),
-    githubApiCall(checkRunsUrl, token, 'POST', {
+    trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
       conclusion: patchesPassed ? 'success' : 'failure',
       output: {

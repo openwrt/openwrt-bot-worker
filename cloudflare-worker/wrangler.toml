@@ -23,3 +23,15 @@ crons = ["30 5 * * *"]
 [vars]
 DEPLOY_HASH = "unknown"
 DEPLOY_DATE = "unknown"
+
+# Cloudflare Workers cap outgoing fetch() calls per invocation (50 on Free,
+# 1000 on Paid). SUBREQUEST_BUDGET_LIMIT is the internal ceiling the handler
+# uses when deciding whether it still has room for optional deep-validation
+# file lookups; SUBREQUEST_RESERVE_HEADROOM is kept off the top of that
+# budget for the always-required terminal writes (labels, PR comment,
+# check-runs), so those never get starved even on huge PRs. Raise
+# SUBREQUEST_BUDGET_LIMIT (e.g. to ~900) after upgrading to Workers Paid.
+SUBREQUEST_BUDGET_LIMIT = "45"
+SUBREQUEST_RESERVE_HEADROOM = "15"
+# Max number of aliased file lookups batched into a single GraphQL query.
+GRAPHQL_CHUNK_SIZE = "50"
