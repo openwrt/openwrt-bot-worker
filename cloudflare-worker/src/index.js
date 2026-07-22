@@ -892,7 +892,7 @@ async function handleWebhook(request, env) {
 
   let releaseDetails = usePrWidePatch 
     ? [{ commitPatch: prPatch }] 
-    : commitDetails;
+    : commitDetails.filter(item => (item.fullCommit?.parents || []).length <= 1);
 
   if (isBackportPr) {
     releaseDetails = releaseDetails.filter(item => !item.isVerbatim);
