@@ -1106,7 +1106,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
     'system', 'multimedia', 'mail', 'sound', 'network'
   ]);
-  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby']);
+  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua']);
 
   const hasPkgName = async (dir) => {
     if (!fetchFileContent) return false;

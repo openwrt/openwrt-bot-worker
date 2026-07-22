@@ -2549,6 +2549,9 @@ describe('findPkgRoot', () => {
     assert.strictEqual(await findPkgRoot('lang/perl/perl-libxml/Makefile', null), 'lang/perl/perl-libxml');
     assert.strictEqual(await findPkgRoot('lang/php/php8-pecl-redis/Makefile', null), 'lang/php/php8-pecl-redis');
     assert.strictEqual(await findPkgRoot('lang/ruby/ruby-sass-listen/Makefile', null), 'lang/ruby/ruby-sass-listen');
+    assert.strictEqual(await findPkgRoot('lang/lua/lua-foo/Makefile', null), 'lang/lua/lua-foo');
+    assert.strictEqual(await findPkgRoot('lang/lua/lua-foo/patches/001-fix.patch', null), 'lang/lua/lua-foo');
+    assert.strictEqual(await findPkgRoot('package/lang/lua/lua-foo/Makefile', null), 'package/lang/lua/lua-foo');
 
     // Non-nested languages (e.g. golang)
     assert.strictEqual(await findPkgRoot('lang/golang/Makefile', null), 'lang/golang');
