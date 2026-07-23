@@ -81,9 +81,9 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   }
 }
 
-export async function fetchRepositoryConfig(data, token, defaultConfig, onCall) {
+export async function fetchRepositoryConfig(data, token, defaultConfig, onCall, branchRefOverride) {
   const repoFullname = data.repository.full_name;
-  const branchRef = data.pull_request.base.ref;
+  const branchRef = branchRefOverride || data.pull_request?.base?.ref || data.repository?.default_branch || 'main';
   const configUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/formalities.json?ref=${encodeURIComponent(branchRef)}`;
 
   onCall?.();
@@ -211,6 +211,110 @@ export async function graphqlBatchFetchFiles(token, probes) {
       results.set(meta.key, { content: null, exists: false, isBinary: false });
     }
   }
+
+  return results;
+}
+
+// --- GRAPHQL REPOSITORY LABELS FETCH ---
+// Fetches all repository label names in a single paginated GraphQL query,
+// replacing multiple REST calls (one per 100-label page). Returns a Set of
+// lowercased label names for O(1) existence checks.
+export async function graphqlFetchRepoLabels(token, repoFullname) {
+  const slashIndex = repoFullname.indexOf('/');
+  const owner = repoFullname.slice(0, slashIndex);
+  const name = repoFullname.slice(slashIndex + 1);
+
+  const labels = new Set();
+  let cursor = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const afterClause = cursor ? `, after: "${cursor}"` : '';
+    const query = `query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    labels(first: 100${afterClause}) {
+      nodes { name }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+
+    const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables: { owner, name } });
+
+    if (res.code !== 200 || !res.data?.data?.repository?.labels) {
+      const cleanRaw = (res.raw || '').trim().slice(0, 200);
+      throw new Error(`GraphQL label fetch failed (HTTP ${res.code}): ${cleanRaw}`);
+    }
+
+    const labelData = res.data.data.repository.labels;
+    for (const node of labelData.nodes) {
+      labels.add(node.name.toLowerCase());
+    }
+    hasNextPage = labelData.pageInfo.hasNextPage;
+    cursor = labelData.pageInfo.endCursor;
+  }
+
+  return labels;
+}
+
+// Creates a repository label if it does not already exist. Shared by both
+// the PR labeler and the issue labeller. Returns true if created, false if
+// it already existed.
+export async function ensureLabelExists(token, repoFullname, name, color, description, existingLabels, onCall) {
+  if (existingLabels.has(name.toLowerCase())) return false;
+  onCall?.();
+  const url = `https://api.github.com/repos/${repoFullname}/labels`;
+  await githubApiCall(url, token, 'POST', { name, color: color || 'ededed', description: description || '' });
+  existingLabels.add(name.toLowerCase());
+  return true;
+}
+
+// --- GRAPHQL ISSUE VALIDATION HELPERS ---
+// Checks tag existence and file/directory presence in a single batched query.
+// probes: Array<{ key: string, type: 'tag' | 'path', value: string }>
+//   type 'tag': checks if refs/tags/<value> exists
+//   type 'path': checks if <ref>:<value> object exists (file or tree)
+// Returns Map<key, boolean>
+export async function graphqlCheckExistence(token, repoFullname, ref, probes) {
+  const results = new Map();
+  if (!probes || probes.length === 0) return results;
+
+  const slashIndex = repoFullname.indexOf('/');
+  const owner = repoFullname.slice(0, slashIndex);
+  const name = repoFullname.slice(slashIndex + 1);
+
+  const varDefs = ['$owner: String!', '$name: String!'];
+  const variables = { owner, name };
+  const fieldParts = [];
+
+  probes.forEach((probe, i) => {
+    const alias = `p${i}`;
+    const eVar = `expr${i}`;
+    varDefs.push(`$${eVar}: String!`);
+    if (probe.type === 'tag') {
+      variables[eVar] = `refs/tags/${probe.value}`;
+      fieldParts.push(`${alias}: ref(qualifiedName: $${eVar}) { name }`);
+    } else {
+      variables[eVar] = `${ref}:${probe.value}`;
+      fieldParts.push(`${alias}: object(expression: $${eVar}) { oid }`);
+    }
+  });
+
+  const query = `query(${varDefs.join(', ')}) {\n  repository(owner: $owner, name: $name) {\n    ${fieldParts.join('\n    ')}\n  }\n}`;
+
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables });
+
+  if (res.code !== 200 || !res.data?.data?.repository) {
+    // On failure, mark all as non-existent rather than throwing
+    for (const probe of probes) results.set(probe.key, false);
+    return results;
+  }
+
+  const repoData = res.data.data.repository;
+  probes.forEach((probe, i) => {
+    const field = repoData[`p${i}`];
+    results.set(probe.key, field !== null && field !== undefined);
+  });
 
   return results;
 }

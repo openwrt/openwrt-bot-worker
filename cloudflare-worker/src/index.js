@@ -1,9 +1,10 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
-import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles } from './github.js';
+import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
 import { handleScheduled } from './stale.js';
+import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
 // Head branches that must not be used as the origin of a pull request.
@@ -149,7 +150,7 @@ async function handleWebhook(request, env) {
 
   const data = JSON.parse(payloadText);
   const event = request.headers.get("x-github-event");
-  if (event !== "pull_request" && event !== "issue_comment") {
+  if (event !== "pull_request" && event !== "issue_comment" && event !== "issues") {
     return new Response("Not a pull request or issue comment event", { status: 200 });
   }
 
@@ -185,6 +186,30 @@ async function handleWebhook(request, env) {
     console.error(`Webhook processing failed: Could not generate installation access token for installation ID ${installationId}.`);
     return new Response("Could not generate installation access token", { status: 500 });
   }
+
+  // --- ISSUES EVENT: Issue Labeller ---
+  if (event === "issues") {
+    if (data.action !== "opened") {
+      return new Response("Ignored issues action", { status: 200 });
+    }
+    const repoFullname = data.repository.full_name;
+    const issueConfig = await fetchRepositoryConfig(data, token, DEFAULT_CONFIG, null);
+    if (!issueConfig.enable_issue_labeller) {
+      return new Response("Issue labeller disabled for this repository", { status: 200 });
+    }
+    const defaultBranch = data.repository.default_branch || "main";
+    const labellerYmlUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/issue-labeller.yml?ref=${encodeURIComponent(defaultBranch)}`;
+    const labellerRes = await githubApiCall(labellerYmlUrl, token, "GET", null, "application/vnd.github.raw");
+    const labellerConfig = (labellerRes.code === 200 && labellerRes.raw)
+      ? (parseIssueLabellerYaml(labellerRes.raw) || DEFAULT_ISSUE_LABELLER_CONFIG)
+      : DEFAULT_ISSUE_LABELLER_CONFIG;
+    const existingLabels = await graphqlFetchRepoLabels(token, repoFullname);
+    const labelling = await handleIssueLabeller(data, token, labellerConfig, repoFullname);
+    const currentIssueLabels = new Set((data.issue.labels || []).map(l => (typeof l === "string" ? l : l.name).toLowerCase()));
+    await applyIssueLabelling(labelling, token, repoFullname, data.issue.number, existingLabels, currentIssueLabels, null);
+    return new Response(`Success: Processed issue labeller for issue #${data.issue.number}`, { status: 200 });
+  }
+
 
   // Cloudflare Workers cap outgoing fetch() calls per invocation (50 on Free,
   // 1000 on Paid). Large PRs (e.g. kernel bumps touching hundreds of patch
@@ -437,44 +462,13 @@ async function handleWebhook(request, env) {
 
   const labelerUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/labeler.yml?ref=${encodeURIComponent(baseBranch)}`;
 
-  // OPTIMIZATION: Fetch repository config, first page of repository labels, labeler config, and commits list pages in parallel
-  const [CONFIG, firstLabelsRes, labelerRes, ...commitsResList] = await Promise.all([
+  // OPTIMIZATION: Fetch repository config, repository labels (GraphQL), labeler config, and commits list pages in parallel
+  const [CONFIG, existingLabels, labelerRes, ...commitsResList] = await Promise.all([
     fetchRepositoryConfig(data, token, DEFAULT_CONFIG, () => { subrequestBudget.used++; }),
-    trackedApiCall(`${labelsUrl}?per_page=100&page=1`, token),
+    graphqlFetchRepoLabels(token, repoFullname).then(labels => { subrequestBudget.used++; return labels; }),
     trackedApiCall(labelerUrl, token, 'GET', null, 'application/vnd.github.raw'),
     ...commitsPromises
   ]);
-
-  if (firstLabelsRes.code !== 200) {
-    const cleanRaw = (firstLabelsRes.raw || "").trim().slice(0, 200);
-    throw new Error(`GitHub API returned HTTP ${firstLabelsRes.code} when fetching repository labels: ${cleanRaw}`);
-  }
-
-  if (!Array.isArray(firstLabelsRes.data)) {
-    throw new Error(`Expected repository labels (page 1) to be an array, but received: ${typeof firstLabelsRes.data}`);
-  }
-  const firstPageLabels = firstLabelsRes.data;
-  const allLabels = [...firstPageLabels];
-  if (firstPageLabels.length === 100) {
-    let page = 2;
-    while (true) {
-      const res = await trackedApiCall(`${labelsUrl}?per_page=100&page=${page}`, token);
-      if (res.code !== 200) {
-        const cleanRaw = (res.raw || "").trim().slice(0, 200);
-        throw new Error(`GitHub API returned HTTP ${res.code} when fetching repository labels (page ${page}): ${cleanRaw}`);
-      }
-      if (!Array.isArray(res.data)) {
-        throw new Error(`Expected repository labels (page ${page}) to be an array, but received: ${typeof res.data}`);
-      }
-      allLabels.push(...res.data);
-      if (res.data.length < 100) {
-        break;
-      }
-      page++;
-    }
-  }
-
-  const existingLabels = new Set(allLabels.map(l => l.name.toLowerCase()));
   
   let commits = [];
   for (let i = 0; i < commitsResList.length; i++) {
@@ -979,17 +973,15 @@ async function handleWebhook(request, env) {
   const labelsToAdd = [];
   const labelOperations = [];
 
-  async function ensureLabelExists(name, color, description) {
-    if (!existingLabels.has(name.toLowerCase())) {
-      await trackedApiCall(labelsUrl, token, 'POST', { name, color, description });
-    }
+  async function ensureLabel(name, color, description) {
+    await ensureLabelExists(token, repoFullname, name, color, description, existingLabels, () => { subrequestBudget.used++; });
   }
 
   const currentPrLabels = new Set((data.pull_request?.labels || []).map(l => l.name.toLowerCase()));
 
   if (!allPassed) {
     if (!currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(ensureLabelExists(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
+      labelOperations.push(ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
       labelsToAdd.push(LABEL_GUIDELINES);
     }
   } else {
@@ -1000,12 +992,12 @@ async function handleWebhook(request, env) {
   }
 
   if (CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
-    labelOperations.push(ensureLabelExists(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
+    labelOperations.push(ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
     labelsToAdd.push(LABEL_ADD_PACKAGE);
   }
 
   if (CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
-    labelOperations.push(ensureLabelExists(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
+    labelOperations.push(ensureLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
     labelsToAdd.push(LABEL_DROP_PACKAGE);
   }
 
@@ -1013,7 +1005,7 @@ async function handleWebhook(request, env) {
     const version = baseBranch.split('-')[1];
     const labelName = `release/${version}`;
     if (!currentPrLabels.has(labelName.toLowerCase())) {
-      labelOperations.push(ensureLabelExists(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
+      labelOperations.push(ensureLabel(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
       labelsToAdd.push(labelName);
     }
   }
@@ -1040,7 +1032,7 @@ async function handleWebhook(request, env) {
       const matchedLabels = getLabelsForChangedFiles(changedFiles, parsedLabeler);
       for (const label of matchedLabels) {
         if (!currentPrLabels.has(label.toLowerCase())) {
-          labelOperations.push(ensureLabelExists(label, 'bfd4f2', ''));
+          labelOperations.push(ensureLabel(label, 'bfd4f2', ''));
           labelsToAdd.push(label);
         }
       }

@@ -26,7 +26,6 @@ export const DEFAULT_CONFIG = {
   add_package_label: true,
   drop_package_label: true,
   branch_labeling: true,
-  enable_labeler_yml: false,
   check_openwrt_meta: true,
   check_conffiles: true,
   check_uci_config: true,
@@ -43,6 +42,10 @@ export const DEFAULT_CONFIG = {
 
   // Identity / Account linking Check features
   require_linked_github_account: true,
+
+  // Labeler features
+  enable_labeler_yml: false,
+  enable_issue_labeller: false,
 };
 
 export const LABEL_GUIDELINES = 'not following guidelines';

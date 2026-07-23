@@ -58,6 +58,7 @@ Scans the contribution tree for nested downstream patch targets:
 *   **`not following guidelines`**: A high-visibility tag automatically attached to the PR if any critical validation check drops a failure blueprint. Clears itself upon a successful push.
 *   **`add package` / `drop package`**: Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages.
 *   **Stable Branch Tracking**: Auto-generates matching grey release tags (e.g., `release/24.10`, `release/25.12`) whenever a PR targets an active release backport branch.
+*   **Issue Labeller**: Replaces the GitHub Actions `issue-labeller.yml` workflow. When a bug-report issue is opened with the trigger label, the bot validates form fields and applies labels based on a declarative `.github/issue-labeller.yml` configuration file (same spirit as `labeler.yml` for PRs — label name → list of conditions). Supports template variables (`{major}`, `{segment0}`, etc.), format validation (regex), existence checks (tag/path via GraphQL), substring matching, and presence checks. Falls back to sensible defaults if no config file exists. Disabled by default — enable per-repository with `"enable_issue_labeller": true`.
 *   **Stale PR Cleanup**: A daily scheduled cron task (05:30 UTC) scans all repositories where the App is installed. If explicitly enabled in a repository's configuration (\`"enable_stale_bot": true\`), it marks PRs containing the \`not following guidelines\` label as \`stale\` (with a warning comment) after 14 days of inactivity, and closes them after another 14 days of silence.
 
 > [!TIP]
@@ -83,6 +84,7 @@ The GitHub App requires the following permissions and event subscriptions:
     *   **Contents:** `Read-only` (to fetch repository-specific configurations like `.github/formalities.json`)
 *   **Event Subscriptions:**
     *   Subscribe to **Pull request** events (triggers on opened, synchronized, and reopened).
+    *   Subscribe to **Issues** events (triggers on opened — required for the issue labeller feature).
 
 ### 2. Cloudflare Worker Configuration
 
@@ -122,6 +124,7 @@ Some configuration keys offer advanced options:
 *   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 *   `enable_labeler_yml`: Set to `true` to enable dynamic pull request labeling based on matching files in the `.github/labeler.yml` configuration file. Defaults to `false` (opt-in).
+*   `enable_issue_labeller`: Set to `true` to enable automated issue form validation and labelling (replaces the GitHub Actions `issue-labeller.yml` workflow). Defaults to `false` (opt-in).
 
 Here is a comprehensive example containing all available toggle options:
 
@@ -160,6 +163,71 @@ Here is a comprehensive example containing all available toggle options:
   "require_linked_github_account": true,
   "check_openwrt_spelling": true,
   "enable_stale_bot": false,
-  "enable_labeler_yml": false
+  "enable_labeler_yml": false,
+  "enable_issue_labeller": false
 }
 ```
+
+### 5. Issue Labeller Configuration (`.github/issue-labeller.yml`)
+
+When `enable_issue_labeller` is `true`, the bot fetches `.github/issue-labeller.yml` from the repository's default branch. The format mirrors `labeler.yml` — each top-level key is a **label name** (supporting `{template}` variables), followed by a list of **conditions** that must all match for the label to apply.
+
+**Template variables** (extracted from the matched field value):
+*   `{value}` — full trimmed value
+*   `{segment0}`, `{segment1}`, … — slash-separated parts (`ramips/mt7621` → `ramips`, `mt7621`)
+*   `{major}`, `{minor}`, `{patch}` — dot-separated parts (`24.10.0` → `24`, `10`, `0`)
+*   `{hash}` — trailing hex string after last `-` (`r28945-24a9f1c224` → `24a9f1c224`)
+
+**Condition types:**
+*   `field` — form field name to check (case-insensitive, normalized to snake_case)
+*   `format` — regex the field value must match (invalid format → `invalid` label + comment)
+*   `exists` — existence check via GraphQL: `"tag:v{value}"`, `"path:target/linux/{segment0}"`, or `"commit:{hash}"`
+*   `contains` — case-insensitive substring match
+*   `not_empty` — field must be non-empty
+
+**Meta keys** (underscore-prefixed, not labels):
+*   `_trigger_label` — label required on the issue to start processing (default: `to-triage`)
+*   `_invalid_label` — label added when validation fails (default: `invalid`)
+*   `_remove_labels` — labels always removed after processing (default: `["to-triage"]`)
+*   `_invalid_comment` — comment template for invalid fields (default: `Invalid {field} reported. \`{value}\``)
+
+**Per-label metadata** (inside a label block, underscore-prefixed):
+*   `_color` — hex color used when the label is auto-created (default: `ededed`)
+*   `_description` — description used when the label is auto-created
+
+**Example:**
+
+```yaml
+# .github/issue-labeller.yml
+_trigger_label: "to-triage"
+_invalid_label: "invalid"
+_remove_labels: ["to-triage"]
+
+"release/{major}.{minor}":
+  _color: "6b7280"
+  _description: "OpenWrt release version reported"
+  - field: "release"
+    format: '^\d+\.\d+\.\d+(-rc\d+)*$|^\d+\.\d+-SNAPSHOT$'
+    exists: "tag:v{value}"
+
+"target/{segment0}":
+  _color: "0e7490"
+  _description: "Hardware target reported"
+  - field: "target"
+    format: '^[a-zA-Z0-9]+/[a-zA-Z0-9]+$'
+    exists: "path:target/linux/{segment0}/{segment1}"
+
+"Official Image":
+  - field: "image_kind"
+    contains: "official"
+
+"Self Built Image":
+  - field: "image_kind"
+    contains: "self"
+
+"Supported Device":
+  - field: "device"
+    not_empty: true
+```
+
+If the file is absent, the bot falls back to the default rules shown above.

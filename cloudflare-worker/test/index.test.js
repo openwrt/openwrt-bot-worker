@@ -75,6 +75,26 @@ function graphqlResponse(groups, resolver) {
   return new Response(JSON.stringify({ data }), { status: 200 });
 }
 
+// Helper: detect and respond to GraphQL labels queries in mocks.
+// Returns a Response if the request is a labels query, null otherwise.
+function graphqlLabelsHandler(url, options, labelNames = []) {
+  if (!url.includes('/graphql')) return null;
+  if (!options || !options.body) return null;
+  const body = JSON.parse(options.body);
+  if (!body.query || !body.query.includes('labels(first:')) return null;
+  return new Response(JSON.stringify({
+    data: {
+      repository: {
+        labels: {
+          nodes: labelNames.map(name => ({ name })),
+          pageInfo: { hasNextPage: false, endCursor: null }
+        }
+      }
+    }
+  }), { status: 200 });
+}
+
+
 async function generateTestPrivateKeyPEM() {
   const keyPair = await crypto.subtle.generateKey(
     {
@@ -218,9 +238,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       if (url.includes('/formalities.json')) {
         return new Response(JSON.stringify({}), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/commits')) {
         return new Response('API rate limit exceeded', { status: 403 });
       }
@@ -358,9 +376,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
@@ -481,9 +497,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
@@ -600,9 +614,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         const parsedUrl = new URL(url);
         const page = Number(parsedUrl.searchParams.get('page') || '1');
@@ -1017,9 +1029,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/issues/123/comments') && (!options || options.method === 'GET')) {
         const parsedUrl = new URL(url);
         const page = parsedUrl.searchParams.get('page') || '1';
@@ -1285,9 +1295,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/commits')) {
         const commitData = {
           sha: 'abcdef123456',
@@ -1386,9 +1394,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/commits')) {
         const commitData = {
           sha: 'abcdef123456',
@@ -1476,9 +1482,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.endsWith('/pulls/123')) {
         prFetched = true;
         return new Response(JSON.stringify({
@@ -1590,9 +1594,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/issues/123/comments') && (!options || options.method === 'GET')) {
         return new Response(JSON.stringify([]), { status: 200 });
       }
@@ -1807,9 +1809,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
@@ -1915,9 +1915,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
@@ -2007,9 +2005,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
@@ -2287,9 +2283,7 @@ index 123456..789012 100644
             ...config
           }), { status: 200 });
         }
-        if (url.includes('/labels')) {
-          return new Response(JSON.stringify([]), { status: 200 });
-        }
+        { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
         if (url.includes('/pulls/123/commits')) {
           return new Response(JSON.stringify([
             {
@@ -2413,9 +2407,7 @@ index 123456..789012 100644
           check_uci_config: true
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -2455,6 +2447,7 @@ index 123456..789012 100644
         }), { status: 200 });
       }
       if (url.includes('/graphql')) {
+        { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
         graphqlCallCount++;
         const { groups } = parseGraphqlRequest(options);
         for (const group of groups) {
@@ -2569,9 +2562,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -2703,9 +2694,7 @@ index 123456..789012 100644
           check_uci_config: true
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -2730,6 +2719,7 @@ index 123456..789012 100644
         );
       }
       if (url.includes('/graphql')) {
+        { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
         graphqlCallCount++;
         const { groups } = parseGraphqlRequest(options);
         const hasBaseGroup = groups.some(g => g.owner === 'test' && g.name === 'repo');
@@ -2851,9 +2841,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -2879,6 +2867,7 @@ index 123456..789012 100644
         );
       }
       if (url.includes('/graphql')) {
+        { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
         graphqlCallCount++;
         const { groups } = parseGraphqlRequest(options);
         if (groups.some(g => g.owner === 'forked' && g.name === 'repo')) {
@@ -2975,9 +2964,7 @@ index 123456..789012 100644
           require_body: false
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -3100,9 +3087,7 @@ index 123456..789012 100644
           check_uci_config: true
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -3138,6 +3123,7 @@ index 123456..789012 100644
       }
       // The budget is forced to zero below, so this must never be hit.
       if (url.includes('/graphql')) {
+        { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
         graphqlCallCount++;
         return new Response(JSON.stringify({ data: {} }), { status: 200 });
       }
@@ -3249,9 +3235,7 @@ index 123456..789012 100644
           check_uci_config: true
         }), { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -3286,6 +3270,7 @@ index 123456..789012 100644
         }), { status: 200 });
       }
       if (url.includes('/graphql')) {
+        { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
         graphqlCallCount++;
         const { groups } = parseGraphqlRequest(options);
         return graphqlResponse(groups, (owner, name, ref, path) => {
@@ -3405,9 +3390,7 @@ index 123456..789012 100644
 `;
         return new Response(labelerYaml, { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -3520,9 +3503,7 @@ index 123456..789012 100644
       if (url.includes('/labeler.yml')) {
         return new Response('Not Found', { status: 404 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
@@ -3641,9 +3622,7 @@ index 123456..789012 100644
 `;
         return new Response(labelerYaml, { status: 200 });
       }
-      if (url.includes('/labels')) {
-        return new Response(JSON.stringify([]), { status: 200 });
-      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify([
           {
