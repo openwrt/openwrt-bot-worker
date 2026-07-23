@@ -42,8 +42,19 @@ export function parseIssueForm(body) {
 
   const flush = () => {
     if (currentKey !== null) {
-      const value = currentLines.join('\n').trim();
-      fields[currentKey] = value === '_No response_' ? '' : value;
+      let value = currentLines.join('\n').trim();
+      if (value === '_No response_') {
+        value = '';
+      } else {
+        // Strip markdown code fences (``` or `) from form field values (resolves issue #31)
+        if (value.startsWith('```')) {
+          value = value.replace(/^```[a-zA-Z0-9_-]*\n?/, '').replace(/\n?```$/, '').trim();
+        }
+        if (value.startsWith('`') && value.endsWith('`') && value.length >= 2) {
+          value = value.slice(1, -1).trim();
+        }
+      }
+      fields[currentKey] = value;
     }
   };
 
@@ -68,6 +79,14 @@ export function normalizeFields(fields) {
   for (const [key, value] of Object.entries(fields)) {
     const normKey = key.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
     normalized[normKey] = value;
+
+    if (normKey.startsWith('openwrt_')) {
+      const shortKey = normKey.slice(8);
+      if (!normalized[shortKey]) normalized[shortKey] = value;
+    }
+    if (normKey === 'openwrt_target_subtarget' || normKey === 'target_subtarget') {
+      if (!normalized['target']) normalized['target'] = value;
+    }
   }
   return normalized;
 }
@@ -348,17 +367,20 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
   for (const rr of ruleResults) {
     if (rr.invalid) {
       hasInvalid = true;
-      invalidFields.push({ field: rr.field, value: rr.value });
+      const failedCond = (rr.conditions || []).find(c => c.format);
+      invalidFields.push({ field: rr.field, value: rr.value, hint: failedCond?.hint });
       continue;
     }
     if (!rr.matched) continue;
 
     // Check existence probes for this rule
     let existsOk = true;
+    let failedExistCond = null;
     for (const cond of rr.conditions) {
       if (cond._probeKey) {
         if (!existenceResults.get(cond._probeKey)) {
           existsOk = false;
+          failedExistCond = cond;
           break;
         }
       }
@@ -366,7 +388,7 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
 
     if (!existsOk) {
       hasInvalid = true;
-      invalidFields.push({ field: rr.field, value: rr.value });
+      invalidFields.push({ field: rr.field, value: rr.value, hint: failedExistCond?.hint });
       continue;
     }
 
@@ -380,15 +402,42 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
     }
   }
 
-  // If any validation failed, add invalid label and comments
+  // If any validation failed, add invalid label and format a clear Call To Action comment
   if (hasInvalid) {
     result.labelsToAdd = [invalidLabel];
+
+    const defaultHints = {
+      release: 'Expected a valid release version (e.g. `24.10.0`, `23.05.5`, `24.10-SNAPSHOT`, or `SNAPSHOT`)',
+      target: 'Expected a valid target/subtarget (e.g. `x86/64`, `ath79/generic`, `ramips/mt7621`)',
+      version: 'Expected a valid revision hash (e.g. `r28945-24a9f1c224`)'
+    };
+
+    const header = meta._invalid_comment_header !== undefined
+      ? meta._invalid_comment_header
+      : 'Thank you for reporting this issue! Some required form fields could not be validated:';
+
+    const footer = meta._invalid_comment_footer !== undefined
+      ? meta._invalid_comment_footer
+      : 'Please edit your issue description to update these fields so maintainers can triage it.';
+
+    const lines = [];
+    if (header) lines.push(header, '');
+
     for (const inv of invalidFields) {
-      const comment = invalidCommentTpl
-        .replace(/\{field\}/g, inv.field)
-        .replace(/\{value\}/g, inv.value);
-      result.comments.push(comment);
+      const fieldName = inv.field || 'field';
+      const val = inv.value ? `\`${inv.value}\`` : '_empty_';
+      const hint = inv.hint || defaultHints[fieldName.toLowerCase()] || '';
+
+      if (hint) {
+        lines.push(`- **${fieldName}**: Invalid value ${val} — *${hint}*`);
+      } else {
+        lines.push(`- **${fieldName}**: Invalid value ${val}`);
+      }
     }
+
+    if (footer) lines.push('', footer);
+
+    result.comments.push(lines.join('\n'));
   }
 
   // Remove triage/type labels

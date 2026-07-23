@@ -51,6 +51,29 @@ _No response_
     assert.strictEqual(fields['Release'], '23.05.0');
   });
 
+  test('strips markdown code blocks and backticks from values (issue #31)', () => {
+    const body = `### OpenWrt Release
+
+\`\`\`
+23.05.3
+\`\`\`
+
+### Target/Subtarget
+
+\`x86/64\`
+
+### OpenWrt Version
+
+\`\`\`text
+r28945-24a9f1c224
+\`\`\``;
+
+    const fields = parseIssueForm(body);
+    assert.strictEqual(fields['OpenWrt Release'], '23.05.3');
+    assert.strictEqual(fields['Target/Subtarget'], 'x86/64');
+    assert.strictEqual(fields['OpenWrt Version'], 'r28945-24a9f1c224');
+  });
+
   test('returns empty object for null/empty body', () => {
     assert.deepStrictEqual(parseIssueForm(null), {});
     assert.deepStrictEqual(parseIssueForm(''), {});
@@ -58,11 +81,13 @@ _No response_
 });
 
 describe('normalizeFields', () => {
-  test('normalizes field names to snake_case', () => {
-    const fields = { 'OpenWrt Release': '24.10', 'Target/Subtarget': 'ramips/mt7621' };
+  test('normalizes field names to snake_case and populates aliases', () => {
+    const fields = { 'OpenWrt Release': '24.10', 'OpenWrt Target/Subtarget': 'ramips/mt7621' };
     const normalized = normalizeFields(fields);
     assert.strictEqual(normalized['openwrt_release'], '24.10');
-    assert.strictEqual(normalized['target_subtarget'], 'ramips/mt7621');
+    assert.strictEqual(normalized['release'], '24.10');
+    assert.strictEqual(normalized['openwrt_target_subtarget'], 'ramips/mt7621');
+    assert.strictEqual(normalized['target'], 'ramips/mt7621');
   });
 });
 
@@ -165,20 +190,16 @@ describe('handleIssueLabeller', () => {
     assert.ok(result.labelsToRemove.includes('feature-request'));
   });
 
-  test('adds invalid label for bad release format', async () => {
-    const body = `### Release\n\nnot-a-release\n\n### Target\n\nramips/mt7621`;
+  test('combines multiple invalid field comments into a single CTA comment', async () => {
+    const body = `### Release\n\nnot-a-release\n\n### Target\n\ninvalid-target`;
     const data = makeIssueData(['to-triage', 'bug', 'bug-report'], body);
     const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
     assert.ok(result.labelsToAdd.includes('invalid'));
-    assert.ok(result.comments.some(c => c.includes('Invalid release')));
-  });
-
-  test('adds invalid label for bad target format', async () => {
-    const body = `### Release\n\n24.10.0\n\n### Target\n\ninvalid-target`;
-    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], body);
-    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
-    assert.ok(result.labelsToAdd.includes('invalid'));
-    assert.ok(result.comments.some(c => c.includes('Invalid target')));
+    assert.strictEqual(result.comments.length, 1);
+    assert.ok(result.comments[0].includes('Thank you for reporting this issue!'));
+    assert.ok(result.comments[0].includes('- **release**: Invalid value `not-a-release`'));
+    assert.ok(result.comments[0].includes('- **target**: Invalid value `invalid-target`'));
+    assert.ok(result.comments[0].includes('Please edit your issue description'));
   });
 
   test('adds contains-based labels (Official Image)', async () => {
