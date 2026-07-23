@@ -242,7 +242,11 @@ export const DEFAULT_ISSUE_LABELLER_CONFIG = {
   rules: [
     {
       label: 'release/{major}.{minor}',
-      conditions: [{ field: 'release', format: '^\\d+\\.\\d+\\.\\d+(-rc\\d+)*$|^\\d+\\.\\d+-SNAPSHOT$', exists: 'tag:v{value}' }]
+      conditions: [{ field: 'release', format: '^\\d+\\.\\d+\\.\\d+(-rc\\d+)*$', exists: 'tag:v{value}' }]
+    },
+    {
+      label: 'release/{major}.{minor}',
+      conditions: [{ field: 'release', format: '^\\d+\\.\\d+-SNAPSHOT$' }]
     },
     {
       label: 'target/{segment0}',
