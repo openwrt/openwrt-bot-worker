@@ -318,3 +318,19 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes) {
 
   return results;
 }
+
+// Checks whether a user has write/admin/maintain permission in a repository.
+// Used as a fallback when author_association is CONTRIBUTOR or NONE (e.g. maintainers with private org membership).
+export async function fetchUserRepoPermission(repoFullname, username, token, onCall) {
+  if (!username) return false;
+  onCall?.();
+  const url = `https://api.github.com/repos/${repoFullname}/collaborators/${encodeURIComponent(username)}/permission`;
+  const res = await githubApiCall(url, token);
+  if (res.code !== 200 || !res.data) {
+    return false;
+  }
+  const perm = (res.data.permission || '').toLowerCase();
+  const role = (res.data.role_name || '').toLowerCase();
+  return ['admin', 'write', 'maintain'].includes(perm) || ['admin', 'write', 'maintain'].includes(role);
+}
+

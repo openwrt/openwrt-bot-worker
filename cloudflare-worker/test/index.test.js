@@ -1038,6 +1038,11 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         }
         return new Response(JSON.stringify([]), { status: 200 });
       }
+      if (url.includes('/collaborators/')) {
+        const username = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
+        const perm = prOptions.collaboratorPermissions?.[username] || 'read';
+        return new Response(JSON.stringify({ permission: perm }), { status: 200 });
+      }
       if (url.includes('/check-runs')) {
         if (options && options.method === 'POST') {
           const body = JSON.parse(options.body);
@@ -1265,6 +1270,40 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         { body: '[allow cherry-pick]', author_association: 'OWNER' }
       ];
       const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
+
+    test('passes on protected head branch if maintainer with CONTRIBUTOR author_association posted an [allow branch] comment', async () => {
+      const comments = [
+        { body: 'Looks intentional, [allow branch]', author_association: 'CONTRIBUTOR', user: { login: 'nmeyerhans' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        collaboratorPermissions: { nmeyerhans: 'admin' }
+      });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('fails on protected head branch if contributor with CONTRIBUTOR author_association posted [allow branch] comment but lacks write permission', async () => {
+      const comments = [
+        { body: 'Can someone [allow branch] please?', author_association: 'CONTRIBUTOR', user: { login: 'someuser' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        collaboratorPermissions: { someuser: 'read' }
+      });
       assert.strictEqual(response.status, 200);
 
       const commitCheck = findCommitCheck();

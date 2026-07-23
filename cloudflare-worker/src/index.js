@@ -1,7 +1,8 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
-import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists } from './github.js';
+import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists, fetchUserRepoPermission } from './github.js';
+
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
@@ -25,6 +26,22 @@ async function scanPrComments(repoFullname, prNumber, token, onCall) {
   let hasCherryPickBypassComment = false;
   let hasBranchBypassComment = false;
   let existingCommentId = null;
+  const userPermissionCache = new Map();
+
+  async function checkIsMaintainer(comment) {
+    const assoc = (comment.author_association || '').toUpperCase();
+    if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc)) {
+      return true;
+    }
+    const username = comment.user?.login;
+    if (!username) return false;
+    if (userPermissionCache.has(username)) {
+      return userPermissionCache.get(username);
+    }
+    const isMaintainer = await fetchUserRepoPermission(repoFullname, username, token, onCall);
+    userPermissionCache.set(username, isMaintainer);
+    return isMaintainer;
+  }
 
   while (true) {
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
@@ -38,15 +55,15 @@ async function scanPrComments(repoFullname, prNumber, token, onCall) {
       if (c.body?.startsWith('## Formality Check:')) {
         existingCommentId = c.id;
       }
-      const assoc = (c.author_association || '').toUpperCase();
-      const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
-      if (isCommentMaintainer) {
-        const body = c.body || '';
-        if (/\[allow[ -]cherry[ -]pick\]/i.test(body)) {
-          hasCherryPickBypassComment = true;
-        }
-        if (/\[allow[ -]branch\]/i.test(body)) {
-          hasBranchBypassComment = true;
+      const body = c.body || '';
+      const hasCherryPickPattern = /\[allow[ -]cherry[ -]pick\]/i.test(body);
+      const hasBranchPattern = /\[allow[ -]branch\]/i.test(body);
+
+      if (hasCherryPickPattern || hasBranchPattern) {
+        const isMaintainer = await checkIsMaintainer(c);
+        if (isMaintainer) {
+          if (hasCherryPickPattern) hasCherryPickBypassComment = true;
+          if (hasBranchPattern) hasBranchBypassComment = true;
         }
       }
     }
@@ -159,12 +176,6 @@ async function handleWebhook(request, env) {
       return new Response("Ignored issue comment action", { status: 200 });
     }
 
-    const commentAssoc = (data.comment?.author_association || '').toUpperCase();
-    const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(commentAssoc);
-    if (!isCommentMaintainer) {
-      return new Response("Ignored non-maintainer issue comment", { status: 200 });
-    }
-
     if (!data.issue?.pull_request) {
       return new Response("Comment is not on a pull request", { status: 200 });
     }
@@ -245,6 +256,18 @@ async function handleWebhook(request, env) {
       throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes.code})`);
     }
     data.pull_request = prRes.data;
+
+    const commentAssoc = (data.comment?.author_association || '').toUpperCase();
+    let isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(commentAssoc);
+    if (!isCommentMaintainer) {
+      const username = data.comment?.user?.login;
+      if (username && await fetchUserRepoPermission(repoFullnameFromPayload, username, token, () => { subrequestBudget.used++; })) {
+        isCommentMaintainer = true;
+      }
+    }
+    if (!isCommentMaintainer) {
+      return new Response("Ignored non-maintainer issue comment", { status: 200 });
+    }
   }
 
   const IGNORED_USERS = [
@@ -530,7 +553,13 @@ async function handleWebhook(request, env) {
 
   const prBody = data.pull_request.body || '';
   const association = (data.pull_request.author_association || 'NONE').toUpperCase();
-  const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
+  let isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
+  if (!isMaintainer) {
+    const prUser = data.pull_request.user?.login;
+    if (prUser && await fetchUserRepoPermission(repoFullname, prUser, token, () => { subrequestBudget.used++; })) {
+      isMaintainer = true;
+    }
+  }
 
   if (CONFIG.check_branch) {
     if (PROTECTED_HEAD_BRANCHES.includes(headBranch)) {
