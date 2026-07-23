@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
-import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists } from './github.js';
+import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists, fetchUserRepoPermission } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
@@ -9,6 +9,44 @@ import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, DEFAU
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
 // Head branches that must not be used as the origin of a pull request.
 const PROTECTED_HEAD_BRANCHES = ['master', 'main', 'stable', 'openwrt-25.12', 'openwrt-24.10'];
+
+// author_association values that identify a maintainer on their own. Anything
+// else needs the repository permission lookup (see createMaintainerResolver).
+const MAINTAINER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
+// GitHub reports author_association CONTRIBUTOR (or NONE) for maintainers who
+// keep their organization membership private, which would lock them out of the
+// override commands. Fall back to the repository permission they actually hold.
+// Answers are memoized per request: the same login shows up as PR author and as
+// comment author, and every lookup costs a subrequest.
+function createMaintainerResolver(repoFullname, token, subrequestBudget) {
+  const cache = new Map();
+
+  return async function isMaintainerUser(user, association) {
+    if (MAINTAINER_ASSOCIATIONS.includes((association || '').toUpperCase())) {
+      return true;
+    }
+    const login = user?.login;
+    // Bots hold write access on some repositories but never act as maintainers
+    // here, and asking about them would just burn a subrequest per comment.
+    if (!login || user?.type === 'Bot' || login.endsWith('[bot]')) {
+      return false;
+    }
+    if (cache.has(login)) {
+      return cache.get(login);
+    }
+    // Leave the reserve untouched so the terminal writes (labels, PR comment,
+    // check-runs) at the end of the handler always have headroom left.
+    if (subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used <= 0) {
+      return false;
+    }
+    // Cache the pending promise, not the result, so concurrent questions about
+    // the same login share a single lookup.
+    const pending = fetchUserRepoPermission(repoFullname, login, token, () => { subrequestBudget.used++; });
+    cache.set(login, pending);
+    return pending;
+  };
+}
 
 // Parses an env var as an integer, falling back to `fallback` only when the
 // value is unset/unparseable — unlike `parseInt(x, 10) || fallback`, this
@@ -20,7 +58,7 @@ function parseEnvInt(value, fallback) {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
-async function scanPrComments(repoFullname, prNumber, token, onCall) {
+async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintainerUser) {
   let page = 1;
   let hasCherryPickBypassComment = false;
   let hasBranchBypassComment = false;
@@ -38,16 +76,15 @@ async function scanPrComments(repoFullname, prNumber, token, onCall) {
       if (c.body?.startsWith('## Formality Check:')) {
         existingCommentId = c.id;
       }
-      const assoc = (c.author_association || '').toUpperCase();
-      const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
-      if (isCommentMaintainer) {
-        const body = c.body || '';
-        if (/\[allow[ -]cherry[ -]pick\]/i.test(body)) {
-          hasCherryPickBypassComment = true;
-        }
-        if (/\[allow[ -]branch\]/i.test(body)) {
-          hasBranchBypassComment = true;
-        }
+      const body = c.body || '';
+      const hasCherryPickPattern = /\[allow[ -]cherry[ -]pick\]/i.test(body);
+      const hasBranchPattern = /\[allow[ -]branch\]/i.test(body);
+
+      // Only comments that actually carry an override command are worth
+      // resolving: for anyone outside the org that costs an extra subrequest.
+      if ((hasCherryPickPattern || hasBranchPattern) && await isMaintainerUser(c.user, c.author_association)) {
+        if (hasCherryPickPattern) hasCherryPickBypassComment = true;
+        if (hasBranchPattern) hasBranchBypassComment = true;
       }
     }
 
@@ -159,12 +196,6 @@ async function handleWebhook(request, env) {
       return new Response("Ignored issue comment action", { status: 200 });
     }
 
-    const commentAssoc = (data.comment?.author_association || '').toUpperCase();
-    const isCommentMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(commentAssoc);
-    if (!isCommentMaintainer) {
-      return new Response("Ignored non-maintainer issue comment", { status: 200 });
-    }
-
     if (!data.issue?.pull_request) {
       return new Response("Comment is not on a pull request", { status: 200 });
     }
@@ -187,12 +218,17 @@ async function handleWebhook(request, env) {
     return new Response("Could not generate installation access token", { status: 500 });
   }
 
+  const repoFullname = data.repository?.full_name;
+  if (!repoFullname) {
+    console.error("Webhook processing failed: Missing repository full name in payload.");
+    return new Response("Missing repository", { status: 400 });
+  }
+
   // --- ISSUES EVENT: Issue Labeller ---
   if (event === "issues") {
     if (data.action !== "opened") {
       return new Response("Ignored issues action", { status: 200 });
     }
-    const repoFullname = data.repository.full_name;
     const issueConfig = await fetchRepositoryConfig(data, token, DEFAULT_CONFIG, null);
     if (!issueConfig.enable_issue_labeller) {
       return new Response("Issue labeller disabled for this repository", { status: 200 });
@@ -231,15 +267,22 @@ async function handleWebhook(request, env) {
     return githubApiCall(...args);
   };
 
+  const isMaintainerUser = createMaintainerResolver(repoFullname, token, subrequestBudget);
+
   if (event === "issue_comment") {
-    const repoFullnameFromPayload = data.repository?.full_name;
     const prNumberFromIssue = data.issue?.number;
-    if (!repoFullnameFromPayload || !prNumberFromIssue) {
-      console.error(`Webhook processing failed: Missing repository (${repoFullnameFromPayload}) or PR number (${prNumberFromIssue}) in issue_comment payload.`);
-      return new Response("Missing repository or pull request number", { status: 400 });
+    if (!prNumberFromIssue) {
+      console.error("Webhook processing failed: Missing pull request number in issue_comment payload.");
+      return new Response("Missing pull request number", { status: 400 });
     }
 
-    const prUrl = `https://api.github.com/repos/${repoFullnameFromPayload}/pulls/${prNumberFromIssue}`;
+    // Settle the commenter before anything else: comments from everyone else
+    // are dropped here, so they never pay for the pull request lookup below.
+    if (!await isMaintainerUser(data.comment?.user, data.comment?.author_association)) {
+      return new Response("Ignored non-maintainer issue comment", { status: 200 });
+    }
+
+    const prUrl = `https://api.github.com/repos/${repoFullname}/pulls/${prNumberFromIssue}`;
     const prRes = await trackedApiCall(prUrl, token);
     if (prRes.code !== 200) {
       throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes.code})`);
@@ -261,7 +304,6 @@ async function handleWebhook(request, env) {
 
 
 
-  const repoFullname = data.repository.full_name;
   const baseBranch = data.pull_request.base.ref;
   const headBranch = data.pull_request.head.ref;
   const prNumber = data.pull_request.number;
@@ -484,7 +526,7 @@ async function handleWebhook(request, env) {
   let fetchCommentsRetried = false;
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }).catch(() => null);
+      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser).catch(() => null);
     }
     return fetchCommentsPromise;
   };
@@ -530,10 +572,14 @@ async function handleWebhook(request, env) {
 
   const prBody = data.pull_request.body || '';
   const association = (data.pull_request.author_association || 'NONE').toUpperCase();
-  const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association);
+  // Resolved on demand, like the comment scan above: only the branch and
+  // cherry-pick bypasses below care, and for an outside contributor the answer
+  // costs a subrequest (see createMaintainerResolver).
+  const isPrAuthorMaintainer = () => isMaintainerUser(data.pull_request.user, association);
 
   if (CONFIG.check_branch) {
     if (PROTECTED_HEAD_BRANCHES.includes(headBranch)) {
+      const isMaintainer = await isPrAuthorMaintainer();
       const scanResult = await getCommentsScanWithRetry() || { hasBranchBypassComment: false, existingCommentId: null };
       const bypassBranchCheck = scanResult.hasBranchBypassComment || (isMaintainer && /\[allow[ -]branch\]/i.test(prBody));
 
@@ -730,6 +776,7 @@ async function handleWebhook(request, env) {
 
     if (isBackportPr) {
       if (!(fullCommit.commit.message || '').toLowerCase().includes('cherry picked from')) {
+        const isMaintainer = await isPrAuthorMaintainer();
         const scanResult = await getCommentsScanWithRetry() || { hasCherryPickBypassComment: false, existingCommentId: null };
         const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (isMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(prBody));
 

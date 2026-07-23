@@ -38,13 +38,13 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
         // probe paths that may not exist (e.g. Makefile discovery in findPkgRoot).
         const isExpected404 = response.status === 404 &&
           method === 'GET' && url.includes('/contents/');
-        // 404/422 on GET /commits/ is expected only for opt-in callers
-        // (options.silent), e.g. the fork fallback when a commit SHA vanished
-        // after a force-push / rebase.
-        const isSilencedCommitMiss = options.silent === true &&
+        // 404/422 on a GET is expected only for opt-in callers (options.silent):
+        // the fork fallback when a commit SHA vanished after a force-push /
+        // rebase, and permission probes for users who are not collaborators.
+        const isSilencedMiss = options.silent === true &&
           (response.status === 404 || response.status === 422) &&
-          method === 'GET' && url.includes('/commits/');
-        if (!isExpected404 && !isSilencedCommitMiss) {
+          method === 'GET';
+        if (!isExpected404 && !isSilencedMiss) {
           console.error(`GitHub API call failed: ${method} ${url} -> HTTP ${response.status}: ${text.trim().slice(0, 500)}`);
         }
       }
@@ -317,4 +317,26 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes) {
   });
 
   return results;
+}
+
+// `permission` reports the base access level (admin/write/read/none), while
+// `role_name` also names the finer-grained or custom role behind it.
+const WRITE_ACCESS_LEVELS = ['admin', 'write', 'maintain'];
+
+// Checks whether a user holds write access to a repository. Used as a fallback
+// when author_association is CONTRIBUTOR or NONE, which is what GitHub reports
+// for maintainers whose organization membership is private.
+// A 404 here is the normal answer for "not a collaborator", so it is silenced
+// rather than logged as an API failure.
+export async function fetchUserRepoPermission(repoFullname, username, token, onCall) {
+  if (!repoFullname || !username) return false;
+  onCall?.();
+  const url = `https://api.github.com/repos/${repoFullname}/collaborators/${encodeURIComponent(username)}/permission`;
+  const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { silent: true });
+  if (res.code !== 200 || !res.data) {
+    return false;
+  }
+  const permission = (res.data.permission || '').toLowerCase();
+  const roleName = (res.data.role_name || '').toLowerCase();
+  return WRITE_ACCESS_LEVELS.includes(permission) || WRITE_ACCESS_LEVELS.includes(roleName);
 }

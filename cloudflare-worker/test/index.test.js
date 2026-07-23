@@ -1038,6 +1038,11 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         }
         return new Response(JSON.stringify([]), { status: 200 });
       }
+      if (url.includes('/collaborators/')) {
+        const username = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
+        const perm = prOptions.collaboratorPermissions?.[username] || 'read';
+        return new Response(JSON.stringify({ permission: perm }), { status: 200 });
+      }
       if (url.includes('/check-runs')) {
         if (options && options.method === 'POST') {
           const body = JSON.parse(options.body);
@@ -1265,6 +1270,40 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         { body: '[allow cherry-pick]', author_association: 'OWNER' }
       ];
       const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, { headBranch: 'stable', checkBranch: true });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
+
+    test('passes on protected head branch if maintainer with CONTRIBUTOR author_association posted an [allow branch] comment', async () => {
+      const comments = [
+        { body: 'Looks intentional, [allow branch]', author_association: 'CONTRIBUTOR', user: { login: 'nmeyerhans' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        collaboratorPermissions: { nmeyerhans: 'admin' }
+      });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('fails on protected head branch if contributor with CONTRIBUTOR author_association posted [allow branch] comment but lacks write permission', async () => {
+      const comments = [
+        { body: 'Can someone [allow branch] please?', author_association: 'CONTRIBUTOR', user: { login: 'someuser' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        collaboratorPermissions: { someuser: 'read' }
+      });
       assert.strictEqual(response.status, 200);
 
       const commitCheck = findCommitCheck();
@@ -1579,6 +1618,139 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
     assert.ok(commitCheck);
     assert.strictEqual(commitCheck.conclusion, 'success');
+  });
+
+  // Maintainers with private organization membership are reported as
+  // CONTRIBUTOR/NONE, so the handler falls back to their repository permission.
+  async function sendIssueComment(comment, collaboratorPermissions = {}) {
+    postedCheckRuns = [];
+    let prFetched = false;
+    const permissionLookups = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({ check_branch: false, require_linked_github_account: false, require_body: false }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/collaborators/')) {
+        const username = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
+        permissionLookups.push(username);
+        const permission = collaboratorPermissions[username];
+        if (!permission) {
+          return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ permission }), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123')) {
+        prFetched = true;
+        return new Response(JSON.stringify({
+          number: 123,
+          title: 'test pr',
+          body: '',
+          base: { ref: 'main', sha: 'base-sha' },
+          head: { ref: 'feature-branch', sha: 'abcdef1234567890' },
+          author_association: 'NONE',
+          commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+          user: { login: 'somecontributor', type: 'User' }
+        }), { status: 200 });
+      }
+      if (url.includes('/commits/abcdef1234567890')) {
+        if (options?.headers?.Accept === 'application/vnd.github.patch') {
+          return new Response('Mock patch content', { status: 200 });
+        }
+        return new Response(JSON.stringify({
+          parents: [{ sha: 'parent-sha' }],
+          commit: {
+            message: 'mypkg: update\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' },
+            verification: { verified: true, key_id: 'GPGKEYID' }
+          }
+        }), { status: 200 });
+      }
+      if (url.includes('/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'abcdef1234567890',
+          html_url: 'https://github.com/test/repo/commit/abcdef1234567890',
+          commit: {
+            message: 'mypkg: update\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' },
+            verification: { verified: true, key_id: 'GPGKEYID' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/check-runs')) {
+        if (options && options.method === 'POST') {
+          postedCheckRuns.push(JSON.parse(options.body));
+        }
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const payload = JSON.stringify({
+      action: 'created',
+      issue: { number: 123, pull_request: { url: 'https://api.github.com/repos/test/repo/pulls/123' } },
+      comment,
+      repository: { full_name: 'test/repo' },
+      installation: { id: 456 }
+    });
+
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const response = await worker.fetch(new Request('http://localhost/webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-github-event': 'issue_comment',
+        'x-hub-signature-256': signature
+      },
+      body: payload
+    }), { WEBHOOK_SECRET: secret, APP_ID: '123', PRIVATE_KEY: 'YW55Y29udGVudA==' });
+
+    return { response, prFetched, permissionLookups };
+  }
+
+  test('processes a comment from a maintainer whose organization membership is private', async () => {
+    const { response, prFetched, permissionLookups } = await sendIssueComment(
+      { body: 'recheck please', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer', type: 'User' } },
+      { privatemaintainer: 'admin' }
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(permissionLookups, ['privatemaintainer']);
+    assert.ok(prFetched);
+    assert.ok(postedCheckRuns.some(cr => cr.name === 'FormalityCheck / Git & Commits'));
+  });
+
+  test('ignores a comment from a user without write access without fetching the pull request', async () => {
+    const { response, prFetched, permissionLookups } = await sendIssueComment(
+      { body: 'recheck please', author_association: 'CONTRIBUTOR', user: { login: 'randomuser', type: 'User' } },
+      { randomuser: 'read' }
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(await response.text(), 'Ignored non-maintainer issue comment');
+    assert.deepStrictEqual(permissionLookups, ['randomuser']);
+    assert.strictEqual(prFetched, false, 'Non-maintainer comments must not pay for the pull request lookup');
+  });
+
+  test('ignores bot comments without spending a permission lookup', async () => {
+    const { response, prFetched, permissionLookups } = await sendIssueComment(
+      { body: '[allow branch]', author_association: 'NONE', user: { login: 'github-actions[bot]', type: 'Bot' } }
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(await response.text(), 'Ignored non-maintainer issue comment');
+    assert.deepStrictEqual(permissionLookups, []);
+    assert.strictEqual(prFetched, false);
   });
 
   async function sendBackportWebhookPR(prTitle, baseBranch, commitMessage, prPatchContent, upstreamPatchContent = null) {
