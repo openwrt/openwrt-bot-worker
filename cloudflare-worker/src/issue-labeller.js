@@ -10,8 +10,12 @@
 //
 //   "release/{major}.{minor}":         # label template ({vars} from field value)
 //     - field: "release"               # form field name (normalized)
-//       format: '^\d+\.\d+'            # regex the value must match
+//       format: '^\d+\.\d+\.\d+$'      # regex the value must match
 //       exists: "tag:v{value}"         # existence check (tag/path/commit)
+//     - field: "release"               # further list items are alternatives (OR,
+//       format: '^\d+\.\d+-SNAPSHOT$'  # like labeler.yml): the label applies when
+//                                      # any single item matches; all checks inside
+//                                      # one item must pass (AND)
 //
 //   "Official Image":
 //     - field: "image_kind"
@@ -21,10 +25,16 @@
 //     - field: "device"
 //       not_empty: true                # field must be non-empty
 //
+// Validation is aggregated per form field: a field is reported invalid only
+// when some format/exists check failed on it and no rule matched it at all,
+// so alternative rules for the same field never invalidate each other.
+//
 // Template variables extracted from field values:
 //   {value}    – full trimmed value
 //   {segment0}, {segment1}, ... – slash-separated parts
-//   {major}, {minor}, {patch}  – dot-separated parts (first three)
+//   {major}, {minor}, {patch}  – dot-separated parts (first three); a dash
+//                                suffix after a numeric part is dropped, so
+//                                24.10-SNAPSHOT yields major 24, minor 10
 //   {hash}     – trailing hex string (7-40 chars) after last '-'
 
 import { githubApiCall, graphqlCheckExistence, ensureLabelExists } from './github.js';
@@ -216,7 +226,11 @@ export function extractTemplateVars(value) {
   const segments = value.split('/');
   segments.forEach((seg, i) => { vars[`segment${i}`] = seg; });
   // Dot-separated parts: 24.10.0 → {major}, {minor}, {patch}
-  const dots = value.split('.');
+  // A dash-suffix after a numeric part is dropped (24.10-SNAPSHOT → minor 10)
+  const dots = value.split('.').map(p => {
+    const m = p.match(/^(\d+)-/);
+    return m ? m[1] : p;
+  });
   if (dots[0] !== undefined) vars.major = dots[0];
   if (dots[1] !== undefined) vars.minor = dots[1];
   if (dots[2] !== undefined) vars.patch = dots[2];
@@ -241,12 +255,18 @@ export const DEFAULT_ISSUE_LABELLER_CONFIG = {
   },
   rules: [
     {
+      // Concrete releases (24.10.0, 25.12.0-rc5) must have a matching Git tag;
+      // stable-branch snapshots (24.10-SNAPSHOT) are format-only — OpenWrt
+      // does not tag snapshot builds.
       label: 'release/{major}.{minor}',
-      conditions: [{ field: 'release', format: '^\\d+\\.\\d+\\.\\d+(-rc\\d+)*$', exists: 'tag:v{value}' }]
+      conditions: [
+        { field: 'release', format: '^\\d+\\.\\d+\\.\\d+(-rc\\d+)*$', exists: 'tag:v{value}' },
+        { field: 'release', format: '^\\d+\\.\\d+-SNAPSHOT$' }
+      ]
     },
     {
-      label: 'release/{major}.{minor}',
-      conditions: [{ field: 'release', format: '^\\d+\\.\\d+-SNAPSHOT$' }]
+      label: 'SNAPSHOT',
+      conditions: [{ field: 'release', format: '^SNAPSHOT$' }]
     },
     {
       label: 'target/{segment0}',
@@ -280,7 +300,6 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
   const triggerLabel = (meta._trigger_label || 'to-triage').toLowerCase();
   const invalidLabel = meta._invalid_label || 'invalid';
   const removeLabels = meta._remove_labels || ['to-triage'];
-  const invalidCommentTpl = meta._invalid_comment || 'Invalid {field} reported. `{value}`';
 
   const issueLabels = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name));
   const issueLabelsLower = new Set(issueLabels.map(l => l.toLowerCase()));
@@ -300,44 +319,45 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
   // Parse the issue form body
   const fields = normalizeFields(parseIssueForm(issue.body));
 
-  // Evaluate each rule
+  // Evaluate each rule. A rule's conditions list is a set of alternatives
+  // (OR, like labeler.yml): the rule matches when any single condition object
+  // matches, and every check inside one condition object must pass (AND).
   const probes = []; // GraphQL existence checks to batch
-  const ruleResults = []; // { label, matched, invalid, field, value }
+  const ruleEvals = []; // { rule, alts: [{ cond, fieldKey, value, vars, softFail, hardFail, probeKey }] }
 
-  for (const rule of (config.rules || [])) {
-    let matched = true;
-    let invalid = false;
-    let fieldValue = '';
-    let ruleField = '';
-    let vars = {};
-
-    for (const cond of rule.conditions) {
-      const fieldName = (cond.field || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-      const value = fields[fieldName] || '';
-      fieldValue = value;
-      ruleField = cond.field || fieldName;
-      vars = extractTemplateVars(value);
+  (config.rules || []).forEach((rule, ruleIdx) => {
+    const alts = (rule.conditions || []).map((cond, condIdx) => {
+      const fieldKey = (cond.field || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+      const value = fields[fieldKey] || '';
+      const vars = extractTemplateVars(value);
+      // softFail: condition doesn't match but says nothing about validity;
+      // hardFail: a non-empty value failed a format check → invalid candidate
+      const alt = { cond, fieldKey, value, vars, softFail: false, hardFail: false, probeKey: null };
 
       // not_empty check
-      if (cond.not_empty) {
-        if (!value) { matched = false; break; }
-        continue;
+      if (cond.not_empty && !value) {
+        alt.softFail = true;
+        return alt;
       }
 
       // contains check (case-insensitive substring)
-      if (cond.contains) {
-        if (!value.toLowerCase().includes(String(cond.contains).toLowerCase())) {
-          matched = false; break;
-        }
-        continue;
+      if (cond.contains && !value.toLowerCase().includes(String(cond.contains).toLowerCase())) {
+        alt.softFail = true;
+        return alt;
       }
 
       // format check (regex)
       if (cond.format) {
-        if (!value) { matched = false; break; }
-        let regex;
-        try { regex = new RegExp(cond.format); } catch { matched = false; break; }
-        if (!regex.test(value)) { invalid = true; matched = false; break; }
+        let regex = null;
+        try { regex = new RegExp(cond.format); } catch { /* broken pattern in config */ }
+        if (!value || !regex) {
+          alt.softFail = true;
+          return alt;
+        }
+        if (!regex.test(value)) {
+          alt.hardFail = true;
+          return alt;
+        }
       }
 
       // exists check (deferred to GraphQL batch)
@@ -345,66 +365,59 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
         const existsTemplate = String(cond.exists);
         const colonIdx = existsTemplate.indexOf(':');
         const checkType = colonIdx !== -1 ? existsTemplate.slice(0, colonIdx) : 'path';
-        const checkPath = colonIdx !== -1 ? interpolate(existsTemplate.slice(colonIdx + 1), vars) : interpolate(existsTemplate, vars);
-        const probeKey = `${rule.label}::${fieldName}`;
-        probes.push({ key: probeKey, type: checkType === 'tag' ? 'tag' : 'path', value: checkPath });
-        // Store probe reference for later evaluation
-        if (!cond._probeKey) cond._probeKey = probeKey;
+        const checkPath = interpolate(colonIdx !== -1 ? existsTemplate.slice(colonIdx + 1) : existsTemplate, vars);
+        alt.probeKey = `p${ruleIdx}_${condIdx}`;
+        probes.push({ key: alt.probeKey, type: checkType === 'tag' ? 'tag' : 'path', value: checkPath });
       }
-    }
-
-    ruleResults.push({ label: rule.label, matched, invalid, field: ruleField, value: fieldValue, vars, conditions: rule.conditions, ruleMeta: rule.meta });
-  }
+      return alt;
+    });
+    ruleEvals.push({ rule, alts });
+  });
 
   // Execute all existence checks in one GraphQL call
   let existenceResults = new Map();
   if (probes.length > 0) {
-    // Determine ref: try to find a release ref from field values, fallback to HEAD
-    const ref = 'HEAD';
-    existenceResults = await graphqlCheckExistence(token, repoFullname, ref, probes);
+    existenceResults = await graphqlCheckExistence(token, repoFullname, 'HEAD', probes);
   }
 
-  // Evaluate existence results and build final labels
-  let hasInvalid = false;
-  const invalidFields = [];
+  // Resolve rule matches and aggregate validation per form field: a field is
+  // invalid only when some format/exists check failed on it and no rule
+  // matched it, so alternative rules for one field never invalidate each other.
+  const fieldStatus = new Map(); // fieldKey → { matched, failures: [{ field, value, hint }] }
+  const statusFor = (key) => {
+    if (!fieldStatus.has(key)) fieldStatus.set(key, { matched: false, failures: [] });
+    return fieldStatus.get(key);
+  };
 
-  for (const rr of ruleResults) {
-    if (rr.invalid) {
-      hasInvalid = true;
-      const failedCond = (rr.conditions || []).find(c => c.format);
-      invalidFields.push({ field: rr.field, value: rr.value, hint: failedCond?.hint });
-      continue;
-    }
-    if (!rr.matched) continue;
-
-    // Check existence probes for this rule
-    let existsOk = true;
-    let failedExistCond = null;
-    for (const cond of rr.conditions) {
-      if (cond._probeKey) {
-        if (!existenceResults.get(cond._probeKey)) {
-          existsOk = false;
-          failedExistCond = cond;
-          break;
-        }
+  for (const { rule, alts } of ruleEvals) {
+    let matchedAlt = null;
+    for (const alt of alts) {
+      if (alt.softFail) continue;
+      if (alt.hardFail || (alt.probeKey && !existenceResults.get(alt.probeKey))) {
+        statusFor(alt.fieldKey).failures.push({ field: alt.cond.field || alt.fieldKey, value: alt.value, hint: alt.cond.hint });
+        continue;
       }
+      if (!matchedAlt) matchedAlt = alt;
     }
+    if (!matchedAlt) continue;
 
-    if (!existsOk) {
-      hasInvalid = true;
-      invalidFields.push({ field: rr.field, value: rr.value, hint: failedExistCond?.hint });
-      continue;
-    }
-
-    // Interpolate label template
-    const labelName = interpolate(rr.label, rr.vars);
-    if (labelName && !labelName.includes('{')) {
+    statusFor(matchedAlt.fieldKey).matched = true;
+    const labelName = interpolate(rule.label, matchedAlt.vars);
+    if (labelName && !labelName.includes('{') && !result.labelsToAdd.includes(labelName)) {
       result.labelsToAdd.push(labelName);
-      if (rr.ruleMeta) {
-        result.labelMeta[labelName] = { color: rr.ruleMeta._color, description: rr.ruleMeta._description };
+      if (rule.meta) {
+        result.labelMeta[labelName] = { color: rule.meta._color, description: rule.meta._description };
       }
     }
   }
+
+  const invalidFields = [];
+  for (const status of fieldStatus.values()) {
+    if (status.matched || status.failures.length === 0) continue;
+    // One entry per field; prefer a failure that carries a config-provided hint
+    invalidFields.push(status.failures.find(f => f.hint) || status.failures[0]);
+  }
+  const hasInvalid = invalidFields.length > 0;
 
   // If any validation failed, add invalid label and format a clear Call To Action comment
   if (hasInvalid) {

@@ -130,6 +130,23 @@ _remove_labels: ["to-triage", "bug-report"]
     assert.strictEqual(parseIssueLabellerYaml(''), null);
   });
 
+  test('parses multiple condition alternatives under one label', () => {
+    const yaml = `
+"release/{major}.{minor}":
+  - field: "release"
+    format: '^\\d+\\.\\d+\\.\\d+(-rc\\d+)*$'
+    exists: "tag:v{value}"
+  - field: "release"
+    format: '^\\d+\\.\\d+-SNAPSHOT$'
+`;
+    const config = parseIssueLabellerYaml(yaml);
+    assert.strictEqual(config.rules.length, 1);
+    assert.strictEqual(config.rules[0].conditions.length, 2);
+    assert.strictEqual(config.rules[0].conditions[0].exists, 'tag:v{value}');
+    assert.strictEqual(config.rules[0].conditions[1].format, '^\\d+\\.\\d+-SNAPSHOT$');
+    assert.strictEqual(config.rules[0].conditions[1].exists, undefined);
+  });
+
   test('handles comments', () => {
     const yaml = `
 # This is a comment
@@ -159,6 +176,15 @@ describe('extractTemplateVars', () => {
     assert.strictEqual(vars.major, '24');
     assert.strictEqual(vars.minor, '10');
     assert.strictEqual(vars.patch, '0');
+  });
+
+  test('strips dash suffix from numeric version parts', () => {
+    const vars = extractTemplateVars('24.10-SNAPSHOT');
+    assert.strictEqual(vars.major, '24');
+    assert.strictEqual(vars.minor, '10');
+    const rc = extractTemplateVars('25.12.0-rc2');
+    assert.strictEqual(rc.minor, '12');
+    assert.strictEqual(rc.patch, '0');
   });
 
   test('extracts hash from version string', () => {
@@ -223,6 +249,75 @@ describe('handleIssueLabeller', () => {
     const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
     assert.ok(result.labelsToRemove.includes('to-triage'));
     assert.ok(result.labelsToRemove.includes('bug-report'));
+  });
+
+  // Stubs global fetch with a GraphQL response; returns a call counter.
+  const stubGraphql = (repository) => {
+    const calls = { count: 0 };
+    globalThis.fetch = async () => {
+      calls.count++;
+      return {
+        status: 200,
+        headers: {},
+        text: async () => JSON.stringify({ data: { repository } })
+      };
+    };
+    return calls;
+  };
+
+  test('labels concrete release when its tag exists', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const calls = stubGraphql({ p0: { name: 'v24.10.7' } });
+
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], '### OpenWrt Release\n\n24.10.7');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.strictEqual(calls.count, 1);
+    assert.deepStrictEqual(result.labelsToAdd, ['release/24.10']);
+    assert.strictEqual(result.comments.length, 0);
+  });
+
+  test('marks release invalid when its tag does not exist', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    stubGraphql({ p0: null });
+
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], '### OpenWrt Release\n\n24.10.99');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.deepStrictEqual(result.labelsToAdd, ['invalid']);
+    assert.ok(result.comments[0].includes('`24.10.99`'));
+  });
+
+  test('labels stable-branch snapshot without tag existence check', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const calls = stubGraphql({});
+
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], '### OpenWrt Release\n\n24.10-SNAPSHOT');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.strictEqual(calls.count, 0);
+    assert.deepStrictEqual(result.labelsToAdd, ['release/24.10']);
+    assert.strictEqual(result.comments.length, 0);
+  });
+
+  test('labels development snapshot release', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const calls = stubGraphql({});
+
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], '### OpenWrt Release\n\nSNAPSHOT');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.strictEqual(calls.count, 0);
+    assert.deepStrictEqual(result.labelsToAdd, ['SNAPSHOT']);
+    assert.strictEqual(result.comments.length, 0);
+  });
+
+  test('reports an invalid field only once despite multiple release rules', async () => {
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], '### OpenWrt Release\n\nnot-a-release');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.deepStrictEqual(result.labelsToAdd, ['invalid']);
+    const mentions = result.comments[0].split('\n').filter(l => l.startsWith('- **release**'));
+    assert.strictEqual(mentions.length, 1);
   });
 
   test('uses custom config from YAML', async () => {
