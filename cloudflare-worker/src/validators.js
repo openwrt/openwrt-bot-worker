@@ -137,13 +137,19 @@ export async function validateFormalities(fullCommit, CONFIG) {
   const lines = message.split("\n");
   let subject = lines[0].trim();
 
+  // Detect GitHub web UI commits: committer is set to "GitHub <noreply@github.com>" automatically
+  const isGitHubWebCommit = committerName === 'GitHub' && committerEmail === 'noreply@github.com';
+
   // Identity Check
   const identityErrors = [];
   if (!isValidName(authorName)) identityErrors.push(`Author name format is invalid ('${authorName}'). Please set your full name (first and last, e.g. 'Jane Doe').`);
-  if (!isValidName(committerName)) identityErrors.push(`Committer name format is invalid ('${committerName}'). Please set your full name (first and last, e.g. 'Jane Doe').`);
+  // Skip committer name/email validation for GitHub web commits - the user cannot control these values
+  if (!isGitHubWebCommit) {
+    if (!isValidName(committerName)) identityErrors.push(`Committer name format is invalid ('${committerName}'). Please set your full name (first and last, e.g. 'Jane Doe').`);
+  }
   if (CONFIG.check_noreply_email) {
     if (isNoreplyEmail(authorEmail)) identityErrors.push(`Author email must not be a GitHub noreply address ('${authorEmail}'). Please use a real email address that is linked to your GitHub account.`);
-    if (isNoreplyEmail(committerEmail)) identityErrors.push(`Committer email must not be a GitHub noreply address ('${committerEmail}'). Please use a real email address that is linked to your GitHub account.`);
+    if (!isGitHubWebCommit && isNoreplyEmail(committerEmail)) identityErrors.push(`Committer email must not be a GitHub noreply address ('${committerEmail}'). Please use a real email address that is linked to your GitHub account.`);
   }
   if (CONFIG.require_linked_github_account && CONFIG.require_linked_github_account !== 'disabled') {
     if (!fullCommit.author || !fullCommit.author.login) {
@@ -366,18 +372,20 @@ export async function validateFormalities(fullCommit, CONFIG) {
       );
 
       // Check that at least one Signed-off-by matches the commit committer
-      const committerMatch = signoffEntries.some(entry =>
+      // Skip committer matching for GitHub web commits since committer is always "GitHub <noreply@github.com>"
+      const committerMatch = !isGitHubWebCommit && signoffEntries.some(entry =>
         entry.name.toLowerCase() === committerName.toLowerCase() &&
         entry.email.toLowerCase() === committerEmail.toLowerCase()
       );
 
       // After a rebase, the committer changes but the original author's SOB
       // remains valid. Require at least one SOB matching author OR committer.
+      // For GitHub web commits, only check against author since committer is GitHub itself.
       if (!authorMatch && !committerMatch) {
-        const isAuthorCommitterSame =
+        const isAuthorCommitterSame = isGitHubWebCommit ? false :
           authorName.toLowerCase() === committerName.toLowerCase() &&
           authorEmail.toLowerCase() === committerEmail.toLowerCase();
-        if (isAuthorCommitterSame) {
+        if (isAuthorCommitterSame || isGitHubWebCommit) {
           signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`). Please add a 'Signed-off-by: ${authorName} <${authorEmail}>' line that matches this name and email exactly.`);
         } else {
           signoffErrors.push(`No Signed-off-by matches commit author (\`${authorName} <${authorEmail}>\`) or committer (\`${committerName} <${committerEmail}>\`). Please add a 'Signed-off-by:' line matching either identity exactly (name and email).`);

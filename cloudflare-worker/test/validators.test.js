@@ -121,6 +121,52 @@ describe('validateFormalities', () => {
     assert.ok(res.errors.some(e => e.includes('Signed-off-by')));
   });
 
+  test('passes GitHub web UI commit with valid author identity', async () => {
+    const commit = {
+      parents: [{ sha: 'parent-sha' }],
+      commit: {
+        message: 'mwan3: add configurable nslookup name\n\nAllow the config to specify a name.\n\nSigned-off-by: Alice B. Cooper <alice@example.com>',
+        author: { name: 'Alice B. Cooper', email: 'alice@example.com' },
+        committer: { name: 'GitHub', email: 'noreply@github.com' },
+        verification: { verified: true, key_id: 'GPGKEYID' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(!res.errors.some(e => e.includes('Committer name format is invalid')), `Should not reject GitHub web commit committer name, got: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes('noreply address')), `Should not reject GitHub web commit noreply email, got: ${res.errors.join(', ')}`);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still catches invalid author name in GitHub web UI commit', async () => {
+    const commit = {
+      parents: [{ sha: 'parent-sha' }],
+      commit: {
+        message: 'mwan3: test\n\nSigned-off-by: badname <bad@example.com>',
+        author: { name: 'badname', email: 'bad@example.com' },
+        committer: { name: 'GitHub', email: 'noreply@github.com' },
+        verification: { verified: true, key_id: 'GPGKEYID' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('Author name format is invalid')), `Should still reject invalid author name in web commit`);
+    assert.ok(!res.errors.some(e => e.includes('Committer name format is invalid')), `Should not reject GitHub web commit committer name`);
+  });
+
+  test('GitHub web commit SOB matches only against author, not committer', async () => {
+    const commit = {
+      parents: [{ sha: 'parent-sha' }],
+      commit: {
+        message: 'mwan3: add test feature\n\nSome body text.\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'GitHub', email: 'noreply@github.com' },
+        verification: { verified: true, key_id: 'GPGKEYID' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(e => e.includes('Signed-off-by')));
+  });
+
   test('rejects merge commits', async () => {
     const commit = {
       parents: [{ sha: 'parent-sha-1' }, { sha: 'parent-sha-2' }],
