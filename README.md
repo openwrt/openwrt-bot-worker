@@ -45,6 +45,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled).
 *   **UCI Config Validation:** Ensures that any configuration files destined to be installed into `/etc/config/` conform to the standard OpenWrt UCI format (consisting of only `package`, `config`, `option`, `list` statements, comments, and empty lines).
 *   **PKG_NAME Reuse Prevention:** Ensures `PKG_NAME` is not reused inside `call`, `define`, and `eval` Makefile lines, requiring the literal package name instead to keep recipes readable and searchable (default true).
+*   **Feed Buildbot-Default Guard (`check_buildbot_default`):** Flags newly added `DEFAULT:=...` lines that condition inclusion on `BUILDBOT` inside feed repositories, since this forces a package into buildbot default images without going through the main `openwrt/openwrt` repo's own default-package process (customizable level: warning/error/disabled; skipped entirely for the main repo).
 
 ### 3. Patches Check
 Scans the contribution tree for nested downstream patch targets:

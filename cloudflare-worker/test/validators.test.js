@@ -28,6 +28,7 @@ const CONFIG = {
   check_openwrt_meta: true,
   check_conffiles: true,
   check_pkg_name_reuse: true,
+  check_buildbot_default: 'warning',
   check_patch_headers: true,
   require_linked_github_account: false,
   check_openwrt_spelling: true
@@ -1625,6 +1626,176 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     };
     const res = validateMakefileContext(commit, patch, testConfig, state);
     assert.strictEqual(res.errors.length, 0);
+  });
+
+  test('warns on DEFAULT conditioned on BUILDBOT in a feed package (issue #4)', () => {
+    const commit = { commit: { message: 'openssh: add sftp-server DEFAULT' } };
+    const patch = `
+diff --git a/net/openssh/Makefile b/net/openssh/Makefile
+--- a/net/openssh/Makefile
++++ b/net/openssh/Makefile
++define Package/openssh-sftp-server
++  $(call Package/openssh/Default)
++  TITLE+= SFTP server
++  DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false,
+      check_pkg_name_reuse: false,
+      check_buildbot_default: 'warning'
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state, 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(res.warnings[0].includes("DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)"));
+    assert.ok(res.warnings[0].includes("inside 'Package/openssh-sftp-server'"));
+  });
+
+  test('treats check_buildbot_default: true as a hard error', () => {
+    const commit = { commit: { message: 'foo: add DEFAULT' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
++define Package/foo
++  DEFAULT:=y if BUILDBOT
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false,
+      check_pkg_name_reuse: false,
+      check_buildbot_default: true
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state, 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 0);
+    assert.strictEqual(res.errors.length, 1);
+    assert.ok(res.errors[0].includes("DEFAULT:=y if BUILDBOT"));
+  });
+
+  test('does not flag DEFAULT without a BUILDBOT condition', () => {
+    const commit = { commit: { message: 'foo: add DEFAULT' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
++define Package/foo
++  DEFAULT:=y if TARGET_x86
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false,
+      check_pkg_name_reuse: false,
+      check_buildbot_default: 'warning'
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state, 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+    assert.ok(res.successes.some(s => s.includes("No feed package forces its own inclusion")));
+  });
+
+  test('does not flag DEFAULT+BUILDBOT in the main openwrt/openwrt repo', () => {
+    const commit = { commit: { message: 'openssh: add sftp-server DEFAULT' } };
+    const patch = `
+diff --git a/net/openssh/Makefile b/net/openssh/Makefile
+--- a/net/openssh/Makefile
++++ b/net/openssh/Makefile
++define Package/openssh-sftp-server
++  DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false,
+      check_pkg_name_reuse: false,
+      check_buildbot_default: 'warning'
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state, 'openwrt/openwrt');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('does not flag pre-existing DEFAULT+BUILDBOT lines left untouched by the diff', () => {
+    const commit = { commit: { message: 'foo: unrelated tweak' } };
+    const patch = `
+diff --git a/utils/owut/Makefile b/utils/owut/Makefile
+--- a/utils/owut/Makefile
++++ b/utils/owut/Makefile
+@@ -10,7 +10,7 @@ define Package/owut
+   DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)
+-  TITLE:=owut - an OpenWrt Upgrade Tool
++  TITLE:=owut - an OpenWrt upgrade tool
+ endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false,
+      check_pkg_name_reuse: false,
+      check_buildbot_default: 'warning'
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state, 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('respects check_buildbot_default: false configuration option', () => {
+    const commit = { commit: { message: 'foo: add DEFAULT' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
++define Package/foo
++  DEFAULT:=y if BUILDBOT
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const testConfig = {
+      ...CONFIG,
+      check_openwrt_meta: false,
+      check_conffiles: false,
+      check_crlf: false,
+      check_pkg_version: false,
+      check_trailing_newline: false,
+      check_makefile_indentation: false,
+      check_pkg_name_reuse: false,
+      check_buildbot_default: false
+    };
+    const res = validateMakefileContext(commit, patch, testConfig, state, 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
   });
 
   test('rejects reuse of PKG_NAME in call, define, and eval lines', () => {

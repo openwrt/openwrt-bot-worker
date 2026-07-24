@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG = {
   check_missing_colon: true,
   check_makefile_indentation: true,
   check_pkg_name_reuse: true,
+  check_buildbot_default: 'warning',
 
   // Patches Check features
   check_patch_headers: true,

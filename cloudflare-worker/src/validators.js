@@ -452,7 +452,12 @@ export function matchVersionString(subject, version) {
   }
 }
 
-export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) {
+// The only repository where a package's own DEFAULT:=y line is allowed to
+// pull it into buildbot default images; everywhere else (feeds) that
+// decision belongs to the main repo, not the package itself.
+const MAIN_REPO_FULLNAME = 'openwrt/openwrt';
+
+export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname) {
   const errors = [];
   const successes = [];
   const warnings = [];
@@ -871,6 +876,81 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
 
     if (indentationCheckRun && indentationErrors === 0) {
       successes.push("✅ Makefile blocks contain valid indentation (spaces for metadata/description, tabs for build/install recipes)");
+    }
+  }
+
+  if (
+    CONFIG.check_buildbot_default &&
+    CONFIG.check_buildbot_default !== 'disabled' &&
+    repoFullname !== MAIN_REPO_FULLNAME
+  ) {
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    const buildbotDefaultMessages = [];
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
+      if (!isMakefile) continue;
+
+      // Track which Package/* block an added line lives in, purely to
+      // produce a friendlier message. Re-derived from hunk header context
+      // (like the conffiles check) so state doesn't leak across hunks.
+      let currentPackage = '';
+      const lines = fileDiff.split('\n');
+
+      for (const line of lines) {
+        if (/^@@/.test(line)) {
+          const hunkContextMatch = line.match(/^@@[^@]*@@\s*(.*)$/);
+          const hunkContext = hunkContextMatch ? hunkContextMatch[1] : '';
+          if (/\bendef\b/.test(hunkContext)) {
+            currentPackage = '';
+          } else {
+            const hunkDefineMatch = hunkContext.match(/^define\s+(Package\/\S+)/);
+            currentPackage = hunkDefineMatch ? hunkDefineMatch[1] : '';
+          }
+          continue;
+        }
+
+        if (line.startsWith('+') || line.startsWith(' ')) {
+          const contentLine = line.slice(1);
+          const defineMatch = contentLine.match(/^define\s+(Package\/\S+)/);
+          if (defineMatch) {
+            currentPackage = defineMatch[1];
+            continue;
+          }
+          if (contentLine.match(/^endef/)) {
+            currentPackage = '';
+            continue;
+          }
+
+          if (line.startsWith('+')) {
+            const trimmed = contentLine.trim();
+            if (trimmed.startsWith('#')) continue;
+
+            if (/^DEFAULT\s*[:+]?=.*\bBUILDBOT\b/.test(trimmed)) {
+              const pkgLabel = currentPackage ? ` inside '${currentPackage}'` : '';
+              buildbotDefaultMessages.push(
+                `- Makefile line '${trimmed}'${pkgLabel} conditions DEFAULT on BUILDBOT, forcing this feed package into buildbot default images. Default package selection should be established in the main openwrt/openwrt repository, not sneaked in via a feed package's own Makefile.`
+              );
+            }
+          }
+        }
+      }
+    }
+
+    if (buildbotDefaultMessages.length > 0) {
+      const isWarning = CONFIG.check_buildbot_default === 'warning';
+      buildbotDefaultMessages.forEach(msg => {
+        if (isWarning) {
+          warnings.push(msg);
+        } else {
+          errors.push(msg);
+        }
+      });
+    } else {
+      successes.push("✅ No feed package forces its own inclusion into buildbot default images via DEFAULT+BUILDBOT");
     }
   }
 
