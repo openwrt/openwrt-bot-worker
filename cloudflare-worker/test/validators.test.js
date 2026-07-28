@@ -1017,6 +1017,60 @@ diff --git a/package/network/ipv6/odhcp6c/Makefile b/package/network/ipv6/odhcp6
     assert.ok(!res.errors.some(e => e.includes("must be an absolute path")), `Should not flag absolute path error: ${res.errors.join(', ')}`);
   });
 
+  test('does not leak conffiles block into a later hunk whose context is not a define', () => {
+    const commit = { commit: { message: 'foo: bump to 3.0.722, replace maintainer' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -33,7 +33,7 @@ endef
+ define Package/foo/description
+ foo is a packet sniffer that runs as a background process on a cable/DSL
+ router, gathers all sorts of statistics about network usage, and serves them
+-over HTTP.
++over HTTPS.
+ endef
+
+ define Package/foo/conffiles
+@@ -49,6 +49,11 @@ CONFIGURE_VARS += \\
+ 	ac_cv_search_strlcpy=no \\
+ 	ac_cv_search_strlcat=no
+
++define Build/Configure
++	( cd $(PKG_BUILD_DIR) && autoreconf -fi )
++	$(call Build/Configure/Default)
++endef
++
+ define Build/Compile
+ 	$(HOSTCC) $(PKG_BUILD_DIR)/static/c-ify.c \\
+ 		-o $(PKG_BUILD_DIR)/c-ify
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(!res.errors.some(e => e.includes('Build/Configure')), `Should not flag Build/Configure block as conffiles error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes('autoreconf')), `Should not flag autoreconf line as conffiles error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes('must not contain any spaces or indentation')), `Should not flag spaces error: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes('must be an absolute path')), `Should not flag absolute path error: ${res.errors.join(', ')}`);
+  });
+
+  test('closes conffiles block on a define that is not a conffiles block', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -41,0 +42,6 @@ define Package/foo/conffiles
++define Build/Configure
++	( cd $(PKG_BUILD_DIR) && autoreconf -fi )
++	$(call Build/Configure/Default)
++endef
++
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
   test('rejects conffiles path for individual file ending with trailing slash', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `

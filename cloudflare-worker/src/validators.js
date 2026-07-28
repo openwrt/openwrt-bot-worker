@@ -590,27 +590,25 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
         // since they may contain context lines that close or open blocks
         if (/^@@/.test(line)) {
           // Git shows the nearest preceding function-like context line after
-          // the second '@@'. If that context names a *different* define
-          // block (e.g. "define Package/foo/install"), the diff hunk lives
-          // outside any conffiles block seen in an earlier hunk, so state
-          // must not leak across hunks.
+          // the second '@@'. If that context is anything other than a conffiles
+          // define, the hunk lives outside any conffiles block seen in an
+          // earlier hunk, so state must not leak across hunks.
           const hunkContextMatch = line.match(/^@@[^@]*@@\s*(.*)$/);
-          const hunkContext = hunkContextMatch ? hunkContextMatch[1] : '';
+          const hunkContext = hunkContextMatch ? hunkContextMatch[1].trim() : '';
 
-          if (/\bendef\b/.test(hunkContext)) {
-            inConffiles = false;
-            currentPackage = '';
-          } else {
+          if (hunkContext) {
+            // Only a conffiles define keeps us inside the block. Lines *inside*
+            // a conffiles block ('/etc/config/foo') never qualify as git's
+            // function context, so any other context ('endef', another define,
+            // 'CONFIGURE_VARS += \') means this hunk starts outside the block.
             const hunkDefineMatch = hunkContext.match(/^define\s+(Package\/\S+)/);
-            if (hunkDefineMatch) {
-              if (/conffiles$/.test(hunkDefineMatch[1])) {
-                inConffiles = true;
-                currentPackage = hunkDefineMatch[1];
-                MakefileHasConffiles = true;
-              } else {
-                inConffiles = false;
-                currentPackage = '';
-              }
+            if (hunkDefineMatch && /conffiles$/.test(hunkDefineMatch[1])) {
+              inConffiles = true;
+              currentPackage = hunkDefineMatch[1];
+              MakefileHasConffiles = true;
+            } else {
+              inConffiles = false;
+              currentPackage = '';
             }
           }
           continue;
@@ -618,11 +616,19 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
 
         if (line.startsWith('+') || line.startsWith(' ')) {
           const contentLine = line.slice(1);
-          const defineMatch = contentLine.match(/^define\s+(Package\/[^\s]*conffiles)/);
+          // Any define opens a new block, so one that is not a conffiles block
+          // (e.g. 'define Build/Configure') closes the current one just as
+          // 'endef' does — its body must not be validated as conffiles paths.
+          const defineMatch = contentLine.match(/^define\s+(\S+)/);
           if (defineMatch) {
-            inConffiles = true;
-            currentPackage = defineMatch[1];
-            MakefileHasConffiles = true;
+            if (/^Package\/[^\s]*conffiles$/.test(defineMatch[1])) {
+              inConffiles = true;
+              currentPackage = defineMatch[1];
+              MakefileHasConffiles = true;
+            } else {
+              inConffiles = false;
+              currentPackage = '';
+            }
             continue;
           }
           if (contentLine.match(/^endef/)) {
