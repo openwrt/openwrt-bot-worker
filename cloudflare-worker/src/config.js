@@ -6,6 +6,7 @@ export const DEFAULT_CONFIG = {
   check_signoff: true,
   check_signature: true,
   allow_autosquash: true,
+  allow_revert: true,
   enable_comments: true,
   show_force_push_tip: true,
   max_subject_len_soft: 60,

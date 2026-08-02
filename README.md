@@ -23,6 +23,7 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
 *   **Linked GitHub Account:** Verifies that the commit author email address is registered and verified on a GitHub account, linking the commit to a valid GitHub username. Can be downgraded to a non-blocking warning or disabled entirely, see `require_linked_github_account` below.
 *   **Autosquash Compliance:** Automatically bypasses style constraints for development-phase `fixup!` and `squash!` syntax blocks.
+*   **Revert Compliance (`allow_revert`):** Accepts the subject line `git revert` generates — `Revert "<original subject>"`, its nested `Revert "Revert "<original subject>""` form, and the prefixed `<package>: Revert "..."` variant. The quoted text is copied verbatim from the reverted commit, so the prefix and lowercase rules are not applied to it, and the `Revert "..."` wrapper is excluded from the subject length limits. A revert also puts `PKG_VERSION` and `PKG_RELEASE` back to the values that preceded the reverted commit, so those restored values are accepted instead of a bump (see **PKG_RELEASE Validation** below). These relaxed rules require the body to identify what is being reverted — either the `This reverts commit <sha>.` line `git revert` generates or the `Reverts <owner>/<repo>#<number>` reference GitHub adds — so that a subject merely shaped like a revert does not lift them.
 *   **Subject String Hygiene:** Enforces `<package name or prefix>: ` prefix headers, checks lowercase starting strings post-prefix, and rejects trailing periods.
 *   **Length Constraints:** Implements dual-layered (soft and hard) line width boundaries for both subject lines and description body text blocks.
 *   **Signed-off-by Check:** Ensures a consistent, properly structured `Signed-off-by:` declaration is present and matches the original author metadata.
@@ -42,7 +43,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **Conffiles Tracker:** Mandates the definition of the `Package/.../conffiles` tracking macro whenever configuration file installations (`INSTALL_CONF`) are triggered.
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
 *   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
-*   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled).
+*   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled). Packages modified exclusively by revert commits are exempt from the reset/initialize rules, because a revert restores the version and release of an already released state. They must still carry a release bump if the revert changes package content without touching the version or release, otherwise users would never receive it.
 *   **UCI Config Validation:** Ensures that any configuration files destined to be installed into `/etc/config/` conform to the standard OpenWrt UCI format (consisting of only `package`, `config`, `option`, `list` statements, comments, and empty lines).
 *   **PKG_NAME Reuse Prevention:** Ensures `PKG_NAME` is not reused inside `call`, `define`, and `eval` Makefile lines, requiring the literal package name instead to keep recipes readable and searchable (default true).
 
@@ -122,6 +123,7 @@ Some configuration keys offer advanced options:
 *   `check_pkg_name_reuse`: Set to `true` (default) to detect and reject reuse of the `PKG_NAME` variable in `call`, `define`, and `eval` lines, or `false` to disable.
 *   `show_force_push_tip`: Set to `true` (default) to append a helpful tip regarding how to correct validation errors using force-pushing. Set to `false` to disable.
 *   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
+*   `allow_revert`: Set to `true` (default) to accept the subject format produced by `git revert` (`Revert "<original subject>"`, nested reverts, and the prefixed `<package>: Revert "..."` variant) and the `PKG_VERSION`/`PKG_RELEASE` values a revert restores, for commits whose body references the reverted commit (`This reverts commit <sha>.` or `Reverts <owner>/<repo>#<number>`). Set to `false` to hold revert commits to the regular subject and release bump rules.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 *   `enable_labeler_yml`: Set to `true` to enable dynamic pull request labeling based on matching files in the `.github/labeler.yml` configuration file. Defaults to `false` (opt-in).
 *   `enable_issue_labeller`: Set to `true` to enable automated issue form validation and labelling (replaces the GitHub Actions `issue-labeller.yml` workflow). Defaults to `false` (opt-in).
@@ -136,6 +138,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_signoff": true,
   "check_signature": true,
   "allow_autosquash": true,
+  "allow_revert": true,
   "enable_comments": true,
   "show_force_push_tip": true,
   "max_subject_len_soft": 60,
