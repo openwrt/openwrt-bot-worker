@@ -46,6 +46,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled). Packages modified exclusively by revert commits are exempt from the reset/initialize rules, because a revert restores the version and release of an already released state. They must still carry a release bump if the revert changes package content without touching the version or release, otherwise users would never receive it.
 *   **UCI Config Validation:** Ensures that any configuration files destined to be installed into `/etc/config/` conform to the standard OpenWrt UCI format (consisting of only `package`, `config`, `option`, `list` statements, comments, and empty lines).
 *   **PKG_NAME Reuse Prevention:** Ensures `PKG_NAME` is not reused inside `call`, `define`, and `eval` Makefile lines, requiring the literal package name instead to keep recipes readable and searchable (default true).
+*   **Feed Buildbot-Default Guard (`check_buildbot_default`):** Flags `DEFAULT` assignments (`=`, `:=`, `::=`, `+=`, `?=`, including backslash-continued ones) that condition inclusion on `BUILDBOT` inside feed repositories — both brand-new assignments and a `BUILDBOT` condition newly added to an existing one, since this forces a package into buildbot default images without going through the main `openwrt/openwrt` repo's own default-package process (customizable level: warning/error/disabled; skipped entirely for the main repo).
 
 ### 3. Patches Check
 Scans the contribution tree for nested downstream patch targets:
@@ -140,6 +141,7 @@ Some configuration keys offer advanced options:
 *   `check_missing_colon`: Set to `true` (default) to detect and reject the use of `=` instead of `:=` for standard variables (e.g. `PKG_NAME`, `TITLE`, `URL`, etc.) in Makefiles, or `false` to disable.
 *   `check_makefile_indentation`: Set to `true` (default) to validate package metadata/description blocks are indented with 2 spaces and install/build blocks are indented with tabs in Makefiles, or `false` to disable.
 *   `check_pkg_name_reuse`: Set to `true` (default) to detect and reject reuse of the `PKG_NAME` variable in `call`, `define`, and `eval` lines, or `false` to disable.
+*   `check_buildbot_default`: Can be `"warning"` (default, non-blocking), `"error"`/`true` (hard error), or `"disabled"`/`false` to disable. Never applies to the main `openwrt/openwrt` repository, where default package selection legitimately lives.
 *   `show_force_push_tip`: Set to `true` (default) to append a helpful tip regarding how to correct validation errors using force-pushing. Set to `false` to disable.
 *   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
 *   `allow_revert`: Set to `true` (default) to accept the subject format produced by `git revert` (`Revert "<original subject>"`, nested reverts, and the prefixed `<package>: Revert "..."` variant) and the `PKG_VERSION`/`PKG_RELEASE` values a revert restores, for commits whose body references the reverted commit (`This reverts commit <sha>.` or `Reverts <owner>/<repo>#<number>`). Set to `false` to hold revert commits to the regular subject and release bump rules.
@@ -180,6 +182,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_missing_colon": true,
   "check_makefile_indentation": true,
   "check_pkg_name_reuse": true,
+  "check_buildbot_default": "warning",
   "check_patch_headers": true,
   "check_pkg_release": "warning",
   "require_linked_github_account": true,
