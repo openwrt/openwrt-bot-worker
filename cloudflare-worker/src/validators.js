@@ -730,7 +730,21 @@ function collectPackageMakefiles(commitPatch, direction) {
   return paths;
 }
 
-export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) {
+// The only repository where a package's own DEFAULT assignment is allowed to
+// pull it into buildbot default images; everywhere else (feeds) that
+// decision belongs to the main repo, not the package itself.
+const MAIN_REPO_FULLNAME = 'openwrt/openwrt';
+
+// GitHub treats owner/repo case-insensitively, so normalise both sides. The
+// constant is lowercase today, but nothing stops a later edit from spelling it
+// OpenWrt/OpenWrt and silently exempting nobody. An absent value counts as
+// "not the main repo" (fail towards reporting) rather than skipping the check.
+function isMainRepo(repoFullname) {
+  return typeof repoFullname === 'string' &&
+    repoFullname.toLowerCase() === MAIN_REPO_FULLNAME.toLowerCase();
+}
+
+export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname) {
   const errors = [];
   const successes = [];
   const warnings = [];
@@ -749,6 +763,24 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   if (collectPackageMakefiles(commitPatch, 'removed').length > 0) {
     state.isDroppedPackage = true;
   }
+
+  // Every Makefile check below wants the same thing: the patch split per file,
+  // narrowed to Makefiles, split into lines. Compute it once (lazily, so
+  // configurations with all Makefile checks off pay nothing) instead of
+  // re-scanning the whole patch once per enabled check.
+  let cachedMakefileChunks = null;
+  const getMakefileChunks = () => {
+    if (cachedMakefileChunks !== null) return cachedMakefileChunks;
+    cachedMakefileChunks = [];
+    for (const fileDiff of commitPatch.split(/^diff --git /m)) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
+      cachedMakefileChunks.push({ filePath, lines: fileDiff.split('\n') });
+    }
+    return cachedMakefileChunks;
+  };
 
   if (CONFIG.check_pkg_version) {
     // Judge each changed Makefile on its own instead of taking the first
@@ -872,19 +904,10 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   }
 
   if (CONFIG.check_conffiles) {
-    const fileDiffs = commitPatch.split(/^diff --git /m);
     let conffilesCheckRun = false;
     let conffilesCheckErrors = 0;
 
-    for (const fileDiff of fileDiffs) {
-      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
-      if (!fileMatch) continue;
-      const filePath = fileMatch[1].trim();
-      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
-      if (!isMakefile) continue;
-
-      const lines = fileDiff.split('\n');
-
+    for (const { lines } of getMakefileChunks()) {
       // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
       // since install blocks can appear after conffiles blocks in the diff)
       const installedDirs = new Set();
@@ -1119,18 +1142,10 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   }
 
   if (CONFIG.check_missing_colon || CONFIG.check_space_after_assignment) {
-    const fileDiffs = commitPatch.split(/^diff --git /m);
     let assignmentCheckRun = false;
     let assignmentErrors = 0;
 
-    for (const fileDiff of fileDiffs) {
-      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
-      if (!fileMatch) continue;
-      const filePath = fileMatch[1].trim();
-      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
-      if (!isMakefile) continue;
-
-      const lines = fileDiff.split('\n');
+    for (const { lines } of getMakefileChunks()) {
       for (const line of lines) {
         if (line.startsWith('+')) {
           const contentLine = line.slice(1);
@@ -1187,22 +1202,14 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   }
 
   if (CONFIG.check_makefile_indentation) {
-    const fileDiffs = commitPatch.split(/^diff --git /m);
     let indentationCheckRun = false;
     let indentationErrors = 0;
 
-    for (const fileDiff of fileDiffs) {
-      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
-      if (!fileMatch) continue;
-      const filePath = fileMatch[1].trim();
-      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
-      if (!isMakefile) continue;
-
+    for (const { lines } of getMakefileChunks()) {
       let inBlock = null; // 'metadata', 'description', 'recipe'
       let blockName = '';
       let isContinuation = false;
 
-      const lines = fileDiff.split('\n');
       for (const line of lines) {
         // Diff hunk headers (@@ ... @@ <context>) carry the nearest preceding
         // define/endef line as context. A block opened in an earlier hunk may
@@ -1309,19 +1316,124 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  if (
+    CONFIG.check_buildbot_default &&
+    CONFIG.check_buildbot_default !== 'disabled' &&
+    !isMainRepo(repoFullname)
+  ) {
+    let buildbotCheckRun = false;
+    const buildbotDefaultMessages = new Set();
+
+    for (const { lines } of getMakefileChunks()) {
+      buildbotCheckRun = true;
+
+      // Track which Package/* block an added line lives in, purely to produce
+      // a friendlier message. Re-derived from hunk header context (like the
+      // indentation check) so state does not leak across hunks.
+      let currentPackage = '';
+      // A DEFAULT assignment may be spread over backslash continuation lines;
+      // BUILDBOT can then sit on a line that does not start with DEFAULT.
+      // The assignment is tracked whether it starts on an added or a context
+      // line — adding an 'if BUILDBOT' continuation under a pre-existing
+      // 'DEFAULT:=y \' is the easiest way to sneak the condition in — and
+      // reported only when the diff actually introduces or re-arms it:
+      // either its value line is added/changed, or an added line carries
+      // BUILDBOT itself.
+      let pendingDefault = null;
+
+      const flushPending = () => {
+        if (pendingDefault && (pendingDefault.startAdded || pendingDefault.buildbotAdded) && /\bBUILDBOT\b/.test(pendingDefault.text)) {
+          const pkgLabel = pendingDefault.pkg ? ` inside '${pendingDefault.pkg}'` : '';
+          buildbotDefaultMessages.add(
+            `- Makefile line '${pendingDefault.text}'${pkgLabel} conditions DEFAULT on BUILDBOT, which forces this feed package into the buildbot default images. Default package selection belongs in the main ${MAIN_REPO_FULLNAME} repository, so please propose it there instead of setting it from a feed package's own Makefile.`
+          );
+        }
+        pendingDefault = null;
+      };
+
+      for (const line of lines) {
+        if (/^@@/.test(line)) {
+          flushPending();
+          const hunkContextMatch = line.match(/^@@[^@]*@@\s*(.*)$/);
+          // Trimmed for the same reason the in-loop define/endef matches are:
+          // Make tolerates leading whitespace, and an indented define carried
+          // as hunk context would otherwise lose the package attribution.
+          const hunkContext = hunkContextMatch ? hunkContextMatch[1].trim() : '';
+          const hunkDefineMatch = /\bendef\b/.test(hunkContext)
+            ? null
+            : hunkContext.match(/^define\s+(Package\/\S+)/);
+          currentPackage = hunkDefineMatch ? hunkDefineMatch[1] : '';
+          continue;
+        }
+
+        if (!line.startsWith('+') && !line.startsWith(' ')) continue;
+        const contentLine = line.slice(1);
+        const trimmed = contentLine.trim();
+
+        // Make tolerates leading whitespace on define/endef, so match on the
+        // trimmed line: an indented endef that failed to close the block would
+        // otherwise label a later DEFAULT with the wrong package name.
+        const defineMatch = trimmed.match(/^define\s+(Package\/\S+)/);
+        if (defineMatch) {
+          flushPending();
+          currentPackage = defineMatch[1];
+          continue;
+        }
+        if (/^endef\b/.test(trimmed)) {
+          flushPending();
+          currentPackage = '';
+          continue;
+        }
+
+        // Continuation of a DEFAULT assignment whose previous line ended in
+        // a backslash. Added and context lines are both part of the
+        // post-image; deleted lines never reach this point (see the guard
+        // above), which is right for the same reason. An added continuation
+        // only implicates the assignment when it carries BUILDBOT itself:
+        // an untouched 'DEFAULT:=y if BUILDBOT \' must not be re-reported
+        // just because an unrelated clause was appended to it.
+        if (pendingDefault) {
+          pendingDefault.text += ` ${trimmed.replace(/\\$/, '').trim()}`;
+          if (line.startsWith('+') && /\bBUILDBOT\b/.test(trimmed)) pendingDefault.buildbotAdded = true;
+          if (!trimmed.endsWith('\\')) flushPending();
+          continue;
+        }
+
+        if (trimmed.startsWith('#')) continue;
+
+        // Accept every Makefile assignment flavour: =, :=, ::=, +=, ?=
+        // `startAdded` means the value line itself is new or changed — that
+        // covers flipping 'DEFAULT:=n' to 'DEFAULT:=y' above an untouched
+        // 'if BUILDBOT' continuation, which an added-BUILDBOT test alone
+        // would miss.
+        if (/^DEFAULT\s*(?::{1,2}|[+?])?=/.test(trimmed)) {
+          pendingDefault = { pkg: currentPackage, text: trimmed.replace(/\\$/, '').trim(), startAdded: line.startsWith('+'), buildbotAdded: false };
+          if (!trimmed.endsWith('\\')) flushPending();
+        }
+      }
+
+      flushPending();
+    }
+
+    if (buildbotDefaultMessages.size > 0) {
+      const isWarning = CONFIG.check_buildbot_default === 'warning';
+      for (const msg of buildbotDefaultMessages) {
+        if (isWarning) {
+          warnings.push(msg);
+        } else {
+          errors.push(msg);
+        }
+      }
+    } else if (buildbotCheckRun) {
+      successes.push("✅ No feed package forces its own inclusion into buildbot default images via DEFAULT+BUILDBOT");
+    }
+  }
+
   if (CONFIG.check_pkg_name_reuse) {
-    const fileDiffs = commitPatch.split(/^diff --git /m);
     let pkgNameCheckRun = false;
     let pkgNameCheckErrors = 0;
 
-    for (const fileDiff of fileDiffs) {
-      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
-      if (!fileMatch) continue;
-      const filePath = fileMatch[1].trim();
-      const isMakefile = filePath.endsWith('/Makefile') || filePath === 'Makefile';
-      if (!isMakefile) continue;
-
-      const lines = fileDiff.split('\n');
+    for (const { lines } of getMakefileChunks()) {
       for (const line of lines) {
         if (line.startsWith('+')) {
           const contentLine = line.slice(1);
