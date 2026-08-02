@@ -331,6 +331,45 @@ describe('validateFormalities', () => {
       `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
   });
 
+  test('warns when body only qualifies the kind of release (e.g. bird3: bump to v3.3.2)', async () => {
+    const commit = {
+      commit: {
+        message: 'bird3: bump to v3.3.2\n\nUpdate to latest upstream bugfix release.\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
+  test('warns when body only claims bugs were fixed', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: update to 2.4.0\n\nStable maintenance release, fixes bugs.\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
+  test('does not warn when the body names what was fixed', async () => {
+    const commit = {
+      commit: {
+        message: 'bird3: bump to v3.3.2\n\nUpstream bugfix release, fixes a crash in the BGP reconfiguration path.\n\nSigned-off-by: Jane Smith <jane@example.com>',
+        author: { name: 'Jane Smith', email: 'jane@example.com' },
+        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(!res.warnings.some(w => w.includes('identical or virtually identical')),
+      `Did not expect duplicate warning but got: ${JSON.stringify(res.warnings)}`);
+  });
+
   test('does not warn when body has meaningful context beyond subject', async () => {
     const commit = {
       commit: {
