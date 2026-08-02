@@ -14,6 +14,18 @@ const PROTECTED_HEAD_BRANCHES = ['master', 'main', 'stable', 'openwrt-25.12', 'o
 // else needs the repository permission lookup (see createMaintainerResolver).
 const MAINTAINER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
+// Override commands, recognized both in the PR description and in comments.
+const ALLOW_BRANCH_PATTERN = /\[allow[ -]branch\]/i;
+const ALLOW_CHERRY_PICK_PATTERN = /\[allow[ -]cherry[ -]pick\]/i;
+
+// Bots never act as maintainers here, whatever access they hold on the
+// repository: this app's own formality reports quote the override commands
+// back at the PR, so honoring a bot comment would let it re-trigger itself.
+function isBotUser(user) {
+  const login = user?.login;
+  return user?.type === 'Bot' || (!!login && login.toLowerCase().endsWith('[bot]'));
+}
+
 // GitHub reports author_association CONTRIBUTOR (or NONE) for maintainers who
 // keep their organization membership private, which would lock them out of the
 // override commands. Fall back to the repository permission they actually hold.
@@ -21,29 +33,49 @@ const MAINTAINER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 // comment author, and every lookup costs a subrequest.
 function createMaintainerResolver(repoFullname, token, subrequestBudget) {
   const cache = new Map();
+  let budgetWarned = false;
 
   return async function isMaintainerUser(user, association) {
+    if (isBotUser(user)) {
+      return false;
+    }
     if (MAINTAINER_ASSOCIATIONS.includes((association || '').toUpperCase())) {
       return true;
     }
+    // Nothing left to ask about: the fallback is keyed on the login.
     const login = user?.login;
-    // Bots hold write access on some repositories but never act as maintainers
-    // here, and asking about them would just burn a subrequest per comment.
-    if (!login || user?.type === 'Bot' || login.endsWith('[bot]')) {
+    if (!login) {
       return false;
     }
-    if (cache.has(login)) {
-      return cache.get(login);
+    // GitHub logins are case-insensitive, and the same user can reach us with
+    // different casing across payloads, so memoize on a normalized key. The
+    // lookup itself keeps the login as written.
+    const cacheKey = login.toLowerCase();
+    if (cache.has(cacheKey)) {
+      return cache.get(cacheKey);
     }
     // Leave the reserve untouched so the terminal writes (labels, PR comment,
     // check-runs) at the end of the handler always have headroom left.
     if (subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used <= 0) {
+      if (!budgetWarned) {
+        budgetWarned = true;
+        console.warn(`Subrequest budget exhausted (used ${subrequestBudget.used}/${subrequestBudget.limit}, ${subrequestBudget.reserve} reserved): permission lookups skipped, maintainers outside the organization are treated as contributors.`);
+      }
       return false;
     }
     // Cache the pending promise, not the result, so concurrent questions about
     // the same login share a single lookup.
-    const pending = fetchUserRepoPermission(repoFullname, login, token, () => { subrequestBudget.used++; });
-    cache.set(login, pending);
+    const pending = fetchUserRepoPermission(repoFullname, login, token, () => { subrequestBudget.used++; })
+      .then(hasWriteAccess => {
+        // A failed lookup is not evidence of missing access, so it must not
+        // stick: drop it and let a later question about the same login retry.
+        if (hasWriteAccess === null) {
+          cache.delete(cacheKey);
+          return false;
+        }
+        return hasWriteAccess;
+      });
+    cache.set(cacheKey, pending);
     return pending;
   };
 }
@@ -77,8 +109,8 @@ async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintaine
         existingCommentId = c.id;
       }
       const body = c.body || '';
-      const hasCherryPickPattern = /\[allow[ -]cherry[ -]pick\]/i.test(body);
-      const hasBranchPattern = /\[allow[ -]branch\]/i.test(body);
+      const hasCherryPickPattern = ALLOW_CHERRY_PICK_PATTERN.test(body);
+      const hasBranchPattern = ALLOW_BRANCH_PATTERN.test(body);
 
       // Only comments that actually carry an override command are worth
       // resolving: for anyone outside the org that costs an extra subrequest.
@@ -198,6 +230,13 @@ async function handleWebhook(request, env) {
 
     if (!data.issue?.pull_request) {
       return new Response("Comment is not on a pull request", { status: 200 });
+    }
+
+    // Drop bot comments before minting an installation token: they can never
+    // be a maintainer action (see isBotUser), and on a busy repository they
+    // are the bulk of the comment traffic.
+    if (isBotUser(data.comment?.user)) {
+      return new Response("Ignored non-maintainer issue comment", { status: 200 });
     }
   } else {
     const action = data.action || '';
@@ -572,16 +611,22 @@ async function handleWebhook(request, env) {
 
   const prBody = data.pull_request.body || '';
   const association = (data.pull_request.author_association || 'NONE').toUpperCase();
-  // Resolved on demand, like the comment scan above: only the branch and
-  // cherry-pick bypasses below care, and for an outside contributor the answer
-  // costs a subrequest (see createMaintainerResolver).
-  const isPrAuthorMaintainer = () => isMaintainerUser(data.pull_request.user, association);
+  const bodyRequestsBranchBypass = ALLOW_BRANCH_PATTERN.test(prBody);
+  const bodyRequestsCherryPickBypass = ALLOW_CHERRY_PICK_PATTERN.test(prBody);
+  // Resolved on demand, like the comment scan above: for an outside
+  // contributor the answer costs a subrequest (see createMaintainerResolver),
+  // so it is only worth asking when the description actually carries an
+  // override. Without one the association alone decides, which at most picks
+  // the wording of the hint printed with the failure.
+  const isPrAuthorMaintainer = (bodyRequestsBypass) => bodyRequestsBypass
+    ? isMaintainerUser(data.pull_request.user, association)
+    : MAINTAINER_ASSOCIATIONS.includes(association);
 
   if (CONFIG.check_branch) {
     if (PROTECTED_HEAD_BRANCHES.includes(headBranch)) {
-      const isMaintainer = await isPrAuthorMaintainer();
+      const isMaintainer = await isPrAuthorMaintainer(bodyRequestsBranchBypass);
       const scanResult = await getCommentsScanWithRetry() || { hasBranchBypassComment: false, existingCommentId: null };
-      const bypassBranchCheck = scanResult.hasBranchBypassComment || (isMaintainer && /\[allow[ -]branch\]/i.test(prBody));
+      const bypassBranchCheck = scanResult.hasBranchBypassComment || (bodyRequestsBranchBypass && isMaintainer);
 
       if (bypassBranchCheck) {
         formalityOutputText += `⚠️ Pull request originates from protected branch \`${headBranch}\` but was allowed via override command\n\n`;
@@ -776,9 +821,9 @@ async function handleWebhook(request, env) {
 
     if (isBackportPr) {
       if (!(fullCommit.commit.message || '').toLowerCase().includes('cherry picked from')) {
-        const isMaintainer = await isPrAuthorMaintainer();
+        const isMaintainer = await isPrAuthorMaintainer(bodyRequestsCherryPickBypass);
         const scanResult = await getCommentsScanWithRetry() || { hasCherryPickBypassComment: false, existingCommentId: null };
-        const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (isMaintainer && /\[allow[ -]cherry[ -]pick\]/i.test(prBody));
+        const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (bodyRequestsCherryPickBypass && isMaintainer);
 
         if (bypassCherryPickCheck) {
           formalityOutputText += "  ⚠️ Commit to stable branch bypasses cherry-pick requirement via override command\n";

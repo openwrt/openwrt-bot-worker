@@ -38,12 +38,12 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
         // probe paths that may not exist (e.g. Makefile discovery in findPkgRoot).
         const isExpected404 = response.status === 404 &&
           method === 'GET' && url.includes('/contents/');
-        // 404/422 on a GET is expected only for opt-in callers (options.silent):
-        // the fork fallback when a commit SHA vanished after a force-push /
-        // rebase, and permission probes for users who are not collaborators.
+        // 404/422 is expected only for opt-in callers (options.silent): the
+        // fork fallback when a commit SHA vanished after a force-push / rebase,
+        // permission probes for users who are not collaborators, and label
+        // deletions racing another writer.
         const isSilencedMiss = options.silent === true &&
-          (response.status === 404 || response.status === 422) &&
-          method === 'GET';
+          (response.status === 404 || response.status === 422);
         if (!isExpected404 && !isSilencedMiss) {
           console.error(`GitHub API call failed: ${method} ${url} -> HTTP ${response.status}: ${text.trim().slice(0, 500)}`);
         }
@@ -319,24 +319,37 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes) {
   return results;
 }
 
-// `permission` reports the base access level (admin/write/read/none), while
-// `role_name` also names the finer-grained or custom role behind it.
-const WRITE_ACCESS_LEVELS = ['admin', 'write', 'maintain'];
+// Fallback for responses without the `user.permissions` object. The flat
+// `permission` field only ever reports admin/write/read/none — a `maintain` or
+// custom role that grants push is already folded into `write` there, so those
+// two levels are the whole set. `role_name` is deliberately not consulted: it
+// can name a custom organization role whose actual rights are unknown.
+const WRITE_PERMISSION_LEVELS = ['admin', 'write'];
 
 // Checks whether a user holds write access to a repository. Used as a fallback
 // when author_association is CONTRIBUTOR or NONE, which is what GitHub reports
 // for maintainers whose organization membership is private.
-// A 404 here is the normal answer for "not a collaborator", so it is silenced
-// rather than logged as an API failure.
+// Returns true/false when GitHub answered authoritatively — including 404,
+// which is the normal answer for "not a collaborator" and is therefore
+// silenced rather than logged as an API failure — and null when the lookup
+// itself failed (403 without the required app permission, 5xx, network error),
+// so callers can tell "no access" apart from "no answer".
 export async function fetchUserRepoPermission(repoFullname, username, token, onCall) {
   if (!repoFullname || !username) return false;
   onCall?.();
   const url = `https://api.github.com/repos/${repoFullname}/collaborators/${encodeURIComponent(username)}/permission`;
   const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { silent: true });
-  if (res.code !== 200 || !res.data) {
+  if (res.code === 404) {
     return false;
   }
-  const permission = (res.data.permission || '').toLowerCase();
-  const roleName = (res.data.role_name || '').toLowerCase();
-  return WRITE_ACCESS_LEVELS.includes(permission) || WRITE_ACCESS_LEVELS.includes(roleName);
+  if (res.code !== 200 || !res.data) {
+    return null;
+  }
+  // `user.permissions` is the documented signal for push access and covers the
+  // maintain and custom roles that the flat field flattens away.
+  const permissions = res.data.user?.permissions;
+  if (permissions && typeof permissions === 'object') {
+    return permissions.admin === true || permissions.maintain === true || permissions.push === true;
+  }
+  return WRITE_PERMISSION_LEVELS.includes((res.data.permission || '').toLowerCase());
 }

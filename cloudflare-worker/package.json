@@ -2,6 +2,6 @@
   "name": "openwrt-bot",
   "type": "module",
   "scripts": {
-    "test": "node --test --test-reporter spec test/*.test.js"
+    "test": "NODE_ENV=test node --test --test-reporter spec test/*.test.js"
   }
 }

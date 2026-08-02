@@ -12,12 +12,12 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Branch Target Enforcement:** Ensures pull requests originate from dedicated feature branches, blocking accidental direct PRs from `main`, `master`, or active stable branches.
 
 > [!TIP]
-> Maintainers (`OWNER`, `MEMBER`, or `COLLABORATOR`) can bypass this check by posting a pull request comment containing `[allow branch]` (or `[allow-branch]`). Alternatively, if the PR author is a maintainer, they can also include `[allow branch]` in the PR description.
+> Maintainers can bypass this check by posting a pull request comment containing `[allow branch]` (or `[allow-branch]`). Alternatively, if the PR author is a maintainer, they can also include `[allow branch]` in the PR description. See [Who counts as a maintainer](#who-counts-as-a-maintainer).
 
 *   **Stable Branch Backports Enforcement:** Ensures that pull requests targeting active stable/backport branches (e.g., `openwrt-25.12`, `openwrt-24.10`) contain the context line `(cherry picked from commit ...)` in every commit message.
 
 > [!TIP]
-> Maintainers (`OWNER`, `MEMBER`, or `COLLABORATOR`) can bypass this check by posting a pull request comment containing `[allow cherry-pick]` (or `[allow-cherry-pick]`). Alternatively, if the PR author is a maintainer, they can also include `[allow cherry-pick]` in the PR description.
+> Maintainers can bypass this check by posting a pull request comment containing `[allow cherry-pick]` (or `[allow-cherry-pick]`). Alternatively, if the PR author is a maintainer, they can also include `[allow cherry-pick]` in the PR description. See [Who counts as a maintainer](#who-counts-as-a-maintainer).
 
 *   **Merge Commit Elimination:** Rejects merge commits inside the PR tracking chain to preserve a clean linear history.
 *   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
@@ -70,6 +70,20 @@ Scans the contribution tree for nested downstream patch targets:
 
 ---
 
+### Who counts as a maintainer
+
+Override commands (`[allow branch]`, `[allow cherry-pick]`) and comment-triggered re-checks are only honored for maintainers. A user qualifies if either of the following holds:
+
+*   their `author_association` on the pull request or comment is `OWNER`, `MEMBER` or `COLLABORATOR`, or
+*   they hold **write**, **maintain** or **admin** access on the repository.
+
+The second rule exists because GitHub reports `author_association: CONTRIBUTOR` (or `NONE`) for maintainers who keep their organization membership private, which would otherwise lock them out of their own overrides. Resolving it costs one extra API lookup per login — and a lookup can retry on transient failures, so it may spend more than one outgoing subrequest — so it is only asked when the association alone is not enough **and** the answer can actually change the outcome — a comment carrying an override command, or a PR description that requests one. Answers are cached for the duration of the webhook, bot accounts are never resolved, and a failed lookup is treated as "not a maintainer".
+
+> [!NOTE]
+> Read-only and `triage` collaborators cannot use the overrides. Organization members are trusted through their association even without write access, matching the behavior the bot has always had.
+
+---
+
 ## Setup & Deployment
 
 The engine is built as a headless JavaScript service hosted on **Cloudflare Workers**. It operates with zero local npm/Node dependencies inside the repository, making it highly secure and maintenance-free.
@@ -83,9 +97,14 @@ The GitHub App requires the following permissions and event subscriptions:
     *   **Commit statuses:** `Read & write` (to update commit statuses)
     *   **Pull requests:** `Read & write` (to add review comments and manage triage labels)
     *   **Contents:** `Read-only` (to fetch repository-specific configurations like `.github/formalities.json`)
+    *   **Metadata:** `Read-only` (mandatory for every App)
 *   **Event Subscriptions:**
     *   Subscribe to **Pull request** events (triggers on opened, synchronized, and reopened).
+    *   Subscribe to **Issue comment** events (triggers on created — required for the override commands and comment-triggered re-checks).
     *   Subscribe to **Issues** events (triggers on opened — required for the issue labeller feature).
+
+> [!NOTE]
+> The maintainer fallback described in [Who counts as a maintainer](#who-counts-as-a-maintainer) calls `GET /repos/{owner}/{repo}/collaborators/{username}/permission`. Whether an installation is allowed to call it is decided by GitHub, so verify it against a real installation rather than assuming the permissions listed above are enough. If the call is refused (`403 Resource not accessible by integration`), the lookup fails closed: maintainers with a private organization membership are treated as contributors, and the refusal is visible in the Worker logs.
 
 ### 2. Cloudflare Worker Configuration
 
