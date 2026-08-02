@@ -39,9 +39,13 @@ export function isVirtuallyIdentical(subject, body, pkgName) {
     'bump', 'bumps', 'bumped',
     'update', 'updates', 'updated',
     'upgrade', 'upgrades', 'upgraded',
-    'newest', 'latest', 'new', 'old',
+    'newest', 'latest', 'new', 'old', 'current', 'currently', 'recent', 'available',
     'from', 'to', 'the', 'a', 'an', 'and', 'or', 'in', 'of', 'for', 'with', 'by', 'on', 'at', 'it', 'its',
     'version', 'versions', 'v', 'cli', 'package', 'packages', 'release', 'releases', 'revision', 'revisions',
+    // Qualifiers that describe the kind of release without saying what changed
+    'upstream', 'downstream', 'stable', 'maintenance', 'point', 'minor', 'major',
+    'bugfix', 'bugfixes', 'hotfix', 'hotfixes', 'fix', 'fixes', 'bug', 'bugs',
+    'source', 'sources', 'tarball', 'changes', 'changelog',
     'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
     'about', 'again', 'all', 'any', 'both', 'each', 'few', 'more', 'other', 'some', 'such', 'than', 'too', 'very',
     'just', 'only', 'then', 'here', 'there', 'when', 'where', 'why', 'how', 'this'
