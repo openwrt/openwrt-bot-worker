@@ -982,6 +982,41 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
   let originalImportKey;
   let originalSign;
   let postedCheckRuns = [];
+  // Logins that the handler asked the collaborator permission API about, in order.
+  let permissionLookups = [];
+
+  // Mirrors GET /repos/{repo}/collaborators/{user}/permission: the flat
+  // `permission` field flattens maintain into write, while `user.permissions`
+  // carries the fine-grained rights the resolver actually reads.
+  const PERMISSION_BODIES = {
+    admin: { permission: 'admin', role_name: 'admin', permissions: { admin: true, maintain: true, push: true, triage: true, pull: true } },
+    maintain: { permission: 'write', role_name: 'maintain', permissions: { admin: false, maintain: true, push: true, triage: true, pull: true } },
+    write: { permission: 'write', role_name: 'write', permissions: { admin: false, maintain: false, push: true, triage: true, pull: true } },
+    triage: { permission: 'read', role_name: 'triage', permissions: { admin: false, maintain: false, push: false, triage: true, pull: true } },
+    read: { permission: 'read', role_name: 'read', permissions: { admin: false, maintain: false, push: false, triage: false, pull: true } }
+  };
+
+  // `failures` maps a login to how many of its lookups should fail before the
+  // real answer is served, so tests can drive the "lookup failed" path.
+  function collaboratorPermissionResponse(url, collaboratorPermissions = {}, failures = {}) {
+    const username = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
+    permissionLookups.push(username);
+    if (failures[username] > 0) {
+      failures[username]--;
+      return new Response(JSON.stringify({ message: 'Resource not accessible by integration' }), { status: 403 });
+    }
+    const level = collaboratorPermissions[username];
+    if (!level) {
+      // What GitHub answers for a user who is not a collaborator at all.
+      return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+    }
+    const body = PERMISSION_BODIES[level];
+    return new Response(JSON.stringify({
+      permission: body.permission,
+      role_name: body.role_name,
+      user: { login: username, permissions: body.permissions }
+    }), { status: 200 });
+  }
 
   before(() => {
     originalFetch = globalThis.fetch;
@@ -1016,8 +1051,9 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
   });
 
   async function sendWebhookPR(prBody, baseBranch, authorAssociation, commitMessage, comments = [], prOptions = {}) {
-    const { headBranch = 'feature-branch', checkBranch = false } = prOptions;
+    const { headBranch = 'feature-branch', checkBranch = false, prUser = { login: 'prauthor', type: 'User' }, env = {} } = prOptions;
     postedCheckRuns = [];
+    permissionLookups = [];
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
         return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
@@ -1039,9 +1075,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         return new Response(JSON.stringify([]), { status: 200 });
       }
       if (url.includes('/collaborators/')) {
-        const username = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
-        const perm = prOptions.collaboratorPermissions?.[username] || 'read';
-        return new Response(JSON.stringify({ permission: perm }), { status: 200 });
+        return collaboratorPermissionResponse(url, prOptions.collaboratorPermissions, prOptions.permissionFailures);
       }
       if (url.includes('/check-runs')) {
         if (options && options.method === 'POST') {
@@ -1062,6 +1096,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         base: { ref: baseBranch },
         head: { ref: headBranch, sha: 'abcdef1234567890' },
         author_association: authorAssociation,
+        user: prUser,
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
       },
       installation: { id: 456 },
@@ -1115,7 +1150,8 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     const response = await worker.fetch(request, {
       WEBHOOK_SECRET: secret,
       APP_ID: '12345',
-      PRIVATE_KEY: 'YW55Y29udGVudA=='
+      PRIVATE_KEY: 'YW55Y29udGVudA==',
+      ...env
     }, {});
 
     return response;
@@ -1189,6 +1225,32 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.ok(commitCheck);
     assert.strictEqual(commitCheck.conclusion, 'success');
     assert.match(commitCheck.output.text, /bypasses cherry-pick requirement via override command/);
+  });
+
+  test('passes on stable branch backport if the PR author has write access despite a CONTRIBUTOR author_association', async () => {
+    const response = await sendWebhookPR('Please [allow cherry-pick] for this PR', 'openwrt-25.12', 'CONTRIBUTOR', 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>', [], {
+      prUser: { login: 'privatemaintainer', type: 'User' },
+      collaboratorPermissions: { privatemaintainer: 'admin' }
+    });
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(permissionLookups, ['privatemaintainer']);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.strictEqual(commitCheck.conclusion, 'success');
+    assert.match(commitCheck.output.text, /bypasses cherry-pick requirement via override command/);
+  });
+
+  test('does not spend a permission lookup on a backport whose description asks for no bypass', async () => {
+    const response = await sendWebhookPR('Contribute feature', 'openwrt-25.12', 'CONTRIBUTOR', 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>', [], {
+      prUser: { login: 'somecontributor', type: 'User' }
+    });
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(permissionLookups, []);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.strictEqual(commitCheck.conclusion, 'failure');
   });
 
   describe('Target Branch Bypass via [allow branch]', () => {
@@ -1293,6 +1355,137 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
       assert.ok(commitCheck);
       assert.strictEqual(commitCheck.conclusion, 'success');
       assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('passes on protected head branch if the PR author has write access despite a CONTRIBUTOR author_association', async () => {
+      const response = await sendWebhookPR('Intentional PR from stable.\n\n[allow branch]', 'main', 'CONTRIBUTOR', validCommit, [], {
+        headBranch: 'stable',
+        checkBranch: true,
+        prUser: { login: 'privatemaintainer', type: 'User' },
+        collaboratorPermissions: { privatemaintainer: 'maintain' }
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(permissionLookups, ['privatemaintainer']);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('fails on protected head branch if the PR author requesting the bypass is not a collaborator', async () => {
+      const response = await sendWebhookPR('Please [allow branch]', 'main', 'CONTRIBUTOR', validCommit, [], {
+        headBranch: 'stable',
+        checkBranch: true,
+        prUser: { login: 'outsider', type: 'User' }
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(permissionLookups, ['outsider']);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+      assert.match(commitCheck.output.text, /Pull request must originate from a feature branch/);
+    });
+
+    test('fails on protected head branch if the PR author only holds the triage role', async () => {
+      const response = await sendWebhookPR('Please [allow branch]', 'main', 'CONTRIBUTOR', validCommit, [], {
+        headBranch: 'stable',
+        checkBranch: true,
+        prUser: { login: 'triager', type: 'User' },
+        collaboratorPermissions: { triager: 'triage' }
+      });
+      assert.strictEqual(response.status, 200);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+    });
+
+    test('does not spend a permission lookup when neither the description nor a comment asks for the bypass', async () => {
+      const comments = [
+        { body: 'Please rebase this', author_association: 'CONTRIBUTOR', user: { login: 'reviewer' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'CONTRIBUTOR', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        prUser: { login: 'somecontributor', type: 'User' }
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(permissionLookups, [], 'Neither the PR author nor plain comments are worth resolving');
+
+      const commitCheck = findCommitCheck();
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+    });
+
+    test('ignores an [allow branch] comment posted by a bot, whatever association it carries', async () => {
+      const comments = [
+        { body: 'Use `[allow branch]` in PR description or comment to override this check', author_association: 'COLLABORATOR', user: { login: 'openwrt-formality-bot[bot]', type: 'Bot' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(permissionLookups, []);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
+    });
+
+    test('retries a login whose first permission lookup failed instead of remembering the failure', async () => {
+      const comments = [
+        { body: 'first thought: [allow branch]', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer' } },
+        { body: 'still think so, [allow branch]', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer' } }
+      ];
+      const response = await sendWebhookPR('Contribute feature', 'main', 'NONE', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        collaboratorPermissions: { privatemaintainer: 'write' },
+        permissionFailures: { privatemaintainer: 1 }
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(permissionLookups, ['privatemaintainer', 'privatemaintainer']);
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+      assert.match(commitCheck.output.text, /allowed via override command/);
+    });
+
+    test('resolves a login only once even when payloads spell it with different casing', async () => {
+      const comments = [
+        { body: 'go ahead, [allow branch]', author_association: 'CONTRIBUTOR', user: { login: 'PrivateMaintainer' } }
+      ];
+      const response = await sendWebhookPR('Please [allow branch]', 'main', 'CONTRIBUTOR', validCommit, comments, {
+        headBranch: 'stable',
+        checkBranch: true,
+        prUser: { login: 'privatemaintainer', type: 'User' },
+        collaboratorPermissions: { privatemaintainer: 'write', PrivateMaintainer: 'write' }
+      });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(permissionLookups.length, 1, 'GitHub logins are case-insensitive, so one lookup must answer both questions');
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'success');
+    });
+
+    test('skips permission lookups once the subrequest reserve is reached', async () => {
+      const response = await sendWebhookPR('Intentional PR from stable.\n\n[allow branch]', 'main', 'CONTRIBUTOR', validCommit, [], {
+        headBranch: 'stable',
+        checkBranch: true,
+        prUser: { login: 'privatemaintainer', type: 'User' },
+        collaboratorPermissions: { privatemaintainer: 'admin' },
+        env: { SUBREQUEST_BUDGET_LIMIT: '20', SUBREQUEST_RESERVE_HEADROOM: '20' }
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(permissionLookups, [], 'The reserve must stay untouched for the terminal writes');
+
+      const commitCheck = findCommitCheck();
+      assert.ok(commitCheck);
+      assert.strictEqual(commitCheck.conclusion, 'failure');
     });
 
     test('fails on protected head branch if contributor with CONTRIBUTOR author_association posted [allow branch] comment but lacks write permission', async () => {
@@ -1622,13 +1815,15 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
 
   // Maintainers with private organization membership are reported as
   // CONTRIBUTOR/NONE, so the handler falls back to their repository permission.
-  async function sendIssueComment(comment, collaboratorPermissions = {}) {
+  async function sendIssueComment(comment, collaboratorPermissions = {}, permissionFailures = {}) {
     postedCheckRuns = [];
+    permissionLookups = [];
     let prFetched = false;
-    const permissionLookups = [];
+    let tokenMinted = false;
 
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
+        tokenMinted = true;
         return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
       }
       if (url.includes('/formalities.json')) {
@@ -1636,13 +1831,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
       }
       { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
       if (url.includes('/collaborators/')) {
-        const username = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
-        permissionLookups.push(username);
-        const permission = collaboratorPermissions[username];
-        if (!permission) {
-          return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
-        }
-        return new Response(JSON.stringify({ permission }), { status: 200 });
+        return collaboratorPermissionResponse(url, collaboratorPermissions, permissionFailures);
       }
       if (url.endsWith('/pulls/123')) {
         prFetched = true;
@@ -1715,7 +1904,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
       body: payload
     }), { WEBHOOK_SECRET: secret, APP_ID: '123', PRIVATE_KEY: 'YW55Y29udGVudA==' });
 
-    return { response, prFetched, permissionLookups };
+    return { response, prFetched, tokenMinted, permissionLookups };
   }
 
   test('processes a comment from a maintainer whose organization membership is private', async () => {
@@ -1742,14 +1931,39 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.strictEqual(prFetched, false, 'Non-maintainer comments must not pay for the pull request lookup');
   });
 
-  test('ignores bot comments without spending a permission lookup', async () => {
-    const { response, prFetched, permissionLookups } = await sendIssueComment(
+  test('ignores bot comments before minting an installation token', async () => {
+    const { response, prFetched, tokenMinted, permissionLookups } = await sendIssueComment(
       { body: '[allow branch]', author_association: 'NONE', user: { login: 'github-actions[bot]', type: 'Bot' } }
     );
 
     assert.strictEqual(response.status, 200);
     assert.strictEqual(await response.text(), 'Ignored non-maintainer issue comment');
     assert.deepStrictEqual(permissionLookups, []);
+    assert.strictEqual(prFetched, false);
+    assert.strictEqual(tokenMinted, false, 'Bot comments must not cost an installation token');
+  });
+
+  test('ignores a bot comment carrying a maintainer association, so the app cannot re-trigger itself', async () => {
+    const { response, prFetched, tokenMinted } = await sendIssueComment(
+      { body: 'Use `[allow branch]` in PR description or comment to override this check', author_association: 'COLLABORATOR', user: { login: 'openwrt-formality-bot[bot]', type: 'Bot' } }
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(await response.text(), 'Ignored non-maintainer issue comment');
+    assert.strictEqual(prFetched, false);
+    assert.strictEqual(tokenMinted, false);
+  });
+
+  test('ignores a comment whose permission lookup failed, rather than trusting it', async () => {
+    const { response, prFetched, permissionLookups } = await sendIssueComment(
+      { body: 'recheck please', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer', type: 'User' } },
+      { privatemaintainer: 'admin' },
+      { privatemaintainer: 1 }
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(await response.text(), 'Ignored non-maintainer issue comment');
+    assert.deepStrictEqual(permissionLookups, ['privatemaintainer']);
     assert.strictEqual(prFetched, false);
   });
 

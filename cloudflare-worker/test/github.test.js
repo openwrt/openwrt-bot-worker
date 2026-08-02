@@ -1,6 +1,6 @@
-import { describe, test, before, after } from 'node:test';
+import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { graphqlBatchFetchFiles, GRAPHQL_URL } from '../src/github.js';
+import { graphqlBatchFetchFiles, fetchUserRepoPermission, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -207,5 +207,123 @@ describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
     ]);
 
     assert.deepStrictEqual(result.get('refprobe'), { content: null, exists: false, isBinary: false });
+  });
+});
+
+describe('fetchUserRepoPermission', { concurrency: 1 }, () => {
+  let originalFetch;
+  let fetchMock;
+  let requestedUrls;
+
+  before(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      requestedUrls.push(url);
+      return fetchMock(url, options);
+    };
+  });
+
+  after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  beforeEach(() => {
+    requestedUrls = [];
+    fetchMock = () => new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+  });
+
+  const permissionResponse = (body, status = 200) =>
+    () => new Response(JSON.stringify(body), { status });
+
+  test('returns false without spending a request when the repository or login is missing', async () => {
+    let onCallCount = 0;
+    assert.strictEqual(await fetchUserRepoPermission('', 'someone', 'token', () => { onCallCount++; }), false);
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', '', 'token', () => { onCallCount++; }), false);
+    assert.deepStrictEqual(requestedUrls, []);
+    assert.strictEqual(onCallCount, 0);
+  });
+
+  test('asks the collaborator permission endpoint with an encoded login and reports the call', async () => {
+    let onCallCount = 0;
+    fetchMock = permissionResponse({ permission: 'write', user: { permissions: { push: true } } });
+
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'user name', 'token', () => { onCallCount++; }), true);
+    assert.deepStrictEqual(requestedUrls, ['https://api.github.com/repos/test/repo/collaborators/user%20name/permission']);
+    assert.strictEqual(onCallCount, 1);
+  });
+
+  test('accepts push access reported through user.permissions', async () => {
+    fetchMock = permissionResponse({
+      permission: 'write',
+      role_name: 'write',
+      user: { permissions: { admin: false, maintain: false, push: true, triage: true, pull: true } }
+    });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'writer', 'token'), true);
+  });
+
+  test('accepts the maintain role', async () => {
+    fetchMock = permissionResponse({
+      permission: 'write',
+      role_name: 'maintain',
+      user: { permissions: { admin: false, maintain: true, push: true, triage: true, pull: true } }
+    });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'maintainer', 'token'), true);
+  });
+
+  test('rejects the triage role, which cannot push', async () => {
+    fetchMock = permissionResponse({
+      permission: 'read',
+      role_name: 'triage',
+      user: { permissions: { admin: false, maintain: false, push: false, triage: true, pull: true } }
+    });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'triager', 'token'), false);
+  });
+
+  test('rejects read access', async () => {
+    fetchMock = permissionResponse({
+      permission: 'read',
+      role_name: 'read',
+      user: { permissions: { admin: false, maintain: false, push: false, triage: false, pull: true } }
+    });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'reader', 'token'), false);
+  });
+
+  test('falls back to the flat permission field when user.permissions is absent', async () => {
+    fetchMock = permissionResponse({ permission: 'admin' });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'owner', 'token'), true);
+
+    fetchMock = permissionResponse({ permission: 'WRITE' });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'writer', 'token'), true);
+
+    fetchMock = permissionResponse({ permission: 'read' });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'reader', 'token'), false);
+  });
+
+  // role_name may carry a custom organization role whose rights are unknown,
+  // so it must not grant write access on its own.
+  test('does not grant access from role_name alone', async () => {
+    fetchMock = permissionResponse({ permission: 'read', role_name: 'maintain' });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'customrole', 'token'), false);
+  });
+
+  test('returns false for a 404, the answer for a user who is not a collaborator', async () => {
+    fetchMock = permissionResponse({ message: 'Not Found' }, 404);
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'outsider', 'token'), false);
+  });
+
+  test('returns null when the lookup itself fails, so callers can tell it apart from a denial', async () => {
+    fetchMock = permissionResponse({ message: 'Resource not accessible by integration' }, 403);
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'someone', 'token'), null);
+  });
+
+  test('returns null after a network error exhausts the retries', async () => {
+    fetchMock = () => { throw new Error('connection reset'); };
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'someone', 'token'), null);
+    assert.strictEqual(requestedUrls.length, 3);
+  });
+
+  test('returns null when the response body is not JSON', async () => {
+    fetchMock = () => new Response('<html>gateway</html>', { status: 200 });
+    assert.strictEqual(await fetchUserRepoPermission('test/repo', 'someone', 'token'), null);
   });
 });
