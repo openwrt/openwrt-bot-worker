@@ -80,6 +80,54 @@ export function isVirtuallyIdentical(subject, body, pkgName) {
   return !hasMeaningfulWord;
 }
 
+// `git revert` builds the subject from the reverted commit verbatim as
+// `Revert "<original subject>"`, reverting a revert nests the wrapper another
+// level, and OpenWrt also uses a prefixed `<pkg>: Revert "<original>"` variant.
+// None of these can satisfy the regular subject rules - the package prefix sits
+// inside the quotes, `Revert` is capitalized, and the wrapper eats into the
+// length budget - and the author cannot rewrite the quoted part without losing
+// the reference to the commit being reverted.
+// Returns { prefix, original, depth } for a revert subject, null otherwise.
+export function parseRevertSubject(subject) {
+  if (typeof subject !== 'string') return null;
+
+  // `(?:<name>: )*` also covers `tools/cmake: ` and chained `toolchain: binutils: ` prefixes.
+  const outer = subject.trim().match(/^((?:[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)?: )*)[Rr]evert "(.+)"$/);
+  if (!outer) return null;
+
+  let original = outer[2];
+  let depth = 1;
+  let nested;
+  while ((nested = original.match(/^[Rr]evert "(.+)"$/))) {
+    original = nested[1];
+    depth++;
+  }
+
+  return { prefix: outer[1], original, depth };
+}
+
+// Besides the subject, `git revert` records the commit being undone in the body
+// as `This reverts commit <sha>.`; the revert button on GitHub references the
+// reverted pull request instead. Requiring one of the two ties the relaxed
+// revert rules to a commit that really is a revert, rather than to any subject
+// that happens to be shaped like one.
+export function hasRevertReference(body) {
+  if (typeof body !== 'string') return false;
+  return /^\s*this reverts commit\s+[0-9a-f]{7,40}\b/im.test(body) ||
+    /^\s*reverts\s+[\w.-]+\/[\w.-]+#\d+\s*$/im.test(body);
+}
+
+// Returns { prefix, original, depth } when a full commit message is a revert -
+// its subject and its body both have to say so - and null otherwise.
+export function parseRevertCommit(message) {
+  if (typeof message !== 'string') return null;
+
+  const lines = message.split('\n');
+  if (!hasRevertReference(lines.slice(1).join('\n'))) return null;
+
+  return parseRevertSubject(lines[0].trim().replace(/^(fixup!|squash!)\s+/, ''));
+}
+
 async function getSshKeyFingerprint(sigText) {
   try {
     let cleanSig = sigText.replace(/-----[a-zA-Z0-9\s]+-----/g, '');
@@ -191,42 +239,66 @@ export async function validateFormalities(fullCommit, CONFIG) {
     subject = subject.replace(/^(fixup!|squash!)\s+/, '');
   }
 
+  const revert = CONFIG.allow_revert === false ? null : parseRevertCommit(message);
+
   if (!isAutosquash) {
     if (/^\s/.test(lines[0])) subjectErrors.push("Commit subject must not start with whitespace");
-    
-    // Special case for tools/* prefix (e.g., tools/cmake: backport bootstrap fix)
-    // These use a subdirectory naming convention like tools/cmake, tools/bison, etc.
-    const toolsPrefixMatch = subject.match(/^(tools\/[a-zA-Z0-9_-]+): /);
-    if (toolsPrefixMatch) {
-      const afterPrefix = subject.replace(/^(tools\/[a-zA-Z0-9_-]+): \s*/, '');
-      if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
-        subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
-      }
-      if (subject.endsWith('.')) {
-        subjectErrors.push("Commit subject must not end with a period");
-      }
-    } else if (!/^[a-zA-Z0-9_-]+: /.test(subject)) {
-      subjectErrors.push("Commit subject must start with `<package name or prefix>: `");
-    } else {
-      const afterPrefix = subject.replace(/^[a-zA-Z0-9_-]+: \s*/, '');
-      if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
-        subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
-      }
-      if (subject.endsWith('.')) {
-        subjectErrors.push("Commit subject must not end with a period");
+
+    // The quoted part of a revert subject is copied from the reverted commit,
+    // so the prefix/lower-case/period rules apply to the original subject and
+    // not to the wrapper `git revert` generated around it.
+    if (!revert) {
+      // Special case for tools/* prefix (e.g., tools/cmake: backport bootstrap fix)
+      // These use a subdirectory naming convention like tools/cmake, tools/bison, etc.
+      const toolsPrefixMatch = subject.match(/^(tools\/[a-zA-Z0-9_-]+): /);
+      if (toolsPrefixMatch) {
+        const afterPrefix = subject.replace(/^(tools\/[a-zA-Z0-9_-]+): \s*/, '');
+        if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
+          subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
+        }
+        if (subject.endsWith('.')) {
+          subjectErrors.push("Commit subject must not end with a period");
+        }
+      } else if (!/^[a-zA-Z0-9_-]+: /.test(subject)) {
+        subjectErrors.push("Commit subject must start with `<package name or prefix>: `");
+      } else {
+        const afterPrefix = subject.replace(/^[a-zA-Z0-9_-]+: \s*/, '');
+        if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
+          subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
+        }
+        if (subject.endsWith('.')) {
+          subjectErrors.push("Commit subject must not end with a period");
+        }
       }
     }
   }
 
-  const subjectLen = lines[0].length;
+  // Measure a revert against the subject underneath the `Revert "..."` wrapper:
+  // the wrapper is generated from the reverted commit, so the author cannot
+  // shorten it without breaking the reference. Everything else is measured on
+  // the normalized subject, so an `fixup!`/`squash!` marker that disappears on
+  // autosquash does not eat into the budget of the subject it is applied to.
+  const subjectLen = revert ? (revert.prefix + revert.original).length : subject.length;
+  const lenSuffix = revert ? ' chars, excluding the `Revert "..."` wrapper' : ' chars';
   if (subjectLen > CONFIG.max_subject_len_hard) {
-    subjectErrors.push(`Subject line exceeds hard limit (${subjectLen}/${CONFIG.max_subject_len_hard} chars)`);
+    subjectErrors.push(`Subject line exceeds hard limit (${subjectLen}/${CONFIG.max_subject_len_hard}${lenSuffix})`);
   } else if (subjectLen > CONFIG.max_subject_len_soft) {
-    warnings.push(`Subject line exceeds soft limit (${subjectLen}/${CONFIG.max_subject_len_soft} chars)`);
+    warnings.push(`Subject line exceeds soft limit (${subjectLen}/${CONFIG.max_subject_len_soft}${lenSuffix})`);
+  }
+
+  // A subject shaped like a revert but without the reference in the body is held
+  // to the regular rules. Say why, because the prefix and lower-case complaints
+  // that follow from the `Revert "..."` wrapper do not point at what is missing.
+  if (subjectErrors.length > 0 && !revert && CONFIG.allow_revert !== false && parseRevertSubject(subject)) {
+    subjectErrors.push('Subject is formatted as a revert, but the body does not reference the reverted commit. Keep the `This reverts commit <sha>.` line that `git revert` generates, or reword the subject to follow the regular `<package name or prefix>: ` format');
   }
 
   if (subjectErrors.length === 0) {
-    successes.push(`✅ Commit subject layout and length are valid: "${lines[0]}"`);
+    if (revert) {
+      successes.push(`✅ Commit subject layout and length are valid (revert of "${revert.original}")`);
+    } else {
+      successes.push(`✅ Commit subject layout and length are valid: "${lines[0]}"`);
+    }
   } else {
     subjectErrors.forEach(err => errors.push("- " + err));
   }
@@ -535,7 +607,14 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
         successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
       } else {
         const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
-        if (!matchVersionString(cleanSubject, newVersion)) {
+        const isRevert = CONFIG.allow_revert !== false && parseRevertCommit(fullCommit.commit.message || '') !== null;
+        if (isRevert) {
+          // A revert restores the PKG_VERSION that preceded the reverted commit,
+          // while its subject quotes that commit (and therefore the version being
+          // undone). Requiring the restored version here would force the author
+          // away from the `git revert` subject format.
+          successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
+        } else if (!matchVersionString(cleanSubject, newVersion)) {
           errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
         } else {
           successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
@@ -1455,7 +1534,18 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   const fileChanges = {}; // filePath -> { added: [], deleted: [] }
   const candidateFiles = [];
 
+  // A revert puts PKG_VERSION and PKG_RELEASE back to the values that preceded
+  // the reverted commit, so the version moves backwards and PKG_RELEASE is
+  // whatever it was before instead of 1. Record which commits touched a file so
+  // packages changed by reverts alone can skip the bump requirements. The
+  // PR-wide patch fallback carries no per-commit message and therefore never
+  // qualifies, keeping the audit strict when the origin of a change is unknown.
+  const nonRevertedFiles = new Set();
+
   for (const item of commitDetails) {
+    const isRevertCommit = CONFIG.allow_revert !== false &&
+      parseRevertCommit(item.fullCommit?.commit?.message || '') !== null;
+
     if (item.commitPatch) {
       const states = parseDiffFileStates(item.commitPatch);
       states.addedFiles.forEach(f => addedFiles.add(f));
@@ -1493,6 +1583,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     const files = getChangedFilesFromPatch(item.commitPatch);
     for (const file of files) {
       modifiedFiles.add(file);
+      if (!isRevertCommit) nonRevertedFiles.add(file);
       if (isHiddenOrSpecial(file)) continue;
 
       // Ignore test files that serve only within CI/CD (e.g. test.sh, test-version.sh)
@@ -1538,6 +1629,11 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       return empty;
     }
 
+    // Only revert commits touched this package, so its PKG_VERSION and
+    // PKG_RELEASE are back at the values that preceded the reverted commit.
+    const pkgFiles = [...modifiedFiles].filter(file => file === pkgRoot || file.startsWith(pkgRoot + '/'));
+    const isRevertOnly = pkgFiles.length > 0 && pkgFiles.every(file => !nonRevertedFiles.has(file));
+
     // OPTIMIZATION: If the Makefile itself was not modified in the PR,
     // then the version and release cannot have changed (bumped = false).
     // We can skip fetching the Makefile contents entirely!
@@ -1567,6 +1663,11 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       headRelease = resolveMakefileVar(headContent, 'PKG_RELEASE');
 
       if (isNew) {
+        if (isRevertOnly) {
+          // Reverting the removal of a package restores it with the PKG_RELEASE
+          // it was dropped with; it is not a new package starting from scratch.
+          return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is restored by a revert with its previous PKG_RELEASE ('${headRelease || 'not defined'}')`] };
+        }
         if (headRelease !== '1') {
           return { errors: [`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
         }
@@ -1672,6 +1773,18 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 - **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`],
         successes: []
       };
+    }
+
+    // A revert takes the package back to a state that was already released, so
+    // its version legitimately moves backwards and PKG_RELEASE keeps the value
+    // it had before the reverted commit. Requiring a reset to 1 here would ask
+    // for a version bump that a revert must not make.
+    if (isRevertOnly) {
+      const restoredVersion = headVersion || headSourceVer || headSourceDate;
+      const restoredState = restoredVersion
+        ? `PKG_VERSION '${restoredVersion}' with PKG_RELEASE '${headRelease || 'not defined'}'`
+        : `PKG_RELEASE '${headRelease || 'not defined'}'`;
+      return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is reverted to ${restoredState}, matching its state before the reverted commit`] };
     }
 
     if (versionChanged) {

@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs, isPackageMakefilePath } from '../src/validators.js';
+import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs, isPackageMakefilePath } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -215,6 +215,23 @@ describe('validateFormalities', () => {
     };
     const resSoft = await validateFormalities(commitSoft, CONFIG);
     assert.ok(resSoft.warnings.some(w => w.includes('exceeds soft limit')));
+  });
+
+  test('measures the subject length without the autosquash marker', async () => {
+    // The `fixup! ` marker disappears when the commit is squashed, so the
+    // subject it is applied to keeps the full length budget.
+    const subject = 'bash: ' + 'a'.repeat(54);
+    assert.strictEqual(subject.length, CONFIG.max_subject_len_soft);
+    const commit = {
+      commit: {
+        message: 'fixup! ' + subject + '\n\nCorrects the build flags.\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.warnings.some(w => w.includes('exceeds soft limit')), `Unexpected warnings: ${res.warnings.join(', ')}`);
   });
 
   test('enforces body line length limit but ignores code blocks and URLs', async () => {
@@ -510,6 +527,151 @@ describe('validateFormalities', () => {
   });
 });
 
+// ─── Revert Subjects ─────────────────────────────────────────────
+
+const revertBody = (sha) => `\n\nThis reverts commit ${sha}.\nIt broke the build on several targets.\n\nSigned-off-by: John Doe <john@doe.com>`;
+
+const revertCommit = (subject) => ({
+  commit: {
+    message: subject + revertBody('9fceb02d0ae598e95dc970b74767f19372d61af8'),
+    author: { name: 'John Doe', email: 'john@doe.com' },
+    committer: { name: 'John Doe', email: 'john@doe.com' }
+  }
+});
+
+describe('parseRevertSubject', () => {
+  test('parses the plain git revert format', () => {
+    const res = parseRevertSubject('Revert "generic: permit support of standalone PCS for external kernel module"');
+    assert.deepStrictEqual(res, {
+      prefix: '',
+      original: 'generic: permit support of standalone PCS for external kernel module',
+      depth: 1
+    });
+  });
+
+  test('parses a prefixed revert (e.g. sing-box: Revert "...")', () => {
+    const res = parseRevertSubject('sing-box: Revert "sing-box: update to 1.12.3"');
+    assert.deepStrictEqual(res, { prefix: 'sing-box: ', original: 'sing-box: update to 1.12.3', depth: 1 });
+  });
+
+  test('parses chained and tools/ style prefixes', () => {
+    assert.strictEqual(parseRevertSubject('tools/cmake: revert "tools/cmake: update to 4.0"').prefix, 'tools/cmake: ');
+    assert.strictEqual(parseRevertSubject('toolchain: binutils: Revert "toolchain: binutils: update to 2.45"').prefix, 'toolchain: binutils: ');
+  });
+
+  test('unwraps a revert of a revert', () => {
+    const res = parseRevertSubject('Revert "Revert "ramips: mt7620: fix patching mac address in caldata""');
+    assert.strictEqual(res.depth, 2);
+    assert.strictEqual(res.original, 'ramips: mt7620: fix patching mac address in caldata');
+  });
+
+  test('rejects subjects that only mention a revert', () => {
+    assert.strictEqual(parseRevertSubject('mypkg: revert the broken change'), null);
+    assert.strictEqual(parseRevertSubject('Revert the broken change'), null);
+    assert.strictEqual(parseRevertSubject('Reverted "mypkg: update to 1.2.3"'), null);
+    assert.strictEqual(parseRevertSubject('toolchain: binutils: partially revert commit 525a1e94b343 "fix update to 2.45.1"'), null);
+  });
+});
+
+describe('parseRevertCommit', () => {
+  const sha = '9fceb02d0ae598e95dc970b74767f19372d61af8';
+
+  test('accepts the reference `git revert` writes into the body', () => {
+    const res = parseRevertCommit(`Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${sha}.`);
+    assert.deepStrictEqual(res, { prefix: '', original: 'mypkg: update to 1.2.3', depth: 1 });
+  });
+
+  test('accepts the abbreviated sha and the pull request reference GitHub writes', () => {
+    assert.ok(parseRevertCommit('Revert "mypkg: update to 1.2.3"\n\nThis reverts commit 9fceb02.'));
+    assert.ok(parseRevertCommit('Revert "mypkg: update to 1.2.3"\n\nReverts openwrt/packages#12345'));
+  });
+
+  test('rejects a revert subject that does not reference the reverted commit', () => {
+    assert.strictEqual(parseRevertCommit('Revert "mypkg: update to 1.2.3"'), null);
+    assert.strictEqual(parseRevertCommit('Revert "mypkg: update to 1.2.3"\n\nThis broke the build.'), null);
+    // The reference belongs in the body, so a subject claiming it is not enough.
+    assert.strictEqual(parseRevertCommit(`Revert "mypkg: update to 1.2.3" This reverts commit ${sha}.`), null);
+  });
+
+  test('rejects a body reference under a subject that is not a revert', () => {
+    assert.strictEqual(parseRevertCommit(`mypkg: update to 1.2.3\n\nThis reverts commit ${sha}.`), null);
+  });
+
+  test('looks past an autosquash marker', () => {
+    const res = parseRevertCommit(`fixup! Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${sha}.`);
+    assert.strictEqual(res.original, 'mypkg: update to 1.2.3');
+  });
+});
+
+describe('validateFormalities revert subjects', () => {
+  test('accepts the plain git revert format without a package prefix', async () => {
+    const res = await validateFormalities(revertCommit('Revert "generic: permit support of standalone PCS for external kernel module"'), CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid (revert of')));
+  });
+
+  test('accepts a revert of a revert', async () => {
+    const res = await validateFormalities(revertCommit('Revert "Revert "ramips: mt7620: fix patching mac address in caldata""'), CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts an upper-case Revert after a package prefix', async () => {
+    const res = await validateFormalities(revertCommit('irqbalance: Revert "irqbalance: update to 1.9.5"'), CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('excludes the Revert wrapper from the subject length limits', async () => {
+    // 86 chars as written, 77 without the wrapper.
+    const res = await validateFormalities(revertCommit('Revert "base-files: handle name collision between kernel UBI volume and MTD partition"'), CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still enforces the hard limit on the reverted subject itself', async () => {
+    const original = 'base-files: handle a name collision between the kernel UBI volume and the MTD partition';
+    assert.ok(original.length > CONFIG.max_subject_len_hard);
+    const res = await validateFormalities(revertCommit(`Revert "${original}"`), CONFIG);
+    assert.ok(res.errors.some(e => e.includes('exceeds hard limit') && e.includes('excluding the `Revert "..."` wrapper')));
+  });
+
+  test('still rejects a revert-like subject without the quoted original', async () => {
+    const res = await validateFormalities(revertCommit('Revert the broken PCS support'), CONFIG);
+    assert.ok(res.errors.some(e => e.includes('must start with `<package name or prefix>: `')));
+  });
+
+  test('enforces the regular subject rules when allow_revert is disabled', async () => {
+    const customConfig = { ...CONFIG, allow_revert: false };
+    const res = await validateFormalities(revertCommit('Revert "generic: permit support of standalone PCS for external kernel module"'), customConfig);
+    assert.ok(res.errors.some(e => e.includes('must start with `<package name or prefix>: `')));
+  });
+
+  test('enforces the regular subject rules when the body does not reference the reverted commit', async () => {
+    const commit = {
+      commit: {
+        message: 'Revert "generic: permit support of standalone PCS for external kernel module"\n\nIt broke the build on several targets.\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('must start with `<package name or prefix>: `')));
+    assert.ok(res.errors.some(e => e.includes('body does not reference the reverted commit')));
+  });
+
+  test('does not hint at a missing reference when the subject passes the regular rules', async () => {
+    // `mypkg: revert "..."` already satisfies the prefix and lower-case rules,
+    // so an unreferenced revert stays valid rather than becoming an error.
+    const commit = {
+      commit: {
+        message: 'mypkg: revert "the broken PCS support"\n\nIt broke the build on several targets.\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+});
+
 // ─── Makefile Context ────────────────────────────────────────────
 
 describe('validateMakefileContext', () => {
@@ -555,6 +717,43 @@ describe('validateMakefileContext', () => {
 --- a/package/utils/bash/Makefile
 +++ b/package/utils/bash/Makefile
 +PKG_VERSION:=5.4
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('PKG_VERSION')));
+  });
+
+  test('skips subject validation for a revert restoring the previous PKG_VERSION', () => {
+    const commit = { commit: { message: 'sing-box: Revert "sing-box: update to 1.12.3"\n\nThis reverts commit 9fceb02d0ae598e95dc970b74767f19372d61af8.' } };
+    const patch = `
+--- a/package/net/sing-box/Makefile
++++ b/package/net/sing-box/Makefile
++PKG_VERSION:=1.12.2
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('Commit reverts a previous change')));
+  });
+
+  test('catches version mismatch on a revert when allow_revert is disabled', () => {
+    const commit = { commit: { message: 'sing-box: Revert "sing-box: update to 1.12.3"' } };
+    const patch = `
+--- a/package/net/sing-box/Makefile
++++ b/package/net/sing-box/Makefile
++PKG_VERSION:=1.12.2
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, allow_revert: false }, state);
+    assert.ok(res.errors.some(e => e.includes('PKG_VERSION')));
+  });
+
+  test('catches version mismatch on a revert that does not reference the reverted commit', () => {
+    const commit = { commit: { message: 'sing-box: Revert "sing-box: update to 1.12.3"\n\nIt broke the build.' } };
+    const patch = `
+--- a/package/net/sing-box/Makefile
++++ b/package/net/sing-box/Makefile
++PKG_VERSION:=1.12.2
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
@@ -2744,6 +2943,112 @@ diff --git a/utils/prometheus-node-exporter-ucode/Makefile b/utils/prometheus-no
     };
 
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
+
+  // ─── Reverts ───────────────────────────────────────────────────
+
+  const commitWith = (subject) => ({ commit: { message: `${subject}\n\nThis reverts commit 9fceb02d0ae598e95dc970b74767f19372d61af8.` } });
+
+  // Reverting `mypkg: update to 1.2.3` restores both the older version and the
+  // PKG_RELEASE that preceded the bump.
+  const versionRevertPatch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+-PKG_VERSION:=1.2.3
++PKG_VERSION:=1.2.2
+-PKG_RELEASE:=1
++PKG_RELEASE:=3
+`;
+  const versionRevertHead = async (path) =>
+    path === 'package/utils/mypkg/Makefile' ? 'PKG_NAME:=mypkg\nPKG_VERSION:=1.2.2\nPKG_RELEASE:=3\n' : null;
+  const versionRevertBase = async (path) =>
+    path === 'package/utils/mypkg/Makefile' ? 'PKG_NAME:=mypkg\nPKG_VERSION:=1.2.3\nPKG_RELEASE:=1\n' : null;
+
+  test('accepts a revert restoring an older version and its previous PKG_RELEASE', async () => {
+    const commitDetails = [{ fullCommit: commitWith('mypkg: Revert "mypkg: update to 1.2.3"'), commitPatch: versionRevertPatch }];
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, versionRevertHead, versionRevertBase);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('matching its state before the reverted commit')));
+  });
+
+  test('still demands a PKG_RELEASE reset for the same downgrade in a regular commit', async () => {
+    const commitDetails = [{ fullCommit: commitWith('mypkg: downgrade to 1.2.2'), commitPatch: versionRevertPatch }];
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, versionRevertHead, versionRevertBase);
+    assert.ok(res.errors.some(e => e.includes('PKG_RELEASE was not reset to 1')));
+  });
+
+  test('keeps the audit strict when no commit message is available (PR-wide patch fallback)', async () => {
+    const commitDetails = [{ commitPatch: versionRevertPatch }];
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, versionRevertHead, versionRevertBase);
+    assert.ok(res.errors.some(e => e.includes('PKG_RELEASE was not reset to 1')));
+  });
+
+  test('keeps the audit strict when allow_revert is disabled', async () => {
+    const commitDetails = [{ fullCommit: commitWith('mypkg: Revert "mypkg: update to 1.2.3"'), commitPatch: versionRevertPatch }];
+    const res = await validatePkgReleaseBumps(commitDetails, { ...defaultConf, allow_revert: false }, versionRevertHead, versionRevertBase);
+    assert.ok(res.errors.some(e => e.includes('PKG_RELEASE was not reset to 1')));
+  });
+
+  test('keeps the audit strict when the body does not reference the reverted commit', async () => {
+    const commitDetails = [{
+      fullCommit: { commit: { message: 'mypkg: Revert "mypkg: update to 1.2.3"\n\nIt broke the build.' } },
+      commitPatch: versionRevertPatch
+    }];
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, versionRevertHead, versionRevertBase);
+    assert.ok(res.errors.some(e => e.includes('PKG_RELEASE was not reset to 1')));
+  });
+
+  test('keeps the audit strict when a regular commit touches the same package', async () => {
+    const commitDetails = [
+      { fullCommit: commitWith('mypkg: Revert "mypkg: update to 1.2.3"'), commitPatch: versionRevertPatch },
+      {
+        fullCommit: { commit: { message: 'mypkg: refresh patches' } },
+        commitPatch: `
+diff --git a/package/utils/mypkg/patches/001-fix.patch b/package/utils/mypkg/patches/001-fix.patch
+--- a/package/utils/mypkg/patches/001-fix.patch
++++ b/package/utils/mypkg/patches/001-fix.patch
++context
+`
+      }
+    ];
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, versionRevertHead, versionRevertBase);
+    assert.ok(res.errors.some(e => e.includes('PKG_RELEASE was not reset to 1')));
+  });
+
+  test('accepts a revert restoring a dropped package with its previous PKG_RELEASE', async () => {
+    const commitDetails = [{
+      fullCommit: commitWith('Revert "oldpkg: remove abandoned package"'),
+      commitPatch: `
+diff --git a/package/utils/oldpkg/Makefile b/package/utils/oldpkg/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/oldpkg/Makefile
+`
+    }];
+    const headFetch = async (path) =>
+      path === 'package/utils/oldpkg/Makefile' ? 'PKG_NAME:=oldpkg\nPKG_VERSION:=2.0\nPKG_RELEASE:=5\n' : null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, async () => null);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('restored by a revert with its previous PKG_RELEASE')));
+  });
+
+  test('still requires a bump when a revert changes content without touching version or release', async () => {
+    const commitDetails = [{
+      fullCommit: commitWith('Revert "mypkg: tweak init script"'),
+      commitPatch: `
+diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/mypkg.init
+--- a/package/utils/mypkg/files/mypkg.init
++++ b/package/utils/mypkg/files/mypkg.init
++start_service() {
+`
+    }];
+    const headFetch = async (path) =>
+      path === 'package/utils/mypkg/Makefile' ? 'PKG_NAME:=mypkg\nPKG_VERSION:=1.2.2\nPKG_RELEASE:=3\n' : null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, headFetch);
     assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
   });
 });
