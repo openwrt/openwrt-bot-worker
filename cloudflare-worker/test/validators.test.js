@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs } from '../src/validators.js';
+import { isValidName, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs, isPackageMakefilePath } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -590,6 +590,98 @@ describe('validateMakefileContext', () => {
     assert.ok(res.errors.some(e => e.includes('PKG_LICENSE')));
     assert.ok(res.errors.some(e => e.includes('PKG_LICENSE_FILES')));
     assert.ok(!res.errors.some(e => e.includes('PKG_VERSION')), 'PKG_VERSION should not be checked for new packages');
+  });
+
+  test('does not require package metadata for a new build target Makefile', () => {
+    const commit = { commit: { message: 'ti-k3: add new target for BeaglePlay' } };
+    const patch = `
+diff --git a/target/linux/ti-k3/Makefile b/target/linux/ti-k3/Makefile
+new file mode 100644
+--- /dev/null
++++ b/target/linux/ti-k3/Makefile
+@@ -0,0 +1,12 @@
++#
++# Copyright (C) 2025 OpenWrt.org
++#
++include $(TOPDIR)/rules.mk
++
++ARCH:=aarch64
++BOARD:=ti-k3
++BOARDNAME:=Texas Instruments K3
++FEATURES:=ext4 squashfs fpu usb gpio rtc pci
++KERNEL_PATCHVER:=6.12
++
++include $(TOPDIR)/target/linux/Makefile
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, false, 'a target definition is not a new package');
+    assert.ok(!res.errors.some(e => e.includes('PKG_MAINTAINER')));
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE')));
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE_FILES')));
+  });
+
+  test('does not require package metadata for a new host tool Makefile', () => {
+    const commit = { commit: { message: 'tools/newtool: add host build helper' } };
+    const patch = `
+--- /dev/null
++++ b/tools/newtool/Makefile
+@@ -0,0 +1,5 @@
++PKG_NAME:=newtool
++PKG_VERSION:=1.0
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, false);
+    assert.ok(!res.errors.some(e => e.includes('mandatory parameter')));
+  });
+
+  test('still requires package metadata when a target commit also adds a package', () => {
+    const commit = { commit: { message: 'ti-k3: add new target for BeaglePlay' } };
+    const patch = `
+diff --git a/target/linux/ti-k3/Makefile b/target/linux/ti-k3/Makefile
+--- /dev/null
++++ b/target/linux/ti-k3/Makefile
+@@ -0,0 +1,3 @@
++BOARD:=ti-k3
++BOARDNAME:=Texas Instruments K3
+diff --git a/package/boot/uboot-ti-k3/Makefile b/package/boot/uboot-ti-k3/Makefile
+--- /dev/null
++++ b/package/boot/uboot-ti-k3/Makefile
+@@ -0,0 +1,3 @@
++PKG_NAME:=uboot-ti-k3
++PKG_VERSION:=2025.01
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, true);
+    assert.ok(res.errors.some(e => e.includes('PKG_MAINTAINER')));
+  });
+
+  test('does not flag a removed target Makefile as a dropped package', () => {
+    const commit = { commit: { message: 'ti-k3: drop target' } };
+    const patch = `
+--- a/target/linux/ti-k3/Makefile
++++ /dev/null
+@@ -1,3 +0,0 @@
+-BOARD:=ti-k3
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isDroppedPackage, false);
+  });
+
+  test('flags a removed package Makefile as a dropped package', () => {
+    const commit = { commit: { message: 'oldpkg: drop package' } };
+    const patch = `
+--- a/package/utils/oldpkg/Makefile
++++ /dev/null
+@@ -1,3 +0,0 @@
+-PKG_NAME:=oldpkg
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isDroppedPackage, true);
   });
 
   test('supports custom metadata fields in check_openwrt_meta', () => {
@@ -1833,6 +1925,30 @@ diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0);
   });
 
+});
+
+describe('isPackageMakefilePath', () => {
+  test('accepts package and feed Makefiles', () => {
+    assert.strictEqual(isPackageMakefilePath('package/utils/bash/Makefile'), true);
+    assert.strictEqual(isPackageMakefilePath('package/lang/python/python3/Makefile'), true);
+    assert.strictEqual(isPackageMakefilePath('net/mosdns/Makefile'), true);
+    assert.strictEqual(isPackageMakefilePath('./package/utils/bash/Makefile'), true);
+  });
+
+  test('rejects build infrastructure Makefiles', () => {
+    assert.strictEqual(isPackageMakefilePath('target/linux/ti-k3/Makefile'), false);
+    assert.strictEqual(isPackageMakefilePath('target/linux/ti-k3/image/Makefile'), false);
+    assert.strictEqual(isPackageMakefilePath('tools/newtool/Makefile'), false);
+    assert.strictEqual(isPackageMakefilePath('toolchain/gcc/Makefile'), false);
+    assert.strictEqual(isPackageMakefilePath('Makefile'), false);
+  });
+
+  test('rejects non-Makefile paths', () => {
+    assert.strictEqual(isPackageMakefilePath('package/utils/bash/Makefile.in'), false);
+    assert.strictEqual(isPackageMakefilePath('include/package.mk'), false);
+    assert.strictEqual(isPackageMakefilePath(''), false);
+    assert.strictEqual(isPackageMakefilePath(null), false);
+  });
 });
 
 // ─── Embedded Patches ────────────────────────────────────────────

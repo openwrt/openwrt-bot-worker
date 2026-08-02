@@ -468,6 +468,45 @@ export function matchVersionString(subject, version) {
   }
 }
 
+// Trees whose Makefiles describe build infrastructure instead of a software
+// package: `target/` holds target/subtarget and image definitions, `tools/` and
+// `toolchain/` host-side build helpers. None of them carry PKG_MAINTAINER,
+// PKG_LICENSE or PKG_LICENSE_FILES, so adding such a Makefile must not be
+// reported as a new package missing its mandatory metadata.
+const NON_PACKAGE_MAKEFILE_ROOTS = new Set(['target', 'tools', 'toolchain']);
+
+export function isPackageMakefilePath(filePath) {
+  if (!filePath) return false;
+  const normalized = filePath.trim().replace(/^\.\//, '');
+  if (normalized !== 'Makefile' && !normalized.endsWith('/Makefile')) return false;
+
+  const parts = normalized.split('/');
+  // The top-level Makefile is the build system entry point, not a package.
+  if (parts.length === 1) return false;
+  if (NON_PACKAGE_MAKEFILE_ROOTS.has(parts[0])) return false;
+  return true;
+}
+
+// Collect the Makefiles a patch adds (`--- /dev/null`) or removes
+// (`+++ /dev/null`), dropping the build-infrastructure paths rejected by
+// isPackageMakefilePath(). Everything else counts as a package Makefile, so
+// unlisted infrastructure trees are still reported as new/dropped packages.
+function collectPackageMakefiles(commitPatch, direction) {
+  const regex = direction === 'added'
+    ? /^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(.*)\r?$/gm
+    : /^---\s+a\/(.*)\r?\n\+\+\+\s+\/dev\/null\r?$/gm;
+
+  const paths = [];
+  let match;
+  while ((match = regex.exec(commitPatch)) !== null) {
+    const filePath = match[1].trim();
+    if (isPackageMakefilePath(filePath)) {
+      paths.push(filePath);
+    }
+  }
+  return paths;
+}
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) {
   const errors = [];
   const successes = [];
@@ -479,12 +518,12 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
   }
 
   let isNewPackageThisCommit = false;
-  if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(commitPatch)) {
+  if (collectPackageMakefiles(commitPatch, 'added').length > 0) {
     state.isNewPackage = true;
     isNewPackageThisCommit = true;
   }
 
-  if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(commitPatch)) {
+  if (collectPackageMakefiles(commitPatch, 'removed').length > 0) {
     state.isDroppedPackage = true;
   }
 
