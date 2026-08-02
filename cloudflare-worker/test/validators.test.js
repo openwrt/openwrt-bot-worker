@@ -29,6 +29,7 @@ const CONFIG = {
   check_openwrt_meta: true,
   check_conffiles: true,
   check_pkg_name_reuse: true,
+  check_buildbot_default: 'warning',
   check_patch_headers: true,
   require_linked_github_account: false,
   check_openwrt_spelling: true
@@ -2268,6 +2269,373 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     };
     const res = validateMakefileContext(commit, patch, testConfig, state);
     assert.strictEqual(res.errors.length, 0);
+  });
+
+  // Isolate the buildbot-default check so unrelated Makefile rules cannot
+  // contribute errors/warnings and skew the assertions below.
+  const buildbotConfig = (level) => ({
+    ...CONFIG,
+    check_openwrt_meta: false,
+    check_conffiles: false,
+    check_crlf: false,
+    check_pkg_version: false,
+    check_trailing_newline: false,
+    check_makefile_indentation: false,
+    check_pkg_name_reuse: false,
+    check_missing_colon: false,
+    check_space_after_assignment: false,
+    check_buildbot_default: level
+  });
+  const freshState = () => ({ isNewPackage: false, isDroppedPackage: false });
+
+  test('warns on DEFAULT conditioned on BUILDBOT in a feed package (issue #4)', () => {
+    const commit = { commit: { message: 'openssh: add sftp-server DEFAULT' } };
+    const patch = `
+diff --git a/net/openssh/Makefile b/net/openssh/Makefile
+--- a/net/openssh/Makefile
++++ b/net/openssh/Makefile
+@@ -80,6 +80,13 @@ define Package/openssh-server
+ endef
+ 
++define Package/openssh-sftp-server
++  $(call Package/openssh/Default)
++  TITLE+= SFTP server
++  DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)
++endef
++
+ define Package/openssh-client/description
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(res.warnings[0].includes("DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)"));
+    assert.ok(res.warnings[0].includes("inside 'Package/openssh-sftp-server'"));
+  });
+
+  test('labels the package from the hunk header when the define is outside the diff', () => {
+    const commit = { commit: { message: 'owut: default on buildbot' } };
+    const patch = `
+diff --git a/utils/owut/Makefile b/utils/owut/Makefile
+--- a/utils/owut/Makefile
++++ b/utils/owut/Makefile
+@@ -20,6 +20,7 @@ define Package/owut
+   SECTION:=utils
+   CATEGORY:=Base system
++  DEFAULT:=y if BUILDBOT
+   TITLE:=owut
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(res.warnings[0].includes("inside 'Package/owut'"));
+  });
+
+  test('does not attribute a DEFAULT line to a package block closed in an earlier hunk', () => {
+    const commit = { commit: { message: 'foo: default on buildbot' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -20,3 +20,4 @@ define Package/foo
+   TITLE:=Foo
+ endef
++DEFAULT:=y if BUILDBOT
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(!res.warnings[0].includes('inside'));
+  });
+
+  test('closes the package block on an indented endef', () => {
+    const commit = { commit: { message: 'foo: default on buildbot' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -20,3 +20,4 @@ define Package/foo
+   TITLE:=Foo
+   endef
++DEFAULT:=y if BUILDBOT
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(!res.warnings[0].includes('inside'), 'indented endef must not leave Package/foo attributed');
+  });
+
+  test('attributes a DEFAULT line under an indented define', () => {
+    const commit = { commit: { message: 'foo: default on buildbot' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -20,3 +20,5 @@ context
++  define Package/foo
++  DEFAULT:=y if BUILDBOT
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(res.warnings[0].includes("inside 'Package/foo'"));
+  });
+
+  test('detects DEFAULT assignments spread over backslash continuation lines', () => {
+    const commit = { commit: { message: 'foo: default on buildbot' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -10,3 +10,5 @@ define Package/foo
+   TITLE:=Foo
++  DEFAULT:=y if \\
++    (BUILDBOT && !SMALL_FLASH)
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(res.warnings[0].includes('BUILDBOT'));
+  });
+
+  test('detects every Makefile assignment flavour for DEFAULT', () => {
+    for (const op of [':=', '=', '?=', '+=', '::=']) {
+      const commit = { commit: { message: 'foo: default on buildbot' } };
+      const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -10,3 +10,4 @@ define Package/foo
+   TITLE:=Foo
++  DEFAULT${op}y if BUILDBOT
+    `;
+      const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+      assert.strictEqual(res.warnings.length, 1, `operator ${op} was not detected`);
+    }
+  });
+
+  test('treats check_buildbot_default: true and "error" as a hard error', () => {
+    for (const level of [true, 'error']) {
+      const commit = { commit: { message: 'foo: add DEFAULT' } };
+      const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -1,2 +1,3 @@
+ define Package/foo
++  DEFAULT:=y if BUILDBOT
+ endef
+    `;
+      const res = validateMakefileContext(commit, patch, buildbotConfig(level), freshState(), 'openwrt/packages');
+      assert.strictEqual(res.warnings.length, 0);
+      assert.strictEqual(res.errors.length, 1);
+      assert.ok(res.errors[0].includes("DEFAULT:=y if BUILDBOT"));
+    }
+  });
+
+  test('does not flag DEFAULT without a BUILDBOT condition', () => {
+    const commit = { commit: { message: 'foo: add DEFAULT' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -1,2 +1,3 @@
+ define Package/foo
++  DEFAULT:=y if TARGET_x86
+ endef
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+    assert.ok(res.successes.some(s => s.includes("No feed package forces its own inclusion")));
+  });
+
+  test('ignores DEFAULT+BUILDBOT inside an added comment line', () => {
+    const commit = { commit: { message: 'foo: document DEFAULT' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -1,2 +1,3 @@
+ define Package/foo
++#  DEFAULT:=y if BUILDBOT
+ endef
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('does not flag DEFAULT+BUILDBOT in the main openwrt/openwrt repo, whatever the casing', () => {
+    for (const repo of ['openwrt/openwrt', 'OpenWrt/OpenWrt']) {
+      const commit = { commit: { message: 'openssh: add sftp-server DEFAULT' } };
+      const patch = `
+diff --git a/net/openssh/Makefile b/net/openssh/Makefile
+--- a/net/openssh/Makefile
++++ b/net/openssh/Makefile
+@@ -1,2 +1,3 @@
+ define Package/openssh-sftp-server
++  DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)
+ endef
+    `;
+      const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), repo);
+      assert.strictEqual(res.errors.length, 0);
+      assert.strictEqual(res.warnings.length, 0);
+      assert.ok(!res.successes.some(s => s.includes('BUILDBOT')), `Successes: ${res.successes.join(', ')}`);
+    }
+  });
+
+  test('does not flag pre-existing DEFAULT+BUILDBOT lines left untouched by the diff', () => {
+    const commit = { commit: { message: 'foo: unrelated tweak' } };
+    const patch = `
+diff --git a/utils/owut/Makefile b/utils/owut/Makefile
+--- a/utils/owut/Makefile
++++ b/utils/owut/Makefile
+@@ -10,7 +10,7 @@ define Package/owut
+   DEFAULT:=y if (BUILDBOT && !SMALL_FLASH)
+-  TITLE:=owut - an OpenWrt Upgrade Tool
++  TITLE:=owut - an OpenWrt upgrade tool
+ endef
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('flags a BUILDBOT continuation added under a pre-existing DEFAULT line', () => {
+    const commit = { commit: { message: 'foo: enable on buildbot' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -10,3 +10,4 @@ define Package/foo
+   TITLE:=Foo
+   DEFAULT:=y \\
++\tif BUILDBOT
+   DEPENDS:=+libc
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1, 'adding the condition to an existing DEFAULT must be caught');
+    assert.ok(res.warnings[0].includes('BUILDBOT'));
+    assert.ok(res.warnings[0].includes("inside 'Package/foo'"));
+  });
+
+  test('does not flag a pre-existing backslash-continued DEFAULT+BUILDBOT left untouched', () => {
+    const commit = { commit: { message: 'foo: unrelated tweak' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -10,4 +10,5 @@ define Package/foo
+   TITLE:=Foo
+   DEFAULT:=y \\
+ \tif BUILDBOT
++  URL:=https://example.org
+   DEPENDS:=+libc
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0);
+  });
+
+  test('does not re-report an untouched DEFAULT+BUILDBOT when an unrelated clause is appended', () => {
+    const commit = { commit: { message: 'foo: extend default condition' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -10,4 +10,5 @@ define Package/foo
+   TITLE:=Foo
+   DEFAULT:=y if BUILDBOT \\
++\t|| ALL_KMODS
+   DEPENDS:=+libc
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.strictEqual(res.warnings.length, 0, 'BUILDBOT was already there; the diff did not introduce it');
+  });
+
+  test('flags a changed DEFAULT value line above an untouched BUILDBOT continuation', () => {
+    const commit = { commit: { message: 'foo: enable by default' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -10,4 +10,4 @@ define Package/foo
+   TITLE:=Foo
+-  DEFAULT:=n \\
++  DEFAULT:=y \\
+ \tif BUILDBOT
+   DEPENDS:=+libc
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1, 'flipping the value re-arms the BUILDBOT default');
+    assert.ok(res.warnings[0].includes('BUILDBOT'));
+  });
+
+  test('attributes the package from an indented define carried as hunk context', () => {
+    const commit = { commit: { message: 'foo: default on buildbot' } };
+    const patch = `
+diff --git a/net/foo/Makefile b/net/foo/Makefile
+--- a/net/foo/Makefile
++++ b/net/foo/Makefile
+@@ -10,3 +10,4 @@   define Package/foo
+   TITLE:=Foo
++  DEFAULT:=y if BUILDBOT
+   DEPENDS:=+libc
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+    assert.ok(res.warnings[0].includes("inside 'Package/foo'"), 'indented define in the hunk header must still attribute the package');
+  });
+
+  test('stays silent when the commit touches no Makefile at all', () => {
+    const commit = { commit: { message: 'docs: tweak readme' } };
+    const patch = `
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,1 +1,2 @@
+ hello
++world
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 0);
+    assert.ok(!res.successes.some(s => s.includes("No feed package forces its own inclusion")));
+  });
+
+  test('reports an identical DEFAULT+BUILDBOT line only once per patch', () => {
+    const commit = { commit: { message: 'foo: default on buildbot' } };
+    const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -1,2 +1,3 @@
+ define Package/foo
++  DEFAULT:=y if BUILDBOT
+ endef
+diff --git a/utils/bar/Makefile b/utils/bar/Makefile
+--- a/utils/bar/Makefile
++++ b/utils/bar/Makefile
+@@ -1,2 +1,3 @@
+ define Package/foo
++  DEFAULT:=y if BUILDBOT
+ endef
+    `;
+    const res = validateMakefileContext(commit, patch, buildbotConfig('warning'), freshState(), 'openwrt/packages');
+    assert.strictEqual(res.warnings.length, 1);
+  });
+
+  test('respects check_buildbot_default: false and "disabled" configuration options', () => {
+    for (const level of [false, 'disabled']) {
+      const commit = { commit: { message: 'foo: add DEFAULT' } };
+      const patch = `
+diff --git a/utils/foo/Makefile b/utils/foo/Makefile
+--- a/utils/foo/Makefile
++++ b/utils/foo/Makefile
+@@ -1,2 +1,3 @@
+ define Package/foo
++  DEFAULT:=y if BUILDBOT
+ endef
+    `;
+      const res = validateMakefileContext(commit, patch, buildbotConfig(level), freshState(), 'openwrt/packages');
+      assert.strictEqual(res.errors.length, 0);
+      assert.strictEqual(res.warnings.length, 0);
+      assert.ok(!res.successes.some(s => s.includes('BUILDBOT')), `Successes: ${res.successes.join(', ')}`);
+    }
   });
 
   test('rejects reuse of PKG_NAME in call, define, and eval lines', () => {
