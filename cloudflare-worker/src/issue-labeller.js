@@ -7,6 +7,11 @@
 //   _invalid_label: "invalid"          # label added when validation fails
 //   _remove_labels: ["to-triage"]      # labels always removed after processing
 //   _invalid_comment: "Invalid {field} reported. `{value}`"  # comment template
+//   _valid_comment: "..."              # posted when an edit fixes the form
+//   _require_form: true                # also process issues without the trigger
+//                                      # label, and flag ones that skipped the
+//                                      # template entirely (maintainers exempt)
+//   _no_form_comment: "..."            # what to say to those
 //
 //   "release/{major}.{minor}":         # label template ({vars} from field value)
 //     - field: "release"               # form field name (normalized)
@@ -16,6 +21,9 @@
 //       format: '^\d+\.\d+-SNAPSHOT$'  # like labeler.yml): the label applies when
 //                                      # any single item matches; all checks inside
 //                                      # one item must pass (AND)
+//       hint: "Run `...` and paste"    # what the reporter should do about it —
+//                                      # replaces the built-in per-field hint in
+//                                      # the invalid-form comment
 //
 //   "Official Image":
 //     - field: "image_kind"
@@ -38,6 +46,7 @@
 //   {hash}     – trailing hex string (7-40 chars) after last '-'
 
 import { githubApiCall, graphqlCheckExistence, ensureLabelExists } from './github.js';
+import { ISSUE_LABELLER_MESSAGES } from './config.js';
 
 // --- ISSUE FORM PARSER ---
 // Parses GitHub issue form markdown body into key-value pairs.
@@ -103,7 +112,7 @@ export function normalizeFields(fields) {
 
 // --- YAML PARSER FOR ISSUE-LABELLER.YML ---
 // Parses the declarative config format. Handles:
-//   - Top-level key: value (strings, booleans, inline arrays)
+//   - Top-level key: value (strings, booleans, inline arrays, block scalars)
 //   - Top-level "label": followed by a list of condition objects
 //   - Condition objects: "- field: x" followed by indented "key: value" lines
 export function parseIssueLabellerYaml(yamlText) {
@@ -137,7 +146,60 @@ export function parseIssueLabellerYaml(yamlText) {
     return v;
   };
 
+  // Block scalars ("key: >-" / "key: |") — hints and comment templates are
+  // sentences, and a sentence on one line is unreadable in a config file.
+  const blockIndicator = (raw) => {
+    const m = raw.trim().match(/^([|>])([-+]?)\d*$/);
+    return m ? { style: m[1], chomp: m[2] } : null;
+  };
+
+  let block = null; // { style, chomp, keyIndent, indent, lines, assign }
+
+  const flushBlock = () => {
+    if (!block) return;
+    while (block.lines.length && block.lines[block.lines.length - 1] === '') block.lines.pop();
+    let value;
+    if (block.style === '|') {
+      value = block.lines.join('\n');
+    } else {
+      // Folded: a blank line is a paragraph break, everything else joins with a space.
+      value = block.lines.reduce((acc, l, i) => {
+        if (i === 0) return l;
+        if (l === '') return `${acc}\n`;
+        return acc.endsWith('\n') ? acc + l : `${acc} ${l}`;
+      }, '');
+    }
+    if (block.chomp === '+') value += '\n';
+    block.assign(value);
+    block = null;
+  };
+
+  const startBlock = (indicator, keyIndent, assign) => {
+    block = { ...indicator, keyIndent, indent: null, lines: [], assign };
+  };
+
   for (let line of lines) {
+    // Inside a block scalar every line is literal text, comments included, so
+    // this runs before comment stripping. Dedenting ends the block.
+    if (block) {
+      if (line.trim() === '') {
+        if (block.indent !== null) block.lines.push('');
+        continue;
+      }
+      const indent = line.length - line.trimStart().length;
+      if (block.indent === null) {
+        if (indent > block.keyIndent) {
+          block.indent = indent;
+          block.lines.push(line.slice(indent));
+          continue;
+        }
+      } else if (indent >= block.indent) {
+        block.lines.push(line.slice(block.indent));
+        continue;
+      }
+      flushBlock();
+    }
+
     // Strip comments (only full-line or after unquoted content)
     const commentIdx = line.indexOf('#');
     if (commentIdx !== -1) {
@@ -152,6 +214,8 @@ export function parseIssueLabellerYaml(yamlText) {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
+    const lineIndent = line.length - line.trimStart().length;
+
     // List item start: "- key: value" (new condition in current label's list)
     if (trimmed.startsWith('- ') && currentLabel !== null) {
       // Flush previous condition
@@ -159,7 +223,11 @@ export function parseIssueLabellerYaml(yamlText) {
       currentCondition = {};
       const kvMatch = trimmed.slice(2).match(/^([^:]+):\s*(.*)$/);
       if (kvMatch) {
-        currentCondition[kvMatch[1].trim()] = parseValue(kvMatch[2]);
+        const key = kvMatch[1].trim();
+        const cond = currentCondition;
+        const indicator = blockIndicator(kvMatch[2]);
+        if (indicator) startBlock(indicator, lineIndent, (v) => { cond[key] = v; });
+        else cond[key] = parseValue(kvMatch[2]);
       }
       continue;
     }
@@ -169,12 +237,17 @@ export function parseIssueLabellerYaml(yamlText) {
       const kvMatch = trimmed.match(/^([^:]+):\s*(.*)$/);
       if (kvMatch) {
         const key = kvMatch[1].trim();
+        const indicator = blockIndicator(kvMatch[2]);
         // Underscore-prefixed keys at label level are metadata (_color, _description)
         if (key.startsWith('_')) {
           if (!currentLabelMeta) currentLabelMeta = {};
-          currentLabelMeta[key] = parseValue(kvMatch[2]);
+          const target = currentLabelMeta;
+          if (indicator) startBlock(indicator, lineIndent, (v) => { target[key] = v; });
+          else target[key] = parseValue(kvMatch[2]);
         } else if (currentCondition) {
-          currentCondition[key] = parseValue(kvMatch[2]);
+          const cond = currentCondition;
+          if (indicator) startBlock(indicator, lineIndent, (v) => { cond[key] = v; });
+          else cond[key] = parseValue(kvMatch[2]);
         }
       }
       continue;
@@ -196,8 +269,12 @@ export function parseIssueLabellerYaml(yamlText) {
       if (!kvMatch) continue;
       const key = kvMatch[1].trim().replace(/^["']|["']$/g, '');
       const rawVal = kvMatch[2].trim();
+      const indicator = blockIndicator(rawVal);
 
-      if (rawVal === '' || rawVal === '|' || rawVal === '>') {
+      if (indicator) {
+        // A block scalar is a multi-line string, never a list of conditions
+        startBlock(indicator, lineIndent, (v) => { config.meta[key] = v; });
+      } else if (rawVal === '') {
         // This key has a block value (list of conditions) → it's a label rule
         currentLabel = key;
         currentConditions = [];
@@ -208,6 +285,7 @@ export function parseIssueLabellerYaml(yamlText) {
       }
     }
   }
+  flushBlock();
 
   // Flush last label
   if (currentLabel !== null) {
@@ -288,10 +366,10 @@ export const DEFAULT_ISSUE_LABELLER_CONFIG = {
 };
 
 // --- MAIN HANDLER ---
-// Processes an opened issue event using the declarative config.
-// Returns { labelsToAdd, labelsToRemove, comments }.
+// Processes an opened, edited or reopened issue event using the declarative
+// config. Returns { labelsToAdd, labelsToRemove, comments, resolvedComment }.
 export async function handleIssueLabeller(data, token, config, repoFullname) {
-  const result = { labelsToAdd: [], labelsToRemove: [], comments: [], labelMeta: {} };
+  const result = { labelsToAdd: [], labelsToRemove: [], comments: [], resolvedComment: null, legacyHeader: null, labelMeta: {} };
 
   const issue = data.issue;
   if (!issue) return result;
@@ -304,20 +382,49 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
   const issueLabels = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name));
   const issueLabelsLower = new Set(issueLabels.map(l => l.toLowerCase()));
 
-  // Only process issues with the trigger label
-  if (!issueLabelsLower.has(triggerLabel)) return result;
+  // The trigger label starts processing, but it is also one of _remove_labels:
+  // after the first run it is gone, so an issue already flagged invalid has to
+  // re-enter on its own label. That is what keeps an edited report supervised
+  // until it is clean.
+  //
+  // _require_form widens the gate to every issue, which covers the two ways a
+  // report escapes the label: a blank issue (the template never ran, so no
+  // label) and a form-shaped report that arrived without the template's labels
+  // anyway.
+  const requireForm = meta._require_form === true;
+  const wasFlagged = issueLabelsLower.has(invalidLabel.toLowerCase());
+  if (!issueLabelsLower.has(triggerLabel) && !wasFlagged && !requireForm) return result;
 
-  // Determine issue type from labels (first label that isn't trigger or generic "bug")
-  let issueType = null;
-  for (const label of issueLabels) {
-    const lower = label.toLowerCase();
-    if (lower === triggerLabel || lower === 'bug') continue;
-    issueType = label;
-    break;
-  }
+  // Deployments before the marker existed left unmarked comments on live
+  // issues. Hand the header down so applyIssueLabelling can recognise one and
+  // adopt it rather than posting a second comment beside it. Set before any
+  // verdict below, so every path that can comment gets the same treatment.
+  result.legacyHeader = meta._invalid_comment_header !== undefined
+    ? meta._invalid_comment_header
+    : ISSUE_LABELLER_MESSAGES.invalidHeader;
 
   // Parse the issue form body
   const fields = normalizeFields(parseIssueForm(issue.body));
+
+  // No "### " sections at all means the reporter bypassed the template. Chasing
+  // that is opt-in and never aimed at the project's own people: maintainers file
+  // free-form tracking issues on purpose, and a bot nagging them is pure noise.
+  if (Object.keys(fields).length === 0) {
+    if (!requireForm) return result;
+    const privileged = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+    if (privileged.includes(issue.author_association)) return result;
+
+    result.labelsToAdd.push(invalidLabel);
+    result.comments.push(meta._no_form_comment !== undefined
+      ? meta._no_form_comment
+      : ISSUE_LABELLER_MESSAGES.noForm);
+    // This is a verdict, not a skipped run, so the trigger label is spent like
+    // on any other outcome. Leaving it behind would queue the issue for a
+    // triage pass that has already happened, and the invalid label is what
+    // brings the report back here once it is edited.
+    result.labelsToRemove.push(...removeLabels);
+    return result;
+  }
 
   // Evaluate each rule. A rule's conditions list is a set of alternatives
   // (OR, like labeler.yml): the rule matches when any single condition object
@@ -419,23 +526,21 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
   }
   const hasInvalid = invalidFields.length > 0;
 
-  // If any validation failed, add invalid label and format a clear Call To Action comment
+  const header = result.legacyHeader;
+
+  // If any validation failed, add invalid label and format a clear Call To Action
+  // comment. Labels that did validate are kept: a report with a good target and
+  // a mistyped release is still a report about that target.
   if (hasInvalid) {
-    result.labelsToAdd = [invalidLabel];
+    result.labelsToAdd.push(invalidLabel);
 
-    const defaultHints = {
-      release: 'Expected a valid release version (e.g. `24.10.0`, `23.05.5`, `24.10-SNAPSHOT`, or `SNAPSHOT`)',
-      target: 'Expected a valid target/subtarget (e.g. `x86/64`, `ath79/generic`, `ramips/mt7621`)',
-      version: 'Expected a valid revision hash (e.g. `r28945-24a9f1c224`)'
-    };
-
-    const header = meta._invalid_comment_header !== undefined
-      ? meta._invalid_comment_header
-      : 'Thank you for reporting this issue! Some required form fields could not be validated:';
+    // A reporter who mistyped a field needs the command that produces the right
+    // value, not a restatement of the grammar. Config `hint:` overrides these.
+    const defaultHints = ISSUE_LABELLER_MESSAGES.hints;
 
     const footer = meta._invalid_comment_footer !== undefined
       ? meta._invalid_comment_footer
-      : 'Please edit your issue description to update these fields so maintainers can triage it.';
+      : ISSUE_LABELLER_MESSAGES.invalidFooter;
 
     const lines = [];
     if (header) lines.push(header, '');
@@ -455,31 +560,101 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
     if (footer) lines.push('', footer);
 
     result.comments.push(lines.join('\n'));
+  } else if (wasFlagged) {
+    // The report was fixed by an edit: drop the label and say so, so the
+    // reporter knows the ball is no longer in their court.
+    result.labelsToRemove.push(invalidLabel);
+    result.resolvedComment = meta._valid_comment !== undefined
+      ? meta._valid_comment
+      : ISSUE_LABELLER_MESSAGES.valid;
   }
 
   // Remove triage/type labels
   for (const rl of removeLabels) {
     result.labelsToRemove.push(rl);
   }
-  if (issueType) {
-    result.labelsToRemove.push(issueType);
+
+  // Remove the issue type label the template applied (the first one that is
+  // neither the trigger nor the generic "bug"). Only on the first run: by the
+  // time an edit re-triggers this, the remaining labels are the bot's own and
+  // whatever a maintainer added by hand, and neither is ours to strip.
+  if (issueLabelsLower.has(triggerLabel)) {
+    const issueType = issueLabels.find(l => {
+      const lower = l.toLowerCase();
+      // The invalid label is never the type: on an issue that carries both it
+      // and the trigger — a maintainer re-triaging a flagged report — removing
+      // it would cut the thread that brings the report back here on the next
+      // edit.
+      return lower !== triggerLabel && lower !== 'bug' && lower !== invalidLabel.toLowerCase();
+    });
+    if (issueType) result.labelsToRemove.push(issueType);
   }
 
   return result;
 }
+
+// An HTML comment renders as nothing and survives edits, so it is a stable
+// handle for finding our own comment again without storing state anywhere.
+export const ISSUE_LABELLER_MARKER = '<!-- issue-labeller -->';
+
+// 1000 comments deep is far past the point where one more bot comment is the
+// thread's problem.
+const MAX_COMMENT_PAGES = 10;
 
 // Applies the labelling result via GitHub REST API (mutations are still REST).
 export async function applyIssueLabelling(result, token, repoFullname, issueNumber, existingLabels, currentIssueLabels, onCall) {
   const issueLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/labels`;
   const currentLabels = currentIssueLabels || new Set();
 
-  // Post comments
-  for (const comment of result.comments) {
-    onCall?.();
-    await githubApiCall(
-      `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments`,
-      token, 'POST', { body: comment }
-    );
+  // One marker-tagged comment per issue, edited in place on every re-run, so a
+  // reporter who fixes the form in three edits gets one comment, not four.
+  const pending = result.comments[0] || result.resolvedComment;
+  if (pending) {
+    const body = `${pending}\n\n${ISSUE_LABELLER_MARKER}`;
+
+    // Page until the marker turns up. It is not reliably the oldest comment:
+    // with _require_form the first complaint can land on an issue that has been
+    // open and discussed for months. Missing it would post a second one, so
+    // walk the pages — most issues are a single call, and the cap only stops a
+    // pathological thread from eating the subrequest budget.
+    //
+    // Comments this bot left before the marker existed carry no marker, so they
+    // are matched on the header text instead and adopted: patching one writes
+    // the marker into it, and every run after this finds it the normal way.
+    let marked = null;
+    let legacy = null;
+    for (let page = 1; page <= MAX_COMMENT_PAGES && !marked; page++) {
+      onCall?.();
+      const listed = await githubApiCall(
+        `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments?per_page=100&page=${page}`,
+        token
+      );
+      if (listed.code !== 200) break;
+      const batch = listed.data || [];
+      marked = batch.find(c => (c.body || '').includes(ISSUE_LABELLER_MARKER));
+      if (!legacy && result.legacyHeader) {
+        legacy = batch.find(c => c.user?.type === 'Bot' && (c.body || '').includes(result.legacyHeader));
+      }
+      if (batch.length < 100) break;
+    }
+    const mine = marked || legacy;
+
+    if (mine) {
+      if (mine.body !== body) {
+        onCall?.();
+        await githubApiCall(
+          `https://api.github.com/repos/${repoFullname}/issues/comments/${mine.id}`,
+          token, 'PATCH', { body }
+        );
+      }
+    } else if (result.comments[0]) {
+      // Nothing to acknowledge on an issue we never complained about.
+      onCall?.();
+      await githubApiCall(
+        `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments`,
+        token, 'POST', { body }
+      );
+    }
   }
 
   // Remove labels (ignore 404 if label wasn't applied)
