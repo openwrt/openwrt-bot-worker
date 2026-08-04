@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { parseIssueForm, normalizeFields, parseIssueLabellerYaml, extractTemplateVars, DEFAULT_ISSUE_LABELLER_CONFIG, handleIssueLabeller } from '../src/issue-labeller.js';
+import { parseIssueForm, normalizeFields, parseIssueLabellerYaml, extractTemplateVars, DEFAULT_ISSUE_LABELLER_CONFIG, handleIssueLabeller, applyIssueLabelling, ISSUE_LABELLER_MARKER } from '../src/issue-labeller.js';
 
 describe('parseIssueForm', () => {
   test('parses structured issue form body', () => {
@@ -163,6 +163,47 @@ _trigger_label: "to-triage"  # inline comment
   });
 });
 
+describe('parseIssueLabellerYaml block scalars', () => {
+  test('folds a multi-line hint into one line', () => {
+    const config = parseIssueLabellerYaml(`
+"target/{segment0}":
+  - field: "target"
+    format: '^\\w+/\\w+$'
+    hint: >-
+      Run \`echo $DISTRIB_TARGET\` on the device
+      and paste that line.
+    exists: "path:target/linux/{segment0}"
+`);
+    const cond = config.rules[0].conditions[0];
+    assert.strictEqual(cond.hint, 'Run `echo $DISTRIB_TARGET` on the device and paste that line.');
+    // The key after the block still parses
+    assert.strictEqual(cond.exists, 'path:target/linux/{segment0}');
+  });
+
+  test('keeps line breaks in a literal block and does not treat # as a comment', () => {
+    const config = parseIssueLabellerYaml(`
+_invalid_comment_footer: |
+  Line one
+  # not a comment
+
+_invalid_label: "invalid"
+`);
+    assert.strictEqual(config.meta._invalid_comment_footer, 'Line one\n# not a comment');
+    assert.strictEqual(config.meta._invalid_label, 'invalid');
+  });
+
+  test('a top-level block scalar is a string, not a label rule', () => {
+    const config = parseIssueLabellerYaml('_valid_comment: >-\n  Thanks, all good.\n');
+    assert.strictEqual(config.meta._valid_comment, 'Thanks, all good.');
+    assert.strictEqual(config.rules.length, 0);
+  });
+
+  test('folds a blank line into a paragraph break', () => {
+    const config = parseIssueLabellerYaml('_valid_comment: >-\n  First para.\n\n  Second para.\n');
+    assert.strictEqual(config.meta._valid_comment, 'First para.\nSecond para.');
+  });
+});
+
 describe('extractTemplateVars', () => {
   test('extracts segments from slash-separated value', () => {
     const vars = extractTemplateVars('ramips/mt7621');
@@ -225,7 +266,7 @@ describe('handleIssueLabeller', () => {
     assert.ok(result.comments[0].includes('Thank you for reporting this issue!'));
     assert.ok(result.comments[0].includes('- **release**: Invalid value `not-a-release`'));
     assert.ok(result.comments[0].includes('- **target**: Invalid value `invalid-target`'));
-    assert.ok(result.comments[0].includes('Please edit your issue description'));
+    assert.ok(result.comments[0].includes('Please fix these by **editing the issue description**'));
   });
 
   test('adds contains-based labels (Official Image)', async () => {
@@ -320,6 +361,114 @@ describe('handleIssueLabeller', () => {
     assert.strictEqual(mentions.length, 1);
   });
 
+  test('re-runs on an already flagged issue without the trigger label', async () => {
+    const data = makeIssueData(['bug', 'invalid'], '### OpenWrt Release\n\nstill-not-a-release');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(result.labelsToAdd.includes('invalid'));
+    assert.strictEqual(result.comments.length, 1);
+  });
+
+  test('clears the invalid label and acknowledges when an edit fixes the form', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    stubGraphql({});
+
+    const data = makeIssueData(['bug', 'invalid'], '### OpenWrt Release\n\nSNAPSHOT');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(result.labelsToRemove.includes('invalid'));
+    assert.strictEqual(result.comments.length, 0);
+    assert.match(result.resolvedComment, /ready for triage/);
+    assert.deepStrictEqual(result.labelsToAdd, ['SNAPSHOT']);
+  });
+
+  test('keeps labels that did validate alongside the invalid label', async () => {
+    const body = `### OpenWrt Release\n\nnot-a-release\n\n### Image Kind\n\nOfficial downloaded image`;
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], body);
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(result.labelsToAdd.includes('Official Image'));
+    assert.ok(result.labelsToAdd.includes('invalid'));
+  });
+
+  test('never mistakes the invalid label for the issue type label', async () => {
+    // A maintainer re-adding the trigger to an already flagged report: the
+    // invalid label must survive, it is what brings the issue back on an edit.
+    const data = makeIssueData(['bug', 'invalid', 'to-triage', 'bug-report'], '### OpenWrt Release\n\nstill-broken');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(!result.labelsToRemove.includes('invalid'));
+    assert.ok(result.labelsToRemove.includes('bug-report'));
+  });
+
+  test('leaves maintainer labels alone when an edit re-triggers the check', async () => {
+    const data = makeIssueData(['bug', 'invalid', 'high priority'], '### OpenWrt Release\n\nstill-broken');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(!result.labelsToRemove.includes('high priority'));
+  });
+
+  test('ignores an issue that skipped the template unless _require_form is set', async () => {
+    const data = { issue: { number: 1, labels: [], body: 'Hi, is there a package for my VPN provider? Cannot find it in the list.', author_association: 'NONE' } };
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.strictEqual(result.labelsToAdd.length, 0);
+    assert.strictEqual(result.comments.length, 0);
+  });
+
+  test('flags a template-less issue from an outside reporter when _require_form is set', async () => {
+    const config = { ...DEFAULT_ISSUE_LABELLER_CONFIG, meta: { ...DEFAULT_ISSUE_LABELLER_CONFIG.meta, _require_form: true } };
+    const data = { issue: { number: 1, labels: [], body: 'Hi, is there a package for my VPN provider? Cannot find it in the list.', author_association: 'NONE' } };
+    const result = await handleIssueLabeller(data, 'token', config, 'openwrt/openwrt');
+    assert.deepStrictEqual(result.labelsToAdd, ['invalid']);
+    assert.match(result.comments[0], /without the bug report form/);
+    assert.match(result.comments[0], /forum\.openwrt\.org/);
+  });
+
+  test('still spends the trigger label when it rejects a template-less issue', async () => {
+    const config = { ...DEFAULT_ISSUE_LABELLER_CONFIG, meta: { ...DEFAULT_ISSUE_LABELLER_CONFIG.meta, _require_form: true } };
+    const data = { issue: { number: 1, labels: [{ name: 'to-triage' }], body: 'no form here', author_association: 'NONE' } };
+    const result = await handleIssueLabeller(data, 'token', config, 'openwrt/openwrt');
+    assert.ok(result.labelsToAdd.includes('invalid'));
+    assert.ok(result.labelsToRemove.includes('to-triage'));
+  });
+
+  test('leaves a maintainer tracking issue alone even with _require_form set', async () => {
+    const config = { ...DEFAULT_ISSUE_LABELLER_CONFIG, meta: { ...DEFAULT_ISSUE_LABELLER_CONFIG.meta, _require_form: true } };
+    for (const assoc of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
+      const data = { issue: { number: 1, labels: [], body: '- run the throughput test\n- wait\n\nneeds a closer look later', author_association: assoc } };
+      const result = await handleIssueLabeller(data, 'token', config, 'openwrt/openwrt');
+      assert.strictEqual(result.labelsToAdd.length, 0, assoc);
+      assert.strictEqual(result.comments.length, 0, assoc);
+    }
+  });
+
+  test('validates a form-shaped report that never received the template labels', async () => {
+    const config = { ...DEFAULT_ISSUE_LABELLER_CONFIG, meta: { ...DEFAULT_ISSUE_LABELLER_CONFIG.meta, _require_form: true } };
+    const body = '### OpenWrt Release\n\nnot-a-release\n\n### Image Kind\n\nOfficial downloaded image';
+    const data = { issue: { number: 1, labels: [], body, author_association: 'NONE' } };
+    const result = await handleIssueLabeller(data, 'token', config, 'openwrt/openwrt');
+    assert.ok(result.labelsToAdd.includes('invalid'));
+    assert.ok(result.labelsToAdd.includes('Official Image'));
+  });
+
+  test('spells out the command behind each built-in hint', async () => {
+    const data = makeIssueData(['to-triage'], '### OpenWrt Release\n\nopenwrt 12.34.5\n\n### OpenWrt target/subtarget\n\nfoobar-generic-somerouter');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.match(result.comments[0], /DISTRIB_RELEASE/);
+    assert.match(result.comments[0], /DISTRIB_TARGET/);
+    assert.match(result.comments[0], /re-runs on every edit/);
+  });
+
+  test('honours a config-provided hint in the invalid comment', async () => {
+    const config = parseIssueLabellerYaml(`
+_trigger_label: "to-triage"
+
+"release/{major}.{minor}":
+  - field: "release"
+    format: '^\\d+$'
+    hint: "Run \`. /etc/openwrt_release && echo $DISTRIB_RELEASE\` and paste that value"
+`);
+    const data = makeIssueData(['to-triage'], '### Release\n\nopenwrt 12.34.5');
+    const result = await handleIssueLabeller(data, 'token', config, 'openwrt/openwrt');
+    assert.match(result.comments[0], /DISTRIB_RELEASE/);
+  });
+
   test('uses custom config from YAML', async () => {
     const yaml = `
 _trigger_label: "needs-triage"
@@ -342,5 +491,178 @@ _remove_labels: ["needs-triage"]
     assert.ok(result.labelsToAdd.includes('urgent'));
     assert.ok(result.labelsToRemove.includes('needs-triage'));
     assert.ok(result.labelsToRemove.includes('bug-report'));
+  });
+});
+
+describe('applyIssueLabelling comment handling', () => {
+  // Records every request and answers comment listings from `existing`.
+  // `existing` is either a flat list of comments (one page) or an array of
+  // pages, which lets a test put the marker beyond the first 100.
+  const stubApi = (existing) => {
+    const pages = Array.isArray(existing[0]) ? existing : [existing];
+    const requests = [];
+    globalThis.fetch = async (url, opts = {}) => {
+      const method = opts.method || 'GET';
+      requests.push({ url, method, body: opts.body ? JSON.parse(opts.body) : null });
+      let payload = [];
+      if (method === 'GET' && url.includes('/comments?')) {
+        const page = Number(new URL(url).searchParams.get('page') || 1);
+        payload = pages[page - 1] || [];
+      }
+      return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify(payload) };
+    };
+    return requests;
+  };
+
+  // A full page, so the pager keeps going.
+  const filler = (n) => Array.from({ length: n }, (_, i) => ({ id: 1000 + i, body: `chatter ${i}` }));
+
+  const empty = { labelsToAdd: [], labelsToRemove: [], comments: [], resolvedComment: null, legacyHeader: null, labelMeta: {} };
+  const LEGACY_HEADER = 'Thank you for reporting this issue! Some required form fields could not be validated:';
+  const bot = (id, body) => ({ id, body, user: { type: 'Bot' } });
+
+  test('posts a marker-tagged comment when none exists yet', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([]);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    const posted = requests.find(r => r.method === 'POST');
+    assert.ok(posted.body.body.includes(ISSUE_LABELLER_MARKER));
+    assert.ok(posted.body.body.startsWith('Fields are wrong'));
+  });
+
+  test('edits the existing comment instead of posting a second one', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([{ id: 42, body: `Old text\n\n${ISSUE_LABELLER_MARKER}` }]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+    const patched = requests.find(r => r.method === 'PATCH');
+    assert.ok(patched.url.endsWith('/issues/comments/42'));
+    assert.ok(patched.body.body.startsWith('New text'));
+  });
+
+  test('leaves an unchanged comment alone', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const body = `Same text\n\n${ISSUE_LABELLER_MARKER}`;
+    const requests = stubApi([{ id: 42, body }]);
+
+    await applyIssueLabelling({ ...empty, comments: ['Same text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.ok(!requests.some(r => r.method === 'PATCH' || r.method === 'POST'));
+  });
+
+  test('finds its comment past the first page instead of posting a second one', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([
+      filler(100),
+      [...filler(20), { id: 42, body: `Old text\n\n${ISSUE_LABELLER_MARKER}` }]
+    ]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+    const patched = requests.find(r => r.method === 'PATCH');
+    assert.ok(patched.url.endsWith('/issues/comments/42'));
+  });
+
+  test('stops paging as soon as the marker is found', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([
+      [...filler(99), { id: 42, body: `Old text\n\n${ISSUE_LABELLER_MARKER}` }],
+      filler(100)
+    ]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 1);
+  });
+
+  test('posts once when a long thread has no marker anywhere', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([filler(100), filler(100), filler(30)]);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 3);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 1);
+  });
+
+  test('adopts a pre-marker comment instead of posting beside it', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([bot(11, `${LEGACY_HEADER}\n\n- **release**: Invalid value \`x\``)]);
+
+    await applyIssueLabelling(
+      { ...empty, comments: ['New text'], legacyHeader: LEGACY_HEADER },
+      'token', 'openwrt/openwrt', 7, new Set(), new Set(), null
+    );
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+    const patched = requests.find(r => r.method === 'PATCH');
+    assert.ok(patched.url.endsWith('/issues/comments/11'));
+    // Patching writes the marker in, so the next run finds it the normal way.
+    assert.ok(patched.body.body.includes(ISSUE_LABELLER_MARKER));
+  });
+
+  test('prefers the marked comment over a legacy one', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([
+      bot(11, `${LEGACY_HEADER}\n\nstale`),
+      bot(22, `Current text\n\n${ISSUE_LABELLER_MARKER}`)
+    ]);
+
+    await applyIssueLabelling(
+      { ...empty, comments: ['New text'], legacyHeader: LEGACY_HEADER },
+      'token', 'openwrt/openwrt', 7, new Set(), new Set(), null
+    );
+    assert.ok(requests.find(r => r.method === 'PATCH').url.endsWith('/issues/comments/22'));
+  });
+
+  test('never adopts a human comment that quotes the header', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([{ id: 33, body: `> ${LEGACY_HEADER}\n\nwhat does this mean?`, user: { type: 'User' } }]);
+
+    await applyIssueLabelling(
+      { ...empty, comments: ['New text'], legacyHeader: LEGACY_HEADER },
+      'token', 'openwrt/openwrt', 7, new Set(), new Set(), null
+    );
+    assert.strictEqual(requests.filter(r => r.method === 'PATCH').length, 0);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 1);
+  });
+
+  test('clears a pre-marker comment when the form is fixed', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([bot(11, `${LEGACY_HEADER}\n\n- **release**: Invalid value \`x\``)]);
+
+    await applyIssueLabelling(
+      { ...empty, resolvedComment: 'All good now', legacyHeader: LEGACY_HEADER },
+      'token', 'openwrt/openwrt', 7, new Set(), new Set(), null
+    );
+    const patched = requests.find(r => r.method === 'PATCH');
+    assert.ok(patched.body.body.startsWith('All good now'));
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+  });
+
+  test('does not announce validity on an issue it never commented on', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([{ id: 9, body: 'a human comment' }]);
+
+    await applyIssueLabelling({ ...empty, resolvedComment: 'All good now' }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.ok(!requests.some(r => r.method === 'PATCH' || r.method === 'POST'));
+  });
+
+  test('skips the comment listing entirely when there is nothing to say', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([]);
+
+    await applyIssueLabelling(empty, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.length, 0);
   });
 });

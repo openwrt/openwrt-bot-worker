@@ -206,12 +206,30 @@ When `enable_issue_labeller` is `true`, the bot fetches `.github/issue-labeller.
 *   `exists` — existence check via GraphQL: `"tag:v{value}"`, `"path:target/linux/{segment0}"`, or `"commit:{hash}"`
 *   `contains` — case-insensitive substring match
 *   `not_empty` — field must be non-empty
+*   `hint` — what the reporter should *do* about a failed check, shown in the invalid-form comment in place of the built-in hint. Write it as an instruction, not a description:
+
+    ```yaml
+    hint: Run `. /etc/openwrt_release && echo $DISTRIB_RELEASE` on the device and paste that value alone.
+    ```
 
 **Meta keys** (underscore-prefixed, not labels):
 *   `_trigger_label` — label required on the issue to start processing (default: `to-triage`)
 *   `_invalid_label` — label added when validation fails (default: `invalid`)
 *   `_remove_labels` — labels always removed after processing (default: `["to-triage"]`)
-*   `_invalid_comment` — comment template for invalid fields (default: `Invalid {field} reported. \`{value}\``)
+*   `_invalid_comment` — comment template for invalid fields (default: `` Invalid {field} reported. `{value}` ``)
+*   `_invalid_comment_header` / `_invalid_comment_footer` — text above and below the list of invalid fields
+*   `_valid_comment` — posted when an edit fixes a previously invalid form
+*   `_require_form` — also process issues that never received `_trigger_label`, and flag ones whose body has no `### ` sections at all as having bypassed the issue template. `OWNER`, `MEMBER` and `COLLABORATOR` are exempt, so maintainers' free-form tracking issues are left alone (default: `false`)
+*   `_no_form_comment` — posted to those issues
+
+> [!NOTE]
+> Every default message the bot posts lives in one place — `ISSUE_LABELLER_MESSAGES` in [`cloudflare-worker/src/config.js`](cloudflare-worker/src/config.js) — with the config key that replaces it named beside each entry. The shipped text is English and its hints name OpenWrt's own commands, which suits `openwrt/openwrt` and nothing else in particular; a feed or a fork rewords or translates all of it from `issue-labeller.yml`, without touching code.
+
+**Re-checking on edit.** The labeller runs on `opened`, `edited` and `reopened`. The trigger label is consumed on the first run, so a re-run re-enters on the `_invalid_label` instead: an issue stays supervised until its form validates. Consequences:
+
+*   The bot keeps **one** comment per issue, tagged with an invisible `<!-- issue-labeller -->` marker and edited in place. Three edits produce one comment, not four.
+*   When the reporter fixes the form, `_invalid_label` is removed and the comment is replaced by `_valid_comment`, so nobody is left staring at a stale complaint.
+*   Labels that validated are kept when another field fails — a report with a good target and a mistyped release still gets its `target/*` label.
 
 **Per-label metadata** (inside a label block, underscore-prefixed):
 *   `_color` — hex color used when the label is auto-created (default: `ededed`)
@@ -238,6 +256,7 @@ _remove_labels: ["to-triage"]
   - field: "target"
     format: '^[a-zA-Z0-9]+/[a-zA-Z0-9]+$'
     exists: "path:target/linux/{segment0}/{segment1}"
+    hint: "Run `. /etc/openwrt_release && echo $DISTRIB_TARGET` on the device and paste that line — it is `target/subtarget`, e.g. `ramips/mt7621`, not the image file name"
 
 "Official Image":
   - field: "image_kind"

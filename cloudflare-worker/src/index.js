@@ -238,6 +238,14 @@ async function handleWebhook(request, env) {
     if (isBotUser(data.comment?.user)) {
       return new Response("Ignored non-maintainer issue comment", { status: 200 });
     }
+  } else if (event === "issues") {
+    // "edited" matters here: the triage comment tells the reporter what to fix,
+    // and the fix arrives as an edit of the issue body. Re-running on it is what
+    // lets the comment and the invalid label clear themselves.
+    const action = data.action || '';
+    if (!['opened', 'edited', 'reopened'].includes(action)) {
+      return new Response("Ignored issues action", { status: 200 });
+    }
   } else {
     const action = data.action || '';
     if (!['opened', 'synchronize', 'reopened'].includes(action)) {
@@ -265,9 +273,6 @@ async function handleWebhook(request, env) {
 
   // --- ISSUES EVENT: Issue Labeller ---
   if (event === "issues") {
-    if (data.action !== "opened") {
-      return new Response("Ignored issues action", { status: 200 });
-    }
     const issueConfig = await fetchRepositoryConfig(data, token, DEFAULT_CONFIG, null);
     if (!issueConfig.enable_issue_labeller) {
       return new Response("Issue labeller disabled for this repository", { status: 200 });
