@@ -1520,13 +1520,33 @@ function isNewSubPackageMakefileAddition(added, deleted, headMakefileContent) {
   return true;
 }
 
+// One package per error keeps the backport filter able to drop a single one;
+// they are folded into a single list at render time (see groupReleaseErrors).
+export const MISSING_BUMP_ERROR = /^Package `([^`]+)` content changed without a PKG_RELEASE or version bump/;
+export const MISSING_BUMP_SUMMARY = 'Content changed in these packages, but without a `PKG_RELEASE` or version bump:';
+export const MISSING_BUMP_ACTION = 'Increment `PKG_RELEASE` by 1 (or bump `PKG_VERSION`/`PKG_SOURCE_DATE` and reset `PKG_RELEASE` to 1) so users receive the update.';
+const MINOR_CHANGE_ADVICE = '**Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (`PKG_MAINTAINER`), or updating source download info (`PKG_SOURCE_URL` / `PKG_HASH`) do not require incrementing `PKG_RELEASE`.';
+
+// Splits the audit's errors into the packages that are missing a bump — one
+// finding stated once, however many packages it names — and everything else.
+export function groupReleaseErrors(errors) {
+  const packages = [];
+  const others = [];
+  for (const err of errors) {
+    const match = err.match(MISSING_BUMP_ERROR);
+    if (match) packages.push(match[1]);
+    else others.push(err);
+  }
+  return { packages, others };
+}
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
   const successes = [];
 
   if (CONFIG.check_pkg_release === false || CONFIG.check_pkg_release === 'disabled') {
-    return { errors, warnings, successes };
+    return { errors, warnings, successes, notes: [] };
   }
 
   // 1. Collect all modified package roots and file changes
@@ -1614,7 +1634,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
   if (pkgRoots.size > 15) {
     warnings.push(`Package release bump audit skipped: PR modifies ${pkgRoots.size} packages. Batch updates of >15 packages are not automatically audited to prevent hitting API rate/subrequest limits.`);
-    return { errors, warnings, successes };
+    return { errors, warnings, successes, notes: [] };
   }
 
   // 2. Process each package root — each root's Makefile-diff analysis runs
@@ -1773,8 +1793,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`] };
       }
       return {
-        errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump. Please increment \`PKG_RELEASE\` by 1 (or bump \`PKG_VERSION\`/\`PKG_SOURCE_DATE\` and reset \`PKG_RELEASE\` to 1) so users receive the update.
-- **Do not increment release for minor changes.** Cosmetic edits (e.g., typos in comments, copyright updates, formatting/whitespace), changing the package maintainer (\`PKG_MAINTAINER\`), or updating source download info (\`PKG_SOURCE_URL\` / \`PKG_HASH\`) do not require incrementing \`PKG_RELEASE\`.`],
+        errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],
         successes: []
       };
     }
@@ -1807,7 +1826,11 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     successes.push(...result.successes);
   }
 
-  return { errors, warnings, successes };
+  // The advice on when a bump is *not* needed is about the rule, not about any
+  // one package: a PR touching twelve Makefiles used to repeat it twelve times.
+  const notes = errors.some(e => MISSING_BUMP_ERROR.test(e)) ? [MINOR_CHANGE_ADVICE] : [];
+
+  return { errors, warnings, successes, notes };
 }
 
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {

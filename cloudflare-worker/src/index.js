@@ -2,7 +2,7 @@ import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists, fetchUserRepoPermission } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
@@ -991,7 +991,7 @@ async function handleWebhook(request, env) {
     releaseDetails = releaseDetails.filter(item => !item.isVerbatim);
   }
 
-  let reportRelease = { successes: [], errors: [], warnings: [] };
+  let reportRelease = { successes: [], errors: [], warnings: [], notes: [] };
   try {
     reportRelease = await validatePkgReleaseBumps(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
   } catch (e) {
@@ -1000,7 +1000,7 @@ async function handleWebhook(request, env) {
   }
   if (isBackportPr && reportRelease.errors.length > 0) {
     reportRelease.errors = reportRelease.errors.filter(err => {
-      const match = err.match(/Package \`([^\`]+)\` content changed without a PKG_RELEASE or version bump/);
+      const match = err.match(MISSING_BUMP_ERROR);
       if (match) {
         const pkgRoot = match[1];
         const preExisting = commitDetails.some(item => {
@@ -1037,13 +1037,34 @@ async function handleWebhook(request, env) {
     }
     if (reportRelease.errors.length > 0) {
       const isWarning = CONFIG.check_pkg_release === 'warning';
-      if (isWarning) {
-        allPrWarnings.push(`**Package Release Audit**:\n` + reportRelease.errors.map(e => `- ⚠️ ${e}`).join("\n"));
-        reportRelease.errors.forEach(err => { makefileOutputText += `  ⚠️ Warning: ${err}\n`; });
-      } else {
-        allMakefileErrors.push(`**Package Release Audit**:\n` + reportRelease.errors.map(e => `- ${e}`).join("\n"));
-        reportRelease.errors.forEach(err => { makefileOutputText += `  ❌ ${err}\n`; });
+      // The packages missing a bump are one finding that happens to name
+      // several packages, not one finding per package. State it once and list
+      // them, then the advice that qualifies it — also once.
+      const { packages, others } = groupReleaseErrors(reportRelease.errors);
+      const bullet = isWarning ? '- ⚠️ ' : '- ';
+      const blocks = [];
+      if (packages.length > 0) {
+        blocks.push(`${bullet}${MISSING_BUMP_SUMMARY}\n` +
+          packages.map(p => `  - \`${p}\``).join("\n") +
+          `\n\n  ${MISSING_BUMP_ACTION}`);
       }
+      blocks.push(...others.map(e => `${bullet}${e}`));
+      const notes = reportRelease.notes.map(n => `\n\n${n}`).join("");
+      const body = `**Package Release Audit**:\n` + blocks.join("\n") + notes;
+
+      if (isWarning) {
+        allPrWarnings.push(body);
+      } else {
+        allMakefileErrors.push(body);
+      }
+
+      const mark = isWarning ? '  ⚠️ Warning: ' : '  ❌ ';
+      if (packages.length > 0) {
+        makefileOutputText += `${mark}${MISSING_BUMP_SUMMARY} ${packages.join(', ')}\n`;
+        makefileOutputText += `${mark}${MISSING_BUMP_ACTION}\n`;
+      }
+      others.forEach(err => { makefileOutputText += `${mark}${err}\n`; });
+      reportRelease.notes.forEach(n => { makefileOutputText += `  ℹ️ ${n}\n`; });
     }
     makefileOutputText += "\n";
   }

@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs, isPackageMakefilePath } from '../src/validators.js';
+import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, findPkgRoot, validateUciConfigs, isPackageMakefilePath, groupReleaseErrors } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -2450,6 +2450,63 @@ diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.
 
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
+  });
+
+  test('states the minor-change advice once per report, not once per package', async () => {
+    const pkgs = ['bash', 'dnsmasq', 'busybox'];
+    const commitDetails = [{
+      commitPatch: pkgs.map(p => `
+diff --git a/package/utils/${p}/files/${p}.init b/package/utils/${p}/files/${p}.init
++++ b/package/utils/${p}/files/${p}.init
++exec ${p}
+`).join('')
+    }];
+    const makefileFor = (path) => {
+      const pkg = pkgs.find(p => path === `package/utils/${p}/Makefile`);
+      return pkg ? `PKG_NAME:=${pkg}\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n` : null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, makefileFor, makefileFor);
+    assert.strictEqual(res.errors.length, 3);
+    assert.ok(!res.errors.some(e => e.includes('Do not increment release for minor changes')));
+    assert.strictEqual(res.notes.length, 1);
+    assert.ok(res.notes[0].includes('Do not increment release for minor changes'));
+  });
+
+  test('carries no minor-change advice when nothing tripped the bump rule', async () => {
+    const res = await validatePkgReleaseBumps([{ commitPatch: '' }], defaultConf, async () => null, async () => null);
+    assert.deepStrictEqual(res.notes, []);
+  });
+
+  test('groupReleaseErrors folds the missing-bump errors into one list of packages', () => {
+    const { packages, others } = groupReleaseErrors([
+      'Package `package/utils/bash` content changed without a PKG_RELEASE or version bump.',
+      "Package `package/utils/dnsmasq` version updated from '1.0' to '1.1', but PKG_RELEASE was not reset to 1 (currently: '3')",
+      'Package `package/utils/busybox` content changed without a PKG_RELEASE or version bump.'
+    ]);
+    assert.deepStrictEqual(packages, ['package/utils/bash', 'package/utils/busybox']);
+    assert.strictEqual(others.length, 1);
+    assert.ok(others[0].includes('was not reset to 1'));
+  });
+
+  test('always returns a notes array, including on the skipped paths', async () => {
+    const off = await validatePkgReleaseBumps([{ commitPatch: '' }], { check_pkg_release: false }, async () => null, async () => null);
+    assert.deepStrictEqual(off.notes, []);
+
+    const many = Array.from({ length: 16 }, (_, i) => `
+diff --git a/package/utils/p${i}/Makefile b/package/utils/p${i}/Makefile
++++ b/package/utils/p${i}/Makefile
++PKG_NAME:=p${i}
+`).join('');
+    const tooMany = await validatePkgReleaseBumps([{ commitPatch: many }], defaultConf, async () => null, async () => null);
+    assert.ok(tooMany.warnings.some(w => w.includes('audit skipped')));
+    assert.deepStrictEqual(tooMany.notes, []);
+  });
+
+  test('groupReleaseErrors leaves unrelated errors untouched', () => {
+    const { packages, others } = groupReleaseErrors(['Something else entirely']);
+    assert.deepStrictEqual(packages, []);
+    assert.deepStrictEqual(others, ['Something else entirely']);
   });
 
   test('passes when u-boot.mk based package Makefile changes non-cosmetically without PKG_RELEASE', async () => {
