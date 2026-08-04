@@ -430,12 +430,14 @@ async function handleWebhook(request, env) {
     // lookup misses (common when findPkgRoot walks up the directory tree)
     // would otherwise leave the ref unknown forever — and every subsequent
     // flush would keep dual-probing base and fork, doubling alias usage.
-    // The ' ' prefix keeps these keys collision-free from item keys,
-    // which are '<sha>:<path>|b' shaped.
+    // The leading NUL is written as the \u0000 escape, never as a raw byte:
+    // one of those turns the whole file binary to grep, linters and editors.
+    // It keeps these keys collision-free from item keys, which are
+    // '<sha>:<path>|b' shaped.
     const refProbeKeys = new Map(); // ref -> { baseKey, forkKey }
     if (hasForkRepo) {
       for (const ref of unknownRefs) {
-        const keys = { baseKey: ` ref:${ref}|b`, forkKey: ` ref:${ref}|f` };
+        const keys = { baseKey: `\u0000ref:${ref}|b`, forkKey: `\u0000ref:${ref}|f` };
         probes.push({ key: keys.baseKey, repoFullname, ref, path: null });
         probes.push({ key: keys.forkKey, repoFullname: headRepoFullname, ref, path: null });
         refProbeKeys.set(ref, keys);
