@@ -808,7 +808,7 @@ index 123456..789012 100644
 
       const commentCall = apiCalls.find(c => c.url.includes('/issues/55/comments') && c.method === 'POST');
       assert.ok(commentCall);
-      assert.ok(commentCall.body.body.includes('inactive for 14 days'));
+      assert.ok(commentCall.body.body.includes('no activity for 14 days'));
     } finally {
       fetchMock = null;
     }
@@ -944,7 +944,7 @@ index 123456..789012 100644
       // Verify it sent a POST comment and a PATCH pulls state:closed
       const commentCall = apiCalls.find(c => c.url.includes('/issues/77/comments') && c.method === 'POST');
       assert.ok(commentCall);
-      assert.ok(commentCall.body.body.includes('closed because it has been marked stale'));
+      assert.ok(commentCall.body.body.includes('closed because it had been marked stale'));
 
       const patchCall = apiCalls.find(c => c.url.includes('/pulls/77') && c.method === 'PATCH');
       assert.ok(patchCall);

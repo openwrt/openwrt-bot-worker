@@ -1,5 +1,5 @@
 import { githubApiCall } from './github.js';
-import { generateJWT, getInstallationToken } from './crypto.js';
+import { generateJWT } from './crypto.js';
 import { LABEL_GUIDELINES } from './config.js';
 
 function parseLinkHeader(header) {
@@ -18,6 +18,43 @@ function parseLinkHeader(header) {
   return links;
 }
 
+// Walks a paginated GitHub listing, following Link headers, and returns
+// { items, outcome }:
+//   'ok'      – every page arrived (or `stop` ended the walk early)
+//   'fatal'   – 403/429 with the rate limit exhausted; the whole scan
+//               should wind down, whatever it is doing
+//   'limited' – 403/429 short of exhaustion (e.g. abuse detection); the
+//               caller skips its current unit of work
+//   'failed'  – any other non-200; the caller decides whether the items
+//               collected so far are still worth acting on
+// `pick` extracts the item array from a page payload, `stop(items)` may end
+// the walk once the caller already has what it needs.
+async function paginateAll(startUrl, token, label, { pick = (data) => data, stop = null } = {}) {
+  const items = [];
+  let url = startUrl;
+  while (url) {
+    const res = await githubApiCall(url, token);
+    if (res.code === 403 || res.code === 429) {
+      if (res.headers?.get('x-ratelimit-remaining') === '0') {
+        console.error(`[Stale Bot] GitHub API rate limit reached ${label}. Exiting gracefully.`);
+        return { items, outcome: 'fatal' };
+      }
+      console.warn(`[Stale Bot] HTTP ${res.code} ${label}.`);
+      return { items, outcome: 'limited' };
+    }
+    if (res.code !== 200) {
+      console.error(`[Stale Bot] Failed ${label} (HTTP ${res.code}): ${res.raw}`);
+      return { items, outcome: 'failed' };
+    }
+    items.push(...(pick(res.data) || []));
+    if (stop && stop(items)) {
+      return { items, outcome: 'ok' };
+    }
+    url = parseLinkHeader(res.headers?.get('link')).next || null;
+  }
+  return { items, outcome: 'ok' };
+}
+
 export async function handleScheduled(env) {
   // Expiration periods:
   // 14 days = 14 * 24 * 60 * 60 * 1000 milliseconds
@@ -30,36 +67,13 @@ export async function handleScheduled(env) {
 
     // 1. Generate App JWT to list all installations
     const jwt = await generateJWT(env.APP_ID, env.PRIVATE_KEY);
-    
-    let installations = [];
-    let installationsUrl = 'https://api.github.com/app/installations?per_page=100';
-    while (installationsUrl) {
-      const resInstallations = await githubApiCall(installationsUrl, jwt);
-      if (resInstallations.code === 403 || resInstallations.code === 429) {
-        const remaining = resInstallations.headers?.get('x-ratelimit-remaining');
-        if (remaining === '0') {
-          console.error('[Stale Bot] GitHub API rate limit reached fetching installations. Exiting gracefully.');
-          return;
-        }
-        console.error(`[Stale Bot] Rate limit or abuse limit hit fetching installations (HTTP ${resInstallations.code}). Exiting gracefully.`);
-        return;
-      }
-      if (resInstallations.code !== 200) {
-        console.error(`[Stale Bot] Failed to fetch installations: ${resInstallations.raw}`);
-        break;
-      }
-      const list = resInstallations.data || [];
-      installations = installations.concat(list);
 
-      const linkHeader = resInstallations.headers?.get('link');
-      installationsUrl = null;
-      if (linkHeader) {
-        const links = parseLinkHeader(linkHeader);
-        if (links.next) {
-          installationsUrl = links.next;
-        }
-      }
+    const installationsResult = await paginateAll(
+      'https://api.github.com/app/installations?per_page=100', jwt, 'fetching installations');
+    if (installationsResult.outcome === 'fatal' || installationsResult.outcome === 'limited') {
+      return;
     }
+    const installations = installationsResult.items;
 
     console.log(`[Stale Bot] Found ${installations.length} active GitHub App installations.`);
 
@@ -77,41 +91,17 @@ export async function handleScheduled(env) {
       }
 
       // 3. List all repositories accessible by this installation
-      let repositories = [];
-      let reposUrl = 'https://api.github.com/installation/repositories?per_page=100';
-      let skipInstallation = false;
-      while (reposUrl) {
-        const resRepos = await githubApiCall(reposUrl, token);
-        if (resRepos.code === 403 || resRepos.code === 429) {
-          const remaining = resRepos.headers?.get('x-ratelimit-remaining');
-          if (remaining === '0') {
-            console.error('[Stale Bot] GitHub API rate limit reached fetching repositories. Exiting gracefully.');
-            return;
-          }
-          console.warn(`[Stale Bot] HTTP ${resRepos.code} fetching repositories for installation ${installationId}. Skipping this installation.`);
-          skipInstallation = true;
-          break;
-        }
-        if (resRepos.code !== 200) {
-          console.error(`[Stale Bot] Failed to fetch repositories for installation ID ${installationId}: ${resRepos.raw}`);
-          break;
-        }
-        const list = resRepos.data?.repositories || [];
-        repositories = repositories.concat(list);
-
-        const linkHeader = resRepos.headers?.get('link');
-        reposUrl = null;
-        if (linkHeader) {
-          const links = parseLinkHeader(linkHeader);
-          if (links.next) {
-            reposUrl = links.next;
-          }
-        }
+      const reposResult = await paginateAll(
+        'https://api.github.com/installation/repositories?per_page=100', token,
+        `fetching repositories for installation ${installationId}`,
+        { pick: (data) => data?.repositories });
+      if (reposResult.outcome === 'fatal') {
+        return;
       }
-
-      if (skipInstallation) {
+      if (reposResult.outcome === 'limited') {
         continue;
       }
+      const repositories = reposResult.items;
 
       console.log(`[Stale Bot] Installation has access to ${repositories.length} repositories.`);
 
@@ -123,10 +113,9 @@ export async function handleScheduled(env) {
           // Fetch repository config from default branch to check if stale bot is disabled
           const configUrl = `https://api.github.com/repos/${repo}/contents/.github/formalities.json`;
           const resConfig = await githubApiCall(configUrl, token, 'GET', null, 'application/vnd.github.raw');
-          
+
           if (resConfig.code === 403 || resConfig.code === 429) {
-            const remaining = resConfig.headers?.get('x-ratelimit-remaining');
-            if (remaining === '0') {
+            if (resConfig.headers?.get('x-ratelimit-remaining') === '0') {
               console.error('[Stale Bot] GitHub API rate limit reached fetching config. Exiting gracefully.');
               return;
             }
@@ -152,118 +141,45 @@ export async function handleScheduled(env) {
             continue;
           }
 
-          // Fetch repository labels with pagination (optimizing with early breakout)
-          let repoLabels = new Set();
-          let repoLabelsUrl = `https://api.github.com/repos/${repo}/labels?per_page=100`;
-          let skipRepoLabels = false;
-          while (repoLabelsUrl) {
-            const resRepoLabels = await githubApiCall(repoLabelsUrl, token);
-            if (resRepoLabels.code === 403 || resRepoLabels.code === 429) {
-              const remaining = resRepoLabels.headers?.get('x-ratelimit-remaining');
-              if (remaining === '0') {
-                console.error('[Stale Bot] GitHub API rate limit reached fetching repository labels. Exiting gracefully.');
-                return;
-              }
-              console.warn(`[Stale Bot] HTTP ${resRepoLabels.code} fetching labels for repository ${repo}. Skipping this repository.`);
-              skipRepoLabels = true;
-              break;
-            }
-            if (resRepoLabels.code !== 200) {
-              console.error(`[Stale Bot] Failed to fetch repository labels for ${repo} (HTTP ${resRepoLabels.code}): ${resRepoLabels.raw}`);
-              skipRepoLabels = true;
-              break;
-            }
-            const list = resRepoLabels.data || [];
-            list.forEach(l => repoLabels.add(l.name.toLowerCase()));
-
-            // Optimizing: break out early if stale label exists
-            if (repoLabels.has('stale')) {
-              break;
-            }
-
-            const linkHeader = resRepoLabels.headers?.get('link');
-            repoLabelsUrl = null;
-            if (linkHeader) {
-              const links = parseLinkHeader(linkHeader);
-              if (links.next) {
-                repoLabelsUrl = links.next;
-              }
-            }
+          // Fetch repository labels, stopping early once the stale label shows up
+          const labelsResult = await paginateAll(
+            `https://api.github.com/repos/${repo}/labels?per_page=100`, token,
+            `fetching labels for repository ${repo}`,
+            { stop: (items) => items.some(l => l.name.toLowerCase() === 'stale') });
+          if (labelsResult.outcome === 'fatal') {
+            return;
           }
-
-          if (skipRepoLabels) {
+          if (labelsResult.outcome !== 'ok') {
+            console.warn(`[Stale Bot] Skipping repository ${repo}.`);
             continue;
           }
+          const repoLabels = new Set(labelsResult.items.map(l => l.name.toLowerCase()));
 
-          // 4. Query issues API for open PRs with guidelines label OR stale label
-          let prMap = new Map();
-
-          // Query 1: Open issues with guidelines label
-          let issuesUrl1 = `https://api.github.com/repos/${repo}/issues?state=open&labels=${encodeURIComponent(LABEL_GUIDELINES)}&per_page=100`;
-          while (issuesUrl1) {
-            const resIssues1 = await githubApiCall(issuesUrl1, token);
-            if (resIssues1.code === 403 || resIssues1.code === 429) {
-              const remaining = resIssues1.headers?.get('x-ratelimit-remaining');
-              if (remaining === '0') {
-                console.error('[Stale Bot] GitHub API rate limit reached querying issues. Exiting gracefully.');
-                return;
-              }
-              console.error(`[Stale Bot] Rate limit or abuse limit hit querying issues (HTTP ${resIssues1.code}). Exiting gracefully.`);
+          // 4. Query issues API for open PRs with guidelines label OR stale label.
+          // The REST issues listing treats multiple labels as AND, so the OR
+          // needs one query per label, deduplicated by PR number.
+          const prMap = new Map();
+          let skipRepoIssues = false;
+          for (const labelName of [LABEL_GUIDELINES, 'stale']) {
+            const issuesResult = await paginateAll(
+              `https://api.github.com/repos/${repo}/issues?state=open&labels=${encodeURIComponent(labelName)}&per_page=100`,
+              token, `querying issues for ${repo}`);
+            if (issuesResult.outcome === 'fatal') {
               return;
             }
-            if (resIssues1.code !== 200) {
-              console.error(`[Stale Bot] Issues query failed for ${repo} with code ${resIssues1.code}: ${resIssues1.raw}`);
+            if (issuesResult.outcome === 'limited') {
+              skipRepoIssues = true;
               break;
             }
-            const items = resIssues1.data || [];
-            items.forEach(item => {
+            for (const item of issuesResult.items) {
               if (item.pull_request) {
                 prMap.set(item.number, item);
-              }
-            });
-
-            const linkHeader = resIssues1.headers?.get('link');
-            issuesUrl1 = null;
-            if (linkHeader) {
-              const links = parseLinkHeader(linkHeader);
-              if (links.next) {
-                issuesUrl1 = links.next;
               }
             }
           }
-
-          // Query 2: Open issues with stale label
-          let issuesUrl2 = `https://api.github.com/repos/${repo}/issues?state=open&labels=stale&per_page=100`;
-          while (issuesUrl2) {
-            const resIssues2 = await githubApiCall(issuesUrl2, token);
-            if (resIssues2.code === 403 || resIssues2.code === 429) {
-              const remaining = resIssues2.headers?.get('x-ratelimit-remaining');
-              if (remaining === '0') {
-                console.error('[Stale Bot] GitHub API rate limit reached querying issues. Exiting gracefully.');
-                return;
-              }
-              console.error(`[Stale Bot] Rate limit or abuse limit hit querying issues (HTTP ${resIssues2.code}). Exiting gracefully.`);
-              return;
-            }
-            if (resIssues2.code !== 200) {
-              console.error(`[Stale Bot] Issues query failed for ${repo} with code ${resIssues2.code}: ${resIssues2.raw}`);
-              break;
-            }
-            const items = resIssues2.data || [];
-            items.forEach(item => {
-              if (item.pull_request) {
-                prMap.set(item.number, item);
-              }
-            });
-
-            const linkHeader = resIssues2.headers?.get('link');
-            issuesUrl2 = null;
-            if (linkHeader) {
-              const links = parseLinkHeader(linkHeader);
-              if (links.next) {
-                issuesUrl2 = links.next;
-              }
-            }
+          if (skipRepoIssues) {
+            console.warn(`[Stale Bot] Skipping repository ${repo}.`);
+            continue;
           }
 
           const prs = Array.from(prMap.values());
@@ -287,44 +203,18 @@ export async function handleScheduled(env) {
 
             if (hasStaleLabel) {
               // If it already has the stale label, fetch events to check when the stale label was added
-              let events = [];
-              let eventsUrl = `https://api.github.com/repos/${repo}/issues/${prNumber}/events?per_page=100`;
-              let skipPr = false;
-              while (eventsUrl) {
-                const resEvents = await githubApiCall(eventsUrl, token);
-                if (resEvents.code === 403 || resEvents.code === 429) {
-                  const remaining = resEvents.headers?.get('x-ratelimit-remaining');
-                  if (remaining === '0') {
-                    console.error('[Stale Bot] GitHub API rate limit reached fetching events. Exiting gracefully.');
-                    return;
-                  }
-                  console.warn(`[Stale Bot] HTTP ${resEvents.code} fetching events for PR #${prNumber}. Skipping this PR.`);
-                  skipPr = true;
-                  break;
-                }
-                if (resEvents.code !== 200) {
-                  console.error(`[Stale Bot] Failed to fetch events for PR #${prNumber} (HTTP ${resEvents.code}): ${resEvents.raw}`);
-                  skipPr = true;
-                  break;
-                }
-                const list = resEvents.data || [];
-                events = events.concat(list);
-
-                const linkHeader = resEvents.headers?.get('link');
-                eventsUrl = null;
-                if (linkHeader) {
-                  const links = parseLinkHeader(linkHeader);
-                  if (links.next) {
-                    eventsUrl = links.next;
-                  }
-                }
+              const eventsResult = await paginateAll(
+                `https://api.github.com/repos/${repo}/issues/${prNumber}/events?per_page=100`, token,
+                `fetching events for PR #${prNumber}`);
+              if (eventsResult.outcome === 'fatal') {
+                return;
               }
-
-              if (skipPr) {
+              if (eventsResult.outcome !== 'ok') {
+                console.warn(`[Stale Bot] Skipping PR #${prNumber}.`);
                 continue;
               }
 
-              const staleLabeledEvent = events
+              const staleLabeledEvent = eventsResult.items
                 .filter(e => e.event === 'labeled' && e.label?.name === 'stale')
                 .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
@@ -344,7 +234,7 @@ export async function handleScheduled(env) {
 
                   // Post closing comment
                   const commentsUrl = `https://api.github.com/repos/${repo}/issues/${prNumber}/comments`;
-                  const commentBody = `This PR was closed because it has been marked stale for 14 days with no activity.`;
+                  const commentBody = `This pull request was closed because it had been marked stale for 14 days with no activity.\n\nIf you would like to continue working on it, fix the reported issues and ask a maintainer to reopen it — or open a new pull request with the updated changes.`;
                   await githubApiCall(commentsUrl, token, 'POST', { body: commentBody });
 
                   // Close PR
@@ -386,7 +276,7 @@ export async function handleScheduled(env) {
 
                 // Post warning comment
                 const commentsUrl = `https://api.github.com/repos/${repo}/issues/${prNumber}/comments`;
-                const commentBody = `This PR is stale because it has been inactive for 14 days and has the "${LABEL_GUIDELINES}" label.\nIt will be closed if no further activity occurs within 14 days.`;
+                const commentBody = `This pull request has been marked stale because it has the "${LABEL_GUIDELINES}" label and has seen no activity for 14 days.\nIt will be closed if nothing happens within another 14 days. Updating your commits to fix the reported issues will remove the stale label automatically.`;
                 await githubApiCall(commentsUrl, token, 'POST', { body: commentBody });
 
               } else {
