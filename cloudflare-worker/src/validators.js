@@ -1831,6 +1831,11 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     }
 
     if (versionChanged) {
+      // Deliberately keyed on head alone, not base: dropping PKG_RELEASE
+      // together with a version update is accepted OpenWrt practice for host
+      // tools (upstream cbf8c76d0a "tools/meson: update to 1.2.1",
+      // c2d4abc380 "tools/libressl: bump to 3.7.1", 6988fe3d98 "tools/llvm:
+      // update to 18.1.7") and equivalent to resetting it to 1.
       if (isHostToolRoot && headRelease === null) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; host-side build tools without PKG_RELEASE don't require a reset to 1`] };
       }

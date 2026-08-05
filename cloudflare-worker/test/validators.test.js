@@ -2617,6 +2617,38 @@ diff --git a/tools/squashfs4/Makefile b/tools/squashfs4/Makefile
     assert.ok(res.errors.some(e => e.includes('was not reset to 1')));
   });
 
+  test('passes when tools/ package drops PKG_RELEASE while updating its version', async () => {
+    // Accepted OpenWrt practice, see upstream cbf8c76d0a "tools/meson:
+    // update to 1.2.1" - the exemption must not require base to lack
+    // PKG_RELEASE too.
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/tools/meson/Makefile b/tools/meson/Makefile
+--- a/tools/meson/Makefile
++++ b/tools/meson/Makefile
+-PKG_VERSION:=1.1.1
+-PKG_RELEASE:=2
++PKG_VERSION:=1.2.1
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'tools/meson/Makefile') {
+        return 'PKG_NAME:=meson\nPKG_VERSION:=1.2.1\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'tools/meson/Makefile') {
+        return 'PKG_NAME:=meson\nPKG_VERSION:=1.1.1\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('host-side build tools without PKG_RELEASE')));
+  });
+
   test('passes when tools/ package without PKG_RELEASE changes patches only', async () => {
     const commitDetails = [{
       commitPatch: `
