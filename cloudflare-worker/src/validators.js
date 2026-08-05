@@ -1648,6 +1648,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     const empty = { errors: [], successes: [] };
     const makefilePath = `${pkgRoot}/Makefile`;
 
+    // `tools/` and `toolchain/` hold host-side build helpers that are never
+    // shipped to users; their rebuilds are driven by Makefile-hash stamps, so
+    // most of them (51 of 73 tools/, 7 of 9 toolchain/ as of 2026) never
+    // define PKG_RELEASE at all. Only enforce the release conventions there
+    // when the tool itself has adopted PKG_RELEASE (e.g. tools/squashfs4).
+    const isHostToolRoot = pkgRoot.startsWith('tools/') || pkgRoot.startsWith('toolchain/');
+
     if (deletedFiles.has(makefilePath)) {
       // Package was deleted/dropped, skip checks
       return empty;
@@ -1691,6 +1698,9 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
           // Reverting the removal of a package restores it with the PKG_RELEASE
           // it was dropped with; it is not a new package starting from scratch.
           return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is restored by a revert with its previous PKG_RELEASE ('${headRelease || 'not defined'}')`] };
+        }
+        if (isHostToolRoot && headRelease === null) {
+          return { errors: [], successes: [`✅ New package \`${pkgRoot}\` is a host-side build tool without PKG_RELEASE, which tools/ and toolchain/ packages are not required to define`] };
         }
         if (headRelease !== '1') {
           return { errors: [`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
@@ -1786,6 +1796,16 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       if (packageHasOnlyMinorChanges) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`] };
       }
+      // A patch-only change leaves the Makefile untouched, so it was never
+      // fetched above; fetch it now to learn whether this host tool ever
+      // adopted PKG_RELEASE.
+      if (isHostToolRoot && headMakefileContent === null) {
+        headMakefileContent = await fetchFileContentAtHead(makefilePath);
+        headRelease = resolveMakefileVar(headMakefileContent, 'PKG_RELEASE');
+      }
+      if (isHostToolRoot && headRelease === null) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is a host-side build tool that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
+      }
       if (hasReleaseExemptInclude) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
       }
@@ -1811,6 +1831,9 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     }
 
     if (versionChanged) {
+      if (isHostToolRoot && headRelease === null) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; host-side build tools without PKG_RELEASE don't require a reset to 1`] };
+      }
       if (headRelease !== '1') {
         return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
       }
