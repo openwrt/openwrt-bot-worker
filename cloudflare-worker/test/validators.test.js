@@ -2665,6 +2665,105 @@ diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
     assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')));
   });
 
+  test('passes when tools/ package without PKG_RELEASE updates its version', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/tools/meson/Makefile b/tools/meson/Makefile
+--- a/tools/meson/Makefile
++++ b/tools/meson/Makefile
+-PKG_VERSION:=1.6.1
++PKG_VERSION:=1.11.2
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'tools/meson/Makefile') {
+        return 'PKG_NAME:=meson\nPKG_VERSION:=1.11.2\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'tools/meson/Makefile') {
+        return 'PKG_NAME:=meson\nPKG_VERSION:=1.6.1\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('host-side build tools without PKG_RELEASE')));
+  });
+
+  test('still fails when tools/ package that adopted PKG_RELEASE updates version without resetting it', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/tools/squashfs4/Makefile b/tools/squashfs4/Makefile
+--- a/tools/squashfs4/Makefile
++++ b/tools/squashfs4/Makefile
+-PKG_VERSION:=4.7.4
++PKG_VERSION:=4.7.5
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'tools/squashfs4/Makefile') {
+        return 'PKG_NAME:=squashfs4\nPKG_VERSION:=4.7.5\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+    const baseFetch = async (path) => {
+      if (path === 'tools/squashfs4/Makefile') {
+        return 'PKG_NAME:=squashfs4\nPKG_VERSION:=4.7.4\nPKG_RELEASE:=2\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('was not reset to 1')));
+  });
+
+  test('passes when tools/ package without PKG_RELEASE changes patches only', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/toolchain/musl/patches/010-fix.patch b/toolchain/musl/patches/010-fix.patch
+--- a/toolchain/musl/patches/010-fix.patch
++++ b/toolchain/musl/patches/010-fix.patch
++-void broken(void);
+++void fixed(void);
+`
+    }];
+    const fetchMakefile = async (path) => {
+      if (path === 'toolchain/musl/Makefile') {
+        return 'PKG_NAME:=musl\nPKG_VERSION:=1.2.5\n';
+      }
+      return null;
+    };
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, fetchMakefile, fetchMakefile);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('host-side build tool')));
+  });
+
+  test('passes for new tools/ package without PKG_RELEASE', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/tools/newtool/Makefile b/tools/newtool/Makefile
+new file mode 100644
+--- /dev/null
++++ b/tools/newtool/Makefile
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'tools/newtool/Makefile') {
+        return 'PKG_NAME:=newtool\nPKG_VERSION:=1.0\n';
+      }
+      return null;
+    };
+    const baseFetch = async () => null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('host-side build tool')));
+  });
+
   test('passes when existing package files modified with only cosmetic changes', async () => {
     const commitDetails = [{
       commitPatch: `
