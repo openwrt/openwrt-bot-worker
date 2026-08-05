@@ -229,17 +229,19 @@ export async function graphqlFetchRepoLabels(token, repoFullname) {
   let hasNextPage = true;
 
   while (hasNextPage) {
-    const afterClause = cursor ? `, after: "${cursor}"` : '';
-    const query = `query($owner: String!, $name: String!) {
+    // The cursor travels as a variable: interpolating an externally supplied
+    // value into the query string is the one thing GraphQL variables exist to
+    // avoid.
+    const query = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    labels(first: 100${afterClause}) {
+    labels(first: 100, after: $after) {
       nodes { name }
       pageInfo { hasNextPage endCursor }
     }
   }
 }`;
 
-    const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables: { owner, name } });
+    const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables: { owner, name, after: cursor } });
 
     if (res.code !== 200 || !res.data?.data?.repository?.labels) {
       const cleanRaw = (res.raw || '').trim().slice(0, 200);
