@@ -313,7 +313,7 @@ export function extractTemplateVars(value) {
   if (dots[1] !== undefined) vars.minor = dots[1];
   if (dots[2] !== undefined) vars.patch = dots[2];
   // Trailing hash after last '-': r28945-24a9f1c224 → {hash}
-  const hashMatch = value.match(/-([0-9a-f]{7,40})$/);
+  const hashMatch = value.match(/-([0-9a-fA-F]{7,40})$/);
   if (hashMatch) vars.hash = hashMatch[1];
   return vars;
 }
@@ -597,12 +597,29 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
 // handle for finding our own comment again without storing state anywhere.
 export const ISSUE_LABELLER_MARKER = '<!-- issue-labeller -->';
 
+// Comments this app posts come back with its numeric id in
+// performed_via_github_app, which no other account — bot or human — can
+// carry. Whenever our own app id is known the match requires it, so a
+// comment another bot planted (whose field names that bot's app, or is
+// absent) is never adopted. Only when the id is not configured does this
+// fall back to "written by some bot", which still keeps humans (and their
+// quotes of our marker) out.
+export function isOwnAppComment(comment, appId) {
+  if (appId != null) {
+    return comment.performed_via_github_app?.id === appId;
+  }
+  const login = comment.user?.login || '';
+  return comment.user?.type === 'Bot' || login.toLowerCase().endsWith('[bot]');
+}
+
 // 1000 comments deep is far past the point where one more bot comment is the
 // thread's problem.
 const MAX_COMMENT_PAGES = 10;
 
 // Applies the labelling result via GitHub REST API (mutations are still REST).
-export async function applyIssueLabelling(result, token, repoFullname, issueNumber, existingLabels, currentIssueLabels, onCall) {
+// `appId` (the numeric GitHub App id) pins comment adoption to this app's own
+// comments; without it the match falls back to bot-authored comments only.
+export async function applyIssueLabelling(result, token, repoFullname, issueNumber, existingLabels, currentIssueLabels, onCall, appId = null) {
   const issueLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/labels`;
   const currentLabels = currentIssueLabels || new Set();
 
@@ -631,9 +648,12 @@ export async function applyIssueLabelling(result, token, repoFullname, issueNumb
       );
       if (listed.code !== 200) break;
       const batch = listed.data || [];
-      marked = batch.find(c => (c.body || '').includes(ISSUE_LABELLER_MARKER));
+      // Only a comment this app wrote itself qualifies: a user quoting the
+      // raw markdown of our comment copies the marker along, and another bot
+      // can paste it too — neither comment is ours to edit.
+      marked = batch.find(c => isOwnAppComment(c, appId) && (c.body || '').includes(ISSUE_LABELLER_MARKER));
       if (!legacy && result.legacyHeader) {
-        legacy = batch.find(c => c.user?.type === 'Bot' && (c.body || '').includes(result.legacyHeader));
+        legacy = batch.find(c => isOwnAppComment(c, appId) && (c.body || '').includes(result.legacyHeader));
       }
       if (batch.length < 100) break;
     }

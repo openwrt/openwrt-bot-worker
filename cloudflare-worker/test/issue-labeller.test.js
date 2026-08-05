@@ -535,7 +535,7 @@ describe('applyIssueLabelling comment handling', () => {
   test('edits the existing comment instead of posting a second one', async (t) => {
     const realFetch = globalThis.fetch;
     t.after(() => { globalThis.fetch = realFetch; });
-    const requests = stubApi([{ id: 42, body: `Old text\n\n${ISSUE_LABELLER_MARKER}` }]);
+    const requests = stubApi([bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)]);
 
     await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
     assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
@@ -547,8 +547,7 @@ describe('applyIssueLabelling comment handling', () => {
   test('leaves an unchanged comment alone', async (t) => {
     const realFetch = globalThis.fetch;
     t.after(() => { globalThis.fetch = realFetch; });
-    const body = `Same text\n\n${ISSUE_LABELLER_MARKER}`;
-    const requests = stubApi([{ id: 42, body }]);
+    const requests = stubApi([bot(42, `Same text\n\n${ISSUE_LABELLER_MARKER}`)]);
 
     await applyIssueLabelling({ ...empty, comments: ['Same text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
     assert.ok(!requests.some(r => r.method === 'PATCH' || r.method === 'POST'));
@@ -559,7 +558,7 @@ describe('applyIssueLabelling comment handling', () => {
     t.after(() => { globalThis.fetch = realFetch; });
     const requests = stubApi([
       filler(100),
-      [...filler(20), { id: 42, body: `Old text\n\n${ISSUE_LABELLER_MARKER}` }]
+      [...filler(20), bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)]
     ]);
 
     await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
@@ -572,7 +571,7 @@ describe('applyIssueLabelling comment handling', () => {
     const realFetch = globalThis.fetch;
     t.after(() => { globalThis.fetch = realFetch; });
     const requests = stubApi([
-      [...filler(99), { id: 42, body: `Old text\n\n${ISSUE_LABELLER_MARKER}` }],
+      [...filler(99), bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)],
       filler(100)
     ]);
 
@@ -619,6 +618,48 @@ describe('applyIssueLabelling comment handling', () => {
       'token', 'openwrt/openwrt', 7, new Set(), new Set(), null
     );
     assert.ok(requests.find(r => r.method === 'PATCH').url.endsWith('/issues/comments/22'));
+  });
+
+  test('never adopts another app\'s comment carrying the marker', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const foreign = { id: 55, body: `Copied text\n\n${ISSUE_LABELLER_MARKER}`, user: { type: 'Bot' }, performed_via_github_app: { id: 111 } };
+    const requests = stubApi([foreign]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null, 999);
+    assert.strictEqual(requests.filter(r => r.method === 'PATCH').length, 0);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 1);
+  });
+
+  test('never adopts a bot comment without an app id when its own id is known', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([bot(55, `Planted text\n\n${ISSUE_LABELLER_MARKER}`)]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null, 999);
+    assert.strictEqual(requests.filter(r => r.method === 'PATCH').length, 0);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 1);
+  });
+
+  test('adopts its own comment matched by the app id', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const own = { id: 55, body: `Old text\n\n${ISSUE_LABELLER_MARKER}`, user: { type: 'Bot' }, performed_via_github_app: { id: 999 } };
+    const requests = stubApi([own]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null, 999);
+    const patched = requests.find(r => r.method === 'PATCH');
+    assert.ok(patched.url.endsWith('/issues/comments/55'));
+  });
+
+  test('never adopts a human comment that quotes the marker', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([{ id: 33, body: `quoted:\n\n${ISSUE_LABELLER_MARKER}`, user: { type: 'User' } }]);
+
+    await applyIssueLabelling({ ...empty, comments: ['New text'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'PATCH').length, 0);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 1);
   });
 
   test('never adopts a human comment that quotes the header', async (t) => {

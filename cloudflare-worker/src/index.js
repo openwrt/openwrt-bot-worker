@@ -4,11 +4,16 @@ import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists, fetchUserRepoPermission } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
-import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
+import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
-// Head branches that must not be used as the origin of a pull request.
-const PROTECTED_HEAD_BRANCHES = ['master', 'main', 'stable', 'openwrt-25.12', 'openwrt-24.10'];
+// Head branches that must not be used as the origin of a pull request. The
+// release branches are matched by shape (openwrt-24.10, openwrt-25.12, ...)
+// so a new release does not need a code change here.
+const PROTECTED_HEAD_BRANCH_NAMES = ['master', 'main', 'stable'];
+function isProtectedHeadBranch(branch) {
+  return PROTECTED_HEAD_BRANCH_NAMES.includes(branch) || /^openwrt-\d{2}\.\d{2}$/.test(branch);
+}
 
 // author_association values that identify a maintainer on their own. Anything
 // else needs the repository permission lookup (see createMaintainerResolver).
@@ -90,7 +95,7 @@ function parseEnvInt(value, fallback) {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
-async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintainerUser) {
+async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintainerUser, appId) {
   let page = 1;
   let hasCherryPickBypassComment = false;
   let hasBranchBypassComment = false;
@@ -105,7 +110,10 @@ async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintaine
     }
 
     for (const c of res.data) {
-      if (c.body?.startsWith('## Formality Check:')) {
+      // Only adopt a comment this app wrote itself: matching on the header text
+      // alone would let anyone — another bot included — plant a comment this
+      // bot then edits or deletes (see isOwnAppComment).
+      if (isOwnAppComment(c, appId) && c.body?.startsWith('## Formality Check:')) {
         existingCommentId = c.id;
       }
       const body = c.body || '';
@@ -258,6 +266,10 @@ async function handleWebhook(request, env) {
     console.error("Webhook processing failed: Missing installation ID in payload.");
     return new Response("Missing installation ID", { status: 400 });
   }
+
+  // The app's own numeric id, used to recognize comments this app posted
+  // (REST returns it as performed_via_github_app.id on each comment).
+  const appId = Number(env.APP_ID) || null;
 
   const token = await getInstallationToken(installationId, env.APP_ID, env.PRIVATE_KEY);
   if (!token) {
@@ -538,7 +550,6 @@ async function handleWebhook(request, env) {
     return fileCache.get(key);
   };
 
-  const labelsUrl = `https://api.github.com/repos/${repoFullname}/labels`;
   const commitsUrl = data.pull_request.commits_url;
 
   const commitsCount = data.pull_request.commits || 1;
@@ -572,7 +583,7 @@ async function handleWebhook(request, env) {
   let fetchCommentsRetried = false;
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser).catch(() => null);
+      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser, appId).catch(() => null);
     }
     return fetchCommentsPromise;
   };
@@ -590,7 +601,7 @@ async function handleWebhook(request, env) {
   // Prefetch the comment scan only when something downstream will need it:
   // comment management, cherry-pick bypass lookups on backport PRs, or the
   // branch-check bypass when the head branch actually violates the rule.
-  const branchCheckViolated = CONFIG.check_branch && PROTECTED_HEAD_BRANCHES.includes(headBranch);
+  const branchCheckViolated = CONFIG.check_branch && isProtectedHeadBranch(headBranch);
   if (CONFIG.enable_comments || isBackportPr || branchCheckViolated) {
     void getCommentsScan();
   }
@@ -630,7 +641,7 @@ async function handleWebhook(request, env) {
     : MAINTAINER_ASSOCIATIONS.includes(association);
 
   if (CONFIG.check_branch) {
-    if (PROTECTED_HEAD_BRANCHES.includes(headBranch)) {
+    if (isProtectedHeadBranch(headBranch)) {
       const isMaintainer = await isPrAuthorMaintainer(bodyRequestsBranchBypass);
       const scanResult = await getCommentsScanWithRetry() || { hasBranchBypassComment: false, existingCommentId: null };
       const bypassBranchCheck = scanResult.hasBranchBypassComment || (bodyRequestsBranchBypass && isMaintainer);
