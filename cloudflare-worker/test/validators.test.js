@@ -236,9 +236,10 @@ describe('validateFormalities', () => {
 
   test('enforces body line length limit but ignores code blocks and URLs', async () => {
     // 1. Commit body line exceeds limit (CONFIG.max_body_line_len is 100)
+    // with ordinary words, so wrapping it under the limit is possible
     const commitLongLine = {
       commit: {
-        message: 'bash: fix build issue\n\n' + 'a'.repeat(105) + '\n\nSigned-off-by: John Doe <john@doe.com>',
+        message: 'bash: fix build issue\n\n' + 'wrappable words '.repeat(8) + '\n\nSigned-off-by: John Doe <john@doe.com>',
         author: { name: 'John Doe', email: 'john@doe.com' },
         committer: { name: 'John Doe', email: 'john@doe.com' }
       }
@@ -277,6 +278,84 @@ describe('validateFormalities', () => {
     };
     const resWithGitUrl = await validateFormalities(commitWithGitUrl, CONFIG);
     assert.ok(!resWithGitUrl.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line containing a git:// URL');
+  });
+
+  test('allows long body lines that cannot be wrapped under the limit', async () => {
+    // A verbatim build error quoting a path longer than the limit — no line
+    // break can bring it under 100 chars, and breaking inside the path would
+    // corrupt the quoted log (openwrt/openwrt#21794).
+    const logLine = "ERROR: module '/home/user/Development/OpenWrt/openwrt/build_dir/target-powerpc64_e5500_musl/linux-qoriq_generic/linux-6.12.67/net/ipv6/netfilter/ip6_tables.ko' is missing.";
+    const commitLogLine = {
+      commit: {
+        message: `netfilter: add missing symbol\n\nBuild fails with:\n\n${logLine}\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resLogLine = await validateFormalities(commitLogLine, CONFIG);
+    assert.ok(!resLogLine.errors.some(e => e.includes('exceeds max width')), 'Should ignore a line whose overflow comes from an unbreakable token');
+
+    // A single token longer than the limit is unbreakable on its own too.
+    const commitLongToken = {
+      commit: {
+        message: 'bash: fix build issue\n\n' + 'a'.repeat(105) + '\n\nSigned-off-by: John Doe <john@doe.com>',
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resLongToken = await validateFormalities(commitLongToken, CONFIG);
+    assert.ok(!resLongToken.errors.some(e => e.includes('exceeds max width')), 'Should ignore a single token longer than the limit');
+
+    // But a long line of ordinary words next to a long token elsewhere in the
+    // body is still held to the limit.
+    const commitMixed = {
+      commit: {
+        message: `bash: fix build issue\n\n${logLine}\n${'wrappable words '.repeat(8)}\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resMixed = await validateFormalities(commitMixed, CONFIG);
+    assert.strictEqual(resMixed.errors.filter(e => e.includes('exceeds max width')).length, 1, 'Only the wrappable line should be flagged');
+  });
+
+  test('allows verbatim terminal-output shapes in the body', async () => {
+    // Each shape is >100 chars of short words — only the verbatim-line rules
+    // can save them, not the unbreakable-token rule.
+    const verbatimLines = [
+      '  wireless-regdb: Add regulatory info for CEPT countries FO GI IM SM and VA listed by the WiFi Alliance',
+      'scripts/mod/modpost.c:1719:9: error: strchrnul is only available on macOS 15.4 or newer [-Werror,-Wunguarded-availability-new]',
+      '[   21.058106] Unable to handle kernel access to user memory outside uaccess routines at virtual address 00000000000000b8',
+      'make[2]: *** [modules/video.mk:620: a very long target path that keeps going far past the configured width limit] Error 1',
+      '$ ./scripts/kconfig.pl + target/linux/generic/config-6.6 /dev/null > target/linux/generic/config-6.6-new and more output',
+      'Fixes: af0546da3440dba24217949527e503820350ff05 ("layerscape: armv8_64b: add Traverse Ten64 NAND variant with a longer tail")'
+    ];
+    for (const vline of verbatimLines) {
+      assert.ok(vline.length > 100, `fixture must exceed the limit: ${vline.slice(0, 40)}`);
+      const commit = {
+        commit: {
+          message: `bash: fix build issue\n\nContext follows:\n\n${vline}\n\nSigned-off-by: John Doe <john@doe.com>`,
+          author: { name: 'John Doe', email: 'john@doe.com' },
+          committer: { name: 'John Doe', email: 'john@doe.com' }
+        }
+      };
+      const res = await validateFormalities(commit, CONFIG);
+      assert.ok(!res.errors.some(e => e.includes('exceeds max width')), `should allow verbatim line: ${vline.slice(0, 40)}...`);
+    }
+
+    // One space of indent is how contributors write ordinary prose bullets —
+    // those must keep wrapping like any other prose.
+    const bullet = ' - This is only working if the first partition is active because recovery images are always flashed to the active partition';
+    assert.ok(bullet.length > 100);
+    const bulletCommit = {
+      commit: {
+        message: `bash: fix build issue\n\n${bullet}\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+    const resBullet = await validateFormalities(bulletCommit, CONFIG);
+    assert.ok(resBullet.errors.some(e => e.includes('exceeds max width')), 'a single-space prose bullet must still be flagged');
   });
 
   test('rejects commit with only Signed-off-by and no description', async () => {

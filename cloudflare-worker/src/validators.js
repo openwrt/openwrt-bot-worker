@@ -168,6 +168,19 @@ async function getSshKeyFingerprint(sigText) {
   }
 }
 
+// Body lines that carry verbatim terminal output, which must never be
+// re-wrapped to satisfy the width limit. One space of indent is deliberately
+// not enough: single-space bullets are how contributors write ordinary prose
+// lists, and those should wrap like any other prose.
+const VERBATIM_LINE_PATTERNS = [
+  /^(?:\t| {2,})/,            // quoted material indented with a tab or 2+ spaces
+  /^\S+:\d+(?::\d+)?: /,      // compiler/linker diagnostic: file.c:12:34: error: ...
+  /^\[ *\d+\.\d+\] /,         // kernel log timestamp: [   10.933640] ...
+  /^make(?:\[\d+\])?: /,      // make output: make[3]: *** ...
+  /^[$#] /,                   // shell prompt / git bisect transcript
+  /^Fixes: [0-9a-f]{7,40}\b/  // Fixes: <sha> ("...") — never wrapped, per git convention
+];
+
 // --- ENGINE CHECKS ---
 export async function validateFormalities(fullCommit, CONFIG) {
   const errors = [];
@@ -413,7 +426,23 @@ export async function validateFormalities(fullCommit, CONFIG) {
       return;
     }
     if (line.length > CONFIG.max_body_line_len) {
-      bodyErrors.push(`Line ${index + 1} in commit body exceeds max width (${line.length}/${CONFIG.max_body_line_len} chars)`);
+      // A line whose overflow comes from a single unbreakable token — a file
+      // path, a kernel symbol, a checksum — cannot be wrapped under the limit
+      // no matter where it breaks. Verbatim build logs and error messages
+      // ('ERROR: module .../ip6_tables.ko is missing.') are quoted exactly so
+      // they stay searchable, and inserting a break inside the token would
+      // corrupt what it quotes.
+      const hasUnbreakableToken = line.trim().split(/\s+/).some(token => token.length > CONFIG.max_body_line_len);
+      // Verbatim terminal output must not be re-wrapped even when its words
+      // are short. These shapes cover what openwrt/openwrt contributors
+      // actually paste (measured over the repo's full history): material
+      // quoted with an indent, compiler/linker diagnostics, kernel log
+      // lines, make output, shell or bisect transcripts, and 'Fixes:'
+      // references, which git convention forbids wrapping.
+      const looksVerbatim = VERBATIM_LINE_PATTERNS.some(pattern => pattern.test(line));
+      if (!hasUnbreakableToken && !looksVerbatim) {
+        bodyErrors.push(`Line ${index + 1} in commit body exceeds max width (${line.length}/${CONFIG.max_body_line_len} chars)`);
+      }
     }
   });
   if (bodyErrors.length === 0) {
