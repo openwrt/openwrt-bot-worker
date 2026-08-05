@@ -682,7 +682,7 @@ async function handleWebhook(request, env) {
   const allPatchesErrors = [];
 
   let formalityOutputText = `### Checking PR #${prNumber}: ${prTitle} (Formalities Audit)\n\n`;
-  let makefileOutputText = `### Checking PR #${prNumber}: ${prTitle} (Makefile Audit Profile)\n\n`;
+  let makefileOutputText = `### Checking PR #${prNumber}: ${prTitle} (Makefile Audit)\n\n`;
   let patchesOutputText = `### Checking PR #${prNumber}: ${prTitle} (Embedded Patches Compliance)\n\n`;
 
   if (pages > 3) {
@@ -1273,7 +1273,7 @@ async function handleWebhook(request, env) {
       if (!allPassed || allPrWarnings.length > 0) {
         const titleStatus = !allPassed ? "Failed" : "Suggestions Available";
         let commentBody = `## Formality Check: ${titleStatus}\n\n`;
-        commentBody += "We completed the verification flow. Please review the formatting overview logs below.\n\n";
+        commentBody += "We checked this pull request against the contribution guidelines. Here is what needs your attention:\n\n";
 
         if (!allPassed) {
           commentBody += "### 🛑 CRITICAL ERRORS\n";
@@ -1343,7 +1343,7 @@ async function handleWebhook(request, env) {
       conclusion: formalityPassed ? 'success' : 'failure',
       output: {
         title: formalityPassed ? 'Git & Commits: Passed' : 'Git & Commits: Failed',
-        summary: formalityPassed ? 'Git formatting rules and structural boundaries validated successfully.' : 'Structural presentation issues detected.',
+        summary: formalityPassed ? 'All commits follow the commit message guidelines.' : 'Some commits do not follow the commit message guidelines — open the details below to see what to change.',
         text: safeTruncate(formalityOutputText)
       }
     }),
@@ -1352,7 +1352,7 @@ async function handleWebhook(request, env) {
       conclusion: makefilePassed ? 'success' : 'failure',
       output: {
         title: makefilePassed ? 'OpenWrt Makefiles: Passed' : 'OpenWrt Makefiles: Failed',
-        summary: makefilePassed ? 'OpenWrt package guidelines and version criteria verified successfully.' : 'Discovered file validation issues in the changed tracking tree.',
+        summary: makefilePassed ? 'The changed package files follow the OpenWrt packaging guidelines.' : 'Some package files need fixing — open the details below to see what to change.',
         text: safeTruncate(makefileOutputText)
       }
     }),
@@ -1361,7 +1361,7 @@ async function handleWebhook(request, env) {
       conclusion: patchesPassed ? 'success' : 'failure',
       output: {
         title: patchesPassed ? 'Code Patches: Passed' : 'Code Patches: Failed',
-        summary: patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Discovered malformed downstream patch objects.',
+        summary: patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Some patch files are missing the required Git headers — open the details below to see what to change.',
         text: safeTruncate(patchesOutputText)
       }
     })

@@ -6,7 +6,8 @@
 //   _trigger_label: "to-triage"        # label required to start processing
 //   _invalid_label: "invalid"          # label added when validation fails
 //   _remove_labels: ["to-triage"]      # labels always removed after processing
-//   _invalid_comment: "Invalid {field} reported. `{value}`"  # comment template
+//   _invalid_comment_header: "..."     # first line of the invalid-form comment
+//   _invalid_comment_footer: "..."     # closing line of the invalid-form comment
 //   _valid_comment: "..."              # posted when an edit fixes the form
 //   _require_form: true                # also process issues without the trigger
 //                                      # label, and flag ones that skipped the
@@ -328,8 +329,7 @@ export const DEFAULT_ISSUE_LABELLER_CONFIG = {
   meta: {
     _trigger_label: 'to-triage',
     _invalid_label: 'invalid',
-    _remove_labels: ['to-triage'],
-    _invalid_comment: 'Invalid {field} reported. `{value}`'
+    _remove_labels: ['to-triage']
   },
   rules: [
     {
