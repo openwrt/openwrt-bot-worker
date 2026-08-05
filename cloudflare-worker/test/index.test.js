@@ -1967,7 +1967,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.strictEqual(prFetched, false);
   });
 
-  async function sendBackportWebhookPR(prTitle, baseBranch, commitMessage, prPatchContent, upstreamPatchContent = null) {
+  async function sendBackportWebhookPR(prTitle, baseBranch, commitMessage, prPatchContent, upstreamPatchContent = null, envOverrides = {}) {
     postedCheckRuns = [];
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
@@ -2057,7 +2057,8 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     return worker.fetch(request, {
       WEBHOOK_SECRET: secret,
       APP_ID: '12345',
-      PRIVATE_KEY: 'YW55Y29udGVudA=='
+      PRIVATE_KEY: 'YW55Y29udGVudA==',
+      ...envOverrides
     }, {});
   }
 
@@ -2141,6 +2142,40 @@ index 123456..789012 100644
     assert.strictEqual(checkRun.conclusion, 'failure');
     assert.match(checkRun.output.text, /bar.*must not contain any spaces/);
     assert.doesNotMatch(checkRun.output.text, /foo.*must not contain any spaces/);
+  });
+
+  test('skips the upstream comparison when the subrequest budget is exhausted', async () => {
+    const prPatchContent = `From: John Doe <john@doe.com>
+Subject: mypkg: update to 1.2.3
+
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+index 123456..789012 100644
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,5 +1,5 @@
++define Package/mypkg/conffiles
++ /etc/config/foo
++endef
+`;
+    // With a zero budget every upstream lookup is skipped: the commit is
+    // validated as a regular change (the conffiles error surfaces instead of
+    // being waved through as a verbatim backport), the coverage warning is
+    // reported, and the check-runs still get posted.
+    const response = await sendBackportWebhookPR(
+      '[24.10] mypkg: update to 1.2.3',
+      'master',
+      'mypkg: update to 1.2.3\n\ncherry-picked from commit a1b2c3d4e5f61111222233334444555566667777\n\nSigned-off-by: John Doe <john@doe.com>',
+      prPatchContent,
+      prPatchContent,
+      { SUBREQUEST_BUDGET_LIMIT: '0', SUBREQUEST_RESERVE_HEADROOM: '0' }
+    );
+    assert.strictEqual(response.status, 200);
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.match(commitCheck.output.text, /Upstream comparison skipped for 1 cherry-picked commit/);
+    const makefileCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.ok(makefileCheck);
+    assert.doesNotMatch(makefileCheck.output.text, /Backport matches upstream commit verbatim/);
   });
 
   test('truncates check run output text if it exceeds GitHub limits', async () => {

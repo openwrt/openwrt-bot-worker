@@ -395,6 +395,9 @@ async function handleWebhook(request, env) {
   // subrequest budget ran out before they could be queried — surfaced later
   // as one friendly PR-facing warning instead of silently under-reporting.
   let budgetSkipCount = 0;
+  // Same idea for the per-commit upstream lookups on backport PRs: counted
+  // here, reported once, never allowed to starve the terminal writes.
+  let upstreamComparisonSkips = 0;
 
   function scheduleFlush() {
     if (flushScheduled) return;
@@ -410,6 +413,18 @@ async function handleWebhook(request, env) {
     const batch = [...pendingQueue.values()];
     pendingQueue.clear();
 
+    // Whatever goes wrong below, every queued promise must settle: the batch
+    // is already detached from pendingQueue, so an exception escaping this
+    // function would leave callers awaiting forever. Rejecting an
+    // already-settled item is a no-op, so the catch is safe to apply broadly.
+    try {
+      await flushBatch(batch);
+    } catch (err) {
+      for (const item of batch) item.reject(err);
+    }
+  }
+
+  async function flushBatch(batch) {
     const headRepoFullname = data.pull_request?.head?.repo?.full_name;
     const hasForkRepo = headRepoFullname && headRepoFullname !== repoFullname;
 
@@ -737,7 +752,15 @@ async function handleWebhook(request, env) {
     if (isBackportPr) {
       const commitMsg = commitData.commit?.message || '';
       const match = commitMsg.match(/cherry-picked from commit ([0-9a-fA-F]{7,40})/i) || commitMsg.match(/cherry picked from commit ([0-9a-fA-F]{7,40})/i);
-      if (match) {
+      // One upstream lookup per cherry-picked commit, and a backport PR can
+      // carry hundreds of them — unchecked, this alone blows through
+      // Cloudflare's subrequest cap and kills the terminal writes at the end
+      // of the handler. A skipped comparison only means the commit is
+      // validated as a regular change instead of being waved through as a
+      // verbatim backport, so degrading here is strictly safe.
+      if (match && subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used <= 0) {
+        upstreamComparisonSkips++;
+      } else if (match) {
         upstreamSha = match[1];
         const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${upstreamSha}`;
         const upstreamRes = await trackedApiCall(upstreamUrl, token, 'GET', null, 'application/vnd.github.patch');
@@ -1092,6 +1115,12 @@ async function handleWebhook(request, env) {
     allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${budgetWarning}`);
     makefileOutputText += `⚠️ Warning: ${budgetWarning}\n\n`;
     patchesOutputText += `⚠️ Warning: ${budgetWarning}\n\n`;
+  }
+
+  if (upstreamComparisonSkips > 0) {
+    const upstreamWarning = `Upstream comparison skipped for ${upstreamComparisonSkips} cherry-picked commit(s): this PR is too large for the available API request budget. Those commits were fully validated as regular changes instead of being matched against their upstream originals.`;
+    allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${upstreamWarning}`);
+    formalityOutputText += `⚠️ Warning: ${upstreamWarning}\n\n`;
   }
 
   const formalityPassed = allFormalityErrors.length === 0;
