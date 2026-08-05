@@ -76,22 +76,56 @@ function graphqlResponse(groups, resolver) {
 }
 
 // Helper: detect and respond to GraphQL labels queries in mocks.
-// Returns a Response if the request is a labels query, null otherwise.
+// Returns a Response (or a Promise of one) if the request is a labels or
+// repo-setup query, null otherwise.
+//
+// The PR handler fetches its per-PR setup (labels + formalities.json +
+// labeler.yml) as one fused GraphQL query (graphqlFetchRepoSetup). Rather
+// than forcing every test to restate its config in GraphQL shape, this
+// helper answers the file parts of that query by re-entering the test's own
+// fetch mock through the REST /contents/ URLs the mocks already handle —
+// each test keeps declaring its config exactly the way it did when the
+// worker still fetched it over REST.
 function graphqlLabelsHandler(url, options, labelNames = []) {
   if (!url.includes('/graphql')) return null;
   if (!options || !options.body) return null;
   const body = JSON.parse(options.body);
   if (!body.query || !body.query.includes('labels(first:')) return null;
-  return new Response(JSON.stringify({
-    data: {
-      repository: {
-        labels: {
-          nodes: labelNames.map(name => ({ name })),
-          pageInfo: { hasNextPage: false, endCursor: null }
-        }
-      }
-    }
-  }), { status: 200 });
+
+  const labelsPayload = {
+    nodes: labelNames.map(name => ({ name })),
+    pageInfo: { hasNextPage: false, endCursor: null }
+  };
+
+  if (!body.query.includes('cfg: object(')) {
+    return new Response(JSON.stringify({
+      data: { repository: { labels: labelsPayload } }
+    }), { status: 200 });
+  }
+
+  // Fused repo-setup query: resolve the two file expressions through the
+  // surrounding fetch mock's REST branches.
+  return (async () => {
+    const { owner, name } = body.variables;
+    const fetchExpr = async (expr) => {
+      const sep = expr.indexOf(':');
+      const ref = expr.slice(0, sep);
+      const path = expr.slice(sep + 1);
+      const res = await globalThis.fetch(
+        `https://api.github.com/repos/${owner}/${name}/contents/${path}?ref=${encodeURIComponent(ref)}`,
+        { method: 'GET', headers: { Accept: 'application/vnd.github.raw' } }
+      );
+      if (res.status !== 200) return null;
+      return { text: await res.text() };
+    };
+    const [cfg, labeler] = await Promise.all([
+      fetchExpr(body.variables.cfgExpr),
+      fetchExpr(body.variables.labExpr)
+    ]);
+    return new Response(JSON.stringify({
+      data: { repository: { labels: labelsPayload, cfg, labeler } }
+    }), { status: 200 });
+  })();
 }
 
 

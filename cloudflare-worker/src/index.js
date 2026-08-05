@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
-import { githubApiCall, fetchRepositoryConfig, graphqlBatchFetchFiles, graphqlFetchRepoLabels, ensureLabelExists, fetchUserRepoPermission } from './github.js';
+import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlFetchRepoSetup, ensureLabelExists, fetchUserRepoPermission } from './github.js';
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
@@ -609,21 +609,32 @@ async function handleWebhook(request, env) {
     commitsPromises.push(trackedApiCall(`${commitsUrl}?per_page=100&page=${p}`, token));
   }
 
-  const labelerUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/labeler.yml?ref=${encodeURIComponent(baseBranch)}`;
-
-  // OPTIMIZATION: Fetch repository config, repository labels (GraphQL), labeler config, and commits list pages in parallel
-  const [CONFIG, existingLabels, labelerRes, ...commitsResList] = await Promise.all([
-    fetchRepositoryConfig(data, token, DEFAULT_CONFIG, () => { subrequestBudget.used++; }),
-    // A failed label listing must not take the whole run down with it — the
-    // validation results and check-runs matter more than label bookkeeping.
-    // ensureLabelExists copes with null by attempting creates blindly.
-    graphqlFetchRepoLabels(token, repoFullname)
-      .then(labels => { subrequestBudget.used++; return labels; })
-      .catch(err => { subrequestBudget.used++; console.warn(`Repository label listing failed, continuing without it: ${err.message}`); return null; }),
-    trackedApiCall(labelerUrl, token, 'GET', null, 'application/vnd.github.raw'),
+  // OPTIMIZATION: One GraphQL query covers the repository config, the
+  // labeler config and the repository labels together (they used to be three
+  // separate requests), and it runs in parallel with the commits list pages.
+  // Every label page past the first counts against the budget too.
+  const [setup, ...commitsResList] = await Promise.all([
+    graphqlFetchRepoSetup(token, repoFullname, baseBranch, '.github/formalities.json', '.github/labeler.yml',
+      () => { subrequestBudget.used++; }),
     ...commitsPromises
   ]);
-  
+
+  // A missing or malformed formalities.json falls back to the defaults, the
+  // same way the REST 404 used to.
+  let CONFIG = DEFAULT_CONFIG;
+  if (setup.configText) {
+    try {
+      const repoConfig = JSON.parse(setup.configText);
+      if (repoConfig && typeof repoConfig === 'object') {
+        CONFIG = { ...DEFAULT_CONFIG, ...repoConfig };
+      }
+    } catch (e) { /* malformed config file falls back to the defaults */ }
+  }
+  // A run without the label listing still validates and reports; label
+  // creation then works blindly (see ensureLabelExists).
+  const existingLabels = setup.labels;
+  const labelerText = setup.labelerText;
+
   let commits = [];
   for (let i = 0; i < commitsResList.length; i++) {
     const res = commitsResList[i];
@@ -1210,7 +1221,7 @@ async function handleWebhook(request, env) {
     }
   }
 
-  if (CONFIG.enable_labeler_yml && labelerRes && labelerRes.code === 200) {
+  if (CONFIG.enable_labeler_yml && labelerText) {
     let changedFiles = [];
     if (usePrWidePatch) {
       changedFiles = getAllChangedFiles(prPatch);
@@ -1228,7 +1239,7 @@ async function handleWebhook(request, env) {
     }
 
     try {
-      const parsedLabeler = parseYaml(labelerRes.raw);
+      const parsedLabeler = parseYaml(labelerText);
       const matchedLabels = getLabelsForChangedFiles(changedFiles, parsedLabeler);
       for (const label of matchedLabels) {
         if (!currentPrLabels.has(label.toLowerCase())) {

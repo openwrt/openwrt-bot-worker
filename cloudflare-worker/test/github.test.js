@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { graphqlBatchFetchFiles, fetchUserRepoPermission, GRAPHQL_URL } from '../src/github.js';
+import { graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -207,6 +207,117 @@ describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
     ]);
 
     assert.deepStrictEqual(result.get('refprobe'), { content: null, exists: false, isBinary: false });
+  });
+});
+
+describe('graphqlFetchRepoSetup', { concurrency: 1 }, () => {
+  let originalFetch;
+  let fetchMock;
+
+  before(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => fetchMock(url, options);
+  });
+
+  after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const setupResponse = (repository) =>
+    new Response(JSON.stringify({ data: { repository } }), { status: 200 });
+
+  test('fetches labels and both config files in a single request', async () => {
+    let requestCount = 0;
+    let capturedVariables = null;
+    fetchMock = (url, options) => {
+      requestCount++;
+      capturedVariables = JSON.parse(options.body).variables;
+      return setupResponse({
+        labels: { nodes: [{ name: 'Bug' }, { name: 'stale' }], pageInfo: { hasNextPage: false, endCursor: null } },
+        cfg: { text: '{"check_branch": false}' },
+        labeler: { text: 'docs:\n  - "docs/**"\n' }
+      });
+    };
+
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml');
+
+    assert.strictEqual(requestCount, 1);
+    assert.strictEqual(capturedVariables.cfgExpr, 'main:.github/formalities.json');
+    assert.strictEqual(capturedVariables.labExpr, 'main:.github/labeler.yml');
+    assert.deepStrictEqual([...setup.labels].sort(), ['bug', 'stale']);
+    assert.strictEqual(setup.configText, '{"check_branch": false}');
+    assert.strictEqual(setup.labelerText, 'docs:\n  - "docs/**"\n');
+  });
+
+  test('reports missing config files as null text', async () => {
+    fetchMock = () => setupResponse({
+      labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+      cfg: null,
+      labeler: null
+    });
+
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml');
+    assert.strictEqual(setup.configText, null);
+    assert.strictEqual(setup.labelerText, null);
+    assert.strictEqual(setup.labels.size, 0);
+  });
+
+  test('pages labels past the first 100 with labels-only queries, counting every page', async () => {
+    let requestCount = 0;
+    let onCallCount = 0;
+    fetchMock = (url, options) => {
+      requestCount++;
+      const body = JSON.parse(options.body);
+      if (requestCount === 1) {
+        return setupResponse({
+          labels: { nodes: [{ name: 'one' }], pageInfo: { hasNextPage: true, endCursor: 'CURSOR1' } },
+          cfg: null,
+          labeler: null
+        });
+      }
+      assert.strictEqual(body.variables.after, 'CURSOR1');
+      return setupResponse({
+        labels: { nodes: [{ name: 'two' }], pageInfo: { hasNextPage: false, endCursor: null } }
+      });
+    };
+
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', () => { onCallCount++; });
+    assert.strictEqual(requestCount, 2);
+    assert.strictEqual(onCallCount, 2);
+    assert.deepStrictEqual([...setup.labels].sort(), ['one', 'two']);
+  });
+
+  test('degrades to labels: null when a later label page fails, keeping the config', async () => {
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      let requestCount = 0;
+      fetchMock = () => {
+        requestCount++;
+        if (requestCount === 1) {
+          return setupResponse({
+            labels: { nodes: [{ name: 'one' }], pageInfo: { hasNextPage: true, endCursor: 'CURSOR1' } },
+            cfg: { text: '{}' },
+            labeler: null
+          });
+        }
+        return new Response('boom', { status: 500 });
+      };
+
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml');
+      assert.strictEqual(setup.labels, null);
+      assert.strictEqual(setup.configText, '{}');
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('throws when the setup query itself fails', async () => {
+    fetchMock = () => new Response('Server Error', { status: 500 });
+    await assert.rejects(
+      () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml'),
+      /GraphQL repository setup fetch failed/
+    );
   });
 });
 

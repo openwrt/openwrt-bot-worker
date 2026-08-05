@@ -81,27 +81,6 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   }
 }
 
-export async function fetchRepositoryConfig(data, token, defaultConfig, onCall, branchRefOverride) {
-  const repoFullname = data.repository.full_name;
-  const branchRef = branchRefOverride || data.pull_request?.base?.ref || data.repository?.default_branch || 'main';
-  const configUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/formalities.json?ref=${encodeURIComponent(branchRef)}`;
-
-  onCall?.();
-  const res = await githubApiCall(configUrl, token, 'GET', null, 'application/vnd.github.raw');
-  if (res.code === 200) {
-    try {
-      const repoConfig = JSON.parse(res.raw);
-      if (repoConfig && typeof repoConfig === 'object') {
-        return { ...defaultConfig, ...repoConfig };
-      }
-    } catch (e) {}
-  } else if (res.code !== 404) {
-    const cleanRaw = (res.raw || "").trim().slice(0, 200);
-    throw new Error(`Failed to fetch repository config from ${configUrl} (HTTP ${res.code}): ${cleanRaw}`);
-  }
-  return defaultConfig;
-}
-
 // --- GRAPHQL BATCH FILE FETCH ---
 // Fetches raw content for many (repo, ref, path) triples in as few HTTP
 // subrequests as possible. GitHub's REST Contents API only serves one file
@@ -216,19 +195,15 @@ export async function graphqlBatchFetchFiles(token, probes) {
 }
 
 // --- GRAPHQL REPOSITORY LABELS FETCH ---
-// Fetches all repository label names in a single paginated GraphQL query,
-// replacing multiple REST calls (one per 100-label page). Returns a Set of
-// lowercased label names for O(1) existence checks.
-export async function graphqlFetchRepoLabels(token, repoFullname) {
-  const slashIndex = repoFullname.indexOf('/');
-  const owner = repoFullname.slice(0, slashIndex);
-  const name = repoFullname.slice(slashIndex + 1);
-
-  const labels = new Set();
-  let cursor = null;
+// Collects label pages into `labels`, starting after `cursor` (null for the
+// first page). Shared by graphqlFetchRepoLabels and graphqlFetchRepoSetup.
+// `onCall` is invoked once per HTTP request so callers can count every page
+// against their subrequest budget.
+async function fetchLabelPages(token, owner, name, labels, cursor, onCall) {
   let hasNextPage = true;
 
   while (hasNextPage) {
+    onCall?.();
     // The cursor travels as a variable: interpolating an externally supplied
     // value into the query string is the one thing GraphQL variables exist to
     // avoid.
@@ -255,8 +230,78 @@ export async function graphqlFetchRepoLabels(token, repoFullname) {
     hasNextPage = labelData.pageInfo.hasNextPage;
     cursor = labelData.pageInfo.endCursor;
   }
+}
 
+// Fetches all repository label names in a single paginated GraphQL query,
+// replacing multiple REST calls (one per 100-label page). Returns a Set of
+// lowercased label names for O(1) existence checks.
+export async function graphqlFetchRepoLabels(token, repoFullname) {
+  const slashIndex = repoFullname.indexOf('/');
+  const owner = repoFullname.slice(0, slashIndex);
+  const name = repoFullname.slice(slashIndex + 1);
+
+  const labels = new Set();
+  await fetchLabelPages(token, owner, name, labels, null);
   return labels;
+}
+
+// --- GRAPHQL PR SETUP FETCH ---
+// Everything a pull_request event needs before validation starts — the
+// repository's labels, .github/formalities.json and .github/labeler.yml —
+// fetched in one GraphQL round trip instead of two REST calls plus a labels
+// query. Returns { labels, configText, labelerText }, where a missing file
+// yields null text (callers fall back to their defaults, like the REST 404
+// used to). Throws when the query itself fails, matching the strictness of
+// the config fetch this replaces; a failure while paging labels past the
+// first 100 degrades to labels: null instead, because label bookkeeping is
+// not worth failing the run over (see ensureLabelExists).
+export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath, labelerPath, onCall) {
+  const slashIndex = repoFullname.indexOf('/');
+  const owner = repoFullname.slice(0, slashIndex);
+  const name = repoFullname.slice(slashIndex + 1);
+
+  onCall?.();
+  const query = `query($owner: String!, $name: String!, $cfgExpr: String!, $labExpr: String!) {
+  repository(owner: $owner, name: $name) {
+    labels(first: 100) {
+      nodes { name }
+      pageInfo { hasNextPage endCursor }
+    }
+    cfg: object(expression: $cfgExpr) { ... on Blob { text } }
+    labeler: object(expression: $labExpr) { ... on Blob { text } }
+  }
+}`;
+
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', {
+    query,
+    variables: { owner, name, cfgExpr: `${ref}:${configPath}`, labExpr: `${ref}:${labelerPath}` }
+  });
+
+  const repo = res.code === 200 ? res.data?.data?.repository : null;
+  if (!repo) {
+    const cleanRaw = (res.raw || '').trim().slice(0, 200);
+    throw new Error(`GraphQL repository setup fetch failed (HTTP ${res.code}): ${cleanRaw}`);
+  }
+
+  let labels = new Set();
+  for (const node of repo.labels?.nodes || []) {
+    labels.add(node.name.toLowerCase());
+  }
+  const pageInfo = repo.labels?.pageInfo;
+  if (pageInfo?.hasNextPage) {
+    try {
+      await fetchLabelPages(token, owner, name, labels, pageInfo.endCursor, onCall);
+    } catch (err) {
+      console.warn(`Repository label listing failed past the first page, continuing without it: ${err.message}`);
+      labels = null;
+    }
+  }
+
+  return {
+    labels,
+    configText: typeof repo.cfg?.text === 'string' ? repo.cfg.text : null,
+    labelerText: typeof repo.labeler?.text === 'string' ? repo.labeler.text : null
+  };
 }
 
 // Creates a repository label if it does not already exist. Shared by both
