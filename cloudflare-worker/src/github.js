@@ -262,13 +262,28 @@ export async function graphqlFetchRepoLabels(token, repoFullname) {
 // Creates a repository label if it does not already exist. Shared by both
 // the PR labeler and the issue labeller. Returns true if created, false if
 // it already existed.
+// `existingLabels` may be null when the label listing could not be fetched:
+// the create is then attempted blindly, with the 422 GitHub answers for an
+// already-existing label silenced — labelling must keep working even when
+// the listing call failed.
 export async function ensureLabelExists(token, repoFullname, name, color, description, existingLabels, onCall) {
-  if (existingLabels.has(name.toLowerCase())) return false;
+  if (existingLabels && existingLabels.has(name.toLowerCase())) return false;
   onCall?.();
   const url = `https://api.github.com/repos/${repoFullname}/labels`;
-  await githubApiCall(url, token, 'POST', { name, color: color || 'ededed', description: description || '' });
-  existingLabels.add(name.toLowerCase());
-  return true;
+  // 422 is GitHub for "already exists" — a benign race with another writer
+  // (or the blind-create path working as intended), so it is silenced.
+  const res = await githubApiCall(url, token, 'POST', { name, color: color || 'ededed', description: description || '' }, 'application/vnd.github+json', { silent: true });
+  if (res.code === 422) {
+    existingLabels?.add(name.toLowerCase());
+    return false;
+  }
+  if (res.code >= 200 && res.code < 300) {
+    existingLabels?.add(name.toLowerCase());
+    return true;
+  }
+  // A failed create must not be recorded as existing, so a later attempt
+  // can retry it.
+  return false;
 }
 
 // --- GRAPHQL ISSUE VALIDATION HELPERS ---

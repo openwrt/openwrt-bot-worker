@@ -2178,6 +2178,103 @@ index 123456..789012 100644
     assert.doesNotMatch(makefileCheck.output.text, /Backport matches upstream commit verbatim/);
   });
 
+  // --- ISSUES EVENT (issue labeller) ---
+  async function sendIssuesWebhook(action, issue, { changes = null, labellerYml = null, formalities = '{"enable_issue_labeller": true}' } = {}) {
+    const requests = [];
+    fetchMock = async (url, options) => {
+      requests.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        return graphqlResponse(groups, (owner, name, ref, path) => {
+          if (path === '.github/formalities.json') return formalities;
+          if (path === '.github/issue-labeller.yml') return labellerYml;
+          return null;
+        });
+      }
+      if (url.includes('/comments') && (!options || options.method === 'GET')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const payload = JSON.stringify({
+      action,
+      issue,
+      ...(changes ? { changes } : {}),
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo', default_branch: 'main' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: { 'x-hub-signature-256': signature, 'x-github-event': 'issues' }
+    });
+    const response = await worker.fetch(request, {
+      WEBHOOK_SECRET: secret,
+      APP_ID: '12345',
+      PRIVATE_KEY: 'YW55Y29udGVudA=='
+    }, {});
+    return { response, requests };
+  }
+
+  test('issues: title-only edit is dropped before any API call', async () => {
+    try {
+      const { response, requests } = await sendIssuesWebhook('edited',
+        { number: 9, body: '### Release\n\n24.10.0', labels: [{ name: 'to-triage' }] },
+        { changes: { title: { from: 'old title' } } }
+      );
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(await response.text(), 'Issue edit did not change the body');
+      assert.strictEqual(requests.length, 0);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('issues: fetches both config files in one GraphQL query and labels the issue', async () => {
+    try {
+      const { response, requests } = await sendIssuesWebhook('opened',
+        { number: 9, body: '### Release\n\n24.10-SNAPSHOT', labels: [{ name: 'to-triage' }], author_association: 'NONE' }
+      );
+      assert.strictEqual(response.status, 200);
+      assert.match(await response.text(), /Processed issue labeller/);
+
+      // Both config files travel in a single batched GraphQL query...
+      const batchCalls = requests.filter(r => r.url.includes('/graphql') && r.body?.query?.includes('object('));
+      assert.strictEqual(batchCalls.length, 1);
+      // ...and no REST /contents/ lookup happens for either of them.
+      assert.ok(!requests.some(r => r.url.includes('/contents/')));
+
+      const labelPost = requests.find(r => r.method === 'POST' && r.url.endsWith('/issues/9/labels'));
+      assert.deepStrictEqual(labelPost.body.labels, ['release/24.10']);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('issues: label listing is skipped when there is nothing to add', async () => {
+    try {
+      // No trigger label, no invalid label, no _require_form: the labeller
+      // returns an empty verdict and the repository label listing is never
+      // fetched.
+      const { response, requests } = await sendIssuesWebhook('opened',
+        { number: 9, body: '### Release\n\n24.10-SNAPSHOT', labels: [], author_association: 'NONE' }
+      );
+      assert.strictEqual(response.status, 200);
+      const labelListings = requests.filter(r => r.url.includes('/graphql') && r.body?.query?.includes('labels(first:'));
+      assert.strictEqual(labelListings.length, 0);
+      assert.ok(!requests.some(r => r.method === 'POST' && r.url.endsWith('/issues/9/labels')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   test('truncates check run output text if it exceeds GitHub limits', async () => {
     // Generate a long list of commits with long messages to bloat the output text
     const commitsList = Array.from({ length: 300 }, (_, i) => ({

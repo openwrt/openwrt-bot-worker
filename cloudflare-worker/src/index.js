@@ -254,6 +254,12 @@ async function handleWebhook(request, env) {
     if (!['opened', 'edited', 'reopened'].includes(action)) {
       return new Response("Ignored issues action", { status: 200 });
     }
+    // The labeller reads form fields out of the issue body, so an edit that
+    // did not touch the body (title fixups are the common case) cannot change
+    // any verdict. Skipping here saves every API call, token minting included.
+    if (action === 'edited' && !data.changes?.body) {
+      return new Response("Issue edit did not change the body", { status: 200 });
+    }
   } else {
     const action = data.action || '';
     if (!['opened', 'synchronize', 'reopened'].includes(action)) {
@@ -285,20 +291,49 @@ async function handleWebhook(request, env) {
 
   // --- ISSUES EVENT: Issue Labeller ---
   if (event === "issues") {
-    const issueConfig = await fetchRepositoryConfig(data, token, DEFAULT_CONFIG, null);
+    // Both config files live in the same repo at the same ref, so one batched
+    // GraphQL query fetches them together instead of two REST round trips.
+    const defaultBranch = data.repository.default_branch || "main";
+    const configFiles = await graphqlBatchFetchFiles(token, [
+      { key: 'config', repoFullname, ref: defaultBranch, path: '.github/formalities.json' },
+      { key: 'labeller', repoFullname, ref: defaultBranch, path: '.github/issue-labeller.yml' }
+    ]);
+    const configRes = configFiles.get('config');
+    if (configRes?.error) {
+      throw new Error(`Failed to fetch repository config for issue labeller: ${configRes.error.message}`);
+    }
+    let issueConfig = DEFAULT_CONFIG;
+    if (configRes?.content) {
+      try {
+        const repoConfig = JSON.parse(configRes.content);
+        if (repoConfig && typeof repoConfig === 'object') {
+          issueConfig = { ...DEFAULT_CONFIG, ...repoConfig };
+        }
+      } catch (e) { /* malformed config file falls back to the defaults */ }
+    }
     if (!issueConfig.enable_issue_labeller) {
       return new Response("Issue labeller disabled for this repository", { status: 200 });
     }
-    const defaultBranch = data.repository.default_branch || "main";
-    const labellerYmlUrl = `https://api.github.com/repos/${repoFullname}/contents/.github/issue-labeller.yml?ref=${encodeURIComponent(defaultBranch)}`;
-    const labellerRes = await githubApiCall(labellerYmlUrl, token, "GET", null, "application/vnd.github.raw");
-    const labellerConfig = (labellerRes.code === 200 && labellerRes.raw)
-      ? (parseIssueLabellerYaml(labellerRes.raw) || DEFAULT_ISSUE_LABELLER_CONFIG)
+
+    const labellerFile = configFiles.get('labeller');
+    const labellerConfig = (labellerFile && !labellerFile.error && labellerFile.content)
+      ? (parseIssueLabellerYaml(labellerFile.content) || DEFAULT_ISSUE_LABELLER_CONFIG)
       : DEFAULT_ISSUE_LABELLER_CONFIG;
-    const existingLabels = await graphqlFetchRepoLabels(token, repoFullname);
+
     const labelling = await handleIssueLabeller(data, token, labellerConfig, repoFullname);
     const currentIssueLabels = new Set((data.issue.labels || []).map(l => (typeof l === "string" ? l : l.name).toLowerCase()));
-    await applyIssueLabelling(labelling, token, repoFullname, data.issue.number, existingLabels, currentIssueLabels, null);
+
+    // The repository label listing exists only to know which labels must be
+    // created first. Most events end with nothing to add (already-triaged
+    // issues, title edits, unmatched forms), so fetch the listing only when a
+    // label actually needs to go on — and labelling must survive the listing
+    // failing, so fall back to blind creates (see ensureLabelExists) then.
+    const needsLabelCreation = labelling.labelsToAdd.some(l => !currentIssueLabels.has(l.toLowerCase()));
+    const existingLabels = needsLabelCreation
+      ? await graphqlFetchRepoLabels(token, repoFullname)
+          .catch(err => { console.warn(`Repository label listing failed, continuing without it: ${err.message}`); return null; })
+      : new Set();
+    await applyIssueLabelling(labelling, token, repoFullname, data.issue.number, existingLabels, currentIssueLabels, null, appId);
     return new Response(`Success: Processed issue labeller for issue #${data.issue.number}`, { status: 200 });
   }
 
@@ -579,7 +614,12 @@ async function handleWebhook(request, env) {
   // OPTIMIZATION: Fetch repository config, repository labels (GraphQL), labeler config, and commits list pages in parallel
   const [CONFIG, existingLabels, labelerRes, ...commitsResList] = await Promise.all([
     fetchRepositoryConfig(data, token, DEFAULT_CONFIG, () => { subrequestBudget.used++; }),
-    graphqlFetchRepoLabels(token, repoFullname).then(labels => { subrequestBudget.used++; return labels; }),
+    // A failed label listing must not take the whole run down with it — the
+    // validation results and check-runs matter more than label bookkeeping.
+    // ensureLabelExists copes with null by attempting creates blindly.
+    graphqlFetchRepoLabels(token, repoFullname)
+      .then(labels => { subrequestBudget.used++; return labels; })
+      .catch(err => { subrequestBudget.used++; console.warn(`Repository label listing failed, continuing without it: ${err.message}`); return null; }),
     trackedApiCall(labelerUrl, token, 'GET', null, 'application/vnd.github.raw'),
     ...commitsPromises
   ]);
