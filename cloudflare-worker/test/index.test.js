@@ -5017,7 +5017,7 @@ new file mode 100644
 
     assert.deepStrictEqual(perCommitFetches, [], 'the quoted header is not a commit of this pull request');
     const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
-    assert.ok(patchesRun.output.text.includes('Missing required Git header'),
+    assert.ok(patchesRun.output.text.includes('mbox separator line'),
       `the second commit's diff must actually be inspected: ${patchesRun.output.text}`);
   });
 
@@ -5060,7 +5060,7 @@ new file mode 100644
 
     assert.deepStrictEqual(perCommitFetches, []);
     const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
-    assert.ok(patchesRun.output.text.includes('Missing required Git header'), patchesRun.output.text);
+    assert.ok(patchesRun.output.text.includes('mbox separator line'), patchesRun.output.text);
 
     // The finding has to sit under the commit that actually carries the patch
     // file. Splitting on the quoted header would hand the first commit the
@@ -5071,8 +5071,8 @@ new file mode 100644
       assert.ok(section, `no section for commit ${sha.slice(0, 7)} in ${patchesRun.output.text}`);
       return section;
     };
-    assert.ok(sectionFor(SPLIT_SHA_2).includes('Missing required Git header'), 'reported under the second commit');
-    assert.ok(!sectionFor(SPLIT_SHA_1).includes('Missing required Git header'), 'not under the first commit');
+    assert.ok(sectionFor(SPLIT_SHA_2).includes('mbox separator line'), 'reported under the second commit');
+    assert.ok(!sectionFor(SPLIT_SHA_1).includes('mbox separator line'), 'not under the first commit');
   });
 
   test('falls back to per-commit patches when the pull request patch is unavailable', async () => {
