@@ -1,6 +1,59 @@
 import { githubApiCall } from './github.js';
 import { generateJWT } from './crypto.js';
-import { LABEL_GUIDELINES } from './config.js';
+import { LABEL_GUIDELINES, DEFAULT_CONFIG } from './config.js';
+
+// Bot accounts cannot rescue a stale PR: the app's own comments, other GitHub
+// Apps and *[bot] accounts are recognized by shape, and automation that runs
+// on a plain User account (an AI reviewer like openwrt-ai) is named in
+// `stale_ignored_users`. Only pushes and people count as activity.
+function isIgnoredActor(user, ignoredLogins) {
+  const login = (user?.login || '').toLowerCase();
+  if (!login) return true;
+  if (user.type === 'Bot' || login.endsWith('[bot]')) return true;
+  return ignoredLogins.has(login);
+}
+
+// Whether anyone able to move the PR forward acted after the stale label was
+// applied: pushed or force-pushed commits, commented, reviewed or reopened.
+// The bare updated_at timestamp cannot answer this - any bot comment bumps
+// it, and one automated review per cycle used to reset the close countdown
+// forever (openwrt/packages#29094).
+export function hasRealActivitySince(timeline, labeledAt, ignoredLogins) {
+  const labeledTime = labeledAt.getTime();
+  for (const item of timeline) {
+    let when = null;
+    let actor = null;
+    // A pushed commit carries no actor of its own and is author work by
+    // definition; every other event has to name who did it, so a missing or
+    // deleted account there is not evidence of anyone being active.
+    let actorRequired = true;
+    switch (item.event) {
+      case 'committed':
+        when = item.committer?.date || item.author?.date;
+        actorRequired = false;
+        break;
+      case 'head_ref_force_pushed':
+      case 'reopened':
+        when = item.created_at;
+        actor = item.actor;
+        break;
+      case 'commented':
+        when = item.created_at;
+        actor = item.actor || item.user;
+        break;
+      case 'reviewed':
+        when = item.submitted_at;
+        actor = item.user;
+        break;
+      default:
+        continue;
+    }
+    if (!when || new Date(when).getTime() <= labeledTime) continue;
+    if (actorRequired && isIgnoredActor(actor, ignoredLogins)) continue;
+    return true;
+  }
+  return false;
+}
 
 function parseLinkHeader(header) {
   if (!header) return {};
@@ -125,9 +178,10 @@ export async function handleScheduled(env) {
 
           // Disabled by default. Only enable if explicitly defined as true.
           let enableStaleBot = false;
+          let repoConfig = null;
           if (resConfig.code === 200) {
             try {
-              const repoConfig = JSON.parse(resConfig.raw);
+              repoConfig = JSON.parse(resConfig.raw);
               if (repoConfig && typeof repoConfig === 'object' && repoConfig.enable_stale_bot === true) {
                 enableStaleBot = true;
               }
@@ -140,6 +194,11 @@ export async function handleScheduled(env) {
             console.log(`[Stale Bot] Stale bot is disabled for repository: ${repo}. Skipping.`);
             continue;
           }
+
+          const ignoredUserList = Array.isArray(repoConfig?.stale_ignored_users)
+            ? repoConfig.stale_ignored_users
+            : DEFAULT_CONFIG.stale_ignored_users;
+          const ignoredLogins = new Set(ignoredUserList.map(u => String(u).toLowerCase()));
 
           // Fetch repository labels, stopping early once the stale label shows up
           const labelsResult = await paginateAll(
@@ -202,19 +261,21 @@ export async function handleScheduled(env) {
             }
 
             if (hasStaleLabel) {
-              // If it already has the stale label, fetch events to check when the stale label was added
-              const eventsResult = await paginateAll(
-                `https://api.github.com/repos/${repo}/issues/${prNumber}/events?per_page=100`, token,
-                `fetching events for PR #${prNumber}`);
-              if (eventsResult.outcome === 'fatal') {
+              // The timeline carries both when the stale label was applied and
+              // who did what since - unlike the plain events listing, it also
+              // contains comments, reviews and commits with their actors.
+              const timelineResult = await paginateAll(
+                `https://api.github.com/repos/${repo}/issues/${prNumber}/timeline?per_page=100`, token,
+                `fetching timeline for PR #${prNumber}`);
+              if (timelineResult.outcome === 'fatal') {
                 return;
               }
-              if (eventsResult.outcome !== 'ok') {
+              if (timelineResult.outcome !== 'ok') {
                 console.warn(`[Stale Bot] Skipping PR #${prNumber}.`);
                 continue;
               }
 
-              const staleLabeledEvent = eventsResult.items
+              const staleLabeledEvent = timelineResult.items
                 .filter(e => e.event === 'labeled' && e.label?.name === 'stale')
                 .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
@@ -224,9 +285,11 @@ export async function handleScheduled(env) {
               }
 
               if (labeledAt) {
-                // If there has been activity since the stale label was applied (buffer to ignore bot's own label/comment update)
-                if (updatedAt.getTime() > labeledAt.getTime() + 60 * 1000) {
-                  console.log(`[Stale Bot] PR #${prNumber} is active again (activity detected after stale labeling). Removing stale label.`);
+                // Only contributor activity clears the label: pushes, or
+                // comments/reviews from someone who is not a bot. Anything a
+                // bot posts after the labeling must not restart the cycle.
+                if (hasRealActivitySince(timelineResult.items, labeledAt, ignoredLogins)) {
+                  console.log(`[Stale Bot] PR #${prNumber} is active again (contributor activity after stale labeling). Removing stale label.`);
                   const labelUrl = `https://api.github.com/repos/${repo}/issues/${prNumber}/labels/stale`;
                   await githubApiCall(labelUrl, token, 'DELETE');
                 } else if (labeledAt < staleThresholdDate) {

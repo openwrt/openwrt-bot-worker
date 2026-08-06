@@ -1,7 +1,7 @@
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import worker from '../src/index.js';
-import { handleScheduled } from '../src/stale.js';
+import { handleScheduled, hasRealActivitySince } from '../src/stale.js';
 import { githubApiCall } from '../src/github.js';
 
 async function calculateHmac(secret, payload) {
@@ -753,6 +753,66 @@ index 123456..789012 100644
     }
   });
 
+  describe('hasRealActivitySince', () => {
+    const labeledAt = new Date('2026-07-01T00:00:00Z');
+    const after = '2026-07-02T00:00:00Z';
+    const before = '2026-06-01T00:00:00Z';
+    const ignored = new Set(['openwrt-ai']);
+    const human = { login: 'contributor', type: 'User' };
+
+    test('counts a human comment or review after the labeling', () => {
+      assert.strictEqual(hasRealActivitySince([{ event: 'commented', actor: human, created_at: after }], labeledAt, ignored), true);
+      assert.strictEqual(hasRealActivitySince([{ event: 'reviewed', user: human, submitted_at: after }], labeledAt, ignored), true);
+    });
+
+    test('counts pushed commits and force-pushes', () => {
+      assert.strictEqual(hasRealActivitySince([{ event: 'committed', committer: { date: after } }], labeledAt, ignored), true);
+      assert.strictEqual(hasRealActivitySince([{ event: 'head_ref_force_pushed', actor: human, created_at: after }], labeledAt, ignored), true);
+    });
+
+    test('ignores GitHub Apps, [bot] logins and configured machine accounts', () => {
+      const items = [
+        { event: 'commented', actor: { login: 'openwrt[bot]', type: 'Bot' }, created_at: after },
+        { event: 'commented', actor: { login: 'some-app', type: 'Bot' }, created_at: after },
+        { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: after },
+        { event: 'reviewed', user: { login: 'OpenWrt-AI', type: 'User' }, submitted_at: after }
+      ];
+      assert.strictEqual(hasRealActivitySince(items, labeledAt, ignored), false);
+    });
+
+    test('ignores activity from a deleted account', () => {
+      // GitHub reports actor: null once the account is gone; treating that as
+      // human activity would keep a dead PR alive forever.
+      const items = [
+        { event: 'commented', actor: null, created_at: after },
+        { event: 'reviewed', user: null, submitted_at: after }
+      ];
+      assert.strictEqual(hasRealActivitySince(items, labeledAt, ignored), false);
+    });
+
+    test('ignores anything that happened before the labeling', () => {
+      const items = [
+        { event: 'commented', actor: human, created_at: before },
+        { event: 'committed', committer: { date: before } }
+      ];
+      assert.strictEqual(hasRealActivitySince(items, labeledAt, ignored), false);
+    });
+
+    test('ignores timeline entries without a usable timestamp', () => {
+      assert.strictEqual(hasRealActivitySince([{ event: 'commented', actor: human }], labeledAt, ignored), false);
+      assert.strictEqual(hasRealActivitySince([{ event: 'committed' }], labeledAt, ignored), false);
+    });
+
+    test('ignores unrelated timeline events such as labelling itself', () => {
+      const items = [
+        { event: 'labeled', label: { name: 'stale' }, actor: human, created_at: after },
+        { event: 'mentioned', actor: human, created_at: after },
+        { event: 'subscribed', actor: human, created_at: after }
+      ];
+      assert.strictEqual(hasRealActivitySince(items, labeledAt, ignored), false);
+    });
+  });
+
   test('marks inactive PRs stale if they violate guidelines', async () => {
     const apiCalls = [];
     fetchMock = async (url, options) => {
@@ -834,7 +894,16 @@ index 123456..789012 100644
       if (url.includes('/labels') && !url.includes('/issues/')) {
         return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
       }
-      if (url.includes('/issues') && !url.includes('/events')) {
+      if (url.includes('/issues/66/timeline')) {
+        // Stale label was added 1 hour ago, then a person commented 1 minute ago
+        const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          { event: 'labeled', label: { name: 'stale' }, created_at: hourAgo },
+          { event: 'commented', actor: { login: 'contributor', type: 'User' }, created_at: minuteAgo }
+        ]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/timeline')) {
         // PR number 66 has both 'stale' and 'not following guidelines' labels
         // and was updated 1 minute ago (recent activity)
         const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
@@ -844,17 +913,6 @@ index 123456..789012 100644
             updated_at: minuteAgo,
             labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
             pull_request: {}
-          }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues/66/events')) {
-        // Stale label was added 1 hour ago (which is older than the recent 1-minute-ago update, i.e., user active post-stale)
-        const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
-            event: 'labeled',
-            label: { name: 'stale' },
-            created_at: hourAgo
           }
         ]), { status: 200 });
       }
@@ -882,6 +940,66 @@ index 123456..789012 100644
     }
   });
 
+  test('keeps the stale label when only bots were active and the close threshold is not reached', async () => {
+    const apiCalls = [];
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      if (url.includes('/contents/.github/formalities.json')) {
+        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
+      }
+      if (url.includes('/labels') && !url.includes('/issues/')) {
+        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
+      }
+      if (url.includes('/issues/99/timeline')) {
+        // Stale label added 2 days ago; an AI review followed 1 day ago.
+        // Before, that review reset the countdown and the cycle restarted.
+        const daysAgo2 = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+        const daysAgo1 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          { event: 'labeled', label: { name: 'stale' }, created_at: daysAgo2 },
+          { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: daysAgo1 }
+        ]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/timeline')) {
+        const daysAgo1 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          {
+            number: 99,
+            updated_at: daysAgo1,
+            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
+            pull_request: {}
+          }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      const env = {
+        APP_ID: "12345",
+        PRIVATE_KEY: privateKeyPEM
+      };
+
+      await handleScheduled(env);
+
+      // The stale label must survive the bot review, and the PR must not be closed yet
+      assert.ok(!apiCalls.some(c => c.url.includes('/issues/99/labels/stale') && c.method === 'DELETE'));
+      assert.ok(!apiCalls.some(c => c.url.includes('/pulls/99') && c.method === 'PATCH'));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   test('closes stale PRs if close threshold is reached without activity', async () => {
     const apiCalls = [];
     fetchMock = async (url, options) => {
@@ -902,26 +1020,28 @@ index 123456..789012 100644
       if (url.includes('/labels') && !url.includes('/issues/')) {
         return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
       }
-      if (url.includes('/issues') && !url.includes('/events')) {
-        // PR 77 has stale and guidelines labels and was updated 15 days ago
+      if (url.includes('/issues/77/timeline')) {
+        // Stale label was added 15 days ago; the only activity since came
+        // from bots (an app comment and an AI review on a User account),
+        // which must not stop the closing.
         const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+        const daysAgo14 = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+        return new Response(JSON.stringify([
+          { event: 'labeled', label: { name: 'stale' }, created_at: daysAgo15 },
+          { event: 'commented', actor: { login: 'openwrt[bot]', type: 'Bot' }, created_at: daysAgo15 },
+          { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: daysAgo14 }
+        ]), { status: 200 });
+      }
+      if (url.includes('/issues') && !url.includes('/timeline')) {
+        // PR 77 has stale and guidelines labels and was updated 14 days ago
+        // (the AI review keeps updated_at fresh-ish, but that must not matter)
+        const daysAgo14 = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
         return new Response(JSON.stringify([
           {
             number: 77,
-            updated_at: daysAgo15,
+            updated_at: daysAgo14,
             labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
             pull_request: {}
-          }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues/77/events')) {
-        // Stale label was added 15 days ago (older than 14 days stale threshold)
-        const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
-            event: 'labeled',
-            label: { name: 'stale' },
-            created_at: daysAgo15
           }
         ]), { status: 200 });
       }
@@ -1016,6 +1136,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
   let originalImportKey;
   let originalSign;
   let postedCheckRuns = [];
+  let deletedLabelUrls = [];
   // Logins that the handler asked the collaborator permission API about, in order.
   let permissionLookups = [];
 
@@ -1085,12 +1206,17 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
   });
 
   async function sendWebhookPR(prBody, baseBranch, authorAssociation, commitMessage, comments = [], prOptions = {}) {
-    const { headBranch = 'feature-branch', checkBranch = false, prUser = { login: 'prauthor', type: 'User' }, env = {} } = prOptions;
+    const { headBranch = 'feature-branch', checkBranch = false, prUser = { login: 'prauthor', type: 'User' }, env = {}, action = 'opened', prLabels = [] } = prOptions;
     postedCheckRuns = [];
     permissionLookups = [];
+    deletedLabelUrls = [];
     fetchMock = async (url, options) => {
       if (url.includes('/access_tokens')) {
         return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/issues/123/labels/') && options?.method === 'DELETE') {
+        deletedLabelUrls.push(url);
+        return new Response(JSON.stringify({}), { status: 200 });
       }
       if (url.includes('/formalities.json')) {
         return new Response(JSON.stringify({
@@ -1122,7 +1248,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     };
 
     const payload = JSON.stringify({
-      action: 'opened',
+      action,
       pull_request: {
         number: 123,
         title: 'test pr',
@@ -1131,6 +1257,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         head: { ref: headBranch, sha: 'abcdef1234567890' },
         author_association: authorAssociation,
         user: prUser,
+        labels: prLabels,
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
       },
       installation: { id: 456 },
@@ -1190,6 +1317,24 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
 
     return response;
   }
+
+  test('drops the stale label when new commits are pushed', async () => {
+    const response = await sendWebhookPR('', 'main', 'NONE', 'mypkg: update to 1.2.3\n\nUpdate to latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: John Doe <john@doe.com>', [], {
+      action: 'synchronize',
+      prLabels: [{ name: 'stale' }, { name: 'not following guidelines' }]
+    });
+    assert.strictEqual(response.status, 200);
+    assert.ok(deletedLabelUrls.some(u => u.endsWith('/labels/stale')), `Deleted labels: ${deletedLabelUrls.join(', ')}`);
+  });
+
+  test('keeps the stale label on a plain re-run without new commits', async () => {
+    const response = await sendWebhookPR('', 'main', 'NONE', 'mypkg: update to 1.2.3\n\nUpdate to latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: John Doe <john@doe.com>', [], {
+      action: 'opened',
+      prLabels: [{ name: 'stale' }]
+    });
+    assert.strictEqual(response.status, 200);
+    assert.ok(!deletedLabelUrls.some(u => u.endsWith('/labels/stale')), `Deleted labels: ${deletedLabelUrls.join(', ')}`);
+  });
 
   test('fails on stable branch backport if commit message lacks cherry-picked context line', async () => {
     const response = await sendWebhookPR('', 'openwrt-25.12', 'NONE', 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>');
