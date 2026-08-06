@@ -990,6 +990,42 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     }
   }
 
+  // Package policy ranks HTTPS above plain http:// and the native git://
+  // protocol for source downloads. The content is pinned either way - by the
+  // checksum for archives, by PKG_SOURCE_VERSION for git checkouts - so this
+  // is a nudge about transport hygiene and availability (git:// is no longer
+  // served by the major code hosts at all), which is why it stays a warning,
+  // never an error. Only Makefiles are read: the same text in a README or a
+  // fixture is not a download location.
+  if (CONFIG.check_source_url_https) {
+    let urlChecked = false;
+    let urlWarned = false;
+    for (const { lines } of getMakefileChunks()) {
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith('+')) continue;
+        // `+=` counts too: extra mirrors are appended to PKG_SOURCE_URL that way.
+        const assign = lines[i].slice(1).match(/^\s*PKG_SOURCE_URL\s*(?::=|\+=|=)\s*(.*)$/);
+        if (!assign) continue;
+        // A trailing backslash carries the assignment onto the next added
+        // line; the whole logical value is what the build sees.
+        let value = assign[1];
+        while (/\\\s*$/.test(value) && i + 1 < lines.length && lines[i + 1].startsWith('+')) {
+          value = value.replace(/\\\s*$/, ' ') + lines[++i].slice(1).trim();
+        }
+        value = value.replace(/\s*#.*$/, '').trim();
+        urlChecked = true;
+        const plain = value.match(/\b(http|git|ftp):\/\//);
+        if (plain) {
+          urlWarned = true;
+          warnings.push(`Prefer https:// in PKG_SOURCE_URL instead of '${plain[1]}://' ('${value}') when the upstream serves it. The content stays pinned - by the checksum for an archive, by PKG_SOURCE_VERSION for a git checkout; OpenWrt package policy simply ranks HTTPS above plain transports${plain[1] === 'git' ? ", and major code hosts no longer serve git:// at all" : ''}.`);
+        }
+      }
+    }
+    if (urlChecked && !urlWarned) {
+      successes.push('✅ PKG_SOURCE_URL uses HTTPS download locations');
+    }
+  }
+
   if (CONFIG.check_conffiles) {
     let conffilesCheckRun = false;
     let conffilesCheckErrors = 0;

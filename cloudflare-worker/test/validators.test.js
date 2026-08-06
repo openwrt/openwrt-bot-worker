@@ -4503,6 +4503,89 @@ diff --git a/applications/luci-app-qosify/Makefile b/applications/luci-app-qosif
   });
 });
 
+// ─── Source URL Transport ────────────────────────────────────────
+
+describe('validateMakefileContext source URLs', () => {
+  const URL_CONFIG = { ...CONFIG, check_source_url_https: true };
+  const state = () => ({ isNewPackage: false, isDroppedPackage: false });
+  const patchWith = (url) => `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_SOURCE_URL:=${url}
+    `;
+  const commit = { commit: { message: 'mypkg: update source location' } };
+
+  test('warns about plain http downloads', () => {
+    const res = validateMakefileContext(commit, patchWith('http://example.com/releases'), URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'http://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('warns about the git protocol', () => {
+    const res = validateMakefileContext(commit, patchWith('git://github.com/example/repo.git'), URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'git://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('accepts https downloads', () => {
+    const res = validateMakefileContext(commit, patchWith('https://example.com/releases'), URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('HTTPS download locations')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('accepts mirror macros', () => {
+    const res = validateMakefileContext(commit, patchWith('@GNU/bash'), URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('ignores the same text outside a Makefile', () => {
+    const patch = `
+diff --git a/package/utils/mypkg/README.md b/package/utils/mypkg/README.md
+--- a/package/utils/mypkg/README.md
++++ b/package/utils/mypkg/README.md
+@@ -1,2 +1,3 @@
+ # mypkg
++Example: PKG_SOURCE_URL:=http://example.com/releases
+`;
+    const res = validateMakefileContext(commit, patch, URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assert.ok(!res.successes.some(s => s.includes('HTTPS download locations')), 'nothing to judge');
+  });
+
+  test('reads a URL carried onto the next line by a backslash', () => {
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -3,3 +3,5 @@
+ PKG_VERSION:=1.0
++PKG_SOURCE_URL:=https://example.com/releases \\
++	http://mirror.example.org/releases
+ PKG_RELEASE:=1
+`;
+    const res = validateMakefileContext(commit, patch, URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'http://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('checks mirrors appended with +=', () => {
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_SOURCE_URL += http://mirror.example.com/releases
+    `;
+    const res = validateMakefileContext(commit, patch, URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'http://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('ignores insecure URLs in trailing comments', () => {
+    const res = validateMakefileContext(commit, patchWith('https://example.com/releases # was http://example.com'), URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('does nothing when disabled', () => {
+    const res = validateMakefileContext(commit, patchWith('http://example.com/releases'), { ...CONFIG, check_source_url_https: false }, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+});
+
 // ─── UCI Config Validation ────────────────────────────────────────
 
 // ─── Package Hash Audit ──────────────────────────────────────────
