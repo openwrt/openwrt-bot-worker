@@ -1246,9 +1246,10 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     name.startsWith('.') ||
     name.startsWith('patches-') ||
     name.startsWith('files-');
+  // 'frameworks' and 'games' come from the video feed.
   const CATEGORIES = new Set([
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
-    'system', 'multimedia', 'mail', 'sound', 'network'
+    'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
   ]);
   const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua']);
 
@@ -1345,8 +1346,12 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     candidates.push(candidate);
   };
 
-  // Fallback candidates for uncommon feed/category layouts.
-  for (let i = parts.length; i >= 2; i--) {
+  // Fallback candidates for uncommon feed/category layouts. Single-segment
+  // candidates cover feeds that keep packages at the repository root - the
+  // routing feed is `babeld/`, `batman-adv/`, ... with no category level at
+  // all. Whether such a directory really is a package is decided by the
+  // Makefile probe below, so non-package roots still resolve to null.
+  for (let i = parts.length; i >= 1; i--) {
     pushCandidate(parts.slice(0, i).join('/'));
   }
 
@@ -1360,8 +1365,12 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
 
   if (!fetchFileContent) {
     // Dry mode (unit tests / no fetch available): trust the first viable
-    // heuristic candidate without probing anything.
-    return viableCandidates.length > 0 ? viableCandidates[0] : null;
+    // heuristic candidate without probing anything. Single-segment candidates
+    // are only trustworthy after the Makefile probe below - without it, a
+    // repository-root directory like scripts/ or include/ would be guessed to
+    // be a package - so dry mode keeps requiring a category level.
+    const dryCandidates = viableCandidates.filter(candidate => candidate.includes('/'));
+    return dryCandidates.length > 0 ? dryCandidates[0] : null;
   }
 
   // Probe every viable candidate's Makefile in one shot instead of walking
