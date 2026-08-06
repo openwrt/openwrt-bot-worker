@@ -1,3 +1,11 @@
+// The grammar of a commit subject prefix: a package name (`bash`) or a source
+// tree path with subdirectories (`tools/cmake`, `toolchain/musl`), followed by
+// `: `. Defined once and reused by every place that has to recognize one, so
+// the subject check and the revert parser cannot drift apart again.
+export const SUBJECT_PREFIX_SOURCE = '[a-zA-Z0-9_-]+(?:\\/[a-zA-Z0-9_-]+)*: ';
+const SUBJECT_PREFIX_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}`);
+const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}\\s*`);
+
 export function isValidName(name) {
   const nameRegex = /^[\p{L}'.-]+(?: [\p{L}'.-]+)+$/u;
   return nameRegex.test(name);
@@ -96,7 +104,7 @@ export function parseRevertSubject(subject) {
   if (typeof subject !== 'string') return null;
 
   // `(?:<name>: )*` also covers `tools/cmake: ` and chained `toolchain: binutils: ` prefixes.
-  const outer = subject.trim().match(/^((?:[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)?: )*)[Rr]evert "(.+)"$/);
+  const outer = subject.trim().match(new RegExp(`^((?:${SUBJECT_PREFIX_SOURCE})*)[Rr]evert "(.+)"$`));
   if (!outer) return null;
 
   let original = outer[2];
@@ -272,21 +280,13 @@ export async function validateFormalities(fullCommit, CONFIG) {
     // so the prefix/lower-case/period rules apply to the original subject and
     // not to the wrapper `git revert` generated around it.
     if (!revert) {
-      // Special case for tools/* prefix (e.g., tools/cmake: backport bootstrap fix)
-      // These use a subdirectory naming convention like tools/cmake, tools/bison, etc.
-      const toolsPrefixMatch = subject.match(/^(tools\/[a-zA-Z0-9_-]+): /);
-      if (toolsPrefixMatch) {
-        const afterPrefix = subject.replace(/^(tools\/[a-zA-Z0-9_-]+): \s*/, '');
-        if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
-          subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
-        }
-        if (subject.endsWith('.')) {
-          subjectErrors.push("Commit subject must not end with a period");
-        }
-      } else if (!/^[a-zA-Z0-9_-]+: /.test(subject)) {
+      // The prefix is a package name (`bash: `) or a source tree path with
+      // subdirectories (`tools/cmake: `, `toolchain/musl: `) - openwrt.git
+      // history uses both shapes, so any of them satisfies the prefix rule.
+      if (!SUBJECT_PREFIX_RE.test(subject)) {
         subjectErrors.push("Commit subject must start with `<package name or prefix>: `");
       } else {
-        const afterPrefix = subject.replace(/^[a-zA-Z0-9_-]+: \s*/, '');
+        const afterPrefix = subject.replace(SUBJECT_PREFIX_STRIP_RE, '');
         if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
           subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
         }
