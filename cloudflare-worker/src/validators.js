@@ -346,6 +346,41 @@ export async function validateFormalities(fullCommit, CONFIG) {
     errors.push("- Commit description body is empty or contains only trailers (e.g. Signed-off-by). Please provide a meaningful description of what this change does and why");
   }
 
+  // Imperative mood: the guidelines ask for "add support for X", not
+  // "added support for X". Only forms that map cleanly back to an
+  // imperative are flagged, so the warning can always say what to write
+  // instead; anything ambiguous passes silently.
+  if (CONFIG.warn_imperative_mood && !isAutosquash && !revert) {
+    const NON_IMPERATIVE = {
+      added: 'add', adding: 'add',
+      fixed: 'fix', fixing: 'fix',
+      updated: 'update', updating: 'update',
+      bumped: 'bump', bumping: 'bump',
+      upgraded: 'upgrade', upgrading: 'upgrade',
+      removed: 'remove', removing: 'remove',
+      dropped: 'drop', dropping: 'drop',
+      changed: 'change', changing: 'change',
+      moved: 'move', moving: 'move',
+      renamed: 'rename', renaming: 'rename',
+      switched: 'switch', switching: 'switch',
+      improved: 'improve', improving: 'improve',
+      corrected: 'correct', correcting: 'correct',
+      reworked: 'rework', reworking: 'rework',
+      refactored: 'refactor', refactoring: 'refactor',
+      introduced: 'introduce', introducing: 'introduce',
+      implemented: 'implement', implementing: 'implement',
+      enabled: 'enable', enabling: 'enable',
+      disabled: 'disable', disabling: 'disable',
+      replaced: 'replace', replacing: 'replace'
+    };
+    const afterPrefix = subject.replace(/^(?:[a-zA-Z0-9_/-]+: )+/, '');
+    const firstWord = (afterPrefix.match(/^[A-Za-z]+/) || [''])[0].toLowerCase();
+    const imperative = NON_IMPERATIVE[firstWord];
+    if (imperative) {
+      warnings.push(`Subject should use the imperative mood: write '${imperative} ...', not '${firstWord} ...' (e.g. "add support for X", not "added support for X").`);
+    }
+  }
+
   // Generic phrase checking
   if (CONFIG.warn_generic_subjects) {
     const genericPatterns = [
