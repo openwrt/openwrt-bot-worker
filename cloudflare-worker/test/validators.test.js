@@ -951,6 +951,61 @@ describe('validateMakefileContext', () => {
     assert.strictEqual(res.errors.length, 0);
   });
 
+  test('validates every Makefile version bump in a commit, not just the first', () => {
+    const commit = { commit: { message: 'bash: update to 5.3' } };
+    const patch = `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_VERSION:=5.3
+diff --git a/package/utils/sed/Makefile b/package/utils/sed/Makefile
+--- a/package/utils/sed/Makefile
++++ b/package/utils/sed/Makefile
++PKG_VERSION:=4.9
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes("'4.9'")), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('(5.3)')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('still validates a version bump when the same commit adds a new package', () => {
+    const commit = { commit: { message: 'newpkg: add package' } };
+    const patch = `
+diff --git a/package/utils/newpkg/Makefile b/package/utils/newpkg/Makefile
+--- /dev/null
++++ b/package/utils/newpkg/Makefile
++PKG_NAME:=newpkg
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++PKG_MAINTAINER:=Jane Doe <jane@doe.com>
++PKG_LICENSE:=MIT
++PKG_LICENSE_FILES:=LICENSE
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_VERSION:=5.3
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(state.isNewPackage, true);
+    assert.ok(res.errors.some(e => e.includes("'5.3'")), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes("'1.0'")), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('skips version subject validation for autosquash commits', () => {
+    const commit = { commit: { message: 'fixup! bash: fix build on musl' } };
+    const patch = `
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
++PKG_VERSION:=5.3
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('Autosquash commit')), `Successes: ${res.successes.join(', ')}`);
+  });
+
   test('requires metadata fields for new packages', () => {
     const commit = { commit: { message: 'newpkg: add package' } };
     const patch = `
