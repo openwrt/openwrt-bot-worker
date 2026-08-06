@@ -1806,8 +1806,8 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 --- a/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
-+TITLE:= Simple WireGuard proxy
-+URL:= https://github.com/foo/bar
++PKG_LICENSE:= MIT
++PKG_SOURCE_URL:= https://github.com/foo/bar
 +PKG_NAME :=  foo
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
@@ -1822,8 +1822,8 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     };
     const res = validateMakefileContext(commit, patch, testConfig, state);
     assert.strictEqual(res.errors.length, 3);
-    assert.ok(res.errors[0].includes("Makefile line 'TITLE:= Simple WireGuard proxy' has a space after ':='"));
-    assert.ok(res.errors[1].includes("Makefile line 'URL:= https://github.com/foo/bar' has a space after ':='"));
+    assert.ok(res.errors[0].includes("Makefile line 'PKG_LICENSE:= MIT' has a space after ':='"));
+    assert.ok(res.errors[1].includes("Makefile line 'PKG_SOURCE_URL:= https://github.com/foo/bar' has a space after ':='"));
     assert.ok(res.errors[2].includes("Makefile line 'PKG_NAME :=  foo' has a space after ':='"));
   });
 
@@ -1833,8 +1833,8 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 --- a/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
-+TITLE:=Simple WireGuard proxy
-+URL:=https://github.com/foo/bar
++PKG_LICENSE:=MIT
++PKG_SOURCE_URL:=https://github.com/foo/bar
 +PKG_NAME:=foo
 +VAR:=
     `;
@@ -1882,7 +1882,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 --- a/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
-+TITLE:= Simple WireGuard proxy
++PKG_LICENSE:= MIT
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const testConfig = {
@@ -1905,7 +1905,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 --- a/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
 +PKG_SOURCE_URL= \\
-+TITLE = Simple WireGuard proxy
++PKG_LICENSE = MIT
 +PKG_VERSION= 1.0.0
 +CUSTOM_VAR = helper
     `;
@@ -1924,7 +1924,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.ok(res.errors[0].includes("uses '=' instead of ':='"));
     assert.ok(res.errors[0].includes("PKG_SOURCE_URL"));
     assert.ok(res.errors[1].includes("uses '=' instead of ':='"));
-    assert.ok(res.errors[1].includes("TITLE"));
+    assert.ok(res.errors[1].includes("PKG_LICENSE"));
     assert.ok(res.errors[2].includes("uses '=' instead of ':='"));
     assert.ok(res.errors[2].includes("PKG_VERSION"));
   });
@@ -2322,7 +2322,7 @@ diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
 --- a/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
 +PKG_BUILD_DIR:=\$(BUILD_DIR)/\$(PKG_NAME)-\$(PKG_VERSION)
-+URL:=https://github.com/foo/\$(PKG_NAME)
++PKG_SOURCE_URL:=https://github.com/foo/\$(PKG_NAME)
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const testConfig = {
@@ -2359,6 +2359,115 @@ diff --git b/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0);
   });
 
+});
+
+describe('validateMakefileContext dead package variables', () => {
+  const DEAD_CONFIG = CONFIG;
+  const state = () => ({ isNewPackage: false, isDroppedPackage: false });
+
+  test('flags top-level PROVIDES in a LuCI Makefile and suggests PKG_PROVIDES', () => {
+    const commit = { commit: { message: 'luci-app-qosify: provide luci-app-qos' } };
+    const patch = `
+diff --git a/applications/luci-app-qosify/Makefile b/applications/luci-app-qosify/Makefile
+--- a/applications/luci-app-qosify/Makefile
++++ b/applications/luci-app-qosify/Makefile
+@@ -7,6 +7,7 @@
+ LUCI_TITLE:=LuCI interface for qosify
+ LUCI_DEPENDS:=+qosify
+ LUCI_PKGARCH:=all
++PROVIDES:=luci-app-qos
+    `;
+    const res = validateMakefileContext(commit, patch, DEAD_CONFIG, state());
+    assert.ok(res.errors.some(e => e.includes("Use 'PKG_PROVIDES:=luci-app-qos'")), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('flags top-level MAINTAINER in a regular package and suggests PKG_MAINTAINER', () => {
+    const commit = { commit: { message: 'mypkg: fix maintainer' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++MAINTAINER:=Jane Doe <jane@doe.com>
+    `;
+    const res = validateMakefileContext(commit, patch, DEAD_CONFIG, state());
+    assert.ok(res.errors.some(e => e.includes("Use 'PKG_MAINTAINER:=Jane Doe <jane@doe.com>'")), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('flags top-level DEPENDS in a regular package and points to the Package block', () => {
+    const commit = { commit: { message: 'mypkg: add dependency' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++DEPENDS:=+libfoo
+    `;
+    const res = validateMakefileContext(commit, patch, DEAD_CONFIG, state());
+    assert.ok(res.errors.some(e => e.includes("Move 'DEPENDS:=+libfoo' into the 'define Package/<name>' block")), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('does not flag variables inside a define block', () => {
+    const commit = { commit: { message: 'mypkg: add package definition' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -10,0 +11,6 @@
++define Package/mypkg
++  SECTION:=utils
++  CATEGORY:=Utilities
++TITLE:=Unindented but still inside the block
++  DEPENDS:=+libbar
++endef
+    `;
+    const res = validateMakefileContext(commit, patch, DEAD_CONFIG, state());
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('derives define state from the hunk header context', () => {
+    const commit = { commit: { message: 'mypkg: extend package definition' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -12,3 +12,4 @@ define Package/mypkg
+   SECTION:=utils
+   CATEGORY:=Utilities
++DEPENDS:=+libbar
+    `;
+    const res = validateMakefileContext(commit, patch, DEAD_CONFIG, state());
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('suppresses the missing-colon suggestion for a dead assignment', () => {
+    const commit = { commit: { message: 'mypkg: provide virtual package' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PROVIDES=mypkg-virtual
+    `;
+    const config = { ...DEAD_CONFIG, check_missing_colon: true, check_space_after_assignment: true };
+    const res = validateMakefileContext(commit, patch, config, state());
+    assert.ok(res.errors.some(e => e.includes('no effect') || e.includes("'define Package/<name>' block")), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes("uses '=' instead of ':='")), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('skips build infrastructure Makefiles', () => {
+    const commit = { commit: { message: 'ti-k3: add target' } };
+    const patch = `
+--- a/target/linux/ti-k3/Makefile
++++ b/target/linux/ti-k3/Makefile
++MAINTAINER:=Jane Doe <jane@doe.com>
+    `;
+    const res = validateMakefileContext(commit, patch, DEAD_CONFIG, state());
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('reports success when a package Makefile stays clean', () => {
+    const commit = { commit: { message: 'mypkg: update to 1.2' } };
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_VERSION:=1.2
+    `;
+    const res = validateMakefileContext(commit, patch, { ...DEAD_CONFIG, check_pkg_version: false }, state());
+    assert.ok(res.successes.some(s => s.includes('per-package variables')), `Successes: ${res.successes.join(', ')}`);
+  });
 });
 
 describe('isPackageMakefilePath', () => {
