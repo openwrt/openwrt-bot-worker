@@ -667,6 +667,43 @@ describe('validateFormalities', () => {
     const res = await validateFormalities(commit, CONFIG);
     assert.ok(res.errors.some(e => e.includes('must not end with a period')));
   });
+
+  test('accepts toolchain/musl prefix format', async () => {
+    const commit = {
+      commit: {
+        message: 'toolchain/musl: update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid')));
+  });
+
+  test('accepts a deeper source tree path as prefix', async () => {
+    const commit = {
+      commit: {
+        message: 'package/network/services/hostapd: fix build\n\nFix build against wolfssl.\nhttps://w1.fi/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('rejects toolchain/musl with uppercase after prefix', async () => {
+    const commit = {
+      commit: {
+        message: 'toolchain/musl: Update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('lower-case word after the prefix')));
+  });
 });
 
 // ─── Revert Subjects ─────────────────────────────────────────────
