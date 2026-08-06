@@ -861,6 +861,95 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  // Variables like PROVIDES or TITLE describe one package and only take effect
+  // inside its `define Package/<name>` block: BuildPackage evaluates
+  // Package/Default (include/package-defaults.mk) first, which resets every one
+  // of them, so a value assigned at the top level of the Makefile is silently
+  // thrown away. LuCI packages never write the block themselves — luci.mk
+  // generates it and reads dedicated variables instead (PKG_PROVIDES,
+  // LUCI_TITLE, ...), so the fix differs per context. Deliberately not
+  // configurable: such an assignment is dead code in every repository.
+  const deadVarLines = new Set();
+  {
+    // Package-block fields that Package/Default resets. The ones seeded from a
+    // PKG_* twin map to that twin; LuCI passes some through LUCI_*/PKG_* names.
+    const PKG_TWINS = {
+      MAINTAINER: 'PKG_MAINTAINER', URL: 'PKG_URL', LICENSE: 'PKG_LICENSE',
+      LICENSE_FILES: 'PKG_LICENSE_FILES', FILE_MODES: 'PKG_FILE_MODES'
+    };
+    const LUCI_TWINS = {
+      PROVIDES: 'PKG_PROVIDES', TITLE: 'LUCI_TITLE', DEPENDS: 'LUCI_DEPENDS',
+      EXTRA_DEPENDS: 'LUCI_EXTRA_DEPENDS', PKGARCH: 'LUCI_PKGARCH',
+      SECTION: 'LUCI_SECTION', CATEGORY: 'LUCI_CATEGORY', URL: 'LUCI_URL',
+      MAINTAINER: 'LUCI_MAINTAINER', DEFAULT: 'LUCI_DEFAULT',
+      LICENSE: 'PKG_LICENSE', LICENSE_FILES: 'PKG_LICENSE_FILES'
+    };
+    const packageBlockVars = new Set([
+      'SECTION', 'CATEGORY', 'SUBMENU', 'TITLE', 'DEPENDS', 'MDEPENDS',
+      'EXTRA_DEPENDS', 'CONFLICTS', 'PROVIDES', 'MAINTAINER', 'URL',
+      'LICENSE', 'LICENSE_FILES', 'FILE_MODES', 'PKGARCH', 'USERID', 'MENU',
+      'DEFAULT', 'HIDDEN', 'BUILDONLY', 'KCONFIG', 'VARIANT', 'ALTERNATIVES',
+      'ABI_VERSION', 'CONFIGFILE'
+    ]);
+
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    let deadVarCheckRun = false;
+    let deadVarErrors = 0;
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      if (!isPackageMakefilePath(filePath)) continue;
+      deadVarCheckRun = true;
+
+      const isLuci = fileDiff.includes('luci.mk') || /^[+ ]LUCI_[A-Z]/m.test(fileDiff);
+
+      // Track define/endef state of the *new* file ('+' and context lines) so
+      // block contents are never flagged, even when written without the
+      // conventional indentation. Hunk headers carry the nearest preceding
+      // define/endef as context; reset there so state cannot leak across hunks.
+      let inDefine = false;
+      const lines = fileDiff.split('\n');
+      for (const line of lines) {
+        if (/^@@/.test(line)) {
+          const hunkContextMatch = line.match(/^@@[^@]*@@\s*(.*)$/);
+          const hunkContext = hunkContextMatch ? hunkContextMatch[1].trim() : '';
+          if (hunkContext) inDefine = /^define\s/.test(hunkContext);
+          continue;
+        }
+        if (!line.startsWith('+') && !line.startsWith(' ')) continue;
+        const contentLine = line.slice(1);
+        const trimmed = contentLine.trim();
+        if (/^define\s/.test(trimmed)) { inDefine = true; continue; }
+        if (/^endef\b/.test(trimmed)) { inDefine = false; continue; }
+        if (!line.startsWith('+') || inDefine) continue;
+
+        const match = contentLine.match(/^([A-Z_]+)\s*(?::=|\+=|\?=|=)\s*(.*)$/);
+        if (!match || !packageBlockVars.has(match[1])) continue;
+
+        const varName = match[1];
+        const value = match[2].trim();
+        deadVarLines.add(contentLine);
+        deadVarErrors++;
+
+        const luciTwin = LUCI_TWINS[varName];
+        const pkgTwin = PKG_TWINS[varName];
+        if (isLuci && luciTwin) {
+          errors.push(`- Use '${luciTwin}:=${value}' instead of '${trimmed}': LuCI packages generate the package definition in luci.mk, which ignores a top-level '${varName}'.`);
+        } else if (pkgTwin) {
+          errors.push(`- Use '${pkgTwin}:=${value}' instead of '${trimmed}': the build system resets '${varName}' before reading the package definition, so this line has no effect.`);
+        } else {
+          errors.push(`- Move '${trimmed}' into the 'define Package/<name>' block: the build system resets '${varName}' before reading the package definition, so a top-level assignment has no effect.`);
+        }
+      }
+    }
+
+    if (deadVarCheckRun && deadVarErrors === 0) {
+      successes.push("✅ Makefile does not assign per-package variables at the top level");
+    }
+  }
+
   if (CONFIG.check_missing_colon || CONFIG.check_space_after_assignment) {
     const fileDiffs = commitPatch.split(/^diff --git /m);
     let assignmentCheckRun = false;
@@ -878,6 +967,11 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
         if (line.startsWith('+')) {
           const contentLine = line.slice(1);
           if (contentLine.trim().startsWith('#') || contentLine.startsWith('\t')) {
+            continue;
+          }
+          // Already reported as a dead top-level assignment — suggesting a
+          // ':=' or spacing fix for a line that must go away would mislead.
+          if (deadVarLines.has(contentLine)) {
             continue;
           }
           const match = contentLine.match(/^(\s*)([^\s:=?+]+)\s*(:=|\+=|\?=|=)(.*)$/);
