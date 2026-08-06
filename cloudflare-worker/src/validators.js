@@ -2445,6 +2445,184 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   return { errors, warnings, successes, notes };
 }
 
+// PKG_HASH (or PKG_MIRROR_HASH for repository checkouts) pins the exact
+// source archive a package is built from; PKG_VERSION / PKG_SOURCE_VERSION /
+// PKG_SOURCE_DATE name it. The pair has to move together: a version bump that
+// keeps the old checksum makes every download fail verification.
+//
+// The severities follow what the build system itself does with a value
+// (include/download.mk, scripts/download.pl): a checksum that is neither 64
+// hex characters nor 'skip' makes download.pl abort, so that is an error; a
+// 32-character MD5 only trips check_hash's "uses deprecated hash" warning;
+// and 'skip' is explicitly honored, so it is reported as verification being
+// switched off rather than as an invalid value.
+export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
+  // `errors` are deterministic - the download step provably cannot use the
+  // value - and stay errors at any severity. `findings` are the heuristic
+  // half: the bot infers that the sources must have changed, which it cannot
+  // prove, so they are warnings unless a repository opts into
+  // `check_pkg_hash: "error"`. `warnings` is what the build system itself
+  // only warns about.
+  const errors = [];
+  const warnings = [];
+  const findings = [];
+  const successes = [];
+
+  if (CONFIG.check_pkg_hash === false || CONFIG.check_pkg_hash === 'disabled') {
+    return { errors, warnings, findings, successes };
+  }
+
+  const addedFiles = new Set();
+  const deletedFiles = new Set();
+  const makefiles = new Set();
+  // Per-Makefile added/deleted lines from the PR's own diff: like the release
+  // audit, the bump comparison below must not trust a base/head content
+  // difference alone, because pull_request.base.sha is frozen when the PR is
+  // opened and drifts as the base branch moves.
+  const makefileLineChanges = {}; // path -> { added: [], deleted: [] }
+  for (const item of commitDetails) {
+    if (!item.commitPatch) continue;
+    const states = parseDiffFileStates(item.commitPatch);
+    states.addedFiles.forEach(f => addedFiles.add(f));
+    states.deletedFiles.forEach(f => deletedFiles.add(f));
+    for (const file of getChangedFilesFromPatch(item.commitPatch)) {
+      if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
+      if (isHiddenOrSpecial(file)) continue;
+      makefiles.add(file);
+    }
+
+    let currentFile = null;
+    for (const line of item.commitPatch.split('\n')) {
+      if (line.startsWith('diff --git ')) {
+        currentFile = null;
+        const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+        if (match) currentFile = match[2].trim().replace(/\r$/, '');
+        continue;
+      }
+      if (!currentFile || !makefiles.has(currentFile)) continue;
+      if (line.startsWith('+++') || line.startsWith('---')) continue;
+      if (line.startsWith('+') || line.startsWith('-')) {
+        if (!makefileLineChanges[currentFile]) makefileLineChanges[currentFile] = { added: [], deleted: [] };
+        makefileLineChanges[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
+      }
+    }
+  }
+
+  const paths = [...makefiles].filter(f => !deletedFiles.has(f));
+  if (paths.length > 15) {
+    warnings.push(`Package hash audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
+    return { errors, warnings, findings, successes };
+  }
+
+  // The raw right-hand side, unresolved: a '$(...)' reference marks the value
+  // as computed, which the format checks must leave alone. '+=' is accepted
+  // alongside ':='/'=' so an appended definition is not read as absent.
+  const rawVar = (content, name) => {
+    if (!content) return null;
+    const match = content.match(new RegExp(`^${name}\\s*(?::=|\\+=|=)\\s*([^#\\r\\n]+)`, 'm'));
+    return match ? match[1].trim() : null;
+  };
+
+  async function processMakefile(path) {
+    const out = { errors: [], warnings: [], findings: [], successes: [] };
+    const headContent = await fetchFileContentAtHead(path);
+    if (headContent === null) return out;
+
+    const headHash = rawVar(headContent, 'PKG_HASH');
+    const headMirror = rawVar(headContent, 'PKG_MIRROR_HASH');
+
+    const checkFormat = (name, value) => {
+      if (value === null || value.includes('$')) return true;
+      if (value.toLowerCase() === 'skip') {
+        out.warnings.push(`${name} in '${path}' is set to 'skip', which turns off checksum verification for this download. That is supported, but the source is then taken on trust — set the SHA256 of the archive unless the download genuinely cannot be pinned.`);
+        return false;
+      }
+      if (/^[0-9a-fA-F]{32}$/.test(value)) {
+        out.warnings.push(`${name} in '${path}' is an MD5 checksum ('${value}'), which the build system reports as a deprecated hash. Use the SHA256 of the source archive (64 hex characters) instead.`);
+        return false;
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(value)) {
+        out.errors.push(`- ${name} in '${path}' is not a usable checksum ('${value}'). The download step accepts a 64-character SHA256, a 32-character MD5 or the literal 'skip', and aborts on anything else.`);
+        return false;
+      }
+      return true;
+    };
+
+    if (addedFiles.has(path)) {
+      // Only a plain archive download is judged here. A PKG_SOURCE_PROTO
+      // checkout (git, svn, hg, ...) builds its own tarball, and the docs
+      // name cases where that tarball is not reproducible and PKG_MIRROR_HASH
+      // is deliberately left out - the bot cannot tell those apart.
+      const usesVcs = rawVar(headContent, 'PKG_SOURCE_PROTO') !== null;
+      if (!usesVcs && rawVar(headContent, 'PKG_SOURCE_URL') !== null && headHash === null && headMirror === null) {
+        out.findings.push(`- New package Makefile '${path}' downloads from PKG_SOURCE_URL but defines no PKG_HASH. Add the SHA256 checksum of the source archive so the download is verified.`);
+        return out;
+      }
+      let formatsOk = true;
+      if (headHash !== null) formatsOk = checkFormat('PKG_HASH', headHash) && formatsOk;
+      if (headMirror !== null) formatsOk = checkFormat('PKG_MIRROR_HASH', headMirror) && formatsOk;
+      if (formatsOk && (headHash !== null || headMirror !== null)) {
+        out.successes.push(`✅ New package Makefile '${path}' pins its source with a valid SHA256 checksum`);
+      }
+      return out;
+    }
+
+    const baseContent = await fetchFileContentAtBase(path);
+    if (baseContent === null) return out;
+
+    const baseHash = rawVar(baseContent, 'PKG_HASH');
+    const baseMirror = rawVar(baseContent, 'PKG_MIRROR_HASH');
+
+    // A version comparison counts only when this PR's diff assigns the
+    // variable - or one its value resolves through - so a difference caused
+    // by a stale base.sha alone never claims the sources changed.
+    const lineChanges = makefileLineChanges[path];
+    const diffTouches = (varName) => {
+      if (!lineChanges) return false;
+      const names = collectResolutionVarNames(headContent, varName);
+      collectResolutionVarNames(baseContent, varName, names);
+      for (const line of [...lineChanges.added, ...lineChanges.deleted]) {
+        const assign = line.match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+        if (assign && names.has(assign[1])) return true;
+      }
+      return false;
+    };
+
+    const versionChanged = ['PKG_VERSION', 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']
+      .some(v => rawVar(baseContent, v) !== rawVar(headContent, v) && diffTouches(v));
+    const hashChanged = baseHash !== headHash || baseMirror !== headMirror;
+
+    if (versionChanged && !hashChanged && (baseHash !== null || baseMirror !== null)) {
+      const varName = baseHash !== null ? 'PKG_HASH' : 'PKG_MIRROR_HASH';
+      out.findings.push(`- Package Makefile '${path}' changes the version but keeps the old ${varName}. If the sources really did change, update it to the SHA256 of the new archive - otherwise every download fails verification.`);
+      return out;
+    }
+
+    if (hashChanged) {
+      let formatsOk = true;
+      if (headHash !== baseHash && headHash !== null) formatsOk = checkFormat('PKG_HASH', headHash) && formatsOk;
+      if (headMirror !== baseMirror && headMirror !== null) formatsOk = checkFormat('PKG_MIRROR_HASH', headMirror) && formatsOk;
+      if (formatsOk && versionChanged) {
+        out.successes.push(`✅ Package Makefile '${path}' updates the source checksum together with the version`);
+      }
+    }
+    return out;
+  }
+
+  // All head/base lookups fire together so the batching loader upstream (see
+  // fetchFileContentCached in index.js) can merge them - and share them with
+  // the release audit's fetches of the very same files - into one request.
+  const results = await Promise.all(paths.map(processMakefile));
+  for (const result of results) {
+    errors.push(...result.errors);
+    warnings.push(...result.warnings);
+    findings.push(...result.findings);
+    successes.push(...result.successes);
+  }
+
+  return { errors, warnings, findings, successes };
+}
+
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {
   const errors = [];
   const successes = [];
