@@ -1190,6 +1190,12 @@ async function handleWebhook(request, env) {
 
   const currentPrLabels = new Set((data.pull_request?.labels || []).map(l => l.name.toLowerCase()));
 
+  // New commits or a reopen are contributor activity: drop the stale marker
+  // right away instead of waiting for the nightly scan to notice it.
+  if ((data.action === 'synchronize' || data.action === 'reopened') && currentPrLabels.has('stale')) {
+    labelOperations.push(trackedApiCall(`${prLabelUrl}/stale`, token, 'DELETE'));
+  }
+
   if (!allPassed) {
     if (!currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       labelOperations.push(ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));

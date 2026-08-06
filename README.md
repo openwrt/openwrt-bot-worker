@@ -60,7 +60,7 @@ Scans the contribution tree for nested downstream patch targets:
 *   **`add package` / `drop package`**: Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages.
 *   **Stable Branch Tracking**: Auto-generates matching grey release tags (e.g., `release/24.10`, `release/25.12`) whenever a PR targets an active release backport branch.
 *   **Issue Labeller**: Replaces the GitHub Actions `issue-labeller.yml` workflow. When a bug-report issue is opened with the trigger label, the bot validates form fields and applies labels based on a declarative `.github/issue-labeller.yml` configuration file (same spirit as `labeler.yml` for PRs — label name → list of conditions). Supports template variables (`{major}`, `{segment0}`, etc.), format validation (regex), existence checks (tag/path via GraphQL), substring matching, and presence checks. Falls back to sensible defaults if no config file exists. Disabled by default — enable per-repository with `"enable_issue_labeller": true`.
-*   **Stale PR Cleanup**: A daily scheduled cron task (05:30 UTC) scans all repositories where the App is installed. If explicitly enabled in a repository's configuration (\`"enable_stale_bot": true\`), it marks PRs containing the \`not following guidelines\` label as \`stale\` (with a warning comment) after 14 days of inactivity, and closes them after another 14 days of silence.
+*   **Stale PR Cleanup**: A daily scheduled cron task (05:30 UTC) scans all repositories where the App is installed. If explicitly enabled in a repository's configuration (\`"enable_stale_bot": true\`), it marks PRs containing the \`not following guidelines\` label as \`stale\` (with a warning comment) after 14 days of inactivity, and closes them after another 14 days of silence. Only contributor activity resets the countdown: pushed commits, force-pushes, reopens, and comments or reviews from people. Comments from GitHub Apps, `*[bot]` accounts and the machine accounts listed in `stale_ignored_users` are ignored, so an automated review can never keep a dead PR alive forever. Pushing new commits also removes the `stale` label immediately via the webhook, without waiting for the nightly scan.
 
 > [!TIP]
 > Stale PR cleanup is completely disabled by default. If a repository wants to enable this automated cleanup flow, it must commit a `.github/formalities.json` file in its default branch containing `"enable_stale_bot": true`. 
@@ -144,6 +144,7 @@ Some configuration keys offer advanced options:
 *   `check_openwrt_spelling`: Set to `true` (default) to validate the correct capitalization of "OpenWrt" in commit subjects and descriptions. Set to `false` to disable.
 *   `allow_revert`: Set to `true` (default) to accept the subject format produced by `git revert` (`Revert "<original subject>"`, nested reverts, and the prefixed `<package>: Revert "..."` variant) and the `PKG_VERSION`/`PKG_RELEASE` values a revert restores, for commits whose body references the reverted commit (`This reverts commit <sha>.` or `Reverts <owner>/<repo>#<number>`). Set to `false` to hold revert commits to the regular subject and release bump rules.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
+*   `stale_ignored_users`: List of account logins whose comments and reviews never reset the stale countdown (default: `["openwrt-ai"]`). GitHub Apps and `*[bot]` accounts are always ignored automatically; this list exists for automation that runs on a plain user account.
 *   `enable_labeler_yml`: Set to `true` to enable dynamic pull request labeling based on matching files in the `.github/labeler.yml` configuration file. Defaults to `false` (opt-in).
 *   `enable_issue_labeller`: Set to `true` to enable automated issue form validation and labelling (replaces the GitHub Actions `issue-labeller.yml` workflow). Defaults to `false` (opt-in).
 
@@ -185,6 +186,7 @@ Here is a comprehensive example containing all available toggle options:
   "require_linked_github_account": true,
   "check_openwrt_spelling": true,
   "enable_stale_bot": false,
+  "stale_ignored_users": ["openwrt-ai"],
   "enable_labeler_yml": false,
   "enable_issue_labeller": false
 }

@@ -47,6 +47,12 @@ export const DEFAULT_CONFIG = {
   // Labeler features
   enable_labeler_yml: false,
   enable_issue_labeller: false,
+
+  // Stale bot: machine accounts whose comments and reviews must not reset the
+  // stale countdown. GitHub Apps and *[bot] accounts are always ignored by
+  // shape; automation running on a plain User account (an AI reviewer such as
+  // openwrt-ai) is indistinguishable from a person and has to be named here.
+  stale_ignored_users: ['openwrt-ai'],
 };
 
 export const LABEL_GUIDELINES = 'not following guidelines';
