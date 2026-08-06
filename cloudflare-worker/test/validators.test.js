@@ -594,6 +594,42 @@ describe('validateFormalities', () => {
     assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
   });
 
+  test('warns when the subject uses past tense instead of imperative mood', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, { ...CONFIG, warn_imperative_mood: true });
+    assert.ok(res.warnings.some(w => w.includes("write 'add ...'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('does not warn about imperative subjects', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: add support for foo\n\nAdd the foo feature.\nhttps://example.com/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, { ...CONFIG, warn_imperative_mood: true });
+    assert.ok(!res.warnings.some(w => w.includes('imperative mood')), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('does not warn about mood when disabled', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, { ...CONFIG, warn_imperative_mood: false });
+    assert.ok(!res.warnings.some(w => w.includes('imperative mood')), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
   test('accepts tools/cmake prefix format for build tool commits', async () => {
     const commit = {
       commit: {

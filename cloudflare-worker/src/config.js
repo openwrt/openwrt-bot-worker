@@ -16,6 +16,7 @@ export const DEFAULT_CONFIG = {
   // Description Quality Warnings
   warn_duplicate_body: true,
   warn_generic_subjects: true,
+  warn_imperative_mood: true,
   require_release_notes: true,
   require_body: true,
   check_openwrt_spelling: true,
