@@ -674,6 +674,31 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     }
   }
 
+  // Package policy ranks HTTPS above plain http:// and the native git://
+  // protocol for source downloads. The checksums (PKG_HASH/PKG_MIRROR_HASH)
+  // pin the content either way, so this is a nudge about transport hygiene
+  // and availability - git:// is no longer served by the major code hosts at
+  // all - which is why it stays a warning, never an error.
+  if (CONFIG.check_source_url_https) {
+    // `+=` counts too: extra mirrors are appended to PKG_SOURCE_URL that way.
+    const sourceUrlRegex = /^\+\s*PKG_SOURCE_URL\s*(?::=|\+=|=)\s*([^#\r\n]+)/gm;
+    let urlChecked = false;
+    let urlWarned = false;
+    let urlMatch;
+    while ((urlMatch = sourceUrlRegex.exec(commitPatch)) !== null) {
+      const value = urlMatch[1].trim();
+      urlChecked = true;
+      const plain = value.match(/\b(http|git|ftp):\/\//);
+      if (plain) {
+        urlWarned = true;
+        warnings.push(`Prefer https:// in PKG_SOURCE_URL instead of '${plain[1]}://' ('${value}') when the upstream serves it. The checksum still pins the content; OpenWrt package policy simply ranks HTTPS above plain transports${plain[1] === 'git' ? ", and major code hosts no longer serve git:// at all" : ''}.`);
+      }
+    }
+    if (urlChecked && !urlWarned) {
+      successes.push('✅ PKG_SOURCE_URL uses HTTPS download locations');
+    }
+  }
+
   if (CONFIG.check_conffiles) {
     const fileDiffs = commitPatch.split(/^diff --git /m);
     let conffilesCheckRun = false;

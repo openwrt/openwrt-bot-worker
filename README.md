@@ -40,6 +40,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 
 *   **PKG_VERSION Sync:** Validates that if a version bump is introduced inside a Makefile, the matching version string exists within the commit subject line context.
 *   **Mandatory Metadata (`check_openwrt_meta`):** Enforces the inclusion of `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` variables whenever a new package is introduced (fully configurable list).
+*   **HTTPS Source URLs (`check_source_url_https`):** Issues a non-blocking warning when a new `PKG_SOURCE_URL` uses plain `http://`, `git://` or `ftp://` — OpenWrt package policy ranks HTTPS above the plain transports. Content integrity is pinned by the checksums either way; this is about transport hygiene, and the native `git://` protocol is no longer served by major code hosts at all (default true).
 *   **Conffiles Tracker:** Mandates the definition of the `Package/.../conffiles` tracking macro whenever configuration file installations (`INSTALL_CONF`) are triggered.
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
 *   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
@@ -136,6 +137,7 @@ Some configuration keys offer advanced options:
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
 *   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
 *   `check_uci_config`: Set to `true` (default) to validate UCI configurations. Set to `false` or `"disabled"` to disable.
+*   `check_source_url_https`: Set to `true` (default) to warn when `PKG_SOURCE_URL` uses plain `http://`, `git://` or `ftp://` instead of HTTPS, or `false` to disable.
 *   `check_space_after_assignment`: Set to `true` (default) to detect and reject spaces/indentation immediately after the `:=` assignment operator in Makefiles, or `false` to disable.
 *   `check_missing_colon`: Set to `true` (default) to detect and reject the use of `=` instead of `:=` for standard variables (e.g. `PKG_NAME`, `TITLE`, `URL`, etc.) in Makefiles, or `false` to disable.
 *   `check_makefile_indentation`: Set to `true` (default) to validate package metadata/description blocks are indented with 2 spaces and install/build blocks are indented with tabs in Makefiles, or `false` to disable.
@@ -174,6 +176,7 @@ Here is a comprehensive example containing all available toggle options:
   "drop_package_label": true,
   "branch_labeling": true,
   "check_openwrt_meta": true,
+  "check_source_url_https": true,
   "check_conffiles": true,
   "check_uci_config": true,
   "check_space_after_assignment": true,
