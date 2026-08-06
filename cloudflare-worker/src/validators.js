@@ -248,6 +248,13 @@ export async function validateFormalities(fullCommit, CONFIG) {
   if (!isAutosquash) {
     if (/^\s/.test(lines[0])) subjectErrors.push("Commit subject must not start with whitespace");
 
+    // Subject, blank line, then the description: without the separator, git
+    // and every tool reading the log treat the whole first paragraph as one
+    // overlong subject.
+    if (lines.length > 1 && lines[1].trim() !== '') {
+      subjectErrors.push("Commit subject must be followed by a blank line separating it from the description body");
+    }
+
     // The quoted part of a revert subject is copied from the reverted commit,
     // so the prefix/lower-case/period rules apply to the original subject and
     // not to the wrapper `git revert` generated around it.
