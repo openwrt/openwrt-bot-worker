@@ -4364,6 +4364,92 @@ diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/my
   });
 });
 
+// ─── LuCI Package Support ────────────────────────────────────────
+
+describe('LuCI package handling', () => {
+  const luciMakefile = 'include $(TOPDIR)/rules.mk\n\nPKG_LICENSE:=Apache-2.0\n\nLUCI_TITLE:=LuCI interface for qosify\nLUCI_DEPENDS:=+qosify\n\ninclude ../../luci.mk\n';
+
+  test('findPkgRoot resolves a LuCI application from its root/ payload', async () => {
+    const fetchFn = async (path) => {
+      if (path === 'applications/luci-app-qosify/Makefile') return luciMakefile;
+      return null;
+    };
+    assert.strictEqual(
+      await findPkgRoot('applications/luci-app-qosify/root/etc/config/qosify', fetchFn, {}),
+      'applications/luci-app-qosify'
+    );
+  });
+
+  test('findPkgRoot resolves a LuCI application from an htdocs file', async () => {
+    const fetchFn = async (path) => {
+      if (path === 'applications/luci-app-qosify/Makefile') return luciMakefile;
+      return null;
+    };
+    assert.strictEqual(
+      await findPkgRoot('applications/luci-app-qosify/htdocs/luci-static/resources/view/qosify.js', fetchFn, {}),
+      'applications/luci-app-qosify'
+    );
+  });
+
+  test('new LuCI packages only need PKG_LICENSE, not maintainer or license files', () => {
+    const commit = { commit: { message: 'luci-app-qosify: add new application' } };
+    const patch = `
+diff --git a/applications/luci-app-qosify/Makefile b/applications/luci-app-qosify/Makefile
+--- /dev/null
++++ b/applications/luci-app-qosify/Makefile
+@@ -0,0 +1,8 @@
++include $(TOPDIR)/rules.mk
++
++PKG_LICENSE:=Apache-2.0
++
++LUCI_TITLE:=LuCI interface for qosify
++LUCI_DEPENDS:=+qosify
++
++include ../../luci.mk
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(!res.errors.some(e => e.includes('PKG_MAINTAINER')), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors.some(e => e.includes('PKG_LICENSE_FILES')), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes("'PKG_LICENSE'")), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('release audit exempts LuCI packages changed without a PKG_RELEASE', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/applications/luci-app-qosify/htdocs/luci-static/resources/view/qosify.js b/applications/luci-app-qosify/htdocs/luci-static/resources/view/qosify.js
++++ b/applications/luci-app-qosify/htdocs/luci-static/resources/view/qosify.js
++return view.extend({});
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'applications/luci-app-qosify/Makefile') return luciMakefile;
+      return null;
+    };
+    const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes("doesn't follow the PKG_RELEASE convention")), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('release audit accepts a new LuCI package without PKG_RELEASE', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/applications/luci-app-qosify/Makefile b/applications/luci-app-qosify/Makefile
+--- /dev/null
++++ b/applications/luci-app-qosify/Makefile
++include ../../luci.mk
+`
+    }];
+    const headFetch = async (path) => {
+      if (path === 'applications/luci-app-qosify/Makefile') return luciMakefile;
+      return null;
+    };
+    const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes("doesn't use PKG_RELEASE")), `Successes: ${res.successes.join(', ')}`);
+  });
+});
+
 // ─── UCI Config Validation ────────────────────────────────────────
 
 describe('validateUciConfigs', () => {

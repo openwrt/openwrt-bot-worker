@@ -840,6 +840,13 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       if (hasLicenseInclude) {
         requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
       }
+      // LuCI packages generate their package block in luci.mk: the emitted
+      // maintainer always comes from LUCI_MAINTAINER (defaulting to the LuCI
+      // community), and apps carry an SPDX header instead of a license file.
+      // PKG_LICENSE is still read by the build system and stays required.
+      if (/^\+\s*include\s+.*\bluci\.mk/m.test(commitPatch)) {
+        requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_MAINTAINER' && meta !== 'PKG_LICENSE_FILES');
+      }
       requiredMeta.forEach(meta => {
         const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
         if (!metaRegex.test(commitPatch)) {
@@ -1685,7 +1692,10 @@ export function isHiddenOrSpecial(filePath) {
 }
 
 export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
-  const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git']);
+  // 'root', 'htdocs', 'luasrc', 'ucode' and 'po' are the payload directories
+  // of LuCI packages (root/ plays the role files/ has elsewhere).
+  const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git',
+    'root', 'htdocs', 'luasrc', 'ucode', 'po']);
   // OpenWrt uses versioned kernel patch dirs such as `target/linux/<subtarget>/patches-6.18/`
   // for kernel-version-specific patches. They must be skipped just like the plain `patches` dir
   // so we don't fall into the expensive candidate fallback and blow past Cloudflare's per-Worker
@@ -1708,7 +1718,12 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
 
     const makefilePath = `${dir}/Makefile`;
     const content = await fetchFileContent(makefilePath);
-    const ok = !!(content && /^PKG_NAME\s*(?::=|=)/m.test(content));
+    // LuCI packages leave PKG_NAME to luci.mk (`PKG_NAME?=$(LUCI_NAME)`), so
+    // the include line is what marks their directory as a package root.
+    const ok = !!(content && (
+      /^PKG_NAME\s*(?::=|=)/m.test(content) ||
+      /^\s*include\s+.*\bluci\.mk\s*$/m.test(content)
+    ));
     cache[dir] = ok;
     return ok;
   };
@@ -2130,6 +2145,15 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     // when the tool itself has adopted PKG_RELEASE (e.g. tools/squashfs4).
     const isHostToolRoot = pkgRoot.startsWith('tools/') || pkgRoot.startsWith('toolchain/');
 
+    // Some package families never adopt PKG_RELEASE: u-boot and ARM Trusted
+    // Firmware track the upstream revision via PKG_VERSION/PKG_SOURCE_VERSION,
+    // and LuCI packages derive their version from git history inside luci.mk.
+    // Don't demand a release convention these Makefiles never had.
+    const RELEASE_EXEMPT_INCLUDES = ['u-boot.mk', 'trusted-firmware-a.mk', 'luci.mk'];
+    const isReleaseExemptMakefile = (content, release) =>
+      release === null && !!content && RELEASE_EXEMPT_INCLUDES.some(mkFile =>
+        new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(content));
+
     if (deletedFiles.has(makefilePath)) {
       // Package was deleted/dropped, skip checks
       return empty;
@@ -2154,6 +2178,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let headSourceDate = null;
     let baseSourceDate = null;
     let headMakefileContent = null;
+    let isReleaseExempt = false;
 
     if (modifiedFiles.has(makefilePath)) {
       const headContent = await fetchFileContentAtHead(makefilePath);
@@ -2167,6 +2192,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
 
       headRelease = resolveMakefileVar(headContent, 'PKG_RELEASE');
+      isReleaseExempt = isReleaseExemptMakefile(headContent, headRelease);
 
       if (isNew) {
         if (isRevertOnly) {
@@ -2176,6 +2202,9 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         }
         if (isHostToolRoot && headRelease === null) {
           return { errors: [], successes: [`✅ New package \`${pkgRoot}\` is a host-side build tool without PKG_RELEASE, which tools/ and toolchain/ packages are not required to define`] };
+        }
+        if (isReleaseExempt) {
+          return { errors: [], successes: [`✅ New package \`${pkgRoot}\` builds on a shared helper (u-boot.mk / trusted-firmware-a.mk / luci.mk) that doesn't use PKG_RELEASE, no initialization required`] };
         }
         if (headRelease !== '1') {
           return { errors: [`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
@@ -2276,16 +2305,6 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         hasDisqualifyingChange = true;
       }
 
-      // Some package families (e.g. u-boot, ARM Trusted Firmware) build on top of a
-      // shared .mk helper that never establishes a PKG_RELEASE convention for them -
-      // PKG_VERSION/PKG_SOURCE_VERSION tracks the upstream revision instead, and
-      // PKG_RELEASE is simply never defined. Don't demand a bump that has no
-      // precedent for these packages.
-      const knownReleaseExemptIncludeFiles = ['u-boot.mk', 'trusted-firmware-a.mk'];
-      const hasReleaseExemptInclude = headRelease === null && headMakefileContent && knownReleaseExemptIncludeFiles.some(mkFile =>
-        new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(headMakefileContent)
-      );
-
       // A new sub-package registered via an already-established per-item template
       // (see isNewSubPackageMakefileAddition) has no prior release for existing
       // users to be out of sync with, as long as nothing else already shipped changed.
@@ -2295,20 +2314,43 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` content changed with only minor/cosmetic updates, no PKG_RELEASE bump required`] };
       }
       // A patch-only change leaves the Makefile untouched, so it was never
-      // fetched above; fetch it now to learn whether this host tool ever
-      // adopted PKG_RELEASE.
-      if (isHostToolRoot && headMakefileContent === null) {
+      // fetched above; fetch it now to learn whether the package follows the
+      // PKG_RELEASE convention at all - host tools by their location, u-boot/
+      // trusted-firmware/LuCI builds by the shared helper they include.
+      // Common for LuCI packages, whose changes usually live under htdocs/
+      // or root/.
+      if (headMakefileContent === null) {
         headMakefileContent = await fetchFileContentAtHead(makefilePath);
+        if (headMakefileContent === null) {
+          return empty;
+        }
         headRelease = resolveMakefileVar(headMakefileContent, 'PKG_RELEASE');
+        isReleaseExempt = isReleaseExemptMakefile(headMakefileContent, headRelease);
       }
       if (isHostToolRoot && headRelease === null) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is a host-side build tool that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
       }
-      if (hasReleaseExemptInclude) {
+      if (isReleaseExempt) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
       }
       if (isNewSubPackageAddition) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`] };
+      }
+      // A package changed without touching its Makefile never had it fetched
+      // above (the optimization at the top), so read it now: whether the
+      // package follows the PKG_RELEASE convention at all decides between the
+      // exemption and the missing-bump finding. Common for LuCI packages,
+      // whose changes usually live under htdocs/ or root/.
+      if (headMakefileContent === null) {
+        headMakefileContent = await fetchFileContentAtHead(makefilePath);
+        if (headMakefileContent === null) {
+          return empty;
+        }
+        headRelease = resolveMakefileVar(headMakefileContent, 'PKG_RELEASE');
+        isReleaseExempt = isReleaseExemptMakefile(headMakefileContent, headRelease);
+      }
+      if (isReleaseExempt) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
       }
       return {
         errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],
@@ -2336,6 +2378,9 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       // update to 18.1.7") and equivalent to resetting it to 1.
       if (isHostToolRoot && headRelease === null) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; host-side build tools without PKG_RELEASE don't require a reset to 1`] };
+      }
+      if (isReleaseExempt) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; packages on a shared helper without PKG_RELEASE don't require a reset to 1`] };
       }
       if (headRelease !== '1') {
         return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
