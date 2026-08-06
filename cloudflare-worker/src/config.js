@@ -28,6 +28,7 @@ export const DEFAULT_CONFIG = {
   drop_package_label: true,
   branch_labeling: true,
   check_openwrt_meta: true,
+  check_init_scripts: true,
   check_conffiles: true,
   check_uci_config: true,
   check_space_after_assignment: true,
