@@ -23,6 +23,14 @@ const MAINTAINER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 const ALLOW_BRANCH_PATTERN = /\[allow[ -]branch\]/i;
 const ALLOW_CHERRY_PICK_PATTERN = /\[allow[ -]cherry[ -]pick\]/i;
 
+// `git cherry-pick -x` records the origin as `(cherry picked from commit
+// <sha>)`; hand-written messages sometimes hyphenate the words. Both count,
+// but the sha must be present - prose like "cherry picked from master"
+// identifies no commit to compare against. One pattern serves the backport
+// formality check and the upstream lookup, so a marker the lookup understands
+// can never fail the formality check again.
+const CHERRY_PICK_MARKER = /cherry[ -]picked from commit ([0-9a-fA-F]{7,40})/i;
+
 // Bots never act as maintainers here, whatever access they hold on the
 // repository: this app's own formality reports quote the override commands
 // back at the PR, so honoring a bot comment would let it re-trigger itself.
@@ -802,7 +810,7 @@ async function handleWebhook(request, env) {
 
     if (isBackportPr) {
       const commitMsg = commitData.commit?.message || '';
-      const match = commitMsg.match(/cherry-picked from commit ([0-9a-fA-F]{7,40})/i) || commitMsg.match(/cherry picked from commit ([0-9a-fA-F]{7,40})/i);
+      const match = commitMsg.match(CHERRY_PICK_MARKER);
       // One upstream lookup per cherry-picked commit, and a backport PR can
       // carry hundreds of them — unchecked, this alone blows through
       // Cloudflare's subrequest cap and kills the terminal writes at the end
@@ -912,7 +920,7 @@ async function handleWebhook(request, env) {
     }
 
     if (isBackportPr) {
-      if (!(fullCommit.commit.message || '').toLowerCase().includes('cherry picked from')) {
+      if (!CHERRY_PICK_MARKER.test(fullCommit.commit.message || '')) {
         const isMaintainer = await isPrAuthorMaintainer(bodyRequestsCherryPickBypass);
         const scanResult = await getCommentsScanWithRetry() || { hasCherryPickBypassComment: false, existingCommentId: null };
         const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (bodyRequestsCherryPickBypass && isMaintainer);
