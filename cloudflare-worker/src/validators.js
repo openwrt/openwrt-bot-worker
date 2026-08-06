@@ -1,3 +1,5 @@
+import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-licenses.js';
+
 // The grammar of a commit subject prefix: a package name (`bash`) or a source
 // tree path with subdirectories (`tools/cmake`, `toolchain/musl`), followed by
 // `: `. Defined once and reused by every place that has to recognize one, so
@@ -580,6 +582,115 @@ export function matchVersionString(subject, version) {
   }
 }
 
+// PKG_LICENSE holds SPDX identifiers, and every judgement below is made
+// against the official SPDX license list shipped in ./spdx-licenses.js -
+// nothing here is hand-maintained guesswork. A suggestion is only ever
+// offered after it has been confirmed to be a real identifier.
+const SPDX_ID_BY_LOWERCASE = new Map();
+for (const id of SPDX_LICENSE_IDS) {
+  SPDX_ID_BY_LOWERCASE.set(id.toLowerCase(), id);
+}
+
+const quoteList = (ids) => ids.map(id => `'${id}'`).join(' or ');
+
+// A bare version reads as either the -only or the -or-later variant, so both
+// are offered; a '+' suffix says -or-later on its own.
+function versionedSuggestions(family, version, orLater) {
+  const wanted = orLater
+    ? [`${family}-${version}-or-later`]
+    : [`${family}-${version}-only`, `${family}-${version}-or-later`];
+  const real = wanted.filter(id => SPDX_LICENSE_IDS.has(id));
+  return real.length > 0 ? quoteList(real) : null;
+}
+
+// Returns null for a valid identifier, otherwise { reason, suggestion }.
+// `suggestion` may be null when SPDX retired an id without a successor and
+// nothing can honestly be recommended in its place.
+export function checkSpdxIdentifier(token) {
+  // 'LicenseRef-...' is how SPDX names a license it does not list, so a
+  // proprietary or vendor license spelled that way is already correct.
+  if (SPDX_LICENSE_IDS.has(token) || SPDX_EXCEPTION_IDS.has(token) || /^LicenseRef-/i.test(token)) {
+    return null;
+  }
+
+  if (SPDX_DEPRECATED.has(token)) {
+    const replacement = SPDX_DEPRECATED.get(token);
+    return {
+      reason: 'is deprecated by SPDX',
+      suggestion: replacement ? quoteList(replacement.split(' or ')) : null
+    };
+  }
+
+  // Right identifier, wrong capitalization (e.g. 'BSD-2-clause').
+  const exact = SPDX_ID_BY_LOWERCASE.get(token.toLowerCase());
+  if (exact) {
+    return { reason: 'is written with the wrong capitalization', suggestion: `'${exact}'` };
+  }
+
+  // Informal GPL-family spellings: GPLv2, GPL2, LGPLv2.1+, AGPLv3, GPL-2 ...
+  const informal = token.match(/^([AaLl]?[Gg][Pp][Ll])[\s_-]*v?(\d)(\.\d+)?(\+)?$/);
+  if (informal) {
+    const family = informal[1].toUpperCase();
+    const version = `${informal[2]}${informal[3] || '.0'}`;
+    const suggestion = versionedSuggestions(family, version, !!informal[4]);
+    if (suggestion) {
+      return { reason: 'is not an SPDX identifier', suggestion };
+    }
+  }
+
+  // 'GPL-2.0-or-later-with-Autoconf-exception-2.0' spells with a hyphen what
+  // SPDX joins with the WITH operator.
+  const withExc = token.match(/^(.+?)-with-(.+)$/i);
+  if (withExc) {
+    const base = SPDX_ID_BY_LOWERCASE.get(withExc[1].toLowerCase());
+    const exception = [...SPDX_EXCEPTION_IDS].find(id => id.toLowerCase() === withExc[2].toLowerCase());
+    if (base && exception) {
+      return { reason: 'is not an SPDX identifier', suggestion: `'${base} WITH ${exception}'` };
+    }
+  }
+
+  // '-later' instead of '-or-later', a common slip.
+  if (/-later$/.test(token)) {
+    const fixed = token.replace(/-later$/, '-or-later');
+    if (SPDX_LICENSE_IDS.has(fixed)) {
+      return { reason: 'is not an SPDX identifier', suggestion: `'${fixed}'` };
+    }
+  }
+
+  // Slash-joined pairs such as 'MIT/X11' name two identifiers at once.
+  if (token.includes('/')) {
+    const parts = token.split('/').map(p => SPDX_ID_BY_LOWERCASE.get(p.toLowerCase())).filter(Boolean);
+    if (parts.length > 0) {
+      return {
+        reason: 'is not an SPDX identifier',
+        suggestion: `${quoteList(parts)} (one identifier per license, joined with OR when a package really is dual-licensed)`
+      };
+    }
+  }
+
+  // A license family without the variant that SPDX actually names.
+  const families = {
+    bsd: ['BSD-3-Clause', 'BSD-2-Clause'],
+    apache: ['Apache-2.0'],
+    lgpl: ['LGPL-2.1-or-later', 'LGPL-3.0-or-later'],
+    gpl: ['GPL-2.0-or-later', 'GPL-3.0-or-later'],
+    mpl: ['MPL-2.0'],
+    zlib: ['Zlib'],
+    'public-domain': ['CC0-1.0', 'Unlicense'],
+    publicdomain: ['CC0-1.0', 'Unlicense'],
+    'public domain': ['CC0-1.0', 'Unlicense']
+  };
+  const family = families[token.toLowerCase()];
+  if (family) {
+    const real = family.filter(id => SPDX_LICENSE_IDS.has(id));
+    if (real.length > 0) {
+      return { reason: 'names a license family rather than an SPDX identifier', suggestion: quoteList(real) };
+    }
+  }
+
+  return { reason: 'is not a known SPDX identifier', suggestion: null };
+}
+
 // Trees whose Makefiles describe build infrastructure instead of a software
 // package: `target/` holds target/subtarget and image definitions, `tools/` and
 // `toolchain/` host-side build helpers. None of them carry PKG_MAINTAINER,
@@ -707,6 +818,38 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
           }
         }
       }
+    }
+  }
+
+  if (CONFIG.check_spdx_license) {
+    // `+=` counts too: multi-license packages append identifiers that way.
+    // Trailing `#` comments are not part of the license expression.
+    const licenseLineRegex = /^\+\s*PKG_LICENSE\s*(?::=|\+=|=)\s*([^#\r\n]+)/gm;
+    let licenseChecked = false;
+    let licenseWarned = false;
+    let licenseMatch;
+    while ((licenseMatch = licenseLineRegex.exec(commitPatch)) !== null) {
+      const value = licenseMatch[1].replace(/["']/g, '').trim();
+      if (value.includes('$')) continue;
+      licenseChecked = true;
+      // A PKG_LICENSE value is an SPDX expression: identifiers joined by
+      // OR/AND/WITH (OpenWrt also space-separates several of them). Judge
+      // each identifier on its own.
+      for (const rawToken of value.split(/\s+/)) {
+        const token = rawToken.replace(/[()]/g, '');
+        if (!token || token === '\\' || /^(or|and|with)$/i.test(token)) continue;
+        const problem = checkSpdxIdentifier(token);
+        if (problem) {
+          licenseWarned = true;
+          const fix = problem.suggestion
+            ? `Use ${problem.suggestion} instead.`
+            : 'Pick the matching identifier from https://spdx.org/licenses/, or write it as `LicenseRef-<name>` if this license is not on the SPDX list.';
+          warnings.push(`PKG_LICENSE value '${token}' ${problem.reason}. ${fix}`);
+        }
+      }
+    }
+    if (licenseChecked && !licenseWarned) {
+      successes.push('✅ PKG_LICENSE uses no deprecated or informal SPDX identifiers');
     }
   }
 
