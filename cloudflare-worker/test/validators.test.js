@@ -594,6 +594,30 @@ describe('validateFormalities', () => {
     assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
   });
 
+  test('rejects a description that follows the subject without a blank line', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: update to 1.2.3\nUpdate to the latest upstream release.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(res.errors.some(e => e.includes('followed by a blank line')), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts a subject separated from the description by a blank line', async () => {
+    const commit = {
+      commit: {
+        message: 'mypkg: update to 1.2.3\n\nUpdate to the latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: Jane Smith <jane@smith.com>',
+        author: { name: 'Jane Smith', email: 'jane@smith.com' },
+        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+      }
+    };
+    const res = await validateFormalities(commit, CONFIG);
+    assert.ok(!res.errors.some(e => e.includes('followed by a blank line')), `Errors: ${res.errors.join(', ')}`);
+  });
+
   test('accepts tools/cmake prefix format for build tool commits', async () => {
     const commit = {
       commit: {
