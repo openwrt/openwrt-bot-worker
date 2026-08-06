@@ -50,7 +50,9 @@ Inspects file modification trees targeting OpenWrt build recipes:
 ### 3. Patches Check
 Scans the contribution tree for nested downstream patch targets:
 
-*   **Git-Am Compliance:** Automatically isolates modified `.patch` assets and checks for accurate `From:` and `Subject:` header identifiers to ensure smooth downstream `git am` deployment runs (customizable level: warning/error/disabled).
+*   **Git-Am Compliance:** Automatically isolates modified `.patch` assets and checks that each carries the `From <hash> Mon Sep 17 00:00:00 2001` mbox separator plus `From:` and `Subject:` headers, so tree patches stay applicable with `git am` — including out-of-tree use, where patches are concatenated into a single mbox stream and the separator line is what keeps them apart. `Date:` is optional (`git am` fills it in). The report names only the headers that are actually missing and points to `git format-patch`.
+
+    Only patches **added** by the pull request are held to this rule (customizable level: warning/error/disabled). Editing a patch that already lacks the headers produces a non-blocking warning instead: measured across all 6755 `.patch` files in `openwrt`, `packages`, `luci`, `routing`, `telephony` and `video`, 64.3 % carry the full header, 27.8 % are bare quilt diffs with no header at all and 7.6 % have `From:`/`Subject:` without the envelope — so an author touching one of those inherited the problem rather than creating it.
 
 ---
 

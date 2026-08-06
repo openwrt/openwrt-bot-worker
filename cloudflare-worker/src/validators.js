@@ -1107,21 +1107,22 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
 
 export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent) {
   const errors = [];
+  const warnings = [];
   const successes = [];
 
   if (CONFIG.check_patch_headers === false || CONFIG.check_patch_headers === 'disabled') {
-    return { errors: [], successes: [] };
+    return { errors: [], warnings: [], successes: [] };
   }
 
   if (!commitPatch) {
-    return { errors: [], successes: ["✅ No diff footprint present for patches validation"] };
+    return { errors: [], warnings: [], successes: ["✅ No diff footprint present for patches validation"] };
   }
 
   const patchMatch = commitPatch.match(/^\+\+\+\s+b\/(.*\.patch)/mg);
   const patchFiles = patchMatch ? patchMatch.map(line => line.replace(/^\+\+\+\s+b\//, '')) : [];
 
   if (patchFiles.length === 0) {
-    return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
+    return { errors: [], warnings: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
   }
 
   // Collect (chunk, patchFile) matches upfront rather than checking each
@@ -1140,20 +1141,26 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     }
   }
 
+  // Tree patches are consumed out of tree too, where several of them are
+  // concatenated into one mbox stream for `git am` — the `From <hash> Mon Sep
+  // 17 00:00:00 2001` envelope is the only thing separating the messages
+  // there, so it is required along with the author and the subject. `Date:`
+  // stays optional: git am fills it in and it has no effect on applicability.
+  // Naming only the headers that are actually absent keeps the report honest —
+  // listing all of them regardless read as a false claim (issue #76).
   async function checkPatchHeader({ chunk, patchFile }) {
-    let hasFromHash = false;
+    let hasEnvelope = false;
     let hasFrom = false;
-    let hasDate = false;
     let hasSubject = false;
     let checked = false;
+    const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
 
     if (fetchFileContent) {
       try {
         const rawContent = await fetchFileContent(patchFile);
         if (rawContent !== null) {
-          hasFromHash = /^From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(rawContent);
+          hasEnvelope = /^From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(rawContent);
           hasFrom = /^From:\s+.+/m.test(rawContent);
-          hasDate = /^Date:\s+.+/m.test(rawContent);
           hasSubject = /^Subject:\s+.+/m.test(rawContent);
           checked = true;
         }
@@ -1163,33 +1170,46 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     }
 
     if (!checked) {
-      // Fallback: only validate if it is a new file
-      const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
       if (!isNewFile) {
         return { success: `✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)` };
       }
-      hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
+      hasEnvelope = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
       hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
-      hasDate = /^\+\s*Date:\s+.+/m.test(chunk);
       hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
     }
 
-    if (!hasFromHash || !hasFrom || !hasDate || !hasSubject) {
-      return { error: `- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From <hash> Mon Sep 17 00:00:00 2001' / 'From:' / 'Date:' / 'Subject:') to ensure 'git am' application compatibility` };
+    const missing = [];
+    if (!hasEnvelope) missing.push("the 'From <commit hash> Mon Sep 17 00:00:00 2001' mbox separator line");
+    if (!hasFrom) missing.push("the 'From:' author line");
+    if (!hasSubject) missing.push("a 'Subject:' line");
+
+    if (missing.length === 0) {
+      return { success: `✅ Embedded patch '${patchFile}' contains valid Git compliance headers` };
     }
-    return { success: `✅ Embedded patch '${patchFile}' contains valid Git compliance headers` };
+
+    const howToFix = "Regenerate the patch with 'git format-patch' so it stays applicable with 'git am' - including out-of-tree use, where patches are concatenated into a single mbox stream and the separator line is what keeps them apart";
+    if (isNewFile) {
+      return { error: `- Embedded patch file '${patchFile}' is missing ${missing.join(', ')}. ${howToFix}` };
+    }
+    // Roughly a third of the patches already in the OpenWrt trees predate this
+    // convention - in the packages feed most of them do. Editing one of those
+    // inherits a problem the author did not create, so say so without blocking
+    // the change; only patches added by this pull request are held to the rule.
+    return { warning: `Embedded patch file '${patchFile}' is missing ${missing.join(', ')}. It predates this pull request, so this does not block it. ${howToFix}` };
   }
 
   const results = await Promise.all(matches.map(checkPatchHeader));
   for (const result of results) {
     if (result.error) {
       errors.push(result.error);
+    } else if (result.warning) {
+      warnings.push(result.warning);
     } else if (result.success) {
       successes.push(result.success);
     }
   }
 
-  return { errors, successes };
+  return { errors, warnings, successes };
 }
 
 export function getChangedFilesFromPatch(patch) {
