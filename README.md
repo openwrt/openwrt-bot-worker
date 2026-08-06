@@ -47,6 +47,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 
     > [!NOTE]
     > `spdx-licenses.js` is generated — never edit it by hand. Run `node scripts/update-spdx-data.mjs` to pull a newer SPDX release; the file records the release it came from in `SPDX_LICENSE_LIST_VERSION`, and the test suite verifies that every replacement it names is itself a valid identifier.
+*   **Init Script Check (`check_init_scripts`):** Issues non-blocking warnings when a newly added file that looks like an init script (`*.init` or under `etc/init.d/`) does not start with `#!/bin/sh /etc/rc.common` or defines no `START=` priority. `rc.common`'s `enable()` only creates the `/etc/rc.d/S<START><name>` boot symlink when `START` is set, so such a script is not started at boot through that path — the file is identified by its path alone, so the wording asks the author to confirm rather than asserting the service is broken (default true).
 *   **Conffiles Tracker:** Mandates the definition of the `Package/.../conffiles` tracking macro whenever configuration file installations (`INSTALL_CONF`) are triggered.
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
 *   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
@@ -144,7 +145,11 @@ Some configuration keys offer advanced options:
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
 *   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
 *   `check_uci_config`: Set to `true` (default) to validate UCI configurations. Set to `false` or `"disabled"` to disable.
+<<<<<<< HEAD
 *   `check_spdx_license`: Set to `true` (default) to validate `PKG_LICENSE` identifiers against the official SPDX license list, or `false` to disable.
+=======
+*   `check_init_scripts`: Set to `true` (default) to warn when a new init script lacks the `#!/bin/sh /etc/rc.common` interpreter line or a `START=` priority, or `false` to disable.
+>>>>>>> 31f91b4 (validators: check new init scripts for rc.common and START=)
 *   `check_space_after_assignment`: Set to `true` (default) to detect and reject spaces/indentation immediately after the `:=` assignment operator in Makefiles, or `false` to disable.
 *   `check_missing_colon`: Set to `true` (default) to detect and reject the use of `=` instead of `:=` for standard variables (e.g. `PKG_NAME`, `TITLE`, `URL`, etc.) in Makefiles, or `false` to disable.
 *   `check_makefile_indentation`: Set to `true` (default) to validate package metadata/description blocks are indented with 2 spaces and install/build blocks are indented with tabs in Makefiles, or `false` to disable.
@@ -184,7 +189,11 @@ Here is a comprehensive example containing all available toggle options:
   "drop_package_label": true,
   "branch_labeling": true,
   "check_openwrt_meta": true,
+<<<<<<< HEAD
   "check_spdx_license": true,
+=======
+  "check_init_scripts": true,
+>>>>>>> 31f91b4 (validators: check new init scripts for rc.common and START=)
   "check_conffiles": true,
   "check_uci_config": true,
   "check_space_after_assignment": true,
