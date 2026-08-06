@@ -52,6 +52,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
 *   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
 *   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled). Packages modified exclusively by revert commits are exempt from the reset/initialize rules, because a revert restores the version and release of an already released state. They must still carry a release bump if the revert changes package content without touching the version or release, otherwise users would never receive it.
+*   **PKG_HASH Validation (`check_pkg_hash`):** Points out source checksums that did not move together with the version: a `PKG_VERSION`/`PKG_SOURCE_VERSION`/`PKG_SOURCE_DATE` change that keeps the old `PKG_HASH`, and new packages that download a plain archive without defining one. Whether the sources really changed is an inference the bot cannot prove, so these are **warnings by default** — set `"check_pkg_hash": "error"` to enforce them. Packages using `PKG_SOURCE_PROTO` (git, svn, …) are left alone, because their generated tarball is not always reproducible and the docs name cases where `PKG_MIRROR_HASH` is deliberately omitted. Checksum values themselves are graded the way the build system treats them: a value that is neither a SHA256 nor `skip` makes `scripts/download.pl` abort and is **always an error**, while an MD5 (which `check_hash` only calls a deprecated hash) and `skip` (explicitly honored, but turns verification off) are warnings. Like the release audit, the bump comparison trusts the pull request's own diff — a version difference caused only by a stale `base.sha` is never reported.
 *   **UCI Config Validation:** Ensures that any configuration files destined to be installed into `/etc/config/` conform to the standard OpenWrt UCI format (consisting of only `package`, `config`, `option`, `list` statements, comments, and empty lines). A Makefile install line naming the exact file is authoritative about its destination, so a file sharing a base name with the package's config (`uhttpd.acl` next to `uhttpd.config`) is never mistaken for UCI just because of the shared stem.
 *   **PKG_NAME Reuse Prevention:** Ensures `PKG_NAME` is not reused inside `call`, `define`, and `eval` Makefile lines, requiring the literal package name instead to keep recipes readable and searchable (default true).
 *   **Dead Package Variable Detection:** Rejects per-package variables (`PROVIDES`, `TITLE`, `DEPENDS`, `MAINTAINER`, ...) assigned at the top level of a package Makefile, where the build system resets them before the package definition is read — so the assignment silently does nothing. Suggests the working replacement: the `define Package/<name>` block, the `PKG_*` twin (e.g. `PKG_MAINTAINER`), or the LuCI equivalent (`PKG_PROVIDES`, `LUCI_TITLE`, ...) for Makefiles built on `luci.mk`. Always on — a dead assignment is a bug in any repository, so there is nothing to configure.
@@ -144,13 +145,11 @@ Some configuration keys offer advanced options:
 *   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
+*   `check_pkg_hash`: `"warning"` (default) reports checksum findings without blocking, `"error"` enforces them, `false` disables the check. An unusable checksum value is an error at any setting.
 *   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
 *   `check_uci_config`: Set to `true` (default) to validate UCI configurations. Set to `false` or `"disabled"` to disable.
-<<<<<<< HEAD
 *   `check_spdx_license`: Set to `true` (default) to validate `PKG_LICENSE` identifiers against the official SPDX license list, or `false` to disable.
-=======
 *   `check_init_scripts`: Set to `true` (default) to warn when a new init script lacks the `#!/bin/sh /etc/rc.common` interpreter line or a `START=` priority, or `false` to disable.
->>>>>>> 31f91b4 (validators: check new init scripts for rc.common and START=)
 *   `check_space_after_assignment`: Set to `true` (default) to detect and reject spaces/indentation immediately after the `:=` assignment operator in Makefiles, or `false` to disable.
 *   `check_missing_colon`: Set to `true` (default) to detect and reject the use of `=` instead of `:=` for standard variables (e.g. `PKG_NAME`, `TITLE`, `URL`, etc.) in Makefiles, or `false` to disable.
 *   `check_makefile_indentation`: Set to `true` (default) to validate package metadata/description blocks are indented with 2 spaces and install/build blocks are indented with tabs in Makefiles, or `false` to disable.
@@ -191,11 +190,8 @@ Here is a comprehensive example containing all available toggle options:
   "drop_package_label": true,
   "branch_labeling": true,
   "check_openwrt_meta": true,
-<<<<<<< HEAD
   "check_spdx_license": true,
-=======
   "check_init_scripts": true,
->>>>>>> 31f91b4 (validators: check new init scripts for rc.common and START=)
   "check_conffiles": true,
   "check_uci_config": true,
   "check_space_after_assignment": true,
@@ -205,6 +201,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_buildbot_default": "warning",
   "check_patch_headers": true,
   "check_pkg_release": "warning",
+  "check_pkg_hash": "warning",
   "require_linked_github_account": true,
   "check_openwrt_spelling": true,
   "enable_stale_bot": false,
