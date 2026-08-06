@@ -903,6 +903,51 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     }
   }
 
+  // OpenWrt init scripts are usually rc.common procedures: rc.common's
+  // `enable()` only creates the `/etc/rc.d/S<START><name>` symlink when
+  // `START` is set, so a script without it is not started at boot through
+  // that path. Which files are init scripts is decided from the path alone,
+  // and a package may legitimately install something else there, so both
+  // findings are warnings phrased as something to confirm.
+  if (CONFIG.check_init_scripts) {
+    const fileDiffs = commitPatch.split(/^diff --git /m);
+    let initCheckRun = false;
+    let initWarned = false;
+
+    for (const fileDiff of fileDiffs) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      // Patches, templates and docs can live under etc/init.d/ paths too -
+      // their content is not an init script and must not be judged as one.
+      const isInitScript = (/\.init$/.test(filePath) || /\/etc\/init\.d\//.test(filePath)) &&
+        !/\.(patch|in|txt|md)$/.test(filePath);
+      if (!isInitScript) continue;
+      // Only whole new scripts: an edited line of an existing script does not
+      // bring its shebang or START= into the diff.
+      if (!/^---\s+\/dev\/null/m.test(fileDiff)) continue;
+
+      const addedLines = fileDiff.split('\n')
+        .filter(l => l.startsWith('+') && !l.startsWith('+++'))
+        .map(l => l.slice(1));
+      if (addedLines.length === 0) continue;
+      initCheckRun = true;
+
+      if (!/^#!\/bin\/sh \/etc\/rc\.common\s*$/.test(addedLines[0])) {
+        initWarned = true;
+        warnings.push(`'${filePath}' looks like an init script but does not start with '#!/bin/sh /etc/rc.common' (currently: '${addedLines[0].trim()}'). OpenWrt init scripts normally use rc.common — please confirm this one deliberately uses a different mechanism.`);
+      }
+      if (!addedLines.some(l => /^START=\d+/.test(l))) {
+        initWarned = true;
+        warnings.push(`'${filePath}' looks like an init script but defines no 'START=' priority. rc.common only creates the /etc/rc.d boot symlink when START is set, so unless the service is started some other way, add e.g. 'START=95' (and 'STOP=' if shutdown ordering matters).`);
+      }
+    }
+
+    if (initCheckRun && !initWarned) {
+      successes.push('✅ New init scripts declare the rc.common interpreter and a START= priority');
+    }
+  }
+
   if (CONFIG.check_conffiles) {
     let conffilesCheckRun = false;
     let conffilesCheckErrors = 0;

@@ -4209,6 +4209,76 @@ describe('validateMakefileContext SPDX licenses', () => {
   });
 });
 
+// ─── Init Script Check ───────────────────────────────────────────
+
+describe('validateMakefileContext init scripts', () => {
+  const INIT_CONFIG = { ...CONFIG, check_init_scripts: true };
+  const state = () => ({ isNewPackage: false, isDroppedPackage: false });
+  const commit = { commit: { message: 'mypkg: add init script' } };
+  const newInitPatch = (lines) => `
+diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/mypkg.init
+--- /dev/null
++++ b/package/utils/mypkg/files/mypkg.init
+@@ -0,0 +1,${lines.length} @@
+${lines.map(l => '+' + l).join('\n')}
+    `;
+
+  test('warns when a new init script lacks the rc.common interpreter', () => {
+    const patch = newInitPatch(['#!/bin/sh', 'START=95', 'start() { true; }']);
+    const res = validateMakefileContext(commit, patch, INIT_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("does not start with '#!/bin/sh /etc/rc.common'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('warns when a new init script has no START= priority', () => {
+    const patch = newInitPatch(['#!/bin/sh /etc/rc.common', 'start() { true; }']);
+    const res = validateMakefileContext(commit, patch, INIT_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("defines no 'START=' priority")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('accepts a proper rc.common init script', () => {
+    const patch = newInitPatch(['#!/bin/sh /etc/rc.common', '', 'START=95', 'STOP=10', 'USE_PROCD=1', 'start_service() { true; }']);
+    const res = validateMakefileContext(commit, patch, INIT_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('rc.common interpreter')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('ignores patches, templates and docs under init.d paths', () => {
+    const patch = `
+diff --git a/package/utils/mypkg/files/etc/init.d/README.txt b/package/utils/mypkg/files/etc/init.d/README.txt
+--- /dev/null
++++ b/package/utils/mypkg/files/etc/init.d/README.txt
++How the init scripts here are organized.
+diff --git a/package/utils/mypkg/patches/001-etc-init.d-fix.patch b/package/utils/mypkg/patches/001-etc-init.d-fix.patch
+--- /dev/null
++++ b/package/utils/mypkg/patches/001-etc-init.d-fix.patch
++--- a/etc/init.d/foo
+++++ b/etc/init.d/foo
++@@ -1 +1 @@
++-old
+++new
+    `;
+    const res = validateMakefileContext(commit, patch, INIT_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('ignores edits to existing init scripts', () => {
+    const patch = `
+diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/mypkg.init
+--- a/package/utils/mypkg/files/mypkg.init
++++ b/package/utils/mypkg/files/mypkg.init
++reload_service() { true; }
+    `;
+    const res = validateMakefileContext(commit, patch, INIT_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('does nothing when disabled', () => {
+    const patch = newInitPatch(['#!/bin/sh', 'start() { true; }']);
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, check_init_scripts: false }, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+});
+
 // ─── UCI Config Validation ────────────────────────────────────────
 
 describe('validateUciConfigs', () => {
