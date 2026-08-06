@@ -603,26 +603,44 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state) 
     state.isDroppedPackage = true;
   }
 
-  if (CONFIG.check_pkg_version && !state.isNewPackage) {
-    const versionMatch = commitPatch.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
-    if (versionMatch) {
+  if (CONFIG.check_pkg_version) {
+    // Judge each changed Makefile on its own instead of taking the first
+    // PKG_VERSION line in the whole patch: a commit that bumps two packages
+    // used to have only its first bump validated, and one new package
+    // anywhere in the PR used to switch the check off for every commit.
+    const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
+    // A fixup's subject is dictated by the commit it amends, so it cannot
+    // name the version it introduces; the pair is squashed before merging.
+    const isAutosquash = CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(subject);
+    const isRevert = CONFIG.allow_revert !== false && parseRevertCommit(fullCommit.commit.message || '') !== null;
+
+    for (const fileDiff of commitPatch.split(/^diff --git /m)) {
+      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
+      if (!fileMatch) continue;
+      const filePath = fileMatch[1].trim();
+      if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
+      // A brand-new Makefile is a package addition, not a version bump: its
+      // subject says what is added and carries no old-to-new version context.
+      if (/^---\s+\/dev\/null/m.test(fileDiff)) continue;
+
+      const versionMatch = fileDiff.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
+      if (!versionMatch) continue;
       const newVersion = versionMatch[1].replace(/["']/g, "").trim();
+
       if (newVersion.includes('$')) {
         successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
+      } else if (isRevert) {
+        // A revert restores the PKG_VERSION that preceded the reverted commit,
+        // while its subject quotes that commit (and therefore the version being
+        // undone). Requiring the restored version here would force the author
+        // away from the `git revert` subject format.
+        successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
+      } else if (isAutosquash) {
+        successes.push(`✅ Autosquash commit, skipping subject validation for PKG_VERSION '${newVersion}'`);
+      } else if (!matchVersionString(cleanSubject, newVersion)) {
+        errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
       } else {
-        const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
-        const isRevert = CONFIG.allow_revert !== false && parseRevertCommit(fullCommit.commit.message || '') !== null;
-        if (isRevert) {
-          // A revert restores the PKG_VERSION that preceded the reverted commit,
-          // while its subject quotes that commit (and therefore the version being
-          // undone). Requiring the restored version here would force the author
-          // away from the `git revert` subject format.
-          successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
-        } else if (!matchVersionString(cleanSubject, newVersion)) {
-          errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
-        } else {
-          successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
-        }
+        successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
       }
     }
   }
