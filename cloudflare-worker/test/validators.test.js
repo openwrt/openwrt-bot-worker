@@ -3313,6 +3313,42 @@ describe('findPkgRoot', () => {
   });
 });
 
+// ─── Root-level Feed Packages ────────────────────────────────────
+
+describe('findPkgRoot for feeds without category directories', () => {
+  const routingFetch = async (path) => {
+    if (path === 'babeld/Makefile' || path === 'batman-adv/Makefile') {
+      return 'PKG_NAME:=' + path.split('/')[0] + '\n';
+    }
+    return null;
+  };
+
+  test('resolves a routing feed package from its Makefile', async () => {
+    assert.strictEqual(await findPkgRoot('babeld/Makefile', routingFetch, {}), 'babeld');
+  });
+
+  test('resolves a routing feed package from a nested file', async () => {
+    assert.strictEqual(await findPkgRoot('batman-adv/files/etc/config/batman-adv', routingFetch, {}), 'batman-adv');
+    assert.strictEqual(await findPkgRoot('babeld/patches/001-fix.patch', routingFetch, {}), 'babeld');
+  });
+
+  test('returns null for root directories that are not packages', async () => {
+    assert.strictEqual(await findPkgRoot('scripts/dl_cleanup.py', async () => null, {}), null);
+  });
+
+  test('never guesses single-segment roots in dry mode (no fetch available)', async () => {
+    assert.strictEqual(await findPkgRoot('scripts/dl_cleanup.py', null), null);
+    assert.strictEqual(await findPkgRoot('babeld/Makefile', null), null);
+    assert.strictEqual(await findPkgRoot('package/utils/bash/Makefile', null), 'package/utils/bash');
+  });
+
+  test('resolves video feed categories without probing', async () => {
+    const noFetch = async () => { throw new Error('should not probe fast-path categories'); };
+    assert.strictEqual(await findPkgRoot('frameworks/gstreamer1/Makefile', noFetch, {}), 'frameworks/gstreamer1');
+    assert.strictEqual(await findPkgRoot('games/prboom/Makefile', noFetch, {}), 'games/prboom');
+  });
+});
+
 // ─── UCI Config Validation ────────────────────────────────────────
 
 describe('validateUciConfigs', () => {
