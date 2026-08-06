@@ -44,6 +44,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 *   **Line Ending Sanitization:** Inspects modifications for Windows-style Carriage Returns (CRLF) to guarantee exclusive UNIX (LF) formatting compliance.
 *   **Trailing Newline Check:** Verifies that newly created or modified files end with a trailing newline character, catching the common `\ No newline at end of file` issue in diffs (customizable level: warning/error/disabled).
 *   **PKG_RELEASE Validation:** Enforces correct release values on package changes: new packages must initialize `PKG_RELEASE` to `1`, version updates must reset `PKG_RELEASE` to `1`, and modifications to package files must be accompanied by a version/release change (customizable level: warning/error/disabled). Packages modified exclusively by revert commits are exempt from the reset/initialize rules, because a revert restores the version and release of an already released state. They must still carry a release bump if the revert changes package content without touching the version or release, otherwise users would never receive it.
+*   **PKG_HASH Validation (`check_pkg_hash`):** Points out source checksums that did not move together with the version: a `PKG_VERSION`/`PKG_SOURCE_VERSION`/`PKG_SOURCE_DATE` change that keeps the old `PKG_HASH`, and new packages that download a plain archive without defining one. Whether the sources really changed is an inference the bot cannot prove, so these are **warnings by default** — set `"check_pkg_hash": "error"` to enforce them. Packages using `PKG_SOURCE_PROTO` (git, svn, …) are left alone, because their generated tarball is not always reproducible and the docs name cases where `PKG_MIRROR_HASH` is deliberately omitted. Checksum values themselves are graded the way the build system treats them: a value that is neither a SHA256 nor `skip` makes `scripts/download.pl` abort and is **always an error**, while an MD5 (which `check_hash` only calls a deprecated hash) and `skip` (explicitly honored, but turns verification off) are warnings.
 *   **UCI Config Validation:** Ensures that any configuration files destined to be installed into `/etc/config/` conform to the standard OpenWrt UCI format (consisting of only `package`, `config`, `option`, `list` statements, comments, and empty lines).
 *   **PKG_NAME Reuse Prevention:** Ensures `PKG_NAME` is not reused inside `call`, `define`, and `eval` Makefile lines, requiring the literal package name instead to keep recipes readable and searchable (default true).
 
@@ -134,6 +135,7 @@ Some configuration keys offer advanced options:
 *   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
+*   `check_pkg_hash`: `"warning"` (default) reports checksum findings without blocking, `"error"` enforces them, `false` disables the check. An unusable checksum value is an error at any setting.
 *   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
 *   `check_uci_config`: Set to `true` (default) to validate UCI configurations. Set to `false` or `"disabled"` to disable.
 *   `check_space_after_assignment`: Set to `true` (default) to detect and reject spaces/indentation immediately after the `:=` assignment operator in Makefiles, or `false` to disable.
@@ -182,6 +184,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_pkg_name_reuse": true,
   "check_patch_headers": true,
   "check_pkg_release": "warning",
+  "check_pkg_hash": "warning",
   "require_linked_github_account": true,
   "check_openwrt_spelling": true,
   "enable_stale_bot": false,
