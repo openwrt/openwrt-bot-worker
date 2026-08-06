@@ -332,7 +332,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
   const cleanBodyLines = [];
   bodyLines.forEach(line => {
     const trimmed = line.trim();
-    if (trimmed === '' || /^(signed-off-by:|cherry picked from)/i.test(trimmed)) {
+    if (trimmed === '' || /^(signed-off-by:|\(?cherry[ -]picked from)/i.test(trimmed)) {
       return;
     }
     cleanBodyLines.push(trimmed);
@@ -390,7 +390,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
         if (spellingInCodeBlock) {
           continue;
         }
-        if (/^(signed-off-by:|cherry picked from)/i.test(trimmed)) {
+        if (/^(signed-off-by:|\(?cherry[ -]picked from)/i.test(trimmed)) {
           continue;
         }
       }

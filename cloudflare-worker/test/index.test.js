@@ -1346,6 +1346,26 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.match(commitCheck.output.text, /Commit to stable branch must be marked as cherry-picked/);
   });
 
+  test('accepts the hyphenated cherry-picked marker on stable branch backports', async () => {
+    const response = await sendWebhookPR('', 'openwrt-25.12', 'NONE', 'mypkg: update to 1.2.3\n\ncherry-picked from commit a1b2c3d4e5f61111222233334444555566667777\n\nSigned-off-by: John Doe <john@doe.com>');
+    assert.strictEqual(response.status, 200);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.match(commitCheck.output.text, /Commit explicitly specifies cherry-pick origin context/);
+    assert.doesNotMatch(commitCheck.output.text, /must be marked as cherry-picked/);
+  });
+
+  test('rejects a cherry-pick note without a commit sha on stable branches', async () => {
+    const response = await sendWebhookPR('', 'openwrt-25.12', 'NONE', 'mypkg: update to 1.2.3\n\ncherry picked from master\n\nSigned-off-by: John Doe <john@doe.com>');
+    assert.strictEqual(response.status, 200);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.strictEqual(commitCheck.conclusion, 'failure');
+    assert.match(commitCheck.output.text, /must be marked as cherry-picked/);
+  });
+
   test('passes on stable branch backport with warning if commit message lacks cherry-picked context line but PR description contains [allow cherry-pick] and author is a maintainer', async () => {
     const response = await sendWebhookPR('Please [allow cherry-pick] for this PR', 'openwrt-25.12', 'OWNER', 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>');
     assert.strictEqual(response.status, 200);
