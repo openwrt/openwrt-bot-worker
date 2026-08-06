@@ -28,6 +28,7 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 *   **Length Constraints:** Implements dual-layered (soft and hard) line width boundaries for both subject lines and description body text blocks.
 *   **Signed-off-by Check:** Ensures a consistent, properly structured `Signed-off-by:` declaration is present and matches the original author metadata.
 *   **Signature Verification:** Validates cryptographic GPG/SSH commit signatures if present.
+*   **Imperative Mood Warning (`warn_imperative_mood`):** Issues a non-blocking warning when the subject starts with a past-tense or gerund verb after the prefix — the guidelines ask for "add support for X", not "added support for X" (default true).
 *   **Description Quality Warnings:** Inspects message bodies and issues non-blocking warnings for lazy/identical description text mirroring the subject or for completely missing reference links (changelogs/release notes).
 *   **Mandatory Description Body:** Rejects commits whose description body is empty or contains only trailers (e.g. `Signed-off-by:`). Every commit must include a meaningful explanation of what the change does and why.
 *   **OpenWrt Spelling Verification (`check_openwrt_spelling`):** Inspects both the subject line and description body to ensure the correct casing of "OpenWrt" is used, issuing warnings for incorrect capitalizations like "OpenWRT" or "Openwrt" (ignoring URLs, code blocks, and trailers).
@@ -182,6 +183,7 @@ Here is a comprehensive example containing all available toggle options:
   "max_body_line_len": 100,
   "warn_duplicate_body": true,
   "warn_generic_subjects": true,
+  "warn_imperative_mood": true,
   "require_release_notes": true,
   "require_body": true,
   "check_pkg_version": true,
