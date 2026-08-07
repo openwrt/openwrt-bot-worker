@@ -378,6 +378,15 @@ async function handleWebhook(request, env) {
     if (prRes.code !== 200) {
       throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes.code})`);
     }
+    // Nothing about a closed pull request can be fixed by re-validating it:
+    // a merged one is already in the history, and a rejected one is not going
+    // anywhere. `pull_request` events for these never reach us (the action
+    // filter above only lets opened/synchronize/reopened through), but a
+    // comment on an old thread would otherwise re-run the whole audit and
+    // repost check-runs against a commit nobody is working on.
+    if (prRes.data?.state === 'closed') {
+      return new Response(`Ignored comment on ${prRes.data.merged ? 'merged' : 'closed'} pull request #${prNumberFromIssue}`, { status: 200 });
+    }
     data.pull_request = prRes.data;
   }
 

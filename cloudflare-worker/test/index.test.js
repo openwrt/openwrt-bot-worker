@@ -1847,6 +1847,77 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.strictEqual(commitCheck.conclusion, 'success');
   });
 
+  // A comment on a pull request that is already closed must not restart the
+  // whole audit: nothing about it can be fixed any more (issue #71).
+  async function sendCommentOnClosedPr(prState) {
+    postedCheckRuns = [];
+    let commitsFetched = false;
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123')) {
+        return new Response(JSON.stringify({
+          number: 123,
+          title: 'test pr',
+          body: '',
+          state: prState.state,
+          merged: prState.merged,
+          base: { ref: 'main', sha: 'base-sha' },
+          head: { ref: 'feature-branch', sha: 'abcdef1234567890' },
+          author_association: 'MEMBER',
+          commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+          user: { login: 'somecontributor', type: 'User' }
+        }), { status: 200 });
+      }
+      if (url.includes('/commits')) {
+        commitsFetched = true;
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/check-runs') && options?.method === 'POST') {
+        postedCheckRuns.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const payload = JSON.stringify({
+      action: 'created',
+      issue: { number: 123, pull_request: { url: 'https://api.github.com/repos/test/repo/pulls/123' } },
+      comment: { body: 'thanks!', author_association: 'MEMBER' },
+      repository: { full_name: 'test/repo' },
+      installation: { id: 456 }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const response = await worker.fetch(new Request('http://localhost/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-github-event': 'issue_comment', 'x-hub-signature-256': signature },
+      body: payload
+    }), { WEBHOOK_SECRET: secret, APP_ID: '123', PRIVATE_KEY: 'YW55Y29udGVudA==' });
+
+    return { response, commitsFetched };
+  }
+
+  test('ignores a comment on a merged pull request', async () => {
+    const { response, commitsFetched } = await sendCommentOnClosedPr({ state: 'closed', merged: true });
+    assert.strictEqual(response.status, 200);
+    assert.match(await response.text(), /merged pull request/);
+    assert.strictEqual(commitsFetched, false, 'a merged PR must not be re-audited');
+    assert.strictEqual(postedCheckRuns.length, 0, 'no check-runs on a merged PR');
+    fetchMock = null;
+  });
+
+  test('ignores a comment on a closed, unmerged pull request', async () => {
+    const { response, commitsFetched } = await sendCommentOnClosedPr({ state: 'closed', merged: false });
+    assert.strictEqual(response.status, 200);
+    assert.match(await response.text(), /closed pull request/);
+    assert.strictEqual(commitsFetched, false);
+    fetchMock = null;
+  });
+
   // Maintainers with private organization membership are reported as
   // CONTRIBUTOR/NONE, so the handler falls back to their repository permission.
   async function sendIssueComment(comment, collaboratorPermissions = {}, permissionFailures = {}) {
