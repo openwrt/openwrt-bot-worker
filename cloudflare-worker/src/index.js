@@ -1343,31 +1343,50 @@ async function handleWebhook(request, env) {
   // Publish Status to Checks API
   const checkRunsUrl = `https://api.github.com/repos/${repoFullname}/check-runs`;
 
+  // A run that could not look at everything must not report a green check:
+  // "passed" would claim the files it never fetched are fine. GitHub's
+  // `neutral` conclusion is the honest third state - it does not block the
+  // pull request, but it does not pretend the work was done either. A run
+  // that found real problems still fails; incompleteness only downgrades a
+  // pass.
+  const commitScanCapped = pages > 3;
+  const formalityIncomplete = upstreamComparisonSkips > 0 || commitScanCapped;
+  const deepScanIncomplete = budgetSkipCount > 0;
+  const conclusionFor = (passed, incomplete) => (!passed ? 'failure' : (incomplete ? 'neutral' : 'success'));
+  const INCOMPLETE_NOTE = ' Some of this pull request could not be inspected, so this check reports neutral instead of a pass — see the warnings in the details below.';
+
+  const formalityConclusion = conclusionFor(formalityPassed, formalityIncomplete);
+  const makefileConclusion = conclusionFor(makefilePassed, deepScanIncomplete);
+  const patchesConclusion = conclusionFor(patchesPassed, deepScanIncomplete);
+
   const checkRunsPromises = [
     trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Git & Commits', head_sha: headSha, status: 'completed',
-      conclusion: formalityPassed ? 'success' : 'failure',
+      conclusion: formalityConclusion,
       output: {
-        title: formalityPassed ? 'Git & Commits: Passed' : 'Git & Commits: Failed',
-        summary: formalityPassed ? 'All commits follow the commit message guidelines.' : 'Some commits do not follow the commit message guidelines — open the details below to see what to change.',
+        title: formalityPassed ? (formalityIncomplete ? 'Git & Commits: Partially checked' : 'Git & Commits: Passed') : 'Git & Commits: Failed',
+        summary: (formalityPassed ? 'All commits follow the commit message guidelines.' : 'Some commits do not follow the commit message guidelines — open the details below to see what to change.') +
+          (formalityConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(formalityOutputText)
       }
     }),
     trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / OpenWrt Makefiles', head_sha: headSha, status: 'completed',
-      conclusion: makefilePassed ? 'success' : 'failure',
+      conclusion: makefileConclusion,
       output: {
-        title: makefilePassed ? 'OpenWrt Makefiles: Passed' : 'OpenWrt Makefiles: Failed',
-        summary: makefilePassed ? 'The changed package files follow the OpenWrt packaging guidelines.' : 'Some package files need fixing — open the details below to see what to change.',
+        title: makefilePassed ? (deepScanIncomplete ? 'OpenWrt Makefiles: Partially checked' : 'OpenWrt Makefiles: Passed') : 'OpenWrt Makefiles: Failed',
+        summary: (makefilePassed ? 'The changed package files follow the OpenWrt packaging guidelines.' : 'Some package files need fixing — open the details below to see what to change.') +
+          (makefileConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(makefileOutputText)
       }
     }),
     trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
-      conclusion: patchesPassed ? 'success' : 'failure',
+      conclusion: patchesConclusion,
       output: {
-        title: patchesPassed ? 'Code Patches: Passed' : 'Code Patches: Failed',
-        summary: patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Some patch files are missing the required Git headers — open the details below to see what to change.',
+        title: patchesPassed ? (deepScanIncomplete ? 'Code Patches: Partially checked' : 'Code Patches: Passed') : 'Code Patches: Failed',
+        summary: (patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
+          (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(patchesOutputText)
       }
     })

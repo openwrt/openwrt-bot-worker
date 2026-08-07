@@ -35,6 +35,9 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 > [!NOTE]
 > To keep API/subrequest usage predictable on extreme PRs, commit-message auditing is intentionally capped to the first 300 commits. If a PR exceeds this size, the check output includes an explicit warning about the reduced commit audit scope.
 
+> [!IMPORTANT]
+> **A green check never means "not checked".** When a pull request is too large for the available API budget — file lookups skipped, upstream comparisons skipped, or the commit scan capped — a check that found no problems reports GitHub's `neutral` conclusion titled *Partially checked* instead of a pass. `neutral` does not block the pull request; it only stops the bot from claiming it inspected something it never fetched. A check that found real problems still fails.
+
 ### 2. Makefile Check
 Inspects file modification trees targeting OpenWrt build recipes:
 

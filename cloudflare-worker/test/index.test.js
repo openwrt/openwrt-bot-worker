@@ -3870,8 +3870,14 @@ index 123456..789012 100644
       const makefileCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
       assert.ok(makefileCheck);
       // Content simply being unavailable must not be reported as a false
-      // validation failure.
-      assert.strictEqual(makefileCheck.conclusion, 'success');
+      // validation failure - but it must not be reported as a pass either,
+      // because the files were never looked at. 'neutral' is the honest
+      // answer and does not block the pull request.
+      assert.strictEqual(makefileCheck.conclusion, 'neutral');
+      assert.match(makefileCheck.output.title, /Partially checked/);
+      assert.match(makefileCheck.output.summary, /could not be inspected/);
+      const patchesCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Code Patches');
+      assert.strictEqual(patchesCheck.conclusion, 'neutral');
 
       assert.ok(commentBody);
       assert.ok(commentBody.includes('Deep file-content validation skipped'));
