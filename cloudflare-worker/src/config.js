@@ -47,6 +47,11 @@ export const DEFAULT_CONFIG = {
   // Labeler features
   enable_labeler_yml: false,
   enable_issue_labeller: false,
+
+  // Stale PR cleanup. Read by the scheduled scan (see stale.js), which checks
+  // the repository config directly, but listed here so this object stays the
+  // full set of keys a repository can set.
+  enable_stale_bot: false,
 };
 
 export const LABEL_GUIDELINES = 'not following guidelines';

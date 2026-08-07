@@ -86,7 +86,7 @@ The second rule exists because GitHub reports `author_association: CONTRIBUTOR` 
 
 ## Setup & Deployment
 
-The engine is built as a headless JavaScript service hosted on **Cloudflare Workers**. It operates with zero local npm/Node dependencies inside the repository, making it highly secure and maintenance-free.
+The engine is built as a headless JavaScript service hosted on **Cloudflare Workers**. The runtime has no third-party production dependencies — the Worker ships only this repository's own source — which keeps the deployed attack surface small. Tests run on Node's built-in test runner, so development needs no dependencies either.
 
 ### 1. GitHub App Configuration
 

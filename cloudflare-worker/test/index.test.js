@@ -1085,7 +1085,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
   });
 
   async function sendWebhookPR(prBody, baseBranch, authorAssociation, commitMessage, comments = [], prOptions = {}) {
-    const { headBranch = 'feature-branch', checkBranch = false, prUser = { login: 'prauthor', type: 'User' }, env = {} } = prOptions;
+    const { headBranch = 'feature-branch', checkBranch = false, prUser = { login: 'prauthor', type: 'User' }, env = {}, rawConfig = null } = prOptions;
     postedCheckRuns = [];
     permissionLookups = [];
     fetchMock = async (url, options) => {
@@ -1093,6 +1093,9 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
       }
       if (url.includes('/formalities.json')) {
+        if (rawConfig !== null) {
+          return new Response(rawConfig, { status: 200 });
+        }
         return new Response(JSON.stringify({
           check_branch: checkBranch,
           require_linked_github_account: false,
@@ -1190,6 +1193,36 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
 
     return response;
   }
+
+  test('says so when the repository config could not be parsed', async () => {
+    const response = await sendWebhookPR('', 'main', 'NONE', 'mypkg: update to 1.2.3\n\nUpdate to the latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: John Doe <john@doe.com>', [], {
+      rawConfig: '{ "check_branch": false, '
+    });
+    assert.strictEqual(response.status, 200);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commitCheck);
+    assert.match(commitCheck.output.text, /could not be read/);
+    assert.match(commitCheck.output.text, /default setting instead of the configured one/);
+  });
+
+  test('says so when the repository config is valid JSON but not an object', async () => {
+    const response = await sendWebhookPR('', 'main', 'NONE', 'mypkg: update to 1.2.3\n\nUpdate to the latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: John Doe <john@doe.com>', [], {
+      rawConfig: '"just a string"'
+    });
+    assert.strictEqual(response.status, 200);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.match(commitCheck.output.text, /does not contain a JSON object/);
+  });
+
+  test('stays quiet when the repository config parses', async () => {
+    const response = await sendWebhookPR('', 'main', 'NONE', 'mypkg: update to 1.2.3\n\nUpdate to the latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: John Doe <john@doe.com>');
+    assert.strictEqual(response.status, 200);
+
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.doesNotMatch(commitCheck.output.text, /could not be read/);
+  });
 
   test('fails on stable branch backport if commit message lacks cherry-picked context line', async () => {
     const response = await sendWebhookPR('', 'openwrt-25.12', 'NONE', 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>');
