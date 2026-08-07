@@ -1,4 +1,9 @@
 // --- GITHUB API HELPER ---
+// `options.onAttempt` is invoked immediately before every outgoing fetch,
+// retries included. Cloudflare counts each of those against the per-invocation
+// subrequest cap, so a caller that only counted the call itself would treat a
+// request that failed twice as one — and could then exhaust the real cap while
+// still believing it had headroom left (see subrequestBudget in index.js).
 export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json', options = {}) {
   const headers = {
     'Authorization': `Bearer ${token}`,
@@ -21,6 +26,7 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      options.onAttempt?.();
       const response = await fetch(url, fetchOptions);
       const text = await response.text();
 
@@ -102,7 +108,7 @@ export const GRAPHQL_URL = 'https://api.github.com/graphql';
 //   exists   true when the ref (and path, if given) resolved at all — a
 //            binary or oversized blob has exists: true with content: null
 //   isBinary true when the path resolved to a binary blob
-export async function graphqlBatchFetchFiles(token, probes) {
+export async function graphqlBatchFetchFiles(token, probes, onCall) {
   const results = new Map();
   if (!probes || probes.length === 0) return results;
 
@@ -152,7 +158,7 @@ export async function graphqlBatchFetchFiles(token, probes) {
 
   const query = `query(${varDefs.join(', ')}) {\n  ${queryParts.join('\n  ')}\n}`;
 
-  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables });
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables }, 'application/vnd.github+json', { onAttempt: onCall });
 
   if (res.code !== 200 || !res.data) {
     const cleanRaw = (res.raw || "").trim().slice(0, 200);
@@ -197,13 +203,12 @@ export async function graphqlBatchFetchFiles(token, probes) {
 // --- GRAPHQL REPOSITORY LABELS FETCH ---
 // Collects label pages into `labels`, starting after `cursor` (null for the
 // first page). Shared by graphqlFetchRepoLabels and graphqlFetchRepoSetup.
-// `onCall` is invoked once per HTTP request so callers can count every page
-// against their subrequest budget.
+// `onCall` is invoked once per outgoing fetch — retries included — so callers
+// can count every one against their subrequest budget.
 async function fetchLabelPages(token, owner, name, labels, cursor, onCall) {
   let hasNextPage = true;
 
   while (hasNextPage) {
-    onCall?.();
     // The cursor travels as a variable: interpolating an externally supplied
     // value into the query string is the one thing GraphQL variables exist to
     // avoid.
@@ -216,7 +221,7 @@ async function fetchLabelPages(token, owner, name, labels, cursor, onCall) {
   }
 }`;
 
-    const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables: { owner, name, after: cursor } });
+    const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables: { owner, name, after: cursor } }, 'application/vnd.github+json', { onAttempt: onCall });
 
     if (res.code !== 200 || !res.data?.data?.repository?.labels) {
       const cleanRaw = (res.raw || '').trim().slice(0, 200);
@@ -260,7 +265,6 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   const owner = repoFullname.slice(0, slashIndex);
   const name = repoFullname.slice(slashIndex + 1);
 
-  onCall?.();
   const query = `query($owner: String!, $name: String!, $cfgExpr: String!, $labExpr: String!) {
   repository(owner: $owner, name: $name) {
     labels(first: 100) {
@@ -275,7 +279,7 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   const res = await githubApiCall(GRAPHQL_URL, token, 'POST', {
     query,
     variables: { owner, name, cfgExpr: `${ref}:${configPath}`, labExpr: `${ref}:${labelerPath}` }
-  });
+  }, 'application/vnd.github+json', { onAttempt: onCall });
 
   const repo = res.code === 200 ? res.data?.data?.repository : null;
   if (!repo) {
@@ -313,11 +317,10 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
 // the listing call failed.
 export async function ensureLabelExists(token, repoFullname, name, color, description, existingLabels, onCall) {
   if (existingLabels && existingLabels.has(name.toLowerCase())) return false;
-  onCall?.();
   const url = `https://api.github.com/repos/${repoFullname}/labels`;
   // 422 is GitHub for "already exists" — a benign race with another writer
   // (or the blind-create path working as intended), so it is silenced.
-  const res = await githubApiCall(url, token, 'POST', { name, color: color || 'ededed', description: description || '' }, 'application/vnd.github+json', { silent: true });
+  const res = await githubApiCall(url, token, 'POST', { name, color: color || 'ededed', description: description || '' }, 'application/vnd.github+json', { silent: true, onAttempt: onCall });
   if (res.code === 422) {
     existingLabels?.add(name.toLowerCase());
     return false;
@@ -398,9 +401,8 @@ const WRITE_PERMISSION_LEVELS = ['admin', 'write'];
 // so callers can tell "no access" apart from "no answer".
 export async function fetchUserRepoPermission(repoFullname, username, token, onCall) {
   if (!repoFullname || !username) return false;
-  onCall?.();
   const url = `https://api.github.com/repos/${repoFullname}/collaborators/${encodeURIComponent(username)}/permission`;
-  const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { silent: true });
+  const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { silent: true, onAttempt: onCall });
   if (res.code === 404) {
     return false;
   }
