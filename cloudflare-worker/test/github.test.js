@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, GRAPHQL_URL } from '../src/github.js';
+import { graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, githubApiCall, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -436,5 +436,63 @@ describe('fetchUserRepoPermission', { concurrency: 1 }, () => {
   test('returns null when the response body is not JSON', async () => {
     fetchMock = () => new Response('<html>gateway</html>', { status: 200 });
     assert.strictEqual(await fetchUserRepoPermission('test/repo', 'someone', 'token'), null);
+  });
+});
+
+describe('subrequest accounting', { concurrency: 1 }, () => {
+  let originalFetch;
+  let fetchMock;
+
+  before(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => fetchMock(url, options);
+  });
+
+  after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test('counts every retry attempt, not just the call', async () => {
+    let served = 0;
+    fetchMock = async () => {
+      served++;
+      return served < 3
+        ? new Response('upstream hiccup', { status: 503 })
+        : new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+
+    let counted = 0;
+    const res = await githubApiCall('https://api.github.com/x', 'token', 'GET', null,
+      'application/vnd.github+json', { onAttempt: () => { counted++; } });
+
+    assert.strictEqual(res.code, 200);
+    assert.strictEqual(served, 3, 'the request really was retried twice');
+    assert.strictEqual(counted, served, 'budget accounting must match the fetches Cloudflare saw');
+  });
+
+  test('counts attempts for network failures too', async () => {
+    fetchMock = async () => { throw new Error('connection reset'); };
+
+    let counted = 0;
+    const res = await githubApiCall('https://api.github.com/x', 'token', 'GET', null,
+      'application/vnd.github+json', { onAttempt: () => { counted++; } });
+
+    assert.strictEqual(res.code, 599);
+    assert.strictEqual(counted, 3, 'all three attempts must be counted');
+  });
+
+  test('passes the counter through the GraphQL batch helper', async () => {
+    let served = 0;
+    fetchMock = async () => {
+      served++;
+      return served < 2
+        ? new Response('boom', { status: 500 })
+        : new Response(JSON.stringify({ data: { repo0: { f0: { oid: 'x', text: 'hello' } } } }), { status: 200 });
+    };
+
+    let counted = 0;
+    await graphqlBatchFetchFiles('token', [{ key: 'k', repoFullname: 'o/r', ref: 'main', path: 'F' }], () => { counted++; });
+    assert.strictEqual(counted, served);
+    assert.strictEqual(counted, 2);
   });
 });
