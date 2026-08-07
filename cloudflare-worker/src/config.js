@@ -52,6 +52,11 @@ export const DEFAULT_CONFIG = {
   enable_labeler_yml: false,
   enable_issue_labeller: false,
 
+  // Stale PR cleanup. Read by the scheduled scan (see stale.js), which checks
+  // the repository config directly, but listed here so this object stays the
+  // full set of keys a repository can set.
+  enable_stale_bot: false,
+
   // Stale bot: machine accounts whose comments and reviews must not reset the
   // stale countdown. GitHub Apps and *[bot] accounts are always ignored by
   // shape; automation running on a plain User account (an AI reviewer such as
