@@ -4345,6 +4345,244 @@ index 123456..789012 100644
     }
   });
 
+  // Drives one webhook whose deep-validation lookups and comment listing can be
+  // made to fail, and reports how many times each was really fetched plus what
+  // the run said about its own coverage.
+  async function runWithBudget({ budgetLimit, reserve, commentAnswers = [], graphqlBatchStatus = null }) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: refresh patch',
+        body: 'Refresh',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const commentFetches = [];
+    const batchFetches = [];
+    let commentBody = null;
+    let commentCall = 0;
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      if (url.includes('/graphql') && options?.body && !JSON.parse(options.body).query.includes('labels(first:')) {
+        batchFetches.push(url);
+        return new Response('upstream hiccup', { status: graphqlBatchStatus || 503 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: refresh patch\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        // One modified patch file, so the run needs one file-content lookup.
+        return new Response(
+          'diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch\n' +
+          '--- a/utils/mypkg/patches/001-fix.patch\n' +
+          '+++ b/utils/mypkg/patches/001-fix.patch\n' +
+          '@@ -10,6 +10,6 @@\n-old\n+new\n',
+          { status: 200 });
+      }
+      if (url.includes('/issues/123/comments') && method === 'GET') {
+        commentFetches.push(url);
+        const answer = commentAnswers[commentCall++];
+        if (answer) return new Response(answer.body, { status: answer.status });
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/issues/123/comments') && method === 'POST') {
+        commentBody = JSON.parse(options.body).body;
+        return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA==',
+        SUBREQUEST_BUDGET_LIMIT: String(budgetLimit),
+        SUBREQUEST_RESERVE_HEADROOM: String(reserve)
+      }, {});
+      return { status: response.status, commentFetches, batchFetches, commentBody };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('does not retry a file lookup once only the reserve is left', async () => {
+    // The budget allows the first attempt of the batched lookup and nothing
+    // more. Retrying it would spend the headroom kept for the closing writes,
+    // which Cloudflare counts whether or not those writes still fit.
+    const { batchFetches, status } = await runWithBudget({ budgetLimit: 7, reserve: 1 });
+    assert.strictEqual(status, 200);
+    assert.strictEqual(batchFetches.length, 1, `the 503 must not be retried into the reserve: ${batchFetches.length} attempts`);
+  });
+
+  test('retries a file lookup while the budget still has room', async () => {
+    const { batchFetches } = await runWithBudget({ budgetLimit: 45, reserve: 15 });
+    assert.strictEqual(batchFetches.length, 3, 'with headroom the transient failure is retried as before');
+  });
+
+  test('counts every attempt of the comment listing, not every page', async () => {
+    // The listing is served 503, 503, 200: three fetches Cloudflare counts.
+    // Counting one leaves the run believing it has two requests it does not
+    // have, and the file lookup it then attempts is one the cap refuses.
+    const answers = [
+      { status: 503, body: 'upstream hiccup' },
+      { status: 503, body: 'upstream hiccup' },
+      { status: 200, body: '[]' }
+    ];
+    const { commentFetches, batchFetches } = await runWithBudget({ budgetLimit: 10, reserve: 1, commentAnswers: answers });
+    assert.strictEqual(commentFetches.length, 3, 'the listing really was retried twice');
+    assert.strictEqual(batchFetches.length, 2,
+      'with all three of those fetches on the bill, the lookup that follows has room for two attempts, not three');
+  });
+
+  test('does not retry the upstream lookups of a backport into the reserve', async () => {
+    // A backport carries one upstream lookup per commit. They are optional -
+    // the run already skips them once the headroom is gone - but a retried
+    // failure used to spend the reserve anyway, and with enough commits the
+    // closing writes then fell past Cloudflare's cap and were refused.
+    const commits = Array.from({ length: 15 }, (_, i) => ({
+      sha: String(i).padStart(40, 'a'),
+      html_url: `https://github.com/test/repo/commit/${i}`,
+      parents: [{}],
+      commit: {
+        message: `mypkg: change ${i}\n\n(cherry picked from commit ${String(i).padStart(40, 'b')})\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    }));
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123, title: '[24.10] backport', body: 'Backport',
+        base: { ref: 'openwrt-24.10', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 }, repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const fetches = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      fetches.push(`${method} ${url}`);
+      if (url.includes('/access_tokens')) return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({ check_branch: false, require_linked_github_account: false, require_body: false, check_uci_config: false, check_pkg_release: false }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) return new Response(JSON.stringify(commits), { status: 200 });
+      if (/\/repos\/test\/repo\/commits\/b/.test(url)) return new Response('upstream hiccup', { status: 503 });
+      if (/\/repos\/test\/repo\/commits\/a/.test(url)) {
+        return new Response('diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile\n--- a/utils/mypkg/Makefile\n+++ b/utils/mypkg/Makefile\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/comments') && method === 'GET') return new Response(JSON.stringify([]), { status: 200 });
+      return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) =>
+      algorithm.name === 'RSASSA-PKCS1-v1_5' ? { type: 'private', extractable: false, algorithm, usages: keyUsages }
+        : originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) =>
+      algorithm === 'RSASSA-PKCS1-v1_5' ? new ArrayBuffer(256) : originalSign.call(crypto.subtle, algorithm, key, data);
+
+    try {
+      const response = await worker.fetch(new Request('http://localhost/webhook', {
+        method: 'POST', body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      }), { WEBHOOK_SECRET: secret, APP_ID: '12345', PRIVATE_KEY: 'YW55Y29udGVudA==' }, {});
+      assert.strictEqual(response.status, 200);
+
+      const upstream = fetches.filter(f => /\/commits\/b+$/.test(f));
+      const attemptedShas = new Set(upstream.map(f => f.split('/commits/')[1]));
+      assert.strictEqual(upstream.length, attemptedShas.size,
+        `each upstream lookup gets one attempt, not a retry into the reserve: ${upstream.length} fetches for ${attemptedShas.size} commits`);
+
+      // The whole invocation has to stay inside Cloudflare's cap, or the
+      // closing writes at the end are the ones GitHub never sees.
+      assert.ok(fetches.length <= 50, `the run made ${fetches.length} requests, past Cloudflare's cap of 50`);
+      assert.strictEqual(fetches.filter(f => f.includes('/check-runs')).length, 3);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('stops paging a long comment thread rather than spending the reserve', async () => {
+    const fullPage = Array.from({ length: 100 }, (_, i) => ({
+      id: i, body: `comment ${i}`, user: { login: 'someone', type: 'User' }, author_association: 'NONE'
+    }));
+    const { commentFetches, commentBody } = await runWithBudget({
+      budgetLimit: 7, reserve: 1,
+      commentAnswers: [
+        { status: 200, body: JSON.stringify(fullPage) },
+        { status: 200, body: JSON.stringify(fullPage) },
+        { status: 200, body: JSON.stringify([]) }
+      ]
+    });
+    assert.ok(commentFetches.length < 3, `the scan must stop at the reserve, it made ${commentFetches.length} listings`);
+    assert.strictEqual(commentBody, null, 'a scan that stopped short must not be acted on');
+  });
+
   test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {

@@ -44,6 +44,21 @@ function isBotUser(user) {
 // override commands. Fall back to the repository permission they actually hold.
 // Answers are memoized per request: the same login shows up as PR author and as
 // comment author, and every lookup costs a subrequest.
+// Counts an outgoing attempt for a lookup the run can do without. The first
+// attempt was already checked against the headroom by its caller, but a retry
+// starts later, when other requests may have used it up - so a retry is
+// declined (githubApiCall then returns the answer it already had) once only
+// the reserve kept for the terminal writes is left.
+function optionalAttemptCounter(subrequestBudget) {
+  return (attempt) => {
+    if (attempt > 1 && subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used <= 0) {
+      return false;
+    }
+    subrequestBudget.used++;
+    return true;
+  };
+}
+
 function createMaintainerResolver(repoFullname, token, subrequestBudget) {
   const cache = new Map();
   let budgetWarned = false;
@@ -78,7 +93,7 @@ function createMaintainerResolver(repoFullname, token, subrequestBudget) {
     }
     // Cache the pending promise, not the result, so concurrent questions about
     // the same login share a single lookup.
-    const pending = fetchUserRepoPermission(repoFullname, login, token, () => { subrequestBudget.used++; })
+    const pending = fetchUserRepoPermission(repoFullname, login, token, optionalAttemptCounter(subrequestBudget))
       .then(hasWriteAccess => {
         // A failed lookup is not evidence of missing access, so it must not
         // stick: drop it and let a later question about the same login retry.
@@ -103,7 +118,12 @@ function parseEnvInt(value, fallback) {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
-async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintainerUser, appId) {
+// `hasHeadroom` is asked before every page after the first: a thread long
+// enough to page is also long enough to eat the headroom kept for the closing
+// writes, and losing those loses the whole report. Stopping counts as a failed
+// scan, which the caller already handles by leaving the comment alone - better
+// a run without its comment than a run whose check-runs GitHub refuses.
+async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintainerUser, appId, hasHeadroom = () => true) {
   let page = 1;
   let hasCherryPickBypassComment = false;
   let hasBranchBypassComment = false;
@@ -111,8 +131,7 @@ async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintaine
 
   while (true) {
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
-    onCall?.();
-    const res = await githubApiCall(url, token);
+    const res = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { onAttempt: onCall });
     if (res.code !== 200 || !Array.isArray(res.data)) {
       return null;
     }
@@ -142,6 +161,10 @@ async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintaine
 
     if (res.data.length < 100) {
       break;
+    }
+    if (!hasHeadroom()) {
+      console.warn(`Comment scan for PR #${prNumber} stopped after page ${page}: no request budget left beyond the reserve.`);
+      return null;
     }
     page++;
   }
@@ -368,20 +391,31 @@ async function handleWebhook(request, env) {
   // files) can burn through that budget on file-content lookups alone,
   // starving the essential terminal writes (check-runs, PR comment) at the
   // end of this handler — which is a silent total failure, not a degraded
-  // one. `subrequestBudget` tracks logical GitHub API calls made so far;
-  // `reserve` keeps enough headroom for those terminal writes to always run.
-  // This under-counts slightly (it doesn't count retry attempts inside
-  // githubApiCall's own internal 3x retry loop), which is why `limit`
-  // defaults a few requests under the Free plan's actual ceiling.
+  // one. `subrequestBudget` counts every outgoing fetch — retries inside
+  // githubApiCall included, since Cloudflare counts those too — and `reserve`
+  // keeps enough headroom for those terminal writes to always run.
   const subrequestBudget = {
     limit: parseEnvInt(env.SUBREQUEST_BUDGET_LIMIT, 45),
     reserve: parseEnvInt(env.SUBREQUEST_RESERVE_HEADROOM, 15),
     used: 0
   };
-  const trackedApiCall = (...args) => {
-    subrequestBudget.used++;
-    return githubApiCall(...args);
-  };
+  // Counting happens per outgoing fetch rather than per call, so a request
+  // that githubApiCall retried twice costs the budget what it really cost
+  // Cloudflare. The options argument is the sixth one, so any caller-supplied
+  // options are merged rather than replaced.
+  const trackedApiCall = (url, token, method, payload, accept, options = {}) =>
+    githubApiCall(url, token, method, payload, accept, {
+      ...options,
+      onAttempt: () => { subrequestBudget.used++; }
+    });
+  const countOptionalAttempt = optionalAttemptCounter(subrequestBudget);
+  // Same as trackedApiCall for a lookup the run can do without: it is counted
+  // like any other, but a retry stops at the reserve instead of spending it.
+  const optionalApiCall = (url, token, method, payload, accept, options = {}) =>
+    githubApiCall(url, token, method, payload, accept, {
+      ...options,
+      onAttempt: countOptionalAttempt
+    });
 
   const isMaintainerUser = createMaintainerResolver(repoFullname, token, subrequestBudget);
 
@@ -557,9 +591,8 @@ async function handleWebhook(request, env) {
         for (const p of chunk) resultsByProbeKey.set(p.key, { content: null, skipped: true });
         continue;
       }
-      subrequestBudget.used++;
       fires.push(
-        graphqlBatchFetchFiles(token, chunk)
+        graphqlBatchFetchFiles(token, chunk, countOptionalAttempt)
           .then(map => { for (const [k, v] of map) resultsByProbeKey.set(k, v); })
           .catch(err => { for (const p of chunk) resultsByProbeKey.set(p.key, { error: err }); })
       );
@@ -695,14 +728,20 @@ async function handleWebhook(request, env) {
   let fetchCommentsRetried = false;
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser, appId).catch(() => null);
+      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, countOptionalAttempt, isMaintainerUser, appId,
+        commentScanHasHeadroom).catch(() => null);
     }
     return fetchCommentsPromise;
   };
 
+  const commentScanHasHeadroom = () => subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used > 0;
+
   const getCommentsScanWithRetry = async () => {
     const result = await getCommentsScan();
-    if (result !== null || fetchCommentsRetried) {
+    // A scan that stopped because the budget ran out is not a transient
+    // failure: running it again would spend the very headroom it stopped to
+    // protect, and end the same way.
+    if (result !== null || fetchCommentsRetried || !commentScanHasHeadroom()) {
       return result;
     }
     fetchCommentsRetried = true;
@@ -866,7 +905,7 @@ async function handleWebhook(request, env) {
       } else if (match) {
         upstreamSha = match[1];
         const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${upstreamSha}`;
-        const upstreamRes = await trackedApiCall(upstreamUrl, token, 'GET', null, 'application/vnd.github.patch');
+        const upstreamRes = await optionalApiCall(upstreamUrl, token, 'GET', null, 'application/vnd.github.patch');
         if (upstreamRes.code === 200) {
           // The base repo just served this commit, so later file lookups at
           // this ref (upstream-diff filtering on backports) never need the
