@@ -2448,6 +2448,76 @@ index 123456..789012 100644
     assert.doesNotMatch(makefileCheck.output.text, /Backport matches upstream commit verbatim/);
   });
 
+  // --- PULL REQUEST EDIT (base branch retarget) ---
+  async function sendPullRequestEdit(changes) {
+    const requests = [];
+    fetchMock = async (url, options) => {
+      requests.push({ url, method: options?.method || 'GET' });
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+    const payload = JSON.stringify({
+      action: 'edited',
+      ...(changes ? { changes } : {}),
+      pull_request: {
+        user: { login: 'someuser', type: 'User' },
+        number: 123,
+        title: 'test pr',
+        base: { ref: 'openwrt-25.12' },
+        head: { ref: 'feature' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo', default_branch: 'main' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+    });
+    const response = await worker.fetch(request, {
+      WEBHOOK_SECRET: secret,
+      APP_ID: '12345',
+      PRIVATE_KEY: 'YW55Y29udGVudA=='
+    }, {});
+    return { response, requests };
+  }
+
+  test('pull_request: title-only edit is dropped before any API call', async () => {
+    try {
+      const { response, requests } = await sendPullRequestEdit({ title: { from: 'old title' } });
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(await response.text(), 'Pull request edit changed neither the base branch nor the description');
+      assert.strictEqual(requests.length, 0);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request: description edit is re-evaluated, it can carry an override', async () => {
+    try {
+      // [allow branch] and [allow cherry-pick] are read out of the pull
+      // request body, so adding one has to reach the checks.
+      const { requests } = await sendPullRequestEdit({ body: { from: 'old body' } });
+      assert.ok(requests.length > 0, 'a description change must reach the GitHub API, not be dropped');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request: retargeting to another base is re-evaluated', async () => {
+    try {
+      const { requests } = await sendPullRequestEdit({ base: { ref: { from: 'master' } } });
+      // The run is not carried through here (the mock answers everything with
+      // an empty body), only that the event was not dropped by the action
+      // filter: a base change has to reach the GitHub API.
+      assert.ok(requests.length > 0, 'a base change must reach the GitHub API, not be dropped');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   // --- ISSUES EVENT (issue labeller) ---
   async function sendIssuesWebhook(action, issue, { changes = null, labellerYml = null, formalities = '{"enable_issue_labeller": true}' } = {}) {
     const requests = [];

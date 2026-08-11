@@ -269,9 +269,21 @@ async function handleWebhook(request, env) {
       return new Response("Issue edit did not change the body", { status: 200 });
     }
   } else {
+    // "edited" matters here for two reasons. Retargeting to another branch
+    // changes the whole diff and the set of commits under review, so every
+    // previous verdict is stale. And the description carries the [allow
+    // branch] and [allow cherry-pick] overrides, so adding one is how a
+    // maintainer answers a failing check. GitHub reports both as an edit,
+    // not as a synchronize.
     const action = data.action || '';
-    if (!['opened', 'synchronize', 'reopened'].includes(action)) {
+    if (!['opened', 'synchronize', 'reopened', 'edited'].includes(action)) {
       return new Response("Ignored pull request action", { status: 200 });
+    }
+    // Edits that touch neither (a retitle is the common case) cannot change
+    // any verdict. Skipping here saves every API call, token minting
+    // included.
+    if (action === 'edited' && !data.changes?.base && !data.changes?.body) {
+      return new Response("Pull request edit changed neither the base branch nor the description", { status: 200 });
     }
   }
 
