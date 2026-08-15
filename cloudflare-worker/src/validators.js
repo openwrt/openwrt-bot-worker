@@ -1844,6 +1844,23 @@ function parseMakefileVar(content, varName) {
   return match ? match[1].replace(/["']/g, "").trim() : null;
 }
 
+// The transitive set of variable names a variable's value is built from:
+// PKG_VERSION:=$(GO_VERSION_MAJOR_MINOR).$(GO_VERSION_PATCH) contributes all
+// three names. Used to decide whether a diff that never assigns PKG_VERSION
+// itself still changed it through one of its helpers.
+export function collectResolutionVarNames(content, varName, out = new Set()) {
+  if (!content || out.has(varName)) return out;
+  out.add(varName);
+  const rawValue = parseMakefileVar(content, varName);
+  if (rawValue === null) return out;
+  const varRegex = /\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g;
+  let match;
+  while ((match = varRegex.exec(rawValue)) !== null) {
+    collectResolutionVarNames(content, (match[1] || match[2]).trim(), out);
+  }
+  return out;
+}
+
 export function resolveMakefileVar(content, varName, seen = new Set()) {
   if (!content || !varName) return null;
   if (seen.has(varName)) {
@@ -2177,8 +2194,31 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       baseSourceDate = resolveMakefileVar(baseContent, 'PKG_SOURCE_DATE');
       headSourceDate = resolveMakefileVar(headContent, 'PKG_SOURCE_DATE');
 
-      versionChanged = (baseVersion !== headVersion) || (baseSourceVer !== headSourceVer) || (baseSourceDate !== headSourceDate);
-      const releaseChanged = (baseRelease !== headRelease);
+      // The PR's own diff is the authority on what this pull request changed;
+      // the base/head contents only supply the values. GitHub freezes
+      // pull_request.base.sha at the moment the PR is opened, so on a branch
+      // created before an in-main version bump the two Makefiles differ in
+      // PKG_SOURCE_VERSION even though the PR never touched it - and the
+      // content comparison alone then reports main's own bump, backwards, as
+      // if this PR had made it and forgot to reset PKG_RELEASE. A variable
+      // counts as touched when the diff assigns it or any variable its value
+      // is resolved through (PKG_VERSION built from GO_VERSION_PATCH, ...).
+      const makefileDiff = fileChanges[makefilePath];
+      const diffTouches = (varName) => {
+        if (!makefileDiff) return false;
+        const names = collectResolutionVarNames(headContent, varName);
+        collectResolutionVarNames(baseContent, varName, names);
+        for (const line of [...makefileDiff.added, ...makefileDiff.deleted]) {
+          const assign = line.match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+          if (assign && names.has(assign[1])) return true;
+        }
+        return false;
+      };
+
+      versionChanged = ((baseVersion !== headVersion) && diffTouches('PKG_VERSION')) ||
+        ((baseSourceVer !== headSourceVer) && diffTouches('PKG_SOURCE_VERSION')) ||
+        ((baseSourceDate !== headSourceDate) && diffTouches('PKG_SOURCE_DATE'));
+      const releaseChanged = (baseRelease !== headRelease) && diffTouches('PKG_RELEASE');
       bumped = versionChanged || releaseChanged;
     }
 
