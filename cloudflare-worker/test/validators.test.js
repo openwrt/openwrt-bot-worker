@@ -3114,6 +3114,8 @@ diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.
 +# tweak init
 diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
 +++ b/package/utils/bash/Makefile
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
 `
     }];
     const headFetch = async (path) => {
@@ -3132,6 +3134,51 @@ diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assert.strictEqual(res.errors.length, 0);
     assert.ok(res.successes.some(s => s.includes('PKG_RELEASE bumped')));
+  });
+
+  // Regression: GitHub freezes pull_request.base.sha when the PR is opened.
+  // A branch created before an in-main source bump then shows a PKG_SOURCE_VERSION
+  // difference between base and head even though the PR never touched it, and
+  // the audit used to report main's own bump - backwards - as this PR's doing,
+  // demanding a PKG_RELEASE reset for a version change that does not exist.
+  test('does not report a version change the PR diff never made (stale base.sha)', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/network/services/uhttpd/Makefile b/package/network/services/uhttpd/Makefile
++++ b/package/network/services/uhttpd/Makefile
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
++  USERID:=uhttpd=456:uhttpd=456
+`
+    }];
+    // Head carries the older source (branched in June); base.sha resolves to a
+    // main that bumped the source in August. The PR itself only bumps RELEASE.
+    const headFetch = async () => 'PKG_NAME:=uhttpd\nPKG_SOURCE_DATE:=2026-06-16\nPKG_SOURCE_VERSION:=7b1bec45826bd78c8afc993435bdc0f1df2fe399\nPKG_RELEASE:=2\n';
+    const baseFetch = async () => 'PKG_NAME:=uhttpd\nPKG_SOURCE_DATE:=2026-08-03\nPKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22\nPKG_RELEASE:=1\n';
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.successes.some(s => s.includes('version updated')), `Successes: ${res.successes.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes("PKG_RELEASE bumped from '1' to '2'")), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('still reports a missing bump when only base.sha drifted and the PR bumped nothing', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/files/bash.init b/package/utils/bash/files/bash.init
++++ b/package/utils/bash/files/bash.init
++exec bash -l
+`
+    }];
+    // Content changed, nothing bumped by the PR - the phantom version delta
+    // from the drifted base must not silently satisfy the bump requirement.
+    const headFetch = async (path) => path === 'package/utils/bash/Makefile'
+      ? 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n' : null;
+    const baseFetch = async (path) => path === 'package/utils/bash/Makefile'
+      ? 'PKG_NAME:=bash\nPKG_VERSION:=5.3\nPKG_RELEASE:=1\n' : null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assert.ok(res.errors.some(e => e.includes('content changed without a PKG_RELEASE or version bump')), `Errors: ${res.errors.join(', ')}`);
   });
 
   test('fails when existing package files modified but PKG_RELEASE or version is not bumped', async () => {
@@ -3548,6 +3595,8 @@ diff --git a/package/iozone/files/iozone.init b/package/iozone/files/iozone.init
 +# modified config
 diff --git a/package/iozone/Makefile b/package/iozone/Makefile
 +++ b/package/iozone/Makefile
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
 `
     }];
     const headFetch = async (path) => {
@@ -3576,6 +3625,8 @@ diff --git a/luci/libs/luci-lib-uqr/patches/001-fix.patch b/luci/libs/luci-lib-u
 +# patch file contents
 diff --git a/luci/libs/luci-lib-uqr/Makefile b/luci/libs/luci-lib-uqr/Makefile
 +++ b/luci/libs/luci-lib-uqr/Makefile
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
 `
     }];
     const headFetch = async (path) => {
