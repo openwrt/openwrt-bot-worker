@@ -1314,6 +1314,40 @@ diff --git a/package/boot/uboot-ti-k3/Makefile b/package/boot/uboot-ti-k3/Makefi
     assert.ok(res.errors.some(e => e.includes("should contain an email address inside angle brackets '<>'")));
   });
 
+  test('does not demand conffiles for non-config payload under /etc', () => {
+    const commit = { commit: { message: 'uhttpd: run in ujail' } };
+    const patch = `
+diff --git a/package/network/services/uhttpd/Makefile b/package/network/services/uhttpd/Makefile
+--- a/package/network/services/uhttpd/Makefile
++++ b/package/network/services/uhttpd/Makefile
++	$(INSTALL_DIR) $(1)/etc/capabilities
++	$(INSTALL_DATA) ./files/uhttpd.capabilities $(1)/etc/capabilities/uhttpd.json
++	$(INSTALL_DIR) $(1)/usr/share/acl.d
++	$(INSTALL_DATA) ./files/uhttpd.acl $(1)/usr/share/acl.d/uhttpd.json
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(!res.errors.some(e => e.includes('conffiles')), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still demands conffiles for INSTALL_CONF and /etc/config destinations', () => {
+    const commit = { commit: { message: 'foo: install config' } };
+    for (const installLine of [
+      '+	$(INSTALL_CONF) ./files/foo.config $(1)/etc/foo',
+      '+	$(CP) ./files/foo.config $(1)/etc/config/foo'
+    ]) {
+      const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+${installLine}
+    `;
+      const state = { isNewPackage: false, isDroppedPackage: false };
+      const res = validateMakefileContext(commit, patch, CONFIG, state);
+      assert.ok(res.errors.some(e => e.includes("missing the required 'conffiles' section")), `Errors for '${installLine.trim()}': ${res.errors.join(', ')}`);
+    }
+  });
+
   test('accepts valid conffiles block with no indentation or space', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
@@ -4282,6 +4316,62 @@ diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/my
 // ─── UCI Config Validation ────────────────────────────────────────
 
 describe('validateUciConfigs', () => {
+  // Regression: files sharing a base name with the package's config file
+  // (uhttpd.acl vs uhttpd.config, both stem 'uhttpd') used to match the
+  // /etc/config/uhttpd conffiles entry and be rejected as invalid UCI, even
+  // though the Makefile installs them explicitly somewhere else entirely.
+  test('leaves alone a JSON sibling installed explicitly outside /etc/config', async () => {
+    const uhttpdMakefile = [
+      'define Package/uhttpd/conffiles',
+      '/etc/config/uhttpd',
+      '/etc/uhttpd.crt',
+      'endef',
+      '',
+      'define Package/uhttpd/install',
+      '\t$(INSTALL_CONF) ./files/uhttpd.config $(1)/etc/config/uhttpd',
+      '\t$(INSTALL_DATA) ./files/uhttpd.capabilities $(1)/etc/capabilities/uhttpd.json',
+      '\t$(INSTALL_DATA) ./files/uhttpd.acl $(1)/usr/share/acl.d/uhttpd.json',
+      'endef'
+    ].join('\n');
+    const patch = `
+diff --git a/package/network/services/uhttpd/files/uhttpd.acl b/package/network/services/uhttpd/files/uhttpd.acl
+--- /dev/null
++++ b/package/network/services/uhttpd/files/uhttpd.acl
++{
++	"user": "uhttpd"
++}
+`;
+    const fetchFn = async (path) => {
+      if (path === 'package/network/services/uhttpd/Makefile') return 'PKG_NAME:=uhttpd\n' + uhttpdMakefile;
+      if (path === 'package/network/services/uhttpd/files/uhttpd.acl') return '{\n\t"user": "uhttpd"\n}\n';
+      return null;
+    };
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still validates a file whose explicit install line points at /etc/config', async () => {
+    const makefile = [
+      'PKG_NAME:=mypkg',
+      'define Package/mypkg/install',
+      '\t$(INSTALL_CONF) ./files/mypkg.json $(1)/etc/config/mypkg',
+      'endef'
+    ].join('\n');
+    const patch = `
+diff --git a/package/utils/mypkg/files/mypkg.json b/package/utils/mypkg/files/mypkg.json
+--- /dev/null
++++ b/package/utils/mypkg/files/mypkg.json
++{ "not": "uci" }
+`;
+    const fetchFn = async (path) => {
+      if (path === 'package/utils/mypkg/Makefile') return makefile;
+      if (path === 'package/utils/mypkg/files/mypkg.json') return '{ "not": "uci" }\n';
+      return null;
+    };
+    const res = await validateUciConfigs(patch, CONFIG, fetchFn);
+    assert.ok(res.errors.some(e => e.includes('not a valid UCI configuration file')), `Errors: ${res.errors.join(', ')}`);
+  });
+
   test('accepts valid UCI configurations (sections, options, lists, comments, empty lines)', async () => {
     const patch = `
 diff --git a/package/utils/foo/files/foo.config b/package/utils/foo/files/foo.config
