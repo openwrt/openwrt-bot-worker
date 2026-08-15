@@ -1025,12 +1025,13 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           }
 
           if (line.startsWith('+')) {
-            // Check if the added line installs configuration files
+            // Only genuine configuration asks for a conffiles entry:
+            // INSTALL_CONF is the macro for installing it and /etc/config/ is
+            // the UCI home. A bare `$(1)/etc` used to qualify as well, which
+            // demanded conffiles for capability files, profile.d snippets and
+            // other /etc payload that is not user configuration at all.
             const isInstallLine = contentLine.includes('INSTALL_CONF') ||
-              (contentLine.includes('$(1)/etc') &&
-               !contentLine.includes('/etc/init.d') &&
-               !contentLine.includes('/etc/uci-defaults') &&
-               !contentLine.includes('/etc/hotplug.d'));
+              contentLine.includes('$(1)/etc/config');
             if (isInstallLine) {
               MakefileInstallsConfig = true;
             }
@@ -2370,6 +2371,19 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
     if (file.includes('/etc/config/')) {
       isDestinedForEtcConfig = true;
     } else if (makefileContent) {
+      // A Makefile line naming this exact file is authoritative about where
+      // it goes: `$(INSTALL_DATA) ./files/uhttpd.acl $(1)/usr/share/acl.d/...`
+      // settles uhttpd.acl, however many siblings share its base name
+      // (uhttpd.config, uhttpd.init, ...). Only when no line names the file
+      // itself may the base-name matching below speak — without this guard,
+      // every such sibling matched the /etc/config/uhttpd conffiles entry
+      // through the shared stem and was rejected as invalid UCI.
+      const namingLines = makefileContent.split('\n')
+        .filter(l => !l.trim().startsWith('#') && l.includes(filename));
+      if (namingLines.length > 0 && !namingLines.some(l => l.includes('etc/config'))) {
+        return empty;
+      }
+
       const nameWithoutExt = filename.includes('.') ? filename.substring(0, filename.lastIndexOf('.')) : filename;
       const lines = makefileContent.split('\n');
       let inConffiles = false;
