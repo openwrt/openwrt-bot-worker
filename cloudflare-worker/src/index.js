@@ -329,7 +329,12 @@ async function handleWebhook(request, env) {
         if (repoConfig && typeof repoConfig === 'object') {
           issueConfig = { ...DEFAULT_CONFIG, ...repoConfig };
         }
-      } catch (e) { /* malformed config file falls back to the defaults */ }
+      } catch (e) {
+        // Nothing is posted on an issue about this, so the log is the only
+        // place it can surface — and the fallback may well be what disables
+        // the labeller the repository meant to enable.
+        console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be parsed, falling back to the defaults: ${e.message}`);
+      }
     }
     if (!issueConfig.enable_issue_labeller) {
       return new Response("Issue labeller disabled for this repository", { status: 200 });
@@ -651,13 +656,25 @@ async function handleWebhook(request, env) {
   // A missing or malformed formalities.json falls back to the defaults, the
   // same way the REST 404 used to.
   let CONFIG = DEFAULT_CONFIG;
+  // A config the bot cannot read means every rule the repository tuned is
+  // silently back at its default — including checks it deliberately turned
+  // off. Falling back is still the right behaviour, but it has to be said out
+  // loud, both in the log and on the pull request.
+  let configParseError = null;
   if (setup.configText) {
     try {
       const repoConfig = JSON.parse(setup.configText);
       if (repoConfig && typeof repoConfig === 'object') {
         CONFIG = { ...DEFAULT_CONFIG, ...repoConfig };
+      } else {
+        configParseError = `it does not contain a JSON object (got ${repoConfig === null ? 'null' : typeof repoConfig})`;
       }
-    } catch (e) { /* malformed config file falls back to the defaults */ }
+    } catch (e) {
+      configParseError = e.message;
+    }
+    if (configParseError) {
+      console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be used, falling back to the defaults: ${configParseError}`);
+    }
   }
   // A run without the label listing still validates and reports; label
   // creation then works blindly (see ensureLabelExists).
@@ -713,6 +730,12 @@ async function handleWebhook(request, env) {
   let formalityOutputText = `### Checking PR #${prNumber}: ${prTitle} (Formalities Audit)\n\n`;
   let makefileOutputText = `### Checking PR #${prNumber}: ${prTitle} (Makefile Audit)\n\n`;
   let patchesOutputText = `### Checking PR #${prNumber}: ${prTitle} (Embedded Patches Compliance)\n\n`;
+
+  if (configParseError) {
+    const configWarning = `\`.github/formalities.json\` in this repository could not be read (${configParseError}), so every check ran with its default setting instead of the configured one. Fix the file on the default branch — this pull request is not the cause.`;
+    formalityOutputText += `⚠️ Warning: ${configWarning}\n\n`;
+    allPrWarnings.push(`**Repository Configuration**:\n- ⚠️ ${configWarning}`);
+  }
 
   if (pages > 3) {
     const cappedWarning = `Commit scan is capped at 300 commits for API safety. This PR has ${commitsCount} commits, so only the first 300 commit messages were audited.`;
