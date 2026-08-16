@@ -363,20 +363,23 @@ async function handleWebhook(request, env) {
   // files) can burn through that budget on file-content lookups alone,
   // starving the essential terminal writes (check-runs, PR comment) at the
   // end of this handler — which is a silent total failure, not a degraded
-  // one. `subrequestBudget` tracks logical GitHub API calls made so far;
-  // `reserve` keeps enough headroom for those terminal writes to always run.
-  // This under-counts slightly (it doesn't count retry attempts inside
-  // githubApiCall's own internal 3x retry loop), which is why `limit`
-  // defaults a few requests under the Free plan's actual ceiling.
+  // one. `subrequestBudget` counts every outgoing fetch — retries inside
+  // githubApiCall included, since Cloudflare counts those too — and `reserve`
+  // keeps enough headroom for those terminal writes to always run.
   const subrequestBudget = {
     limit: parseEnvInt(env.SUBREQUEST_BUDGET_LIMIT, 45),
     reserve: parseEnvInt(env.SUBREQUEST_RESERVE_HEADROOM, 15),
     used: 0
   };
-  const trackedApiCall = (...args) => {
-    subrequestBudget.used++;
-    return githubApiCall(...args);
-  };
+  // Counting happens per outgoing fetch rather than per call, so a request
+  // that githubApiCall retried twice costs the budget what it really cost
+  // Cloudflare. The options argument is the sixth one, so any caller-supplied
+  // options are merged rather than replaced.
+  const trackedApiCall = (url, token, method, payload, accept, options = {}) =>
+    githubApiCall(url, token, method, payload, accept, {
+      ...options,
+      onAttempt: () => { subrequestBudget.used++; }
+    });
 
   const isMaintainerUser = createMaintainerResolver(repoFullname, token, subrequestBudget);
 
@@ -552,9 +555,8 @@ async function handleWebhook(request, env) {
         for (const p of chunk) resultsByProbeKey.set(p.key, { content: null, skipped: true });
         continue;
       }
-      subrequestBudget.used++;
       fires.push(
-        graphqlBatchFetchFiles(token, chunk)
+        graphqlBatchFetchFiles(token, chunk, () => { subrequestBudget.used++; })
           .then(map => { for (const [k, v] of map) resultsByProbeKey.set(k, v); })
           .catch(err => { for (const p of chunk) resultsByProbeKey.set(p.key, { error: err }); })
       );
