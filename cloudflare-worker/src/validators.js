@@ -953,6 +953,12 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     let conffilesCheckErrors = 0;
 
     for (const { lines } of getMakefileChunks()) {
+      // A diff of an existing Makefile is a window, not the file: the conffiles
+      // block usually sits far from the install recipe and never shows up in
+      // the hunks, so its absence here proves nothing. Only a newly added
+      // Makefile arrives in full, which is where a missing block is real.
+      const isAddedMakefile = lines.some(line => /^---\s+\/dev\/null\r?$/.test(line));
+
       // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
       // since install blocks can appear after conffiles blocks in the diff)
       const installedDirs = new Set();
@@ -1086,7 +1092,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         }
       }
 
-      if (MakefileInstallsConfig && !MakefileHasConffiles) {
+      if (MakefileInstallsConfig && !MakefileHasConffiles && isAddedMakefile) {
         errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
       } else if (MakefileInstallsConfig && MakefileHasConffiles) {
         successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
