@@ -1330,22 +1330,38 @@ diff --git a/package/network/services/uhttpd/Makefile b/package/network/services
     assert.ok(!res.errors.some(e => e.includes('conffiles')), `Errors: ${res.errors.join(', ')}`);
   });
 
-  test('still demands conffiles for INSTALL_CONF and /etc/config destinations', () => {
-    const commit = { commit: { message: 'foo: install config' } };
+  test('still demands conffiles for INSTALL_CONF and /etc/config destinations in a new Makefile', () => {
+    const commit = { commit: { message: 'foo: add new package' } };
     for (const installLine of [
       '+	$(INSTALL_CONF) ./files/foo.config $(1)/etc/foo',
       '+	$(CP) ./files/foo.config $(1)/etc/config/foo'
     ]) {
       const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
---- a/package/utils/foo/Makefile
+new file mode 100644
+--- /dev/null
 +++ b/package/utils/foo/Makefile
 ${installLine}
     `;
-      const state = { isNewPackage: false, isDroppedPackage: false };
+      const state = { isNewPackage: true, isDroppedPackage: false };
       const res = validateMakefileContext(commit, patch, CONFIG, state);
       assert.ok(res.errors.some(e => e.includes("missing the required 'conffiles' section")), `Errors for '${installLine.trim()}': ${res.errors.join(', ')}`);
     }
+  });
+
+  test('does not demand conffiles when an existing Makefile only changes its install line', () => {
+    const commit = { commit: { message: 'foo: install the configuration with INSTALL_CONF' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -120,7 +120,7 @@ define Package/foo/install
+-	$(INSTALL_DATA) ./files/foo.conf $(1)/etc/foo.conf
++	$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(!res.errors.some(e => e.includes("missing the required 'conffiles' section")), `Errors: ${res.errors.join(', ')}`);
   });
 
   test('accepts valid conffiles block with no indentation or space', () => {
@@ -1666,14 +1682,15 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
---- a/package/utils/foo/Makefile
+new file mode 100644
+--- /dev/null
 +++ b/package/utils/foo/Makefile
 +define Package/foo/install
 +	$(INSTALL_DIR) $(1)/etc/config
 +	$(INSTALL_DATA) ./files/foo.config $(1)/etc/config/foo
 +endef
     `;
-    const state = { isNewPackage: false, isDroppedPackage: false };
+    const state = { isNewPackage: true, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
     assert.ok(res.errors.some(e => e.includes("Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section")));
   });
