@@ -4381,6 +4381,60 @@ diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/my
   });
 });
 
+// ─── Source URL Transport ────────────────────────────────────────
+
+describe('validateMakefileContext source URLs', () => {
+  const URL_CONFIG = { ...CONFIG, check_source_url_https: true };
+  const state = () => ({ isNewPackage: false, isDroppedPackage: false });
+  const patchWith = (url) => `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_SOURCE_URL:=${url}
+    `;
+  const commit = { commit: { message: 'mypkg: update source location' } };
+
+  test('warns about plain http downloads', () => {
+    const res = validateMakefileContext(commit, patchWith('http://example.com/releases'), URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'http://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('warns about the git protocol', () => {
+    const res = validateMakefileContext(commit, patchWith('git://github.com/example/repo.git'), URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'git://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('accepts https downloads', () => {
+    const res = validateMakefileContext(commit, patchWith('https://example.com/releases'), URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('HTTPS download locations')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('accepts mirror macros', () => {
+    const res = validateMakefileContext(commit, patchWith('@GNU/bash'), URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('checks mirrors appended with +=', () => {
+    const patch = `
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
++PKG_SOURCE_URL += http://mirror.example.com/releases
+    `;
+    const res = validateMakefileContext(commit, patch, URL_CONFIG, state());
+    assert.ok(res.warnings.some(w => w.includes("instead of 'http://'")), `Warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('ignores insecure URLs in trailing comments', () => {
+    const res = validateMakefileContext(commit, patchWith('https://example.com/releases # was http://example.com'), URL_CONFIG, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('does nothing when disabled', () => {
+    const res = validateMakefileContext(commit, patchWith('http://example.com/releases'), { ...CONFIG, check_source_url_https: false }, state());
+    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+});
+
 // ─── UCI Config Validation ────────────────────────────────────────
 
 describe('validateUciConfigs', () => {

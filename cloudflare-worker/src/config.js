@@ -30,6 +30,7 @@ export const DEFAULT_CONFIG = {
   check_openwrt_meta: true,
   check_spdx_license: true,
   check_init_scripts: true,
+  check_source_url_https: true,
   check_conffiles: true,
   check_uci_config: true,
   check_space_after_assignment: true,
