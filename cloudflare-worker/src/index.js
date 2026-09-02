@@ -2,7 +2,7 @@ import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlFetchRepoSetup, ensureLabelExists, fetchUserRepoPermission } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, collectPackageMakefiles, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
@@ -911,26 +911,21 @@ async function handleWebhook(request, env) {
     commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false)));
   }
 
-  // Pre-scan all commit patches to see if this PR introduces or drops any package Makefiles
-  if (!usePrWidePatch) {
-    for (const item of commitDetails) {
-      if (item.commitPatch) {
-        if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(item.commitPatch)) {
-          state.isNewPackage = true;
-        }
-        if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(item.commitPatch)) {
-          state.isDroppedPackage = true;
-        }
-      }
+  // Pre-scan all commit patches to see if this PR introduces or drops any
+  // package Makefiles. Only package Makefiles count: a new target, tool or
+  // toolchain Makefile is build infrastructure, not a package, and must not
+  // earn the PR an "add package" label (the same rule the Makefile checks
+  // apply, see isPackageMakefilePath).
+  const scannedPatches = usePrWidePatch
+    ? [prPatch]
+    : commitDetails.map(item => item.commitPatch);
+  for (const patch of scannedPatches) {
+    if (!patch) continue;
+    if (collectPackageMakefiles(patch, 'added').length > 0) {
+      state.isNewPackage = true;
     }
-  } else {
-    if (prPatch) {
-      if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(prPatch)) {
-        state.isNewPackage = true;
-      }
-      if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(prPatch)) {
-        state.isDroppedPackage = true;
-      }
+    if (collectPackageMakefiles(patch, 'removed').length > 0) {
+      state.isDroppedPackage = true;
     }
   }
 

@@ -749,7 +749,7 @@ export function isPackageMakefilePath(filePath) {
 // (`+++ /dev/null`), dropping the build-infrastructure paths rejected by
 // isPackageMakefilePath(). Everything else counts as a package Makefile, so
 // unlisted infrastructure trees are still reported as new/dropped packages.
-function collectPackageMakefiles(commitPatch, direction) {
+export function collectPackageMakefiles(commitPatch, direction) {
   const regex = direction === 'added'
     ? /^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(.*)\r?$/gm
     : /^---\s+a\/(.*)\r?\n\+\+\+\s+\/dev\/null\r?$/gm;
