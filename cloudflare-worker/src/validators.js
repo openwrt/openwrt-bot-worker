@@ -1702,7 +1702,29 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   return { errors, successes };
 }
 
-export function getChangedFilesFromPatch(patch) {
+// The two parsers below walk a whole patch line by line, and the validators
+// ask each of them more than once for the same commit patch: the UCI check,
+// the release audit and the hash audit all start from the same file lists.
+// Their results are remembered per patch text so the walk happens once. The
+// cache stays small and bounded - a Worker isolate serves many webhooks in a
+// row, and old pull requests must not pile up in memory. Every caller shares
+// one result, so it is frozen; freezing does not reach inside the two Sets it
+// holds, which callers must therefore treat as read-only.
+const PATCH_PARSE_CACHE_LIMIT = 32;
+function rememberPerPatch(parse) {
+  const cache = new Map();
+  return (patch) => {
+    if (!patch) return parse(patch);
+    const remembered = cache.get(patch);
+    if (remembered !== undefined) return remembered;
+    const result = parse(patch);
+    if (cache.size >= PATCH_PARSE_CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(patch, result);
+    return result;
+  };
+}
+
+export const getChangedFilesFromPatch = rememberPerPatch(function getChangedFilesFromPatch(patch) {
   if (!patch) return [];
   const files = [];
   const lines = patch.split('\n');
@@ -1711,10 +1733,10 @@ export function getChangedFilesFromPatch(patch) {
       files.push(line.slice(6).trim().replace(/\r$/, ''));
     }
   }
-  return files;
-}
+  return Object.freeze(files);
+});
 
-export function parseDiffFileStates(patch) {
+export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates(patch) {
   const addedFiles = new Set();
   const deletedFiles = new Set();
   if (!patch) return { addedFiles, deletedFiles };
@@ -1738,8 +1760,8 @@ export function parseDiffFileStates(patch) {
     }
   }
 
-  return { addedFiles, deletedFiles };
-}
+  return Object.freeze({ addedFiles, deletedFiles });
+});
 
 export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
