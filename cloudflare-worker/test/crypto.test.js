@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { verifySignature } from '../src/crypto.js';
+import { verifySignature, getInstallationToken } from '../src/crypto.js';
 
 describe('verifySignature', () => {
   const secret = 'super-secret-key';
@@ -71,5 +71,32 @@ describe('verifySignature', () => {
     const header = `sha256=${shortHex}`;
     const isValid = await verifySignature(payload, header, secret);
     assert.strictEqual(isValid, false);
+  });
+});
+
+describe('getInstallationToken', () => {
+  async function testPrivateKeyPEM() {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+      true, ['sign', 'verify']);
+    const exported = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
+    return `-----BEGIN PRIVATE KEY-----\n${b64}\n-----END PRIVATE KEY-----`;
+  }
+
+  test('reports every outgoing fetch of the token mint, retries included', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let fetches = 0;
+    globalThis.fetch = async () => {
+      fetches++;
+      if (fetches === 1) return new Response('{"message":"upstream hiccup"}', { status: 502 });
+      return new Response('{"token":"ghs_abc"}', { status: 201 });
+    };
+    let attempts = 0;
+    const token = await getInstallationToken(456, '12345', await testPrivateKeyPEM(), () => { attempts++; });
+    assert.strictEqual(token, 'ghs_abc');
+    assert.strictEqual(fetches, 2);
+    assert.strictEqual(attempts, 2);
   });
 });
