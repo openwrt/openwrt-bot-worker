@@ -5203,6 +5203,124 @@ new file mode 100644
     assert.strictEqual(status, 200);
   });
 
+  test('looks up the files of every commit in one batched request', async () => {
+    const shas = [SPLIT_SHA_1, SPLIT_SHA_2, SPLIT_SHA_3];
+    const commits = shas.map((sha, i) => splitCommit(sha, `mypkg: patch ${i}`));
+    // Each commit refreshes a different downstream patch file, so the header
+    // check has to read all three files - one lookup per commit.
+    const prPatch = shas.map((sha, i) => `From ${sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH ${i + 1}/3] mypkg: patch ${i}
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/00${i}-fix.patch | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-fix.patch
+--- a/utils/mypkg/patches/00${i}-fix.patch
++++ b/utils/mypkg/patches/00${i}-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+--
+2.45.0
+
+`).join('');
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: refresh patches',
+        body: 'Refresh',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: SPLIT_SHA_3 },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const batchCalls = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        const probes = groups.flatMap(g => g.probes.filter(p => p.path !== null));
+        if (probes.length > 0) batchCalls.push(probes.map(p => p.path));
+        return graphqlResponse(groups, () =>
+          'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix\n');
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commits), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123') && options?.headers?.Accept === 'application/vnd.github.patch') {
+        return new Response(prPatch, { status: 200 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+
+      assert.strictEqual(batchCalls.length, 1, `expected one batched lookup, got ${JSON.stringify(batchCalls)}`);
+      for (let i = 0; i < 3; i++) {
+        assert.ok(batchCalls[0].includes(`utils/mypkg/patches/00${i}-fix.patch`), `commit ${i}'s patch file is in the batch`);
+      }
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
   test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {

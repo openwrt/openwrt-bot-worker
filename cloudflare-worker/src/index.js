@@ -1008,8 +1008,29 @@ async function handleWebhook(request, env) {
     }
   }
 
+  // The two validators that look files up (patch headers, UCI configs) are
+  // started for every commit before the reporting loop consumes them. Started
+  // together, their lookups land in the same batch and go out as one request
+  // instead of one per commit; the loop below still reports the commits in
+  // order. A rejection is marked handled here and surfaces at the await.
+  const settled = (promise) => { promise.catch(() => {}); return promise; };
+  const deepChecks = commitDetails.map(item => {
+    if (usePrWidePatch || item.isVerbatim) return null;
+    // A commit with no patch of its own (a merge commit) still goes through
+    // the validators, which answer for an empty diff the way they always did.
+    const fetchFileContent = (path) => fetchFileContentCached(path, item.sha);
+    const fetchUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
+    const hasUpstream = isBackportPr && item.upstreamPatch;
+    return {
+      uci: settled(validateUciConfigs(item.commitPatch, CONFIG, fetchFileContent)),
+      upstreamUci: hasUpstream ? settled(validateUciConfigs(item.upstreamPatch, CONFIG, fetchUpstream)) : null,
+      patches: settled(validateEmbeddedPatches(item.commitPatch, CONFIG, fetchFileContent)),
+      upstreamPatches: hasUpstream ? settled(validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchUpstream)) : null
+    };
+  });
+
   // RUN CHECKS ON COMMITS
-  for (const item of commitDetails) {
+  for (const [commitIndex, item] of commitDetails.entries()) {
     const { sha, html_url, fullCommit, commitPatch } = item;
 
     const commitMsgLines = (fullCommit.commit.message || '').split("\n");
@@ -1075,8 +1096,6 @@ async function handleWebhook(request, env) {
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (path) => fetchFileContentCached(path, sha);
-
         const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname);
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
@@ -1086,10 +1105,9 @@ async function handleWebhook(request, env) {
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
         }
 
-        const reportUci = await validateUciConfigs(commitPatch, CONFIG, fetchFileContent);
-        if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
-          const reportUpstreamUci = await validateUciConfigs(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+        const reportUci = await deepChecks[commitIndex].uci;
+        if (deepChecks[commitIndex].upstreamUci) {
+          const reportUpstreamUci = await deepChecks[commitIndex].upstreamUci;
           reportUci.errors = reportUci.errors.filter(err => !reportUpstreamUci.errors.includes(err));
           reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
         }
@@ -1116,12 +1134,10 @@ async function handleWebhook(request, env) {
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (patchFile) => fetchFileContentCached(patchFile, sha);
-        const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
-        
-        if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = (patchFile) => fetchFileContentCached(patchFile, item.upstreamSha);
-          const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+        const reportPatches = await deepChecks[commitIndex].patches;
+
+        if (deepChecks[commitIndex].upstreamPatches) {
+          const reportUpstreamPatches = await deepChecks[commitIndex].upstreamPatches;
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
