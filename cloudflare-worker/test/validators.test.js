@@ -4951,3 +4951,34 @@ new file mode 100644
     assert.strictEqual(res.errors.length, 0);
   });
 });
+
+describe('validatePkgReleaseBumps lookups', () => {
+  test('asks for the head and base Makefile at the same time', async () => {
+    const patch = `diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile
+--- a/utils/mypkg/Makefile
++++ b/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+ PKG_NAME:=mypkg
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+ PKG_LICENSE:=MIT
+`;
+    const inFlight = new Set();
+    let overlapped = false;
+    const lookup = (kind, content) => async () => {
+      inFlight.add(kind);
+      if (inFlight.has('head') && inFlight.has('base')) overlapped = true;
+      await new Promise(resolve => setTimeout(resolve, 1));
+      inFlight.delete(kind);
+      return content;
+    };
+    const res = await validatePkgReleaseBumps(
+      [{ commitPatch: patch, fullCommit: { commit: { message: 'mypkg: bump release' } } }],
+      CONFIG,
+      lookup('head', 'PKG_NAME:=mypkg\nPKG_RELEASE:=2\nPKG_LICENSE:=MIT\n'),
+      lookup('base', 'PKG_NAME:=mypkg\nPKG_RELEASE:=1\nPKG_LICENSE:=MIT\n')
+    );
+    assert.ok(overlapped, 'the base lookup must not wait for the head lookup to finish');
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+});

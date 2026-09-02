@@ -2257,15 +2257,19 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let isReleaseExempt = false;
 
     if (modifiedFiles.has(makefilePath)) {
-      const headContent = await fetchFileContentAtHead(makefilePath);
+      const isNew = addedFiles.has(makefilePath);
+      // Ask for both versions at once: the loader behind these callbacks
+      // (fetchFileContentCached in index.js) batches lookups that are in
+      // flight together into one request instead of one round trip each.
+      const [headContent, baseContent] = await Promise.all([
+        fetchFileContentAtHead(makefilePath),
+        isNew ? Promise.resolve(null) : fetchFileContentAtBase(makefilePath)
+      ]);
       headMakefileContent = headContent;
       if (headContent === null) {
         // Package was deleted/dropped, skip checks
         return empty;
       }
-
-      const isNew = addedFiles.has(makefilePath);
-      const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
 
       headRelease = resolveMakefileVar(headContent, 'PKG_RELEASE');
       isReleaseExempt = isReleaseExemptMakefile(headContent, headRelease);

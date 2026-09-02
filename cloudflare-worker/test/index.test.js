@@ -3657,10 +3657,10 @@ index 123456..789012 100644
 
       assert.strictEqual(response.status, 200);
 
-      // Exactly one GraphQL call per unresolved ref (head sha + base sha),
-      // not one call per repo — proving base and fork are queried together
-      // instead of the old reactive fetch -> 404 -> retry-under-fork.
-      assert.strictEqual(graphqlCallCount, 2);
+      // The head and base Makefile lookups go out together in one GraphQL
+      // call, and within it base and fork are probed together for each
+      // unresolved ref - not one call per repo, and not one per ref.
+      assert.strictEqual(graphqlCallCount, 1);
       assert.strictEqual(Object.keys(callsByRef).length, 2);
       for (const calls of Object.values(callsByRef)) {
         assert.strictEqual(calls.length, 1, 'expected exactly one GraphQL call for this ref');
