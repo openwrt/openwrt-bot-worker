@@ -738,9 +738,17 @@ async function handleWebhook(request, env) {
 
   let fetchCommentsPromise = null;
   let fetchCommentsRetried = false;
+  // GitHub sends the pull request's comment count along with the event. With
+  // no comments there is nothing to scan - no earlier bot comment to update
+  // and no override command to honour - so a freshly opened pull request
+  // skips that request altogether.
+  const knownCommentCount = data.pull_request.comments;
+  const emptyCommentScan = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null };
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser, appId).catch(() => null);
+      fetchCommentsPromise = knownCommentCount === 0
+        ? Promise.resolve(emptyCommentScan)
+        : scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser, appId).catch(() => null);
     }
     return fetchCommentsPromise;
   };

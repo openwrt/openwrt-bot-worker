@@ -4758,6 +4758,108 @@ new file mode 100644
     assert.strictEqual(checkRunsPosted.length, 3);
   });
 
+  async function commentListingsFor(commentCount) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        comments: commentCount,
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const commentListings = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: true,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/issues/123/comments?')) {
+        commentListings.push(url);
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return commentListings;
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('does not list comments on a pull request GitHub reports as having none', async () => {
+    const listings = await commentListingsFor(0);
+    assert.deepStrictEqual(listings, []);
+  });
+
+  test('still lists comments when the pull request has some', async () => {
+    const listings = await commentListingsFor(2);
+    assert.strictEqual(listings.length, 1);
+  });
+
   test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
