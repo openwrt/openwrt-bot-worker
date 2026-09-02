@@ -4860,6 +4860,237 @@ new file mode 100644
     assert.strictEqual(listings.length, 1);
   });
 
+  async function runWithCheckRunAnswer(answer) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const checkRunPosts = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/check-runs') && options?.method === 'POST') {
+        checkRunPosts.push(JSON.parse(options.body).name);
+        return answer(checkRunPosts.length);
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      return { status: response.status, text: await response.text(), checkRunPosts };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('a refused check-run turns the webhook answer into an error naming it', async () => {
+    const { status, text, checkRunPosts } = await runWithCheckRunAnswer((n) =>
+      n === 2
+        ? new Response('{"message":"Resource not accessible by integration"}', { status: 403 })
+        : new Response('{}', { status: 201 }));
+    assert.strictEqual(status, 502);
+    assert.ok(text.includes('check-run "OpenWrt Makefiles" (HTTP 403)'), text);
+    assert.strictEqual(checkRunPosts.length, 3, 'the remaining check-runs are still posted');
+  });
+
+  test('check-runs are posted one after another, not as a burst', async () => {
+    let inFlight = 0;
+    let burst = false;
+    const { status } = await runWithCheckRunAnswer(async () => {
+      inFlight++;
+      if (inFlight > 1) burst = true;
+      await new Promise(resolve => setTimeout(resolve, 1));
+      inFlight--;
+      return new Response('{}', { status: 201 });
+    });
+    assert.strictEqual(status, 200);
+    assert.strictEqual(burst, false);
+  });
+
+  // Drives a pull request that passes every check while still carrying the
+  // guidelines label, so the run removes it, and lets the test decide how
+  // GitHub answers that removal.
+  async function runWithLabelRemovalAnswer(answer) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        labels: [{ name: 'not following guidelines' }],
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const removals = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, ['not following guidelines']); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3\n\nA proper description of the change.\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/issues/123/labels/') && method === 'DELETE') {
+        removals.push(decodeURIComponent(url.split('/labels/')[1]));
+        return answer();
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 201 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      return { status: response.status, text: await response.text(), removals };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('a refused label removal is reported, not swallowed', async () => {
+    const { status, text, removals } = await runWithLabelRemovalAnswer(() =>
+      new Response('{"message":"Server Error"}', { status: 500 }));
+    // A 500 is retried, so the removal is attempted more than once.
+    assert.deepStrictEqual([...new Set(removals)], ['not following guidelines']);
+    assert.strictEqual(status, 502, text);
+    assert.ok(text.includes('label removal "not following guidelines"'), text);
+  });
+
+  test('a label that is already gone is not a failed write', async () => {
+    const { status, removals } = await runWithLabelRemovalAnswer(() =>
+      new Response('{"message":"Label does not exist"}', { status: 404 }));
+    assert.deepStrictEqual(removals, ['not following guidelines']);
+    assert.strictEqual(status, 200);
+  });
+
   test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
