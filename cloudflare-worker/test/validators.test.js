@@ -2982,6 +2982,83 @@ new file mode 100644
     assert.ok(res.successes.length > 0);
   });
 
+  test('pairs each diff chunk with the patch file its own header names', async () => {
+    // The first patch file patches the second one, so its diff body contains
+    // the second file's path. Pairing chunks with files by "does this chunk
+    // mention that path" therefore checks the second file twice - once
+    // against its own chunk and once against the first file's - which both
+    // wastes a lookup and reports the finding twice.
+    const patch = `diff --git a/utils/mypkg/patches/001-a.patch b/utils/mypkg/patches/001-a.patch
+--- a/utils/mypkg/patches/001-a.patch
++++ b/utils/mypkg/patches/001-a.patch
+@@ -1,4 +1,5 @@
+ some context
+++--- a/utils/mypkg/patches/002-b.patch
++++++ b/utils/mypkg/patches/002-b.patch
+ more context
+diff --git a/utils/mypkg/patches/002-b.patch b/utils/mypkg/patches/002-b.patch
+--- a/utils/mypkg/patches/002-b.patch
++++ b/utils/mypkg/patches/002-b.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+`;
+    const fetched = [];
+    const fetchFileContent = async (file) => {
+      fetched.push(file);
+      // Neither file carries the mbox envelope, so each one is one finding.
+      return 'From: John Doe <john@doe.com>\nSubject: [PATCH] Fix\n';
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
+
+    assert.deepStrictEqual(fetched.sort(), [
+      'utils/mypkg/patches/001-a.patch',
+      'utils/mypkg/patches/002-b.patch'
+    ], 'one lookup per changed patch file');
+    assert.strictEqual(res.errors.length, 2, `one finding per file: ${JSON.stringify(res.errors)}`);
+  });
+
+  test('does not read a leftover like 001-fix.patch.bak as a patch file', async () => {
+    const patch = `diff --git a/utils/mypkg/patches/001-fix.patch.bak b/utils/mypkg/patches/001-fix.patch.bak
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/001-fix.patch.bak
+@@ -0,0 +1,2 @@
++a backup file with no Git headers
++that nobody applies
+`;
+    const fetched = [];
+    const res = await validateEmbeddedPatches(patch, CONFIG, async (file) => { fetched.push(file); return null; });
+    assert.deepStrictEqual(fetched, [], 'nothing to look up');
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(m => m.includes('No downstream raw embedded patch files')),
+      `Unexpected successes: ${res.successes.join(', ')}`);
+  });
+
+  test('checks every patch file of a large refresh exactly once', async () => {
+    const count = 300;
+    const patch = Array.from({ length: count }, (_, i) => {
+      const file = `target/linux/generic/pending-6.12/${String(i).padStart(3, '0')}-fix.patch`;
+      return `diff --git a/${file} b/${file}
+new file mode 100644
+--- /dev/null
++++ b/${file}
++From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
++From: John Doe <john@doe.com>
++Date: Tue, 7 Jul 2026 20:09:55 +0300
++Subject: [PATCH] Fix ${i}
+`;
+    }).join('');
+    const fetched = [];
+    const fetchFileContent = async (file) => {
+      fetched.push(file);
+      return 'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix\n';
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.strictEqual(new Set(fetched).size, fetched.length, 'no patch file looked up twice');
+  });
+
   test('rejects patches missing From hash or Date headers (user example)', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch

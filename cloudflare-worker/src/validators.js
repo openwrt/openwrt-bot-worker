@@ -1614,8 +1614,16 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     return { errors: [], successes: ["✅ No diff footprint present for patches validation"] };
   }
 
-  const patchMatch = commitPatch.match(/^\+\+\+\s+b\/(.*\.patch)/mg);
-  const patchFiles = patchMatch ? patchMatch.map(line => line.replace(/^\+\+\+\s+b\//, '')) : [];
+  // Anchored at the end of the line: without that, the greedy match reads
+  // "foo.patch.bak" - a leftover a contributor did not mean to commit - as a
+  // patch file named "foo.patch", and the checks then run against a file that
+  // was never touched.
+  const patchFiles = [];
+  const patchHeader = /^\+\+\+\s+b\/(.*\.patch)\r?$/mg;
+  let patchHeaderMatch;
+  while ((patchHeaderMatch = patchHeader.exec(commitPatch)) !== null) {
+    patchFiles.push(patchHeaderMatch[1]);
+  }
 
   if (patchFiles.length === 0) {
     return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
@@ -1627,13 +1635,18 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   // instead of one-at-a-time, so a batching loader upstream (see
   // fetchFileContentCached in index.js) can combine them into a single
   // GraphQL request instead of one HTTP call per patch file.
+  //
+  // Each chunk is paired with the patch file its own `+++ b/` header names.
+  // Testing every chunk against every patch file instead is quadratic in the
+  // number of files: a kernel bump that refreshes 800 patches would spend
+  // ~180 ms of CPU here alone, far past what a Worker invocation gets.
+  const wantedPatchFiles = new Set(patchFiles);
   const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
   const matches = [];
   for (const chunk of fileChunks) {
-    for (const patchFile of patchFiles) {
-      if (chunk.includes('b/' + patchFile)) {
-        matches.push({ chunk, patchFile });
-      }
+    const header = chunk.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
+    if (header && wantedPatchFiles.has(header[1])) {
+      matches.push({ chunk, patchFile: header[1] });
     }
   }
 
