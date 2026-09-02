@@ -176,6 +176,51 @@ function getDiffFromPatch(patchText) {
   return idx === -1 ? '' : patchText.slice(idx);
 }
 
+// A pull request's .patch is the mbox-style concatenation of its commits'
+// patches in commit order, each opening with git's
+// "From <sha> Mon Sep 17 00:00:00 2001" envelope line. Split it back into one
+// patch per commit, keyed by SHA, so one request stands in for one fetch per
+// commit. The diff bodies are byte-identical to what /commits/<sha> serves;
+// only the mail header lines differ (e.g. "[PATCH 2/3]" subjects), and
+// nothing downstream reads those from the patch text.
+//
+// A commit message may itself contain such a line - quoting the upstream mail
+// a change was taken from is common, and git passes the body through verbatim
+// (openwrt/openwrt commit bcd8d530 is one). Splitting on every envelope-shaped
+// line would cut that commit's patch in two and file its diff under the quoted
+// SHA, leaving the real commit with headers and no diff, which every check
+// then reports as clean. So only an envelope naming one of this pull request's
+// own commits counts, taken in the order the commits list gives them: a quoted
+// header names some other commit, and one naming a commit already passed is
+// behind the position the scan has reached.
+function splitPrPatchByCommit(prPatch, commitShas) {
+  const byCommit = new Map();
+  if (!prPatch || !commitShas || commitShas.length === 0) return byCommit;
+
+  let pending = commitShas;
+  const starts = [];
+  const envelope = /^From ([0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$/gm;
+  let match;
+  while ((match = envelope.exec(prPatch)) !== null) {
+    const position = pending.indexOf(match[1]);
+    if (position === -1) continue;
+    pending = pending.slice(position + 1);
+    starts.push({ sha: match[1], index: match.index });
+  }
+
+  for (let i = 0; i < starts.length; i++) {
+    const end = i + 1 < starts.length ? starts[i + 1].index : prPatch.length;
+    const part = prPatch.slice(starts[i].index, end);
+    // Anything without a diff is not something the checks can be run against.
+    // Leaving it out sends the commit down its own fetch, which is what the
+    // handler did before, rather than passing an empty diff off as inspected.
+    if (part.includes('\ndiff --git ')) {
+      byCommit.set(starts[i].sha, part);
+    }
+  }
+  return byCommit;
+}
+
 function normalizeDiff(diffText) {
   return (diffText || '')
     .replace(/\r\n/g, '\n')
@@ -798,6 +843,30 @@ async function handleWebhook(request, env) {
     prPatch = await fetchPrWidePatch();
   }
 
+  // One request for the whole pull request's patch replaces one request per
+  // commit: the PR patch is the concatenation of the per-commit patches (see
+  // splitPrPatchByCommit). Commits the split does not cover - merge commits,
+  // which format-patch leaves out, or a branch force-pushed while this run
+  // was in flight - still fall back to their own per-commit fetch below.
+  let splitCommitPatches = new Map();
+  let prWidePatchText = null;
+  // With a single commit the two are the same request, and asking for the
+  // commit directly cannot be refused for being too large.
+  if (!usePrWidePatch && commits.length > 1) {
+    const prPatchRes = await trackedApiCall(data.pull_request.url, token, 'GET', null, 'application/vnd.github.patch');
+    if (prPatchRes.code === 200 && typeof prPatchRes.raw === 'string') {
+      prWidePatchText = prPatchRes.raw;
+      splitCommitPatches = splitPrPatchByCommit(prWidePatchText, commits.map(c => c.sha));
+      // The base repo just served these commits, so file lookups at their
+      // SHAs never need the fork fallback (as after a per-commit fetch).
+      for (const sha of splitCommitPatches.keys()) {
+        if (!refSource.has(sha)) refSource.set(sha, 'base');
+      }
+    } else {
+      console.warn(`PR-wide patch unavailable (HTTP ${prPatchRes.code}), fetching commit patches one by one.`);
+    }
+  }
+
   const mapCommitData = async (commitData, fetchPatch) => {
     const commitItemType = (commitData === null)
       ? 'null'
@@ -816,7 +885,9 @@ async function handleWebhook(request, env) {
     }
 
     let commitPatch = null;
-    if (fetchPatch) {
+    if (fetchPatch && splitCommitPatches.has(sha)) {
+      commitPatch = splitCommitPatches.get(sha);
+    } else if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
       let patchRes = await trackedApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
       if (patchRes.code === 200 && !refSource.has(sha)) {
@@ -903,7 +974,7 @@ async function handleWebhook(request, env) {
     } catch (e) {
       console.warn(`Failed to fetch individual commit patches, falling back to PR-wide patch: ${e.message}`);
       usePrWidePatch = true;
-      prPatch = await fetchPrWidePatch();
+      prPatch = prWidePatchText !== null ? prWidePatchText : await fetchPrWidePatch();
     }
   }
 

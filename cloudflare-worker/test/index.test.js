@@ -4458,6 +4458,306 @@ index 123456..789012 100644
     assert.ok(!labels.includes('add package'), `labels posted: ${JSON.stringify(labels)}`);
   });
 
+  const SPLIT_SHA_1 = '1111111111111111111111111111111111111111';
+  const SPLIT_SHA_2 = '2222222222222222222222222222222222222222';
+  const SPLIT_SHA_3 = '3333333333333333333333333333333333333333';
+
+  function envelopePatch(sha, index, total, subject, file) {
+    return `From ${sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH ${index}/${total}] ${subject}
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ ${file} | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/${file} b/${file}
+--- a/${file}
++++ b/${file}
+@@ -1,3 +1,4 @@
+ PKG_NAME:=mypkg
++PKG_RELEASE:=2
+ PKG_LICENSE:=MIT
+--
+2.45.0
+
+`;
+  }
+
+  // Drives one pull_request webhook through the worker and reports which
+  // patch requests it made and what it posted as check-runs.
+  async function runPatchScenario({ commits, prPatchResponse, perCommitPatches = {} }) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: bump release',
+        body: 'Bump release',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: commits[commits.length - 1].sha },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const prPatchFetches = [];
+    const perCommitFetches = [];
+    const checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commits), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123') && options?.headers?.Accept === 'application/vnd.github.patch') {
+        prPatchFetches.push(url);
+        return prPatchResponse();
+      }
+      const commitMatch = url.match(/\/repos\/test\/repo\/commits\/([0-9a-f]{40})$/);
+      if (commitMatch) {
+        perCommitFetches.push(commitMatch[1]);
+        const body = perCommitPatches[commitMatch[1]];
+        if (body === undefined) {
+          throw new Error(`Unexpected per-commit patch fetch: ${url}`);
+        }
+        return new Response(body, { status: 200 });
+      }
+      if (url.includes('/check-runs') && method === 'POST') {
+        checkRunsPosted.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return { prPatchFetches, perCommitFetches, checkRunsPosted };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  function splitCommit(sha, subject, parents = 1) {
+    return {
+      sha,
+      html_url: `https://github.com/test/repo/commit/${sha}`,
+      parents: Array.from({ length: parents }, (_, i) => ({ sha: `parent${i}` })),
+      commit: {
+        message: `${subject}\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+  }
+
+  test('fetches the pull request patch once and splits it per commit', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+      envelopePatch(SPLIT_SHA_2, 2, 2, 'mypkg: second', 'utils/mypkg/Makefile');
+
+    const { prPatchFetches, perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1, 'exactly one PR-wide patch request');
+    assert.deepStrictEqual(perCommitFetches, [], 'no per-commit patch requests');
+    const makefileRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.ok(makefileRun, 'Makefile check-run posted');
+    assert.ok(makefileRun.output.text.includes(`[${SPLIT_SHA_1.slice(0, 7)}]`), 'first commit audited on its own');
+    assert.ok(makefileRun.output.text.includes(`[${SPLIT_SHA_2.slice(0, 7)}]`), 'second commit audited on its own');
+  });
+
+  test('fetches only the commits the pull request patch does not carry', async () => {
+    // format-patch leaves merge commits out of the PR patch, so the merge
+    // commit in the middle still needs its own request - and only that one.
+    const commits = [
+      splitCommit(SPLIT_SHA_1, 'mypkg: first'),
+      splitCommit(SPLIT_SHA_2, "Merge branch 'main' into feature", 2),
+      splitCommit(SPLIT_SHA_3, 'mypkg: third')
+    ];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+      envelopePatch(SPLIT_SHA_3, 2, 2, 'mypkg: third', 'utils/mypkg/Makefile');
+
+    const { prPatchFetches, perCommitFetches } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 }),
+      perCommitPatches: { [SPLIT_SHA_2]: '' }
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(perCommitFetches, [SPLIT_SHA_2], 'only the merge commit is fetched on its own');
+  });
+
+  test('is not fooled by a commit message quoting an upstream mail header', async () => {
+    // openwrt/openwrt commit bcd8d530 is a real example: the message quotes the
+    // upstream submission, mail envelope and all, and git writes that body out
+    // verbatim. Splitting on it would leave the commit with headers and no
+    // diff, which every check reports as clean.
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: import upstream fix')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: import upstream fix
+
+Taken from the upstream submission:
+
+From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
+From: Upstream Author <up@stream.tld>
+Date: Fri, 27 Apr 2012 14:17:52 -0400
+Subject: [PATCH] the upstream change
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/001-fix.patch | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/001-fix.patch
+@@ -0,0 +1,3 @@
++--- a/src/main.c
+++++ b/src/main.c
++ a change with no Git headers above it
+--
+2.45.0
+
+`;
+
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.deepStrictEqual(perCommitFetches, [], 'the quoted header is not a commit of this pull request');
+    const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.ok(patchesRun.output.text.includes('Missing required Git header'),
+      `the second commit's diff must actually be inspected: ${patchesRun.output.text}`);
+  });
+
+  test('does not re-split on a quoted header naming an earlier commit of the same pull request', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: fix the first')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: fix the first
+
+Fixes the commit quoted below:
+
+From ${SPLIT_SHA_1} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Subject: [PATCH 1/2] mypkg: first
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/002-fix.patch | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/utils/mypkg/patches/002-fix.patch b/utils/mypkg/patches/002-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/002-fix.patch
+@@ -0,0 +1,3 @@
++--- a/src/main.c
+++++ b/src/main.c
++ another change with no Git headers
+--
+2.45.0
+
+`;
+
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.deepStrictEqual(perCommitFetches, []);
+    const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.ok(patchesRun.output.text.includes('Missing required Git header'), patchesRun.output.text);
+
+    // The finding has to sit under the commit that actually carries the patch
+    // file. Splitting on the quoted header would hand the first commit the
+    // second one's diff and leave the second with nothing.
+    const sectionFor = (sha) => {
+      const sections = patchesRun.output.text.split('#### Commit [');
+      const section = sections.find(part => part.startsWith(sha.slice(0, 7)));
+      assert.ok(section, `no section for commit ${sha.slice(0, 7)} in ${patchesRun.output.text}`);
+      return section;
+    };
+    assert.ok(sectionFor(SPLIT_SHA_2).includes('Missing required Git header'), 'reported under the second commit');
+    assert.ok(!sectionFor(SPLIT_SHA_1).includes('Missing required Git header'), 'not under the first commit');
+  });
+
+  test('falls back to per-commit patches when the pull request patch is unavailable', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+
+    const { prPatchFetches, perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response('Sorry, the diff exceeded the maximum number of lines', { status: 406 }),
+      perCommitPatches: {
+        [SPLIT_SHA_1]: envelopePatch(SPLIT_SHA_1, 1, 1, 'mypkg: first', 'utils/mypkg/Makefile'),
+        [SPLIT_SHA_2]: envelopePatch(SPLIT_SHA_2, 1, 1, 'mypkg: second', 'utils/mypkg/Makefile')
+      }
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(perCommitFetches.sort(), [SPLIT_SHA_1, SPLIT_SHA_2]);
+    assert.strictEqual(checkRunsPosted.length, 3);
+  });
+
   test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
