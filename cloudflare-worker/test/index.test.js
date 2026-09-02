@@ -129,6 +129,69 @@ function graphqlLabelsHandler(url, options, labelNames = []) {
 }
 
 
+// --- STALE SCAN GRAPHQL MOCKING HELPERS ---
+// The daily scan asks GitHub two GraphQL questions per repository: the repo
+// setup (its formalities.json and whether the `stale` label exists) and the
+// open pull requests carrying either label, each with the recent slice of its
+// timeline attached. These helpers answer both from plain fixtures, so a test
+// declares what GitHub holds instead of the wire format.
+function staleTimelineNodes(entries) {
+  return (entries || []).map(e => {
+    switch (e.kind) {
+      case 'labeled':
+        return { __typename: 'LabeledEvent', createdAt: e.at, label: { name: e.label } };
+      case 'commented':
+        return { __typename: 'IssueComment', createdAt: e.at, author: { login: e.login, __typename: e.type || 'User' } };
+      case 'reviewed':
+        return { __typename: 'PullRequestReview', submittedAt: e.at, author: { login: e.login, __typename: e.type || 'User' } };
+      case 'committed':
+        return { __typename: 'PullRequestCommit', commit: { committedDate: e.at, authoredDate: e.at } };
+      case 'force_pushed':
+        return { __typename: 'HeadRefForcePushedEvent', createdAt: e.at, actor: { login: e.login, __typename: e.type || 'User' } };
+      case 'reopened':
+        return { __typename: 'ReopenedEvent', createdAt: e.at, actor: { login: e.login, __typename: e.type || 'User' } };
+      default:
+        throw new Error(`unknown timeline entry kind: ${e.kind}`);
+    }
+  });
+}
+
+function staleGraphqlHandler(url, options, { config = null, staleLabelExists = true, prs = [] } = {}) {
+  if (!url.includes('/graphql') || !options?.body) return null;
+  const body = JSON.parse(options.body);
+  if (body.query.includes('staleLabel: label(')) {
+    return new Response(JSON.stringify({
+      data: {
+        repository: {
+          cfg: config === null ? null : { text: JSON.stringify(config) },
+          staleLabel: staleLabelExists ? { name: 'stale' } : null
+        }
+      }
+    }), { status: 200 });
+  }
+  if (body.query.includes('pullRequests(states: OPEN')) {
+    return new Response(JSON.stringify({
+      data: {
+        repository: {
+          pullRequests: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: prs.map(pr => ({
+              number: pr.number,
+              updatedAt: pr.updatedAt,
+              labels: { nodes: (pr.labels || []).map(name => ({ name })) },
+              timelineItems: {
+                totalCount: pr.timelineTotalCount ?? (pr.timeline || []).length,
+                nodes: staleTimelineNodes(pr.timeline)
+              }
+            }))
+          }
+        }
+      }
+    }), { status: 200 });
+  }
+  return null;
+}
+
 async function generateTestPrivateKeyPEM() {
   const keyPair = await crypto.subtle.generateKey(
     {
@@ -712,8 +775,12 @@ index 123456..789012 100644
 
   test('does not scan repository if enable_stale_bot is not true in formalities.json', async () => {
     const urls = [];
+    const graphqlQueries = [];
     fetchMock = async (url, options) => {
       urls.push(url);
+      if (url.includes('/graphql') && options?.body) {
+        graphqlQueries.push(JSON.parse(options.body).query);
+      }
       if (url.includes('/access_tokens')) {
         return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
       }
@@ -723,10 +790,8 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        // formalities.json exists but enable_stale_bot is unset / false
-        return new Response(JSON.stringify({ enable_stale_bot: false }), { status: 200 });
-      }
+      // formalities.json exists but enable_stale_bot is unset / false
+      { const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: false } }); if (sr) return sr; }
       return new Response(JSON.stringify({}), { status: 200 });
     };
 
@@ -744,8 +809,11 @@ index 123456..789012 100644
       // Invoke handleScheduled directly to await execution
       await handleScheduled(env);
 
-      // Should have checked config but skipped label list and issues query
-      assert.ok(urls.some(u => u.includes('/contents/.github/formalities.json')));
+      // Should have asked for the repository setup, then stopped: no pull
+      // request listing, and no separate label or issue requests at all.
+      assert.strictEqual(graphqlQueries.length, 1);
+      assert.ok(graphqlQueries[0].includes('staleLabel: label('));
+      assert.ok(!graphqlQueries.some(q => q.includes('pullRequests(states: OPEN')));
       assert.ok(!urls.some(u => u.includes('/labels')));
       assert.ok(!urls.some(u => u.includes('/issues')));
     } finally {
@@ -827,23 +895,15 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/events')) {
-        // Query returns 1 open guidelines-violating PR (number 55) which is older than 14 days and doesn't have the stale label
+      {
+        // One open guidelines-violating PR (number 55), older than 14 days and
+        // without the stale label.
         const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
-            number: 55,
-            updated_at: daysAgo15,
-            labels: [{ name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{ number: 55, updatedAt: daysAgo15, labels: ['not following guidelines'] }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -888,33 +948,24 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues/66/timeline')) {
-        // Stale label was added 1 hour ago, then a person commented 1 minute ago
+      {
+        // PR 66 carries both labels. The stale label was added 1 hour ago and
+        // a person commented 1 minute ago.
         const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
         const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          { event: 'labeled', label: { name: 'stale' }, created_at: hourAgo },
-          { event: 'commented', actor: { login: 'contributor', type: 'User' }, created_at: minuteAgo }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/timeline')) {
-        // PR number 66 has both 'stale' and 'not following guidelines' labels
-        // and was updated 1 minute ago (recent activity)
-        const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
             number: 66,
-            updated_at: minuteAgo,
-            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+            updatedAt: minuteAgo,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [
+              { kind: 'labeled', label: 'stale', at: hourAgo },
+              { kind: 'commented', login: 'contributor', at: minuteAgo }
+            ]
+          }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -954,32 +1005,24 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues/99/timeline')) {
+      {
         // Stale label added 2 days ago; an AI review followed 1 day ago.
         // Before, that review reset the countdown and the cycle restarted.
         const daysAgo2 = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
         const daysAgo1 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          { event: 'labeled', label: { name: 'stale' }, created_at: daysAgo2 },
-          { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: daysAgo1 }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/timeline')) {
-        const daysAgo1 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
             number: 99,
-            updated_at: daysAgo1,
-            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+            updatedAt: daysAgo1,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [
+              { kind: 'labeled', label: 'stale', at: daysAgo2 },
+              { kind: 'reviewed', login: 'openwrt-ai', at: daysAgo1 }
+            ]
+          }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -1014,36 +1057,27 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues/77/timeline')) {
-        // Stale label was added 15 days ago; the only activity since came
-        // from bots (an app comment and an AI review on a User account),
-        // which must not stop the closing.
+      {
+        // Stale label was added 15 days ago; the only activity since came from
+        // bots (an app comment and an AI review on a User account), which must
+        // not stop the closing. updated_at stays fresh-ish because of them,
+        // and that must not matter either.
         const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
         const daysAgo14 = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          { event: 'labeled', label: { name: 'stale' }, created_at: daysAgo15 },
-          { event: 'commented', actor: { login: 'openwrt[bot]', type: 'Bot' }, created_at: daysAgo15 },
-          { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: daysAgo14 }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/timeline')) {
-        // PR 77 has stale and guidelines labels and was updated 14 days ago
-        // (the AI review keeps updated_at fresh-ish, but that must not matter)
-        const daysAgo14 = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
             number: 77,
-            updated_at: daysAgo14,
-            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+            updatedAt: daysAgo14,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [
+              { kind: 'labeled', label: 'stale', at: daysAgo15 },
+              { kind: 'commented', login: 'openwrt[bot]', type: 'Bot', at: daysAgo15 },
+              { kind: 'reviewed', login: 'openwrt-ai', at: daysAgo14 }
+            ]
+          }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -1074,6 +1108,93 @@ index 123456..789012 100644
     }
   });
 
+  test('scans a repository with two requests, whatever the number of stale PRs', async () => {
+    const graphqlQueries = [];
+    const restReads = [];
+    const daysAgo20 = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+    const prs = [11, 22, 33, 44].map(number => ({
+      number,
+      updatedAt: daysAgo20,
+      labels: ['stale', 'not following guidelines'],
+      timeline: [{ kind: 'labeled', label: 'stale', at: daysAgo20 }]
+    }));
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/graphql')) {
+        graphqlQueries.push(JSON.parse(options.body).query);
+      } else if (method === 'GET' && !url.includes('/access_tokens')) {
+        restReads.push(url);
+      }
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      { const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: true }, prs }); if (sr) return sr; }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM });
+
+      // Setup and pull request listing - and nothing per pull request: the
+      // timelines that used to cost one request each travel with the listing.
+      assert.strictEqual(graphqlQueries.length, 2);
+      assert.deepStrictEqual(restReads.filter(u => u.includes('/repos/')), []);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('leaves a stale PR alone when its timeline is longer than the fetched window', async () => {
+    const apiCalls = [];
+    const daysAgo30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET' });
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      {
+        // The stale labelling happened before the window that was fetched, so
+        // when it was applied is unknown - and an unknown date must not be
+        // read as "long ago".
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
+            number: 123,
+            updatedAt: daysAgo30,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [{ kind: 'commented', login: 'someone', at: daysAgo30 }],
+            timelineTotalCount: 250
+          }]
+        });
+        if (sr) return sr;
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM });
+
+      assert.ok(!apiCalls.some(c => c.url.includes('/pulls/123') && c.method === 'PATCH'), 'must not close');
+      assert.ok(!apiCalls.some(c => c.url.includes('/issues/123/labels/stale') && c.method === 'DELETE'), 'must not unlabel');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   test('removes stale label immediately if guidelines label was removed (resolved)', async () => {
     const apiCalls = [];
     fetchMock = async (url, options) => {
@@ -1088,22 +1209,13 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/events')) {
+      {
         // PR 88 has only the stale label (the guidelines label is missing/resolved)
-        return new Response(JSON.stringify([
-          {
-            number: 88,
-            updated_at: new Date().toISOString(),
-            labels: [{ name: 'stale' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{ number: 88, updatedAt: new Date().toISOString(), labels: ['stale'] }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };

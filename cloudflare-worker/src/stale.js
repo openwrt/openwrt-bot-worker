@@ -1,4 +1,4 @@
-import { githubApiCall } from './github.js';
+import { githubApiCall, GRAPHQL_URL } from './github.js';
 import { generateJWT } from './crypto.js';
 import { LABEL_GUIDELINES, DEFAULT_CONFIG } from './config.js';
 
@@ -108,6 +108,155 @@ async function paginateAll(startUrl, token, label, { pick = (data) => data, stop
   return { items, outcome: 'ok' };
 }
 
+// Classifies a GraphQL answer the same way paginateAll classifies a REST one,
+// so the scan winds down on an exhausted rate limit and skips one repository
+// on anything else.
+function graphqlOutcome(res, label) {
+  if (res.code === 403 || res.code === 429) {
+    if (res.headers?.get('x-ratelimit-remaining') === '0') {
+      console.error(`[Stale Bot] GitHub API rate limit reached ${label}. Exiting gracefully.`);
+      return 'fatal';
+    }
+    console.warn(`[Stale Bot] HTTP ${res.code} ${label}.`);
+    return 'limited';
+  }
+  if (res.code !== 200 || !res.data?.data?.repository) {
+    const errors = res.data?.errors?.map(e => e.message).join('; ');
+    console.error(`[Stale Bot] Failed ${label} (HTTP ${res.code}): ${errors || (res.raw || '').trim().slice(0, 200)}`);
+    return 'failed';
+  }
+  return 'ok';
+}
+
+// Everything needed to decide whether this repository is scanned at all: its
+// configuration file and whether the `stale` label already exists. Asking for
+// the one label by name replaces walking the repository's whole label list.
+async function fetchStaleRepoSetup(token, repo) {
+  const slashIndex = repo.indexOf('/');
+  const query = `query($owner: String!, $name: String!, $cfgExpr: String!) {
+  repository(owner: $owner, name: $name) {
+    cfg: object(expression: $cfgExpr) { ... on Blob { text } }
+    staleLabel: label(name: "stale") { name }
+  }
+}`;
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', {
+    query,
+    variables: {
+      owner: repo.slice(0, slashIndex),
+      name: repo.slice(slashIndex + 1),
+      cfgExpr: 'HEAD:.github/formalities.json'
+    }
+  });
+  const outcome = graphqlOutcome(res, `fetching setup for repository ${repo}`);
+  if (outcome !== 'ok') return { outcome };
+  const repository = res.data.data.repository;
+  return {
+    outcome,
+    configText: typeof repository.cfg?.text === 'string' ? repository.cfg.text : null,
+    staleLabelExists: repository.staleLabel !== null && repository.staleLabel !== undefined
+  };
+}
+
+// GraphQL timeline items carry their own shapes; hasRealActivitySince reads the
+// REST ones, so translate rather than teach it a second vocabulary. An author
+// that is a GitHub App arrives with __typename "Bot", which is exactly what the
+// bot-account rule looks for.
+function actorFromGraphql(actor) {
+  if (!actor) return null;
+  return { login: actor.login, type: actor.__typename === 'Bot' ? 'Bot' : 'User' };
+}
+
+function timelineFromGraphql(nodes) {
+  const items = [];
+  for (const node of nodes || []) {
+    switch (node.__typename) {
+      case 'PullRequestCommit':
+        items.push({ event: 'committed', committer: { date: node.commit?.committedDate }, author: { date: node.commit?.authoredDate } });
+        break;
+      case 'HeadRefForcePushedEvent':
+        items.push({ event: 'head_ref_force_pushed', created_at: node.createdAt, actor: actorFromGraphql(node.actor) });
+        break;
+      case 'ReopenedEvent':
+        items.push({ event: 'reopened', created_at: node.createdAt, actor: actorFromGraphql(node.actor) });
+        break;
+      case 'IssueComment':
+        items.push({ event: 'commented', created_at: node.createdAt, actor: actorFromGraphql(node.author) });
+        break;
+      case 'PullRequestReview':
+        items.push({ event: 'reviewed', submitted_at: node.submittedAt, user: actorFromGraphql(node.author) });
+        break;
+      case 'LabeledEvent':
+        items.push({ event: 'labeled', created_at: node.createdAt, label: { name: node.label?.name } });
+        break;
+      default:
+        break;
+    }
+  }
+  return items;
+}
+
+// The open pull requests carrying either label, each with the recent slice of
+// its timeline. GraphQL treats the label list as "any of", which the REST
+// issues listing cannot do - it ANDs them - and the timeline travels along
+// instead of costing one request per pull request.
+const STALE_TIMELINE_WINDOW = 100;
+
+async function fetchStalePullRequests(token, repo, labelNames) {
+  const slashIndex = repo.indexOf('/');
+  const owner = repo.slice(0, slashIndex);
+  const name = repo.slice(slashIndex + 1);
+  const query = `query($owner: String!, $name: String!, $labels: [String!], $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, labels: $labels, first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        updatedAt
+        labels(first: 50) { nodes { name } }
+        timelineItems(last: ${STALE_TIMELINE_WINDOW}, itemTypes: [LABELED_EVENT, ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT, REOPENED_EVENT]) {
+          totalCount
+          nodes {
+            __typename
+            ... on LabeledEvent { createdAt label { name } }
+            ... on IssueComment { createdAt author { login __typename } }
+            ... on PullRequestReview { submittedAt author { login __typename } }
+            ... on PullRequestCommit { commit { committedDate authoredDate } }
+            ... on HeadRefForcePushedEvent { createdAt actor { login __typename } }
+            ... on ReopenedEvent { createdAt actor { login __typename } }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+  const prs = [];
+  let after = null;
+  while (true) {
+    const res = await githubApiCall(GRAPHQL_URL, token, 'POST', {
+      query,
+      variables: { owner, name, labels: labelNames, after }
+    });
+    const outcome = graphqlOutcome(res, `querying pull requests for ${repo}`);
+    if (outcome !== 'ok') return { outcome, prs };
+    const page = res.data.data.repository.pullRequests;
+    for (const node of page?.nodes || []) {
+      prs.push({
+        number: node.number,
+        updated_at: node.updatedAt,
+        labels: (node.labels?.nodes || []).map(l => ({ name: l.name })),
+        timeline: timelineFromGraphql(node.timelineItems?.nodes),
+        // True when the window did not reach back far enough to hold the whole
+        // history, which is what makes a missing stale-labelling event
+        // inconclusive rather than proof that there was none.
+        timelineTruncated: (node.timelineItems?.totalCount || 0) > STALE_TIMELINE_WINDOW
+      });
+    }
+    if (!page?.pageInfo?.hasNextPage) return { outcome: 'ok', prs };
+    after = page.pageInfo.endCursor;
+  }
+}
+
 export async function handleScheduled(env) {
   // Expiration periods:
   // 14 days = 14 * 24 * 60 * 60 * 1000 milliseconds
@@ -163,25 +312,24 @@ export async function handleScheduled(env) {
         console.log(`[Stale Bot] Scanning repository: ${repo}`);
 
         try {
-          // Fetch repository config from default branch to check if stale bot is disabled
-          const configUrl = `https://api.github.com/repos/${repo}/contents/.github/formalities.json`;
-          const resConfig = await githubApiCall(configUrl, token, 'GET', null, 'application/vnd.github.raw');
-
-          if (resConfig.code === 403 || resConfig.code === 429) {
-            if (resConfig.headers?.get('x-ratelimit-remaining') === '0') {
-              console.error('[Stale Bot] GitHub API rate limit reached fetching config. Exiting gracefully.');
-              return;
-            }
-            console.warn(`[Stale Bot] HTTP ${resConfig.code} fetching config for repository: ${repo}. Skipping this repository.`);
+          // One query answers both questions that decide whether this
+          // repository is scanned: what its configuration says, and whether
+          // the `stale` label exists.
+          const setup = await fetchStaleRepoSetup(token, repo);
+          if (setup.outcome === 'fatal') {
+            return;
+          }
+          if (setup.outcome !== 'ok') {
+            console.warn(`[Stale Bot] Skipping repository ${repo}.`);
             continue;
           }
 
           // Disabled by default. Only enable if explicitly defined as true.
           let enableStaleBot = false;
           let repoConfig = null;
-          if (resConfig.code === 200) {
+          if (setup.configText !== null) {
             try {
-              repoConfig = JSON.parse(resConfig.raw);
+              repoConfig = JSON.parse(setup.configText);
               if (repoConfig && typeof repoConfig === 'object' && repoConfig.enable_stale_bot === true) {
                 enableStaleBot = true;
               }
@@ -199,49 +347,23 @@ export async function handleScheduled(env) {
             ? repoConfig.stale_ignored_users
             : DEFAULT_CONFIG.stale_ignored_users;
           const ignoredLogins = new Set(ignoredUserList.map(u => String(u).toLowerCase()));
+          let staleLabelExists = setup.staleLabelExists;
 
-          // Fetch repository labels, stopping early once the stale label shows up
-          const labelsResult = await paginateAll(
-            `https://api.github.com/repos/${repo}/labels?per_page=100`, token,
-            `fetching labels for repository ${repo}`,
-            { stop: (items) => items.some(l => l.name.toLowerCase() === 'stale') });
-          if (labelsResult.outcome === 'fatal') {
+          // 4. The open pull requests carrying either label, each with its
+          // recent timeline attached. GraphQL reads the label list as "any
+          // of", so one query replaces the two REST listings that had to be
+          // merged by hand - and the timelines no longer cost one request per
+          // pull request.
+          const prsResult = await fetchStalePullRequests(token, repo, [LABEL_GUIDELINES, 'stale']);
+          if (prsResult.outcome === 'fatal') {
             return;
           }
-          if (labelsResult.outcome !== 'ok') {
-            console.warn(`[Stale Bot] Skipping repository ${repo}.`);
-            continue;
-          }
-          const repoLabels = new Set(labelsResult.items.map(l => l.name.toLowerCase()));
-
-          // 4. Query issues API for open PRs with guidelines label OR stale label.
-          // The REST issues listing treats multiple labels as AND, so the OR
-          // needs one query per label, deduplicated by PR number.
-          const prMap = new Map();
-          let skipRepoIssues = false;
-          for (const labelName of [LABEL_GUIDELINES, 'stale']) {
-            const issuesResult = await paginateAll(
-              `https://api.github.com/repos/${repo}/issues?state=open&labels=${encodeURIComponent(labelName)}&per_page=100`,
-              token, `querying issues for ${repo}`);
-            if (issuesResult.outcome === 'fatal') {
-              return;
-            }
-            if (issuesResult.outcome === 'limited') {
-              skipRepoIssues = true;
-              break;
-            }
-            for (const item of issuesResult.items) {
-              if (item.pull_request) {
-                prMap.set(item.number, item);
-              }
-            }
-          }
-          if (skipRepoIssues) {
+          if (prsResult.outcome !== 'ok') {
             console.warn(`[Stale Bot] Skipping repository ${repo}.`);
             continue;
           }
 
-          const prs = Array.from(prMap.values());
+          const prs = prsResult.prs;
           console.log(`[Stale Bot] Found ${prs.length} open PRs to verify in ${repo}`);
 
           for (const pr of prs) {
@@ -261,21 +383,11 @@ export async function handleScheduled(env) {
             }
 
             if (hasStaleLabel) {
-              // The timeline carries both when the stale label was applied and
-              // who did what since - unlike the plain events listing, it also
-              // contains comments, reviews and commits with their actors.
-              const timelineResult = await paginateAll(
-                `https://api.github.com/repos/${repo}/issues/${prNumber}/timeline?per_page=100`, token,
-                `fetching timeline for PR #${prNumber}`);
-              if (timelineResult.outcome === 'fatal') {
-                return;
-              }
-              if (timelineResult.outcome !== 'ok') {
-                console.warn(`[Stale Bot] Skipping PR #${prNumber}.`);
-                continue;
-              }
-
-              const staleLabeledEvent = timelineResult.items
+              // The timeline arrived with the listing above. It carries both
+              // when the stale label was applied and who did what since -
+              // unlike the plain events listing, it also contains comments,
+              // reviews and commits with their actors.
+              const staleLabeledEvent = pr.timeline
                 .filter(e => e.event === 'labeled' && e.label?.name === 'stale')
                 .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
@@ -288,7 +400,7 @@ export async function handleScheduled(env) {
                 // Only contributor activity clears the label: pushes, or
                 // comments/reviews from someone who is not a bot. Anything a
                 // bot posts after the labeling must not restart the cycle.
-                if (hasRealActivitySince(timelineResult.items, labeledAt, ignoredLogins)) {
+                if (hasRealActivitySince(pr.timeline, labeledAt, ignoredLogins)) {
                   console.log(`[Stale Bot] PR #${prNumber} is active again (contributor activity after stale labeling). Removing stale label.`);
                   const labelUrl = `https://api.github.com/repos/${repo}/issues/${prNumber}/labels/stale`;
                   await githubApiCall(labelUrl, token, 'DELETE');
@@ -306,6 +418,8 @@ export async function handleScheduled(env) {
                 } else {
                   console.log(`[Stale Bot] PR #${prNumber} is stale but close threshold not reached yet (labeled stale on: ${labeledAt}). Skipping.`);
                 }
+              } else if (pr.timelineTruncated) {
+                console.log(`[Stale Bot] PR #${prNumber} has a timeline longer than the fetched window and no stale labelling event in it. Skipping.`);
               } else {
                 // Fallback: If stale label is present but no labeling event was found (unlikely), check updatedAt
                 if (updatedAt < staleThresholdDate) {
@@ -323,14 +437,14 @@ export async function handleScheduled(env) {
                 console.log(`[Stale Bot] Marking PR #${prNumber} as stale`);
 
                 // Ensure "stale" label exists
-                if (!repoLabels.has('stale')) {
+                if (!staleLabelExists) {
                   const createLabelUrl = `https://api.github.com/repos/${repo}/labels`;
                   await githubApiCall(createLabelUrl, token, 'POST', {
                     name: 'stale',
                     color: '6b7280',
                     description: 'This PR has been marked stale due to inactivity'
                   });
-                  repoLabels.add('stale');
+                  staleLabelExists = true;
                 }
 
                 // Add "stale" label
