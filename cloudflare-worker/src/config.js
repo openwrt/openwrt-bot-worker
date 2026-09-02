@@ -45,6 +45,12 @@ export const DEFAULT_CONFIG = {
   // Package Release Check features
   check_pkg_release: 'warning',
 
+  // Package Hash Check features. 'warning' by default: whether a version
+  // change really means the source archive changed is an inference, not a
+  // fact the bot can establish. A checksum the download step cannot use at
+  // all is reported as an error regardless of this setting.
+  check_pkg_hash: 'warning',
+
   // Identity / Account linking Check features
   require_linked_github_account: true,
 

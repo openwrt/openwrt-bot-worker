@@ -2,7 +2,7 @@ import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlFetchRepoSetup, ensureLabelExists, fetchUserRepoPermission } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
@@ -1202,6 +1202,38 @@ async function handleWebhook(request, env) {
       }
       others.forEach(err => { makefileOutputText += `${mark}${err}\n`; });
       reportRelease.notes.forEach(n => { makefileOutputText += `  ℹ️ ${n}\n`; });
+    }
+    makefileOutputText += "\n";
+  }
+
+  // 5. Package Hash Audit (PR-wide): the fetches here hit the same cached
+  // loader as the release audit above, so auditing the checksums costs no
+  // extra GitHub API requests.
+  let reportHashes = { successes: [], errors: [], warnings: [], findings: [] };
+  try {
+    reportHashes = await validatePkgHashes(releaseDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase);
+  } catch (e) {
+    console.error(`Failed to audit package hashes: ${e.message}`);
+    reportHashes.warnings = [`Could not complete package hash audit because of an error fetching file content: ${e.message}`];
+  }
+  // A checksum the download step provably cannot use is always an error. The
+  // inferred findings — sources presumed changed, hash presumed required —
+  // are warnings unless the repository opted into `check_pkg_hash: "error"`.
+  const hashErrors = [...reportHashes.errors, ...(CONFIG.check_pkg_hash === 'error' ? reportHashes.findings : [])];
+  const hashWarnings = [
+    ...reportHashes.warnings.map(w => `- ${w}`),
+    ...(CONFIG.check_pkg_hash === 'error' ? [] : reportHashes.findings)
+  ];
+  if (reportHashes.successes.length > 0 || hashErrors.length > 0 || hashWarnings.length > 0) {
+    makefileOutputText += `#### Package Hash Audit:\n`;
+    reportHashes.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    if (hashWarnings.length > 0) {
+      allPrWarnings.push(`**Package Hash Audit**:\n` + hashWarnings.map(w => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+      hashWarnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    }
+    if (hashErrors.length > 0) {
+      allMakefileErrors.push(`**Package Hash Audit**:\n` + hashErrors.join("\n"));
+      hashErrors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     makefileOutputText += "\n";
   }
