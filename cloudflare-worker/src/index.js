@@ -297,7 +297,10 @@ async function handleWebhook(request, env) {
   // (REST returns it as performed_via_github_app.id on each comment).
   const appId = Number(env.APP_ID) || null;
 
-  const token = await getInstallationToken(installationId, env.APP_ID, env.PRIVATE_KEY);
+  // The token mint is the first subrequest of this invocation; it is counted
+  // into the budget below once that exists.
+  let tokenMintAttempts = 0;
+  const token = await getInstallationToken(installationId, env.APP_ID, env.PRIVATE_KEY, () => { tokenMintAttempts++; });
   if (!token) {
     console.error(`Webhook processing failed: Could not generate installation access token for installation ID ${installationId}.`);
     return new Response("Could not generate installation access token", { status: 500 });
@@ -374,7 +377,7 @@ async function handleWebhook(request, env) {
   const subrequestBudget = {
     limit: parseEnvInt(env.SUBREQUEST_BUDGET_LIMIT, 45),
     reserve: parseEnvInt(env.SUBREQUEST_RESERVE_HEADROOM, 15),
-    used: 0
+    used: tokenMintAttempts
   };
   // Counting happens per outgoing fetch rather than per call, so a request
   // that githubApiCall retried twice costs the budget what it really cost

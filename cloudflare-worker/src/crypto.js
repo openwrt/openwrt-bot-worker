@@ -63,10 +63,12 @@ export async function generateJWT(appId, privateKeyPEM) {
   return `${encodedHeader}.${encodedPayload}.${arrayBufferToBase64Url(signature)}`;
 }
 
-export async function getInstallationToken(installationId, appId, privateKeyPEM) {
+// `onAttempt` is invoked before every outgoing fetch, retries included, so
+// the caller can count the token mint against its subrequest budget.
+export async function getInstallationToken(installationId, appId, privateKeyPEM, onAttempt) {
   const jwt = await generateJWT(appId, privateKeyPEM);
   const url = `https://api.github.com/app/installations/${installationId}/access_tokens`;
-  const res = await githubApiCall(url, jwt, 'POST');
+  const res = await githubApiCall(url, jwt, 'POST', null, 'application/vnd.github+json', { onAttempt });
   return res.data?.token || null;
 }
 
