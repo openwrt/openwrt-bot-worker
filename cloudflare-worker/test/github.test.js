@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, GRAPHQL_URL } from '../src/github.js';
+import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -436,5 +436,36 @@ describe('fetchUserRepoPermission', { concurrency: 1 }, () => {
   test('returns null when the response body is not JSON', async () => {
     fetchMock = () => new Response('<html>gateway</html>', { status: 200 });
     assert.strictEqual(await fetchUserRepoPermission('test/repo', 'someone', 'token'), null);
+  });
+});
+
+describe('githubApiCall rate limits', () => {
+  test('waits out a Retry-After answer and tries again', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      if (calls === 1) {
+        return new Response('{"message":"You have exceeded a secondary rate limit"}', { status: 429, headers: { 'retry-after': '1' } });
+      }
+      return new Response('{"id":1}', { status: 201 });
+    };
+    const res = await githubApiCall('https://api.github.com/repos/o/r/check-runs', 'token', 'POST', { name: 'x' });
+    assert.strictEqual(calls, 2);
+    assert.strictEqual(res.code, 201);
+  });
+
+  test('does not retry a plain 403 refusal', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return new Response('{"message":"Resource not accessible by integration"}', { status: 403 });
+    };
+    const res = await githubApiCall('https://api.github.com/repos/o/r/check-runs', 'token', 'POST', { name: 'x' });
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(res.code, 403);
   });
 });
