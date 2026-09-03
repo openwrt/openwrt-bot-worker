@@ -2,7 +2,7 @@ import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlFetchRepoSetup, ensureLabelExists, fetchUserRepoPermission } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validateUciConfigs, groupReleaseErrors, collectPackageMakefiles, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
@@ -174,6 +174,51 @@ function getDiffFromPatch(patchText) {
   if (!patchText) return '';
   const idx = patchText.indexOf('diff --git ');
   return idx === -1 ? '' : patchText.slice(idx);
+}
+
+// A pull request's .patch is the mbox-style concatenation of its commits'
+// patches in commit order, each opening with git's
+// "From <sha> Mon Sep 17 00:00:00 2001" envelope line. Split it back into one
+// patch per commit, keyed by SHA, so one request stands in for one fetch per
+// commit. The diff bodies are byte-identical to what /commits/<sha> serves;
+// only the mail header lines differ (e.g. "[PATCH 2/3]" subjects), and
+// nothing downstream reads those from the patch text.
+//
+// A commit message may itself contain such a line - quoting the upstream mail
+// a change was taken from is common, and git passes the body through verbatim
+// (openwrt/openwrt commit bcd8d530 is one). Splitting on every envelope-shaped
+// line would cut that commit's patch in two and file its diff under the quoted
+// SHA, leaving the real commit with headers and no diff, which every check
+// then reports as clean. So only an envelope naming one of this pull request's
+// own commits counts, taken in the order the commits list gives them: a quoted
+// header names some other commit, and one naming a commit already passed is
+// behind the position the scan has reached.
+function splitPrPatchByCommit(prPatch, commitShas) {
+  const byCommit = new Map();
+  if (!prPatch || !commitShas || commitShas.length === 0) return byCommit;
+
+  let pending = commitShas;
+  const starts = [];
+  const envelope = /^From ([0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$/gm;
+  let match;
+  while ((match = envelope.exec(prPatch)) !== null) {
+    const position = pending.indexOf(match[1]);
+    if (position === -1) continue;
+    pending = pending.slice(position + 1);
+    starts.push({ sha: match[1], index: match.index });
+  }
+
+  for (let i = 0; i < starts.length; i++) {
+    const end = i + 1 < starts.length ? starts[i + 1].index : prPatch.length;
+    const part = prPatch.slice(starts[i].index, end);
+    // Anything without a diff is not something the checks can be run against.
+    // Leaving it out sends the commit down its own fetch, which is what the
+    // handler did before, rather than passing an empty diff off as inspected.
+    if (part.includes('\ndiff --git ')) {
+      byCommit.set(starts[i].sha, part);
+    }
+  }
+  return byCommit;
 }
 
 function normalizeDiff(diffText) {
@@ -693,9 +738,17 @@ async function handleWebhook(request, env) {
 
   let fetchCommentsPromise = null;
   let fetchCommentsRetried = false;
+  // GitHub sends the pull request's comment count along with the event. With
+  // no comments there is nothing to scan - no earlier bot comment to update
+  // and no override command to honour - so a freshly opened pull request
+  // skips that request altogether.
+  const knownCommentCount = data.pull_request.comments;
+  const emptyCommentScan = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null };
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser, appId).catch(() => null);
+      fetchCommentsPromise = knownCommentCount === 0
+        ? Promise.resolve(emptyCommentScan)
+        : scanPrComments(repoFullname, prNumber, token, () => { subrequestBudget.used++; }, isMaintainerUser, appId).catch(() => null);
     }
     return fetchCommentsPromise;
   };
@@ -798,6 +851,30 @@ async function handleWebhook(request, env) {
     prPatch = await fetchPrWidePatch();
   }
 
+  // One request for the whole pull request's patch replaces one request per
+  // commit: the PR patch is the concatenation of the per-commit patches (see
+  // splitPrPatchByCommit). Commits the split does not cover - merge commits,
+  // which format-patch leaves out, or a branch force-pushed while this run
+  // was in flight - still fall back to their own per-commit fetch below.
+  let splitCommitPatches = new Map();
+  let prWidePatchText = null;
+  // With a single commit the two are the same request, and asking for the
+  // commit directly cannot be refused for being too large.
+  if (!usePrWidePatch && commits.length > 1) {
+    const prPatchRes = await trackedApiCall(data.pull_request.url, token, 'GET', null, 'application/vnd.github.patch');
+    if (prPatchRes.code === 200 && typeof prPatchRes.raw === 'string') {
+      prWidePatchText = prPatchRes.raw;
+      splitCommitPatches = splitPrPatchByCommit(prWidePatchText, commits.map(c => c.sha));
+      // The base repo just served these commits, so file lookups at their
+      // SHAs never need the fork fallback (as after a per-commit fetch).
+      for (const sha of splitCommitPatches.keys()) {
+        if (!refSource.has(sha)) refSource.set(sha, 'base');
+      }
+    } else {
+      console.warn(`PR-wide patch unavailable (HTTP ${prPatchRes.code}), fetching commit patches one by one.`);
+    }
+  }
+
   const mapCommitData = async (commitData, fetchPatch) => {
     const commitItemType = (commitData === null)
       ? 'null'
@@ -816,7 +893,9 @@ async function handleWebhook(request, env) {
     }
 
     let commitPatch = null;
-    if (fetchPatch) {
+    if (fetchPatch && splitCommitPatches.has(sha)) {
+      commitPatch = splitCommitPatches.get(sha);
+    } else if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
       let patchRes = await trackedApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
       if (patchRes.code === 200 && !refSource.has(sha)) {
@@ -903,7 +982,7 @@ async function handleWebhook(request, env) {
     } catch (e) {
       console.warn(`Failed to fetch individual commit patches, falling back to PR-wide patch: ${e.message}`);
       usePrWidePatch = true;
-      prPatch = await fetchPrWidePatch();
+      prPatch = prWidePatchText !== null ? prWidePatchText : await fetchPrWidePatch();
     }
   }
 
@@ -911,31 +990,47 @@ async function handleWebhook(request, env) {
     commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false)));
   }
 
-  // Pre-scan all commit patches to see if this PR introduces or drops any package Makefiles
-  if (!usePrWidePatch) {
-    for (const item of commitDetails) {
-      if (item.commitPatch) {
-        if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(item.commitPatch)) {
-          state.isNewPackage = true;
-        }
-        if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(item.commitPatch)) {
-          state.isDroppedPackage = true;
-        }
-      }
+  // Pre-scan all commit patches to see if this PR introduces or drops any
+  // package Makefiles. Only package Makefiles count: a new target, tool or
+  // toolchain Makefile is build infrastructure, not a package, and must not
+  // earn the PR an "add package" label (the same rule the Makefile checks
+  // apply, see isPackageMakefilePath).
+  const scannedPatches = usePrWidePatch
+    ? [prPatch]
+    : commitDetails.map(item => item.commitPatch);
+  for (const patch of scannedPatches) {
+    if (!patch) continue;
+    if (collectPackageMakefiles(patch, 'added').length > 0) {
+      state.isNewPackage = true;
     }
-  } else {
-    if (prPatch) {
-      if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(prPatch)) {
-        state.isNewPackage = true;
-      }
-      if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(prPatch)) {
-        state.isDroppedPackage = true;
-      }
+    if (collectPackageMakefiles(patch, 'removed').length > 0) {
+      state.isDroppedPackage = true;
     }
   }
 
+  // The two validators that look files up (patch headers, UCI configs) are
+  // started for every commit before the reporting loop consumes them. Started
+  // together, their lookups land in the same batch and go out as one request
+  // instead of one per commit; the loop below still reports the commits in
+  // order. A rejection is marked handled here and surfaces at the await.
+  const settled = (promise) => { promise.catch(() => {}); return promise; };
+  const deepChecks = commitDetails.map(item => {
+    if (usePrWidePatch || item.isVerbatim) return null;
+    // A commit with no patch of its own (a merge commit) still goes through
+    // the validators, which answer for an empty diff the way they always did.
+    const fetchFileContent = (path) => fetchFileContentCached(path, item.sha);
+    const fetchUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
+    const hasUpstream = isBackportPr && item.upstreamPatch;
+    return {
+      uci: settled(validateUciConfigs(item.commitPatch, CONFIG, fetchFileContent)),
+      upstreamUci: hasUpstream ? settled(validateUciConfigs(item.upstreamPatch, CONFIG, fetchUpstream)) : null,
+      patches: settled(validateEmbeddedPatches(item.commitPatch, CONFIG, fetchFileContent)),
+      upstreamPatches: hasUpstream ? settled(validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchUpstream)) : null
+    };
+  });
+
   // RUN CHECKS ON COMMITS
-  for (const item of commitDetails) {
+  for (const [commitIndex, item] of commitDetails.entries()) {
     const { sha, html_url, fullCommit, commitPatch } = item;
 
     const commitMsgLines = (fullCommit.commit.message || '').split("\n");
@@ -1001,8 +1096,6 @@ async function handleWebhook(request, env) {
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (path) => fetchFileContentCached(path, sha);
-
         const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname);
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
@@ -1012,10 +1105,9 @@ async function handleWebhook(request, env) {
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
         }
 
-        const reportUci = await validateUciConfigs(commitPatch, CONFIG, fetchFileContent);
-        if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
-          const reportUpstreamUci = await validateUciConfigs(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+        const reportUci = await deepChecks[commitIndex].uci;
+        if (deepChecks[commitIndex].upstreamUci) {
+          const reportUpstreamUci = await deepChecks[commitIndex].upstreamUci;
           reportUci.errors = reportUci.errors.filter(err => !reportUpstreamUci.errors.includes(err));
           reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
         }
@@ -1042,12 +1134,10 @@ async function handleWebhook(request, env) {
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (patchFile) => fetchFileContentCached(patchFile, sha);
-        const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
-        
-        if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = (patchFile) => fetchFileContentCached(patchFile, item.upstreamSha);
-          const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+        const reportPatches = await deepChecks[commitIndex].patches;
+
+        if (deepChecks[commitIndex].upstreamPatches) {
+          const reportUpstreamPatches = await deepChecks[commitIndex].upstreamPatches;
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
@@ -1236,6 +1326,22 @@ async function handleWebhook(request, env) {
   const labelsToAdd = [];
   const labelOperations = [];
 
+  // Every write that reports the result to the pull request is checked: a
+  // failed one is logged and turns the webhook response into an error, so it
+  // shows in the App's delivery log instead of vanishing.
+  const statusWrites = [];
+  const recordWrite = (what, res) => { statusWrites.push({ what, code: res?.code }); };
+
+  // Removing a label is as visible as adding one - a pull request left
+  // carrying "not following guidelines" after it was fixed reads as broken,
+  // and the nightly scan acts on that label. 404 means the label is already
+  // gone, which is a race with another writer rather than a failure.
+  const removeLabel = (name) => trackedApiCall(`${prLabelUrl}/${encodeURIComponent(name)}`, token, 'DELETE')
+    .then(res => {
+      if (res.code !== 404) recordWrite(`label removal "${name}"`, res);
+      return res;
+    });
+
   async function ensureLabel(name, color, description) {
     await ensureLabelExists(token, repoFullname, name, color, description, existingLabels, () => { subrequestBudget.used++; });
   }
@@ -1245,7 +1351,7 @@ async function handleWebhook(request, env) {
   // New commits or a reopen are contributor activity: drop the stale marker
   // right away instead of waiting for the nightly scan to notice it.
   if ((data.action === 'synchronize' || data.action === 'reopened') && currentPrLabels.has('stale')) {
-    labelOperations.push(trackedApiCall(`${prLabelUrl}/stale`, token, 'DELETE'));
+    labelOperations.push(removeLabel('stale'));
   }
 
   if (!allPassed) {
@@ -1256,7 +1362,7 @@ async function handleWebhook(request, env) {
   } else {
     // Delete validation failure label if present
     if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(trackedApiCall(`${prLabelUrl}/${encodeURIComponent(LABEL_GUIDELINES)}`, token, 'DELETE'));
+      labelOperations.push(removeLabel(LABEL_GUIDELINES));
     }
   }
 
@@ -1315,11 +1421,11 @@ async function handleWebhook(request, env) {
 
   // Apply all relevant labels to the PR in one API call
   if (labelsToAdd.length > 0) {
-    await trackedApiCall(prLabelUrl, token, 'POST', { labels: labelsToAdd });
+    recordWrite('labels', await trackedApiCall(prLabelUrl, token, 'POST', { labels: labelsToAdd }));
   }
 
   // PR Comment Management
-  const commentPromises = [];
+  const commentWrites = [];
   if (CONFIG.enable_comments) {
     const scanResult = await getCommentsScanWithRetry();
     const fetchSucceeded = scanResult !== null;
@@ -1380,13 +1486,13 @@ async function handleWebhook(request, env) {
         commentBody += footerMd;
 
         if (existingCommentId) {
-          commentPromises.push(trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) }));
+          commentWrites.push(['PR comment update', () => trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) })]);
         } else {
-          commentPromises.push(trackedApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) }));
+          commentWrites.push(['PR comment', () => trackedApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) })]);
         }
       } else {
         if (existingCommentId) {
-          commentPromises.push(trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE'));
+          commentWrites.push(['PR comment removal', () => trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE')]);
         }
       }
     }
@@ -1411,8 +1517,8 @@ async function handleWebhook(request, env) {
   const makefileConclusion = conclusionFor(makefilePassed, deepScanIncomplete);
   const patchesConclusion = conclusionFor(patchesPassed, deepScanIncomplete);
 
-  const checkRunsPromises = [
-    trackedApiCall(checkRunsUrl, token, 'POST', {
+  const checkRunWrites = [
+    ['check-run "Git & Commits"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Git & Commits', head_sha: headSha, status: 'completed',
       conclusion: formalityConclusion,
       output: {
@@ -1421,8 +1527,8 @@ async function handleWebhook(request, env) {
           (formalityConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(formalityOutputText)
       }
-    }),
-    trackedApiCall(checkRunsUrl, token, 'POST', {
+    })],
+    ['check-run "OpenWrt Makefiles"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / OpenWrt Makefiles', head_sha: headSha, status: 'completed',
       conclusion: makefileConclusion,
       output: {
@@ -1431,8 +1537,8 @@ async function handleWebhook(request, env) {
           (makefileConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(makefileOutputText)
       }
-    }),
-    trackedApiCall(checkRunsUrl, token, 'POST', {
+    })],
+    ['check-run "Code Patches"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
       conclusion: patchesConclusion,
       output: {
@@ -1441,11 +1547,22 @@ async function handleWebhook(request, env) {
           (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(patchesOutputText)
       }
-    })
+    })]
   ];
 
-  // OPTIMIZATION: Wait for comments, check runs, and PR labeling updates to publish concurrently
-  await Promise.all([...commentPromises, ...checkRunsPromises]);
+  // The writes go out one after another rather than as a burst: GitHub asks
+  // for content-creating requests to be made serially and answers bursts
+  // with its secondary rate limits. Waiting on a response costs no CPU time.
+  for (const [what, write] of [...commentWrites, ...checkRunWrites]) {
+    recordWrite(what, await write());
+  }
+
+  const failedWrites = statusWrites.filter(w => !(w.code >= 200 && w.code < 300));
+  if (failedWrites.length > 0) {
+    const summary = failedWrites.map(w => `${w.what} (HTTP ${w.code ?? 'no response'})`).join(', ');
+    console.error(`Status reporting for PR #${prNumber} failed: ${summary}`);
+    return new Response(`Failed to report status for PR #${prNumber}: ${summary}`, { status: 502 });
+  }
 
   return new Response(`Success: Processed check runs for PR #${prNumber}`, { status: 200 });
 }

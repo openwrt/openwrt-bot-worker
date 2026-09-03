@@ -129,6 +129,69 @@ function graphqlLabelsHandler(url, options, labelNames = []) {
 }
 
 
+// --- STALE SCAN GRAPHQL MOCKING HELPERS ---
+// The daily scan asks GitHub two GraphQL questions per repository: the repo
+// setup (its formalities.json and whether the `stale` label exists) and the
+// open pull requests carrying either label, each with the recent slice of its
+// timeline attached. These helpers answer both from plain fixtures, so a test
+// declares what GitHub holds instead of the wire format.
+function staleTimelineNodes(entries) {
+  return (entries || []).map(e => {
+    switch (e.kind) {
+      case 'labeled':
+        return { __typename: 'LabeledEvent', createdAt: e.at, label: { name: e.label } };
+      case 'commented':
+        return { __typename: 'IssueComment', createdAt: e.at, author: { login: e.login, __typename: e.type || 'User' } };
+      case 'reviewed':
+        return { __typename: 'PullRequestReview', submittedAt: e.at, author: { login: e.login, __typename: e.type || 'User' } };
+      case 'committed':
+        return { __typename: 'PullRequestCommit', commit: { committedDate: e.at, authoredDate: e.at } };
+      case 'force_pushed':
+        return { __typename: 'HeadRefForcePushedEvent', createdAt: e.at, actor: { login: e.login, __typename: e.type || 'User' } };
+      case 'reopened':
+        return { __typename: 'ReopenedEvent', createdAt: e.at, actor: { login: e.login, __typename: e.type || 'User' } };
+      default:
+        throw new Error(`unknown timeline entry kind: ${e.kind}`);
+    }
+  });
+}
+
+function staleGraphqlHandler(url, options, { config = null, staleLabelExists = true, prs = [] } = {}) {
+  if (!url.includes('/graphql') || !options?.body) return null;
+  const body = JSON.parse(options.body);
+  if (body.query.includes('staleLabel: label(')) {
+    return new Response(JSON.stringify({
+      data: {
+        repository: {
+          cfg: config === null ? null : { text: JSON.stringify(config) },
+          staleLabel: staleLabelExists ? { name: 'stale' } : null
+        }
+      }
+    }), { status: 200 });
+  }
+  if (body.query.includes('pullRequests(states: OPEN')) {
+    return new Response(JSON.stringify({
+      data: {
+        repository: {
+          pullRequests: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: prs.map(pr => ({
+              number: pr.number,
+              updatedAt: pr.updatedAt,
+              labels: { nodes: (pr.labels || []).map(name => ({ name })) },
+              timelineItems: {
+                totalCount: pr.timelineTotalCount ?? (pr.timeline || []).length,
+                nodes: staleTimelineNodes(pr.timeline)
+              }
+            }))
+          }
+        }
+      }
+    }), { status: 200 });
+  }
+  return null;
+}
+
 async function generateTestPrivateKeyPEM() {
   const keyPair = await crypto.subtle.generateKey(
     {
@@ -712,8 +775,12 @@ index 123456..789012 100644
 
   test('does not scan repository if enable_stale_bot is not true in formalities.json', async () => {
     const urls = [];
+    const graphqlQueries = [];
     fetchMock = async (url, options) => {
       urls.push(url);
+      if (url.includes('/graphql') && options?.body) {
+        graphqlQueries.push(JSON.parse(options.body).query);
+      }
       if (url.includes('/access_tokens')) {
         return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
       }
@@ -723,10 +790,8 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        // formalities.json exists but enable_stale_bot is unset / false
-        return new Response(JSON.stringify({ enable_stale_bot: false }), { status: 200 });
-      }
+      // formalities.json exists but enable_stale_bot is unset / false
+      { const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: false } }); if (sr) return sr; }
       return new Response(JSON.stringify({}), { status: 200 });
     };
 
@@ -744,8 +809,11 @@ index 123456..789012 100644
       // Invoke handleScheduled directly to await execution
       await handleScheduled(env);
 
-      // Should have checked config but skipped label list and issues query
-      assert.ok(urls.some(u => u.includes('/contents/.github/formalities.json')));
+      // Should have asked for the repository setup, then stopped: no pull
+      // request listing, and no separate label or issue requests at all.
+      assert.strictEqual(graphqlQueries.length, 1);
+      assert.ok(graphqlQueries[0].includes('staleLabel: label('));
+      assert.ok(!graphqlQueries.some(q => q.includes('pullRequests(states: OPEN')));
       assert.ok(!urls.some(u => u.includes('/labels')));
       assert.ok(!urls.some(u => u.includes('/issues')));
     } finally {
@@ -827,23 +895,15 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/events')) {
-        // Query returns 1 open guidelines-violating PR (number 55) which is older than 14 days and doesn't have the stale label
+      {
+        // One open guidelines-violating PR (number 55), older than 14 days and
+        // without the stale label.
         const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
-            number: 55,
-            updated_at: daysAgo15,
-            labels: [{ name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{ number: 55, updatedAt: daysAgo15, labels: ['not following guidelines'] }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -888,33 +948,24 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues/66/timeline')) {
-        // Stale label was added 1 hour ago, then a person commented 1 minute ago
+      {
+        // PR 66 carries both labels. The stale label was added 1 hour ago and
+        // a person commented 1 minute ago.
         const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
         const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          { event: 'labeled', label: { name: 'stale' }, created_at: hourAgo },
-          { event: 'commented', actor: { login: 'contributor', type: 'User' }, created_at: minuteAgo }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/timeline')) {
-        // PR number 66 has both 'stale' and 'not following guidelines' labels
-        // and was updated 1 minute ago (recent activity)
-        const minuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
             number: 66,
-            updated_at: minuteAgo,
-            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+            updatedAt: minuteAgo,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [
+              { kind: 'labeled', label: 'stale', at: hourAgo },
+              { kind: 'commented', login: 'contributor', at: minuteAgo }
+            ]
+          }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -954,32 +1005,24 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues/99/timeline')) {
+      {
         // Stale label added 2 days ago; an AI review followed 1 day ago.
         // Before, that review reset the countdown and the cycle restarted.
         const daysAgo2 = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
         const daysAgo1 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          { event: 'labeled', label: { name: 'stale' }, created_at: daysAgo2 },
-          { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: daysAgo1 }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/timeline')) {
-        const daysAgo1 = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
             number: 99,
-            updated_at: daysAgo1,
-            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+            updatedAt: daysAgo1,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [
+              { kind: 'labeled', label: 'stale', at: daysAgo2 },
+              { kind: 'reviewed', login: 'openwrt-ai', at: daysAgo1 }
+            ]
+          }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -1014,36 +1057,27 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues/77/timeline')) {
-        // Stale label was added 15 days ago; the only activity since came
-        // from bots (an app comment and an AI review on a User account),
-        // which must not stop the closing.
+      {
+        // Stale label was added 15 days ago; the only activity since came from
+        // bots (an app comment and an AI review on a User account), which must
+        // not stop the closing. updated_at stays fresh-ish because of them,
+        // and that must not matter either.
         const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
         const daysAgo14 = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          { event: 'labeled', label: { name: 'stale' }, created_at: daysAgo15 },
-          { event: 'commented', actor: { login: 'openwrt[bot]', type: 'Bot' }, created_at: daysAgo15 },
-          { event: 'reviewed', user: { login: 'openwrt-ai', type: 'User' }, submitted_at: daysAgo14 }
-        ]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/timeline')) {
-        // PR 77 has stale and guidelines labels and was updated 14 days ago
-        // (the AI review keeps updated_at fresh-ish, but that must not matter)
-        const daysAgo14 = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-        return new Response(JSON.stringify([
-          {
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
             number: 77,
-            updated_at: daysAgo14,
-            labels: [{ name: 'stale' }, { name: 'not following guidelines' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+            updatedAt: daysAgo14,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [
+              { kind: 'labeled', label: 'stale', at: daysAgo15 },
+              { kind: 'commented', login: 'openwrt[bot]', type: 'Bot', at: daysAgo15 },
+              { kind: 'reviewed', login: 'openwrt-ai', at: daysAgo14 }
+            ]
+          }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -1074,6 +1108,93 @@ index 123456..789012 100644
     }
   });
 
+  test('scans a repository with two requests, whatever the number of stale PRs', async () => {
+    const graphqlQueries = [];
+    const restReads = [];
+    const daysAgo20 = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+    const prs = [11, 22, 33, 44].map(number => ({
+      number,
+      updatedAt: daysAgo20,
+      labels: ['stale', 'not following guidelines'],
+      timeline: [{ kind: 'labeled', label: 'stale', at: daysAgo20 }]
+    }));
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/graphql')) {
+        graphqlQueries.push(JSON.parse(options.body).query);
+      } else if (method === 'GET' && !url.includes('/access_tokens')) {
+        restReads.push(url);
+      }
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      { const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: true }, prs }); if (sr) return sr; }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM });
+
+      // Setup and pull request listing - and nothing per pull request: the
+      // timelines that used to cost one request each travel with the listing.
+      assert.strictEqual(graphqlQueries.length, 2);
+      assert.deepStrictEqual(restReads.filter(u => u.includes('/repos/')), []);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('leaves a stale PR alone when its timeline is longer than the fetched window', async () => {
+    const apiCalls = [];
+    const daysAgo30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    fetchMock = async (url, options) => {
+      apiCalls.push({ url, method: options?.method || 'GET' });
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      }
+      if (url.includes('/app/installations')) {
+        return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      }
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+      }
+      {
+        // The stale labelling happened before the window that was fetched, so
+        // when it was applied is unknown - and an unknown date must not be
+        // read as "long ago".
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{
+            number: 123,
+            updatedAt: daysAgo30,
+            labels: ['stale', 'not following guidelines'],
+            timeline: [{ kind: 'commented', login: 'someone', at: daysAgo30 }],
+            timelineTotalCount: 250
+          }]
+        });
+        if (sr) return sr;
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    try {
+      await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM });
+
+      assert.ok(!apiCalls.some(c => c.url.includes('/pulls/123') && c.method === 'PATCH'), 'must not close');
+      assert.ok(!apiCalls.some(c => c.url.includes('/issues/123/labels/stale') && c.method === 'DELETE'), 'must not unlabel');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   test('removes stale label immediately if guidelines label was removed (resolved)', async () => {
     const apiCalls = [];
     fetchMock = async (url, options) => {
@@ -1088,22 +1209,13 @@ index 123456..789012 100644
       if (url.includes('/installation/repositories')) {
         return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
       }
-      if (url.includes('/contents/.github/formalities.json')) {
-        return new Response(JSON.stringify({ enable_stale_bot: true }), { status: 200 });
-      }
-      if (url.includes('/labels') && !url.includes('/issues/')) {
-        return new Response(JSON.stringify([{ name: 'stale' }]), { status: 200 });
-      }
-      if (url.includes('/issues') && !url.includes('/events')) {
+      {
         // PR 88 has only the stale label (the guidelines label is missing/resolved)
-        return new Response(JSON.stringify([
-          {
-            number: 88,
-            updated_at: new Date().toISOString(),
-            labels: [{ name: 'stale' }],
-            pull_request: {}
-          }
-        ]), { status: 200 });
+        const sr = staleGraphqlHandler(url, options, {
+          config: { enable_stale_bot: true },
+          prs: [{ number: 88, updatedAt: new Date().toISOString(), labels: ['stale'] }]
+        });
+        if (sr) return sr;
       }
       return new Response(JSON.stringify({}), { status: 200 });
     };
@@ -3657,10 +3769,10 @@ index 123456..789012 100644
 
       assert.strictEqual(response.status, 200);
 
-      // Exactly one GraphQL call per unresolved ref (head sha + base sha),
-      // not one call per repo — proving base and fork are queried together
-      // instead of the old reactive fetch -> 404 -> retry-under-fork.
-      assert.strictEqual(graphqlCallCount, 2);
+      // The head and base Makefile lookups go out together in one GraphQL
+      // call, and within it base and fork are probed together for each
+      // unresolved ref - not one call per repo, and not one per ref.
+      assert.strictEqual(graphqlCallCount, 1);
       assert.strictEqual(Object.keys(callsByRef).length, 2);
       for (const calls of Object.values(callsByRef)) {
         assert.strictEqual(calls.length, 1, 'expected exactly one GraphQL call for this ref');
@@ -4338,6 +4450,870 @@ index 123456..789012 100644
       const labelPostCalls = apiCalls.filter(c => c.url.includes('/issues/123/labels') && c.method === 'POST');
       assert.ok(labelPostCalls.some(c => c.body?.labels?.includes('target/airoha')));
       assert.ok(!labelPostCalls.some(c => c.body?.labels?.includes('target/at91')));
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  async function labelsPostedForAddedMakefile(makefilePath) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'add a Makefile',
+        body: 'Adds a Makefile',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const apiCalls = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      apiCalls.push({ url, method, body: options?.body ? JSON.parse(options.body) : null });
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, ['add package']); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'foo: add Makefile\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          `diff --git a/${makefilePath} b/${makefilePath}\n` +
+          'new file mode 100644\n' +
+          '--- /dev/null\n' +
+          `+++ b/${makefilePath}\n` +
+          '@@ -0,0 +1,2 @@\n' +
+          '+include $(TOPDIR)/rules.mk\n' +
+          '+# placeholder\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200);
+      return apiCalls
+        .filter(c => c.url.includes('/issues/123/labels') && c.method === 'POST')
+        .flatMap(c => c.body?.labels || []);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('a new package Makefile earns the "add package" label', async () => {
+    const labels = await labelsPostedForAddedMakefile('package/utils/newpkg/Makefile');
+    assert.ok(labels.includes('add package'), `labels posted: ${JSON.stringify(labels)}`);
+  });
+
+  test('a new target Makefile is build infrastructure, not a package', async () => {
+    const labels = await labelsPostedForAddedMakefile('target/linux/newtarget/Makefile');
+    assert.ok(!labels.includes('add package'), `labels posted: ${JSON.stringify(labels)}`);
+  });
+
+  const SPLIT_SHA_1 = '1111111111111111111111111111111111111111';
+  const SPLIT_SHA_2 = '2222222222222222222222222222222222222222';
+  const SPLIT_SHA_3 = '3333333333333333333333333333333333333333';
+
+  function envelopePatch(sha, index, total, subject, file) {
+    return `From ${sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH ${index}/${total}] ${subject}
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ ${file} | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/${file} b/${file}
+--- a/${file}
++++ b/${file}
+@@ -1,3 +1,4 @@
+ PKG_NAME:=mypkg
++PKG_RELEASE:=2
+ PKG_LICENSE:=MIT
+--
+2.45.0
+
+`;
+  }
+
+  // Drives one pull_request webhook through the worker and reports which
+  // patch requests it made and what it posted as check-runs.
+  async function runPatchScenario({ commits, prPatchResponse, perCommitPatches = {} }) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: bump release',
+        body: 'Bump release',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: commits[commits.length - 1].sha },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const prPatchFetches = [];
+    const perCommitFetches = [];
+    const checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commits), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123') && options?.headers?.Accept === 'application/vnd.github.patch') {
+        prPatchFetches.push(url);
+        return prPatchResponse();
+      }
+      const commitMatch = url.match(/\/repos\/test\/repo\/commits\/([0-9a-f]{40})$/);
+      if (commitMatch) {
+        perCommitFetches.push(commitMatch[1]);
+        const body = perCommitPatches[commitMatch[1]];
+        if (body === undefined) {
+          throw new Error(`Unexpected per-commit patch fetch: ${url}`);
+        }
+        return new Response(body, { status: 200 });
+      }
+      if (url.includes('/check-runs') && method === 'POST') {
+        checkRunsPosted.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return { prPatchFetches, perCommitFetches, checkRunsPosted };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  function splitCommit(sha, subject, parents = 1) {
+    return {
+      sha,
+      html_url: `https://github.com/test/repo/commit/${sha}`,
+      parents: Array.from({ length: parents }, (_, i) => ({ sha: `parent${i}` })),
+      commit: {
+        message: `${subject}\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+  }
+
+  test('fetches the pull request patch once and splits it per commit', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+      envelopePatch(SPLIT_SHA_2, 2, 2, 'mypkg: second', 'utils/mypkg/Makefile');
+
+    const { prPatchFetches, perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1, 'exactly one PR-wide patch request');
+    assert.deepStrictEqual(perCommitFetches, [], 'no per-commit patch requests');
+    const makefileRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.ok(makefileRun, 'Makefile check-run posted');
+    assert.ok(makefileRun.output.text.includes(`[${SPLIT_SHA_1.slice(0, 7)}]`), 'first commit audited on its own');
+    assert.ok(makefileRun.output.text.includes(`[${SPLIT_SHA_2.slice(0, 7)}]`), 'second commit audited on its own');
+  });
+
+  test('fetches only the commits the pull request patch does not carry', async () => {
+    // format-patch leaves merge commits out of the PR patch, so the merge
+    // commit in the middle still needs its own request - and only that one.
+    const commits = [
+      splitCommit(SPLIT_SHA_1, 'mypkg: first'),
+      splitCommit(SPLIT_SHA_2, "Merge branch 'main' into feature", 2),
+      splitCommit(SPLIT_SHA_3, 'mypkg: third')
+    ];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+      envelopePatch(SPLIT_SHA_3, 2, 2, 'mypkg: third', 'utils/mypkg/Makefile');
+
+    const { prPatchFetches, perCommitFetches } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 }),
+      perCommitPatches: { [SPLIT_SHA_2]: '' }
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(perCommitFetches, [SPLIT_SHA_2], 'only the merge commit is fetched on its own');
+  });
+
+  test('is not fooled by a commit message quoting an upstream mail header', async () => {
+    // openwrt/openwrt commit bcd8d530 is a real example: the message quotes the
+    // upstream submission, mail envelope and all, and git writes that body out
+    // verbatim. Splitting on it would leave the commit with headers and no
+    // diff, which every check reports as clean.
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: import upstream fix')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: import upstream fix
+
+Taken from the upstream submission:
+
+From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
+From: Upstream Author <up@stream.tld>
+Date: Fri, 27 Apr 2012 14:17:52 -0400
+Subject: [PATCH] the upstream change
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/001-fix.patch | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/001-fix.patch
+@@ -0,0 +1,3 @@
++--- a/src/main.c
+++++ b/src/main.c
++ a change with no Git headers above it
+--
+2.45.0
+
+`;
+
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.deepStrictEqual(perCommitFetches, [], 'the quoted header is not a commit of this pull request');
+    const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.ok(patchesRun.output.text.includes('Missing required Git header'),
+      `the second commit's diff must actually be inspected: ${patchesRun.output.text}`);
+  });
+
+  test('does not re-split on a quoted header naming an earlier commit of the same pull request', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: fix the first')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: fix the first
+
+Fixes the commit quoted below:
+
+From ${SPLIT_SHA_1} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Subject: [PATCH 1/2] mypkg: first
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/002-fix.patch | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/utils/mypkg/patches/002-fix.patch b/utils/mypkg/patches/002-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/002-fix.patch
+@@ -0,0 +1,3 @@
++--- a/src/main.c
+++++ b/src/main.c
++ another change with no Git headers
+--
+2.45.0
+
+`;
+
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.deepStrictEqual(perCommitFetches, []);
+    const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.ok(patchesRun.output.text.includes('Missing required Git header'), patchesRun.output.text);
+
+    // The finding has to sit under the commit that actually carries the patch
+    // file. Splitting on the quoted header would hand the first commit the
+    // second one's diff and leave the second with nothing.
+    const sectionFor = (sha) => {
+      const sections = patchesRun.output.text.split('#### Commit [');
+      const section = sections.find(part => part.startsWith(sha.slice(0, 7)));
+      assert.ok(section, `no section for commit ${sha.slice(0, 7)} in ${patchesRun.output.text}`);
+      return section;
+    };
+    assert.ok(sectionFor(SPLIT_SHA_2).includes('Missing required Git header'), 'reported under the second commit');
+    assert.ok(!sectionFor(SPLIT_SHA_1).includes('Missing required Git header'), 'not under the first commit');
+  });
+
+  test('falls back to per-commit patches when the pull request patch is unavailable', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+
+    const { prPatchFetches, perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response('Sorry, the diff exceeded the maximum number of lines', { status: 406 }),
+      perCommitPatches: {
+        [SPLIT_SHA_1]: envelopePatch(SPLIT_SHA_1, 1, 1, 'mypkg: first', 'utils/mypkg/Makefile'),
+        [SPLIT_SHA_2]: envelopePatch(SPLIT_SHA_2, 1, 1, 'mypkg: second', 'utils/mypkg/Makefile')
+      }
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(perCommitFetches.sort(), [SPLIT_SHA_1, SPLIT_SHA_2]);
+    assert.strictEqual(checkRunsPosted.length, 3);
+  });
+
+  async function commentListingsFor(commentCount) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        comments: commentCount,
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const commentListings = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: true,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/issues/123/comments?')) {
+        commentListings.push(url);
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return commentListings;
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('does not list comments on a pull request GitHub reports as having none', async () => {
+    const listings = await commentListingsFor(0);
+    assert.deepStrictEqual(listings, []);
+  });
+
+  test('still lists comments when the pull request has some', async () => {
+    const listings = await commentListingsFor(2);
+    assert.strictEqual(listings.length, 1);
+  });
+
+  async function runWithCheckRunAnswer(answer) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const checkRunPosts = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/check-runs') && options?.method === 'POST') {
+        checkRunPosts.push(JSON.parse(options.body).name);
+        return answer(checkRunPosts.length);
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      return { status: response.status, text: await response.text(), checkRunPosts };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('a refused check-run turns the webhook answer into an error naming it', async () => {
+    const { status, text, checkRunPosts } = await runWithCheckRunAnswer((n) =>
+      n === 2
+        ? new Response('{"message":"Resource not accessible by integration"}', { status: 403 })
+        : new Response('{}', { status: 201 }));
+    assert.strictEqual(status, 502);
+    assert.ok(text.includes('check-run "OpenWrt Makefiles" (HTTP 403)'), text);
+    assert.strictEqual(checkRunPosts.length, 3, 'the remaining check-runs are still posted');
+  });
+
+  test('check-runs are posted one after another, not as a burst', async () => {
+    let inFlight = 0;
+    let burst = false;
+    const { status } = await runWithCheckRunAnswer(async () => {
+      inFlight++;
+      if (inFlight > 1) burst = true;
+      await new Promise(resolve => setTimeout(resolve, 1));
+      inFlight--;
+      return new Response('{}', { status: 201 });
+    });
+    assert.strictEqual(status, 200);
+    assert.strictEqual(burst, false);
+  });
+
+  // Drives a pull request that passes every check while still carrying the
+  // guidelines label, so the run removes it, and lets the test decide how
+  // GitHub answers that removal.
+  async function runWithLabelRemovalAnswer(answer) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        labels: [{ name: 'not following guidelines' }],
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const removals = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, ['not following guidelines']); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3\n\nA proper description of the change.\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/issues/123/labels/') && method === 'DELETE') {
+        removals.push(decodeURIComponent(url.split('/labels/')[1]));
+        return answer();
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 201 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      return { status: response.status, text: await response.text(), removals };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('a refused label removal is reported, not swallowed', async () => {
+    const { status, text, removals } = await runWithLabelRemovalAnswer(() =>
+      new Response('{"message":"Server Error"}', { status: 500 }));
+    // A 500 is retried, so the removal is attempted more than once.
+    assert.deepStrictEqual([...new Set(removals)], ['not following guidelines']);
+    assert.strictEqual(status, 502, text);
+    assert.ok(text.includes('label removal "not following guidelines"'), text);
+  });
+
+  test('a label that is already gone is not a failed write', async () => {
+    const { status, removals } = await runWithLabelRemovalAnswer(() =>
+      new Response('{"message":"Label does not exist"}', { status: 404 }));
+    assert.deepStrictEqual(removals, ['not following guidelines']);
+    assert.strictEqual(status, 200);
+  });
+
+  test('looks up the files of every commit in one batched request', async () => {
+    const shas = [SPLIT_SHA_1, SPLIT_SHA_2, SPLIT_SHA_3];
+    const commits = shas.map((sha, i) => splitCommit(sha, `mypkg: patch ${i}`));
+    // Each commit refreshes a different downstream patch file, so the header
+    // check has to read all three files - one lookup per commit.
+    const prPatch = shas.map((sha, i) => `From ${sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH ${i + 1}/3] mypkg: patch ${i}
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/00${i}-fix.patch | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-fix.patch
+--- a/utils/mypkg/patches/00${i}-fix.patch
++++ b/utils/mypkg/patches/00${i}-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+--
+2.45.0
+
+`).join('');
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: refresh patches',
+        body: 'Refresh',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: SPLIT_SHA_3 },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const batchCalls = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        const probes = groups.flatMap(g => g.probes.filter(p => p.path !== null));
+        if (probes.length > 0) batchCalls.push(probes.map(p => p.path));
+        return graphqlResponse(groups, () =>
+          'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix\n');
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commits), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123') && options?.headers?.Accept === 'application/vnd.github.patch') {
+        return new Response(prPatch, { status: 200 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+
+      assert.strictEqual(batchCalls.length, 1, `expected one batched lookup, got ${JSON.stringify(batchCalls)}`);
+      for (let i = 0; i < 3; i++) {
+        assert.ok(batchCalls[0].includes(`utils/mypkg/patches/00${i}-fix.patch`), `commit ${i}'s patch file is in the batch`);
+      }
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;

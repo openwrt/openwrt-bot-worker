@@ -17,7 +17,8 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   }
 
   const maxAttempts = 3;
-  let delay = (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') ? 1 : 500;
+  const isTestEnv = typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test';
+  let delay = isTestEnv ? 1 : 500;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -30,6 +31,19 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
         console.warn(`GitHub API call failed with HTTP ${response.status} (attempt ${attempt}/${maxAttempts}). Retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         delay *= 2;
+        continue;
+      }
+
+      // GitHub's secondary rate limits (too many writes in a short burst)
+      // answer with 403 or 429 and a Retry-After header. Wait it out - capped,
+      // so a webhook still answers in time - and try again like a transient
+      // 5xx. Without the header a 403 is a real refusal and is not retried.
+      const retryAfterSeconds = Number(response.headers?.get?.('retry-after'));
+      const isRateLimited = (response.status === 403 || response.status === 429) && retryAfterSeconds > 0;
+      if (isRateLimited && attempt < maxAttempts) {
+        const wait = isTestEnv ? 1 : Math.min(retryAfterSeconds, 5) * 1000;
+        console.warn(`GitHub API rate limited: ${method} ${url} -> HTTP ${response.status} (attempt ${attempt}/${maxAttempts}). Retrying in ${wait}ms...`);
+        await new Promise(resolve => setTimeout(resolve, wait));
         continue;
       }
 
