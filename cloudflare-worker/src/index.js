@@ -1049,11 +1049,16 @@ async function handleWebhook(request, env) {
           const fetchFileContentForUpstream = (patchFile) => fetchFileContentCached(patchFile, item.upstreamSha);
           const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
+          reportPatches.warnings = reportPatches.warnings.filter(warn => !reportUpstreamPatches.warnings.includes(warn));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
 
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+        if (reportPatches.warnings.length > 0) {
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.warnings.map(w => `- ⚠️ ${w}`).join("\n"));
+          reportPatches.warnings.forEach(w => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
+        }
         if (reportPatches.errors.length > 0) {
           const isPatchWarning = CONFIG.check_patch_headers === 'warning';
           if (isPatchWarning) {
@@ -1100,6 +1105,10 @@ async function handleWebhook(request, env) {
     const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent);
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+    if (reportPatches.warnings.length > 0) {
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.warnings.map(w => `- ⚠️ ${w}`).join("\n"));
+      reportPatches.warnings.forEach(w => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
+    }
     if (reportPatches.errors.length > 0) {
       const isPatchWarning = CONFIG.check_patch_headers === 'warning';
       if (isPatchWarning) {
