@@ -1446,6 +1446,22 @@ async function handleWebhook(request, env) {
   const labelsToAdd = [];
   const labelOperations = [];
 
+  // Every write that reports the result to the pull request is checked: a
+  // failed one is logged and turns the webhook response into an error, so it
+  // shows in the App's delivery log instead of vanishing.
+  const statusWrites = [];
+  const recordWrite = (what, res) => { statusWrites.push({ what, code: res?.code }); };
+
+  // Removing a label is as visible as adding one - a pull request left
+  // carrying "not following guidelines" after it was fixed reads as broken,
+  // and the nightly scan acts on that label. 404 means the label is already
+  // gone, which is a race with another writer rather than a failure.
+  const removeLabel = (name) => trackedApiCall(`${prLabelUrl}/${encodeURIComponent(name)}`, token, 'DELETE')
+    .then(res => {
+      if (res.code !== 404) recordWrite(`label removal "${name}"`, res);
+      return res;
+    });
+
   async function ensureLabel(name, color, description) {
     await ensureLabelExists(token, repoFullname, name, color, description, existingLabels, () => { subrequestBudget.used++; });
   }
@@ -1455,28 +1471,28 @@ async function handleWebhook(request, env) {
   // New commits or a reopen are contributor activity: drop the stale marker
   // right away instead of waiting for the nightly scan to notice it.
   if ((data.action === 'synchronize' || data.action === 'reopened') && currentPrLabels.has('stale')) {
-    labelOperations.push(trackedApiCall(`${prLabelUrl}/stale`, token, 'DELETE'));
+    labelOperations.push(() => removeLabel('stale'));
   }
 
   if (!allPassed) {
     if (!currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
+      labelOperations.push(() => ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
       labelsToAdd.push(LABEL_GUIDELINES);
     }
   } else {
     // Delete validation failure label if present
     if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(trackedApiCall(`${prLabelUrl}/${encodeURIComponent(LABEL_GUIDELINES)}`, token, 'DELETE'));
+      labelOperations.push(() => removeLabel(LABEL_GUIDELINES));
     }
   }
 
   if (CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
-    labelOperations.push(ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
+    labelOperations.push(() => ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
     labelsToAdd.push(LABEL_ADD_PACKAGE);
   }
 
   if (CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
-    labelOperations.push(ensureLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
+    labelOperations.push(() => ensureLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
     labelsToAdd.push(LABEL_DROP_PACKAGE);
   }
 
@@ -1484,7 +1500,7 @@ async function handleWebhook(request, env) {
     const version = baseBranch.split('-')[1];
     const labelName = `release/${version}`;
     if (!currentPrLabels.has(labelName.toLowerCase())) {
-      labelOperations.push(ensureLabel(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
+      labelOperations.push(() => ensureLabel(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
       labelsToAdd.push(labelName);
     }
   }
@@ -1511,7 +1527,7 @@ async function handleWebhook(request, env) {
       const matchedLabels = getLabelsForChangedFiles(changedFiles, parsedLabeler);
       for (const label of matchedLabels) {
         if (!currentPrLabels.has(label.toLowerCase())) {
-          labelOperations.push(ensureLabel(label, 'bfd4f2', ''));
+          labelOperations.push(() => ensureLabel(label, 'bfd4f2', ''));
           labelsToAdd.push(label);
         }
       }
@@ -1520,16 +1536,20 @@ async function handleWebhook(request, env) {
     }
   }
 
-  // Pre-create any missing repository labels in parallel
-  await Promise.all(labelOperations);
+  // Label removals and creations go out one after another, like every other
+  // write below: GitHub answers a burst of content-creating requests with its
+  // secondary rate limit.
+  for (const operation of labelOperations) {
+    await operation();
+  }
 
   // Apply all relevant labels to the PR in one API call
   if (labelsToAdd.length > 0) {
-    await trackedApiCall(prLabelUrl, token, 'POST', { labels: labelsToAdd });
+    recordWrite('labels', await trackedApiCall(prLabelUrl, token, 'POST', { labels: labelsToAdd }));
   }
 
   // PR Comment Management
-  const commentPromises = [];
+  const commentWrites = [];
   if (CONFIG.enable_comments) {
     const scanResult = await getCommentsScanWithRetry();
     const fetchSucceeded = scanResult !== null;
@@ -1590,13 +1610,13 @@ async function handleWebhook(request, env) {
         commentBody += footerMd;
 
         if (existingCommentId) {
-          commentPromises.push(trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) }));
+          commentWrites.push(['PR comment update', () => trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'PATCH', { body: safeTruncate(commentBody) })]);
         } else {
-          commentPromises.push(trackedApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) }));
+          commentWrites.push(['PR comment', () => trackedApiCall(commentsUrl, token, 'POST', { body: safeTruncate(commentBody) })]);
         }
       } else {
         if (existingCommentId) {
-          commentPromises.push(trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE'));
+          commentWrites.push(['PR comment removal', () => trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, token, 'DELETE')]);
         }
       }
     }
@@ -1620,8 +1640,8 @@ async function handleWebhook(request, env) {
   const makefileConclusion = conclusionFor(makefilePassed, deepScanIncomplete);
   const patchesConclusion = conclusionFor(patchesPassed, deepScanIncomplete);
 
-  const checkRunsPromises = [
-    trackedApiCall(checkRunsUrl, token, 'POST', {
+  const checkRunWrites = [
+    ['check-run "Git & Commits"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Git & Commits', head_sha: headSha, status: 'completed',
       conclusion: formalityConclusion,
       output: {
@@ -1630,8 +1650,8 @@ async function handleWebhook(request, env) {
           (formalityConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(formalityOutputText)
       }
-    }),
-    trackedApiCall(checkRunsUrl, token, 'POST', {
+    })],
+    ['check-run "OpenWrt Makefiles"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / OpenWrt Makefiles', head_sha: headSha, status: 'completed',
       conclusion: makefileConclusion,
       output: {
@@ -1640,8 +1660,8 @@ async function handleWebhook(request, env) {
           (makefileConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(makefileOutputText)
       }
-    }),
-    trackedApiCall(checkRunsUrl, token, 'POST', {
+    })],
+    ['check-run "Code Patches"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
       conclusion: patchesConclusion,
       output: {
@@ -1650,11 +1670,22 @@ async function handleWebhook(request, env) {
           (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(patchesOutputText)
       }
-    })
+    })]
   ];
 
-  // OPTIMIZATION: Wait for comments, check runs, and PR labeling updates to publish concurrently
-  await Promise.all([...commentPromises, ...checkRunsPromises]);
+  // The writes go out one after another rather than as a burst: GitHub asks
+  // for content-creating requests to be made serially and answers bursts
+  // with its secondary rate limits. Waiting on a response costs no CPU time.
+  for (const [what, write] of [...commentWrites, ...checkRunWrites]) {
+    recordWrite(what, await write());
+  }
+
+  const failedWrites = statusWrites.filter(w => !(w.code >= 200 && w.code < 300));
+  if (failedWrites.length > 0) {
+    const summary = failedWrites.map(w => `${w.what} (HTTP ${w.code ?? 'no response'})`).join(', ');
+    console.error(`Status reporting for PR #${prNumber} failed: ${summary}`);
+    return new Response(`Failed to report status for PR #${prNumber}: ${summary}`, { status: 502 });
+  }
 
   return new Response(`Success: Processed check runs for PR #${prNumber}`, { status: 200 });
 }
@@ -1666,7 +1697,14 @@ export default {
       const url = new URL(request.url);
 
       if (request.method === "POST" && url.pathname === "/webhook") {
-        return await handleWebhook(request, env);
+        // GitHub gives up on a delivery after ten seconds, and once the client
+        // is gone Cloudflare may cancel whatever is still in flight - the
+        // status writes at the end of a long run included. Registering the
+        // work keeps it alive for up to thirty seconds past that; the answer
+        // still waits for it, so the delivery log keeps showing failures.
+        const work = handleWebhook(request, env);
+        ctx?.waitUntil?.(work.catch(() => {}));
+        return await work;
       }
 
       return new Response("Invalid Request", { status: 400 });
