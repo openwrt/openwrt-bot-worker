@@ -1614,8 +1614,16 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     return { errors: [], successes: ["✅ No diff footprint present for patches validation"] };
   }
 
-  const patchMatch = commitPatch.match(/^\+\+\+\s+b\/(.*\.patch)/mg);
-  const patchFiles = patchMatch ? patchMatch.map(line => line.replace(/^\+\+\+\s+b\//, '')) : [];
+  // Anchored at the end of the line: without that, the greedy match reads
+  // "foo.patch.bak" - a leftover a contributor did not mean to commit - as a
+  // patch file named "foo.patch", and the checks then run against a file that
+  // was never touched.
+  const patchFiles = [];
+  const patchHeader = /^\+\+\+\s+b\/(.*\.patch)\r?$/mg;
+  let patchHeaderMatch;
+  while ((patchHeaderMatch = patchHeader.exec(commitPatch)) !== null) {
+    patchFiles.push(patchHeaderMatch[1]);
+  }
 
   if (patchFiles.length === 0) {
     return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
@@ -1627,13 +1635,18 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   // instead of one-at-a-time, so a batching loader upstream (see
   // fetchFileContentCached in index.js) can combine them into a single
   // GraphQL request instead of one HTTP call per patch file.
+  //
+  // Each chunk is paired with the patch file its own `+++ b/` header names.
+  // Testing every chunk against every patch file instead is quadratic in the
+  // number of files: a kernel bump that refreshes 800 patches would spend
+  // ~180 ms of CPU here alone, far past what a Worker invocation gets.
+  const wantedPatchFiles = new Set(patchFiles);
   const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
   const matches = [];
   for (const chunk of fileChunks) {
-    for (const patchFile of patchFiles) {
-      if (chunk.includes('b/' + patchFile)) {
-        matches.push({ chunk, patchFile });
-      }
+    const header = chunk.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
+    if (header && wantedPatchFiles.has(header[1])) {
+      matches.push({ chunk, patchFile: header[1] });
     }
   }
 
@@ -1689,7 +1702,29 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   return { errors, successes };
 }
 
-export function getChangedFilesFromPatch(patch) {
+// The two parsers below walk a whole patch line by line, and the validators
+// ask each of them more than once for the same commit patch: the UCI check,
+// the release audit and the hash audit all start from the same file lists.
+// Their results are remembered per patch text so the walk happens once. The
+// cache stays small and bounded - a Worker isolate serves many webhooks in a
+// row, and old pull requests must not pile up in memory. Every caller shares
+// one result, so it is frozen; freezing does not reach inside the two Sets it
+// holds, which callers must therefore treat as read-only.
+const PATCH_PARSE_CACHE_LIMIT = 32;
+function rememberPerPatch(parse) {
+  const cache = new Map();
+  return (patch) => {
+    if (!patch) return parse(patch);
+    const remembered = cache.get(patch);
+    if (remembered !== undefined) return remembered;
+    const result = parse(patch);
+    if (cache.size >= PATCH_PARSE_CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(patch, result);
+    return result;
+  };
+}
+
+export const getChangedFilesFromPatch = rememberPerPatch(function getChangedFilesFromPatch(patch) {
   if (!patch) return [];
   const files = [];
   const lines = patch.split('\n');
@@ -1698,10 +1733,10 @@ export function getChangedFilesFromPatch(patch) {
       files.push(line.slice(6).trim().replace(/\r$/, ''));
     }
   }
-  return files;
-}
+  return Object.freeze(files);
+});
 
-export function parseDiffFileStates(patch) {
+export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates(patch) {
   const addedFiles = new Set();
   const deletedFiles = new Set();
   if (!patch) return { addedFiles, deletedFiles };
@@ -1725,8 +1760,8 @@ export function parseDiffFileStates(patch) {
     }
   }
 
-  return { addedFiles, deletedFiles };
-}
+  return Object.freeze({ addedFiles, deletedFiles });
+});
 
 export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
