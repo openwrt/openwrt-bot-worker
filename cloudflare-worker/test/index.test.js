@@ -89,6 +89,7 @@ function graphqlResponse(groups, resolver) {
 function graphqlLabelsHandler(url, options, labelNames = []) {
   if (!url.includes('/graphql')) return null;
   if (!options || !options.body) return null;
+  { const pageAnswer = graphqlCommitPageHandler(url, options); if (pageAnswer) return pageAnswer; }
   const body = JSON.parse(options.body);
   if (!body.query || !body.query.includes('labels(first:')) return null;
 
@@ -104,7 +105,11 @@ function graphqlLabelsHandler(url, options, labelNames = []) {
   }
 
   // Fused repo-setup query: resolve the two file expressions through the
-  // surrounding fetch mock's REST branches.
+  // surrounding fetch mock's REST branches, and - when the query asks for the
+  // pull request - its commits and comments through the REST listings the
+  // mocks already declare, reshaped the way GraphQL returns them (the
+  // worker reshapes them back, see restCommitFromGraphql). A test therefore
+  // keeps describing commits in the REST shape it always used.
   return (async () => {
     const { owner, name } = body.variables;
     const fetchExpr = async (expr) => {
@@ -122,10 +127,100 @@ function graphqlLabelsHandler(url, options, labelNames = []) {
       fetchExpr(body.variables.cfgExpr),
       fetchExpr(body.variables.labExpr)
     ]);
+    const repository = { labels: labelsPayload, cfg, labeler };
+
+    if (body.query.includes('pullRequest(number:')) {
+      const pr = body.variables.pr;
+      // The listings are re-entered with `_setup=1` so a test counting real
+      // REST requests can tell these apart from ones the worker makes itself.
+      const commits = await restPages(`https://api.github.com/repos/${owner}/${name}/pulls/${pr}/commits`);
+      const commentsPage1 = await restListJson(`https://api.github.com/repos/${owner}/${name}/issues/${pr}/comments?per_page=100&page=1&_setup=1`);
+      repository.pullRequest = {
+        commits: {
+          totalCount: commits.length,
+          pageInfo: { hasNextPage: commits.length > 100, endCursor: commits.length > 100 ? 'page2' : null },
+          nodes: commits.slice(0, 100).map(c => ({ commit: graphqlCommitFromRest(c, owner, name) }))
+        },
+        comments: {
+          totalCount: commentsPage1.length,
+          // A full first page means GitHub would report more to come.
+          pageInfo: { hasNextPage: commentsPage1.length >= 100 },
+          nodes: commentsPage1.map(graphqlCommentFromRest)
+        }
+      };
+    }
+    return new Response(JSON.stringify({ data: { repository } }), { status: 200 });
+  })();
+}
+
+async function restListJson(url) {
+  const res = await globalThis.fetch(url, { method: 'GET', headers: { Accept: 'application/vnd.github+json' } });
+  if (res.status !== 200) return [];
+  try { const parsed = JSON.parse(await res.text()); return Array.isArray(parsed) ? parsed : []; } catch (e) { return []; }
+}
+
+// Walks the REST listing the mock declares, page by page, the way the worker
+// used to, so a fixture of 350 commits still means 350 commits.
+async function restPages(baseUrl) {
+  const all = [];
+  for (let page = 1; page <= 10; page++) {
+    const items = await restListJson(`${baseUrl}?per_page=100&page=${page}&_setup=1`);
+    all.push(...items);
+    if (items.length < 100) break;
+  }
+  return all;
+}
+
+// The worker pages commits past the first hundred with a cursor query; answer
+// it from the same REST listing.
+function graphqlCommitPageHandler(url, options) {
+  if (!url.includes('/graphql') || !options?.body) return null;
+  const body = JSON.parse(options.body);
+  if (!body.query || !body.query.includes('commits(first: 100, after: $after)')) return null;
+  return (async () => {
+    const { owner, name, pr, after } = body.variables;
+    const pageNumber = Number(String(after).replace('page', ''));
+    const all = await restPages(`https://api.github.com/repos/${owner}/${name}/pulls/${pr}/commits`);
+    const start = (pageNumber - 1) * 100;
+    const nodes = all.slice(start, start + 100).map(c => ({ commit: graphqlCommitFromRest(c, owner, name) }));
+    const hasNextPage = all.length > start + 100;
     return new Response(JSON.stringify({
-      data: { repository: { labels: labelsPayload, cfg, labeler } }
+      data: { repository: { pullRequest: { commits: { pageInfo: { hasNextPage, endCursor: hasNextPage ? `page${pageNumber + 1}` : null }, nodes } } } }
     }), { status: 200 });
   })();
+}
+
+// REST -> GraphQL for one commit of the listing, the inverse of the worker's
+// restCommitFromGraphql for every field the checks read.
+function graphqlCommitFromRest(c, owner, name) {
+  const verification = c.commit?.verification;
+  const signed = verification && (verification.verified || (verification.reason && verification.reason !== 'unsigned') || verification.signature);
+  return {
+    oid: c.sha,
+    url: c.html_url || `https://github.com/${owner}/${name}/commit/${c.sha}`,
+    message: c.commit?.message ?? '',
+    changedFilesIfAvailable: Number.isInteger(c.changed_files) ? c.changed_files : null,
+    author: { name: c.commit?.author?.name ?? null, email: c.commit?.author?.email ?? null, user: c.author?.login ? { login: c.author.login } : null },
+    committer: { name: c.commit?.committer?.name ?? null, email: c.commit?.committer?.email ?? null, user: c.committer?.login ? { login: c.committer.login } : null },
+    parents: { totalCount: Array.isArray(c.parents) ? c.parents.length : 1 },
+    signature: signed
+      ? { isValid: verification.verified === true, state: String(verification.reason || 'valid').toUpperCase(), signature: verification.signature ?? null, keyId: verification.key_id ?? null }
+      : null
+  };
+}
+
+// REST -> GraphQL for one issue comment. Tests run with APP_ID 12345, so a
+// comment performed via that app is the viewer's own.
+function graphqlCommentFromRest(c) {
+  const login = String(c.user?.login ?? '');
+  const isBot = c.user?.type === 'Bot' || /\[bot\]$/.test(login);
+  return {
+    databaseId: c.id,
+    body: c.body ?? '',
+    authorAssociation: c.author_association ?? 'NONE',
+    viewerDidAuthor: c.performed_via_github_app?.id === 12345,
+    author: c.user ? { login: login.replace(/\[bot\]$/, ''), __typename: isBot ? 'Bot' : 'User' } : null
+  };
 }
 
 
@@ -239,7 +334,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
     assert.strictEqual(resJson.message, resJson.exception.message);
   });
 
-  test('throws and catches explicit error when GitHub API returns non-200 status for commits list', async () => {
+  test('answers 500 with the reason when the setup query that lists the commits is refused', async () => {
     const payload = JSON.stringify({
       action: 'synchronize',
       pull_request: {
@@ -272,8 +367,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       if (url.includes('/formalities.json')) {
         return new Response(JSON.stringify({}), { status: 200 });
       }
-      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
-      if (url.includes('/commits')) {
+      if (url.includes('/graphql')) {
         return new Response('API rate limit exceeded', { status: 403 });
       }
       return new Response(JSON.stringify({}), { status: 404 });
@@ -304,7 +398,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       assert.strictEqual(response.status, 500);
       const resJson = await response.json();
       assert.ok(resJson.exception);
-      assert.match(resJson.exception.message, /GitHub API returned HTTP 403/);
+      assert.match(resJson.exception.message, /HTTP 403/);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -597,7 +691,7 @@ index 123456..789012 100644
   });
 
   test('adds warning when PR has more than 300 commits and commit audit is capped', async () => {
-    const commitsList = Array.from({ length: 300 }, (_, i) => ({
+    const commitsList = Array.from({ length: 350 }, (_, i) => ({
       sha: `sha300${i}`,
       html_url: `https://github.com/commit/sha300${i}`,
       commit: {
@@ -652,9 +746,6 @@ index 123456..789012 100644
       if (url.includes('/pulls/123/commits')) {
         const parsedUrl = new URL(url);
         const page = Number(parsedUrl.searchParams.get('page') || '1');
-        if (page > 3) {
-          throw new Error(`Unexpected commit page requested: ${page}`);
-        }
         const start = (page - 1) * 100;
         const end = page * 100;
         return new Response(JSON.stringify(commitsList.slice(start, end)), { status: 200 });
@@ -1840,11 +1931,14 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.match(commitCheck.output.text, /bypasses cherry-pick requirement via override command/);
   });
 
-  test('falls back to fetching comments in comment-management block if initial prefetch fails with 500', async () => {
+  test('lists the thread through REST, retrying once, when the inline comments cannot say whose the report is', async () => {
     let callCount = 0;
     const comments = [
       { body: 'Looks good, [allow cherry-pick]', author_association: 'OWNER' }
     ];
+    // A Formality Check comment by some GitHub App that the setup query does
+    // not mark as the viewer's own: only the REST listing can tell.
+    const reportByAnApp = { id: 7, body: '## Formality Check: Failed\n\nold', user: { login: 'openwrt[bot]', type: 'Bot' }, author_association: 'NONE' };
 
     postedCheckRuns = [];
     fetchMock = async (url, options) => {
@@ -1875,6 +1969,9 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         return new Response(JSON.stringify(commitData), { status: 200 });
       }
       if (url.includes('/issues/123/comments') && (!options || options.method === 'GET')) {
+        if (url.includes('_setup=1')) {
+          return new Response(JSON.stringify([...comments, reportByAnApp]), { status: 200 });
+        }
         callCount++;
         if (callCount === 1) {
           return new Response('Internal Server Error', { status: 500 });
@@ -3657,10 +3754,10 @@ index 123456..789012 100644
 
       assert.strictEqual(response.status, 200);
 
-      // Exactly one GraphQL call per unresolved ref (head sha + base sha),
-      // not one call per repo — proving base and fork are queried together
-      // instead of the old reactive fetch -> 404 -> retry-under-fork.
-      assert.strictEqual(graphqlCallCount, 2);
+      // The head and base Makefile lookups go out together in one GraphQL
+      // call, and within it base and fork are probed together for each
+      // unresolved ref - not one call per repo, and not one per ref.
+      assert.strictEqual(graphqlCallCount, 1);
       assert.strictEqual(Object.keys(callsByRef).length, 2);
       for (const calls of Object.values(callsByRef)) {
         assert.strictEqual(calls.length, 1, 'expected exactly one GraphQL call for this ref');
@@ -4345,6 +4442,744 @@ index 123456..789012 100644
     }
   });
 
+  async function labelsPostedForAddedMakefile(makefilePath) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'add a Makefile',
+        body: 'Adds a Makefile',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const apiCalls = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      apiCalls.push({ url, method, body: options?.body ? JSON.parse(options.body) : null });
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, ['add package']); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'foo: add Makefile\n\nSigned-off-by: John Doe <john@doe.com>',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          `diff --git a/${makefilePath} b/${makefilePath}\n` +
+          'new file mode 100644\n' +
+          '--- /dev/null\n' +
+          `+++ b/${makefilePath}\n` +
+          '@@ -0,0 +1,2 @@\n' +
+          '+include $(TOPDIR)/rules.mk\n' +
+          '+# placeholder\n',
+          { status: 200 }
+        );
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200);
+      return apiCalls
+        .filter(c => c.url.includes('/issues/123/labels') && c.method === 'POST')
+        .flatMap(c => c.body?.labels || []);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('a new package Makefile earns the "add package" label', async () => {
+    const labels = await labelsPostedForAddedMakefile('package/utils/newpkg/Makefile');
+    assert.ok(labels.includes('add package'), `labels posted: ${JSON.stringify(labels)}`);
+  });
+
+  test('a new target Makefile is build infrastructure, not a package', async () => {
+    const labels = await labelsPostedForAddedMakefile('target/linux/newtarget/Makefile');
+    assert.ok(!labels.includes('add package'), `labels posted: ${JSON.stringify(labels)}`);
+  });
+
+  const SPLIT_SHA_1 = '1111111111111111111111111111111111111111';
+  const SPLIT_SHA_2 = '2222222222222222222222222222222222222222';
+  const SPLIT_SHA_3 = '3333333333333333333333333333333333333333';
+
+  function envelopePatch(sha, index, total, subject, file) {
+    return `From ${sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH ${index}/${total}] ${subject}
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ ${file} | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/${file} b/${file}
+--- a/${file}
++++ b/${file}
+@@ -1,3 +1,4 @@
+ PKG_NAME:=mypkg
++PKG_RELEASE:=2
+ PKG_LICENSE:=MIT
+--
+2.45.0
+
+`;
+  }
+
+  // Drives one pull_request webhook through the worker and reports which
+  // patch requests it made and what it posted as check-runs.
+  async function runPatchScenario({ commits, prPatchResponse, perCommitPatches = {}, envOverrides = {}, payloadCommits = undefined }) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        commits: payloadCommits,
+        title: 'mypkg: bump release',
+        body: 'Bump release',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: commits[commits.length - 1].sha },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const prPatchFetches = [];
+    const perCommitFetches = [];
+    const checkRunsPosted = [];
+    const order = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      if (url.includes('/graphql') && options?.body && JSON.parse(options.body).query.includes('labels(first:')) order.push('setup');
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commits), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123') && options?.headers?.Accept === 'application/vnd.github.patch') {
+        prPatchFetches.push(url);
+        order.push('patch');
+        return prPatchResponse();
+      }
+      const commitMatch = url.match(/\/repos\/test\/repo\/commits\/([0-9a-f]{40})$/);
+      if (commitMatch) {
+        perCommitFetches.push(commitMatch[1]);
+        const body = perCommitPatches[commitMatch[1]];
+        if (body === undefined) {
+          throw new Error(`Unexpected per-commit patch fetch: ${url}`);
+        }
+        return new Response(body, { status: 200 });
+      }
+      if (url.includes('/check-runs') && method === 'POST') {
+        checkRunsPosted.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA==',
+        ...envOverrides
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return { prPatchFetches, perCommitFetches, checkRunsPosted, order };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  function splitCommit(sha, subject, parents = 1, extra = {}) {
+    return {
+      ...extra,
+      sha,
+      html_url: `https://github.com/test/repo/commit/${sha}`,
+      parents: Array.from({ length: parents }, (_, i) => ({ sha: `parent${i}` })),
+      commit: {
+        message: `${subject}\n\nSigned-off-by: John Doe <john@doe.com>`,
+        author: { name: 'John Doe', email: 'john@doe.com' },
+        committer: { name: 'John Doe', email: 'john@doe.com' }
+      }
+    };
+  }
+
+  test('fetches the pull request patch once and splits it per commit', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+      envelopePatch(SPLIT_SHA_2, 2, 2, 'mypkg: second', 'utils/mypkg/Makefile');
+
+    const { prPatchFetches, perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1, 'exactly one PR-wide patch request');
+    assert.deepStrictEqual(perCommitFetches, [], 'no per-commit patch requests');
+    const makefileRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.ok(makefileRun, 'Makefile check-run posted');
+    assert.ok(makefileRun.output.text.includes(`[${SPLIT_SHA_1.slice(0, 7)}]`), 'first commit audited on its own');
+    assert.ok(makefileRun.output.text.includes(`[${SPLIT_SHA_2.slice(0, 7)}]`), 'second commit audited on its own');
+  });
+
+  test('fetches only the commits the pull request patch does not carry, and never a merge commit', async () => {
+    // git leaves merge commits out of the PR patch. What GitHub would serve
+    // for one is the whole merged-in branch, so it is not fetched at all; a
+    // regular commit the patch lacks (pushed while the run was in flight)
+    // still gets its own request.
+    const commits = [
+      splitCommit(SPLIT_SHA_1, 'mypkg: first'),
+      splitCommit(SPLIT_SHA_2, "Merge branch 'main' into feature", 2),
+      splitCommit(SPLIT_SHA_3, 'mypkg: third')
+    ];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 1, 'mypkg: first', 'utils/mypkg/Makefile');
+
+    const { prPatchFetches, perCommitFetches } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 }),
+      perCommitPatches: { [SPLIT_SHA_3]: envelopePatch(SPLIT_SHA_3, 1, 1, 'mypkg: third', 'utils/mypkg/Makefile') }
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(perCommitFetches, [SPLIT_SHA_3], 'the merge commit is skipped, the missing regular commit fetched');
+  });
+
+  test('fetches a commit on its own when its part of the split does not match its file count', async () => {
+    // GitHub says the second commit changed one file; the part the split hands
+    // it carries two diffs, so the boundaries cannot be trusted for it.
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second', 1, { changed_files: 1 })];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: second
+
+Signed-off-by: John Doe <john@doe.com>
+---
+diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile
+--- a/utils/mypkg/Makefile
++++ b/utils/mypkg/Makefile
+@@ -1,3 +1,4 @@
+ PKG_NAME:=mypkg
++PKG_RELEASE:=3
+ PKG_LICENSE:=MIT
+diff --git a/utils/mypkg/README b/utils/mypkg/README
+--- a/utils/mypkg/README
++++ b/utils/mypkg/README
+@@ -1 +1 @@
+-a
++b
+`;
+    const { perCommitFetches } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 }),
+      perCommitPatches: { [SPLIT_SHA_2]: envelopePatch(SPLIT_SHA_2, 1, 1, 'mypkg: second', 'utils/mypkg/Makefile') }
+    });
+    assert.deepStrictEqual(perCommitFetches, [SPLIT_SHA_2]);
+  });
+
+  test('starts the pull request patch before the setup query when the payload says several commits', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+      envelopePatch(SPLIT_SHA_2, 2, 2, 'mypkg: second', 'utils/mypkg/Makefile');
+    const { order, prPatchFetches } = await runPatchScenario({
+      commits,
+      payloadCommits: 2,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(order.slice(0, 2), ['patch', 'setup'], 'the patch request overlaps the setup query instead of waiting behind it');
+  });
+
+  const manyShas = Array.from({ length: 20 }, (_, i) => 'c'.repeat(38) + String(i).padStart(2, '0'));
+
+  test('falls back to one request per commit when GitHub refuses the patch of a large pull request', async () => {
+    const commits = manyShas.map((sha, i) => splitCommit(sha, `mypkg: change ${i}`));
+    const perCommitPatches = Object.fromEntries(manyShas.map((sha, i) => [sha, envelopePatch(sha, 1, 1, `mypkg: change ${i}`, 'utils/mypkg/Makefile')]));
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response('Sorry, the diff exceeded the maximum number of lines', { status: 406 }),
+      perCommitPatches
+    });
+    assert.strictEqual(perCommitFetches.length, 20);
+    assert.strictEqual(checkRunsPosted.length, 3, 'the run still reports instead of dying');
+    assert.strictEqual(checkRunsPosted.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles').conclusion, 'success');
+  });
+
+  test('reports neutral when the refused patch cannot be replaced within the request budget', async () => {
+    const commits = manyShas.map((sha, i) => splitCommit(sha, `mypkg: change ${i}`));
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response('Sorry, the diff exceeded the maximum number of lines', { status: 406 }),
+      envOverrides: { SUBREQUEST_BUDGET_LIMIT: '20', SUBREQUEST_RESERVE_HEADROOM: '15' }
+    });
+    assert.deepStrictEqual(perCommitFetches, [], 'twenty fetches would not fit');
+    const makefileRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.strictEqual(makefileRun.conclusion, 'neutral');
+    assert.ok(makefileRun.output.text.includes("did not serve this pull request's patch"), makefileRun.output.text);
+    assert.strictEqual(checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches').conclusion, 'neutral');
+  });
+
+  test('is not fooled by a commit message quoting an upstream mail header', async () => {
+    // openwrt/openwrt commit bcd8d530 is a real example: the message quotes the
+    // upstream submission, mail envelope and all, and git writes that body out
+    // verbatim. Splitting on it would leave the commit with headers and no
+    // diff, which every check reports as clean.
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: import upstream fix')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: import upstream fix
+
+Taken from the upstream submission:
+
+From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
+From: Upstream Author <up@stream.tld>
+Date: Fri, 27 Apr 2012 14:17:52 -0400
+Subject: [PATCH] the upstream change
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/001-fix.patch | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/001-fix.patch
+@@ -0,0 +1,3 @@
++--- a/src/main.c
+++++ b/src/main.c
++ a change with no Git headers above it
+--
+2.45.0
+
+`;
+
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.deepStrictEqual(perCommitFetches, [], 'the quoted header is not a commit of this pull request');
+    const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.ok(patchesRun.output.text.includes('Missing required Git header'),
+      `the second commit's diff must actually be inspected: ${patchesRun.output.text}`);
+  });
+
+  test('does not re-split on a quoted header naming an earlier commit of the same pull request', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: fix the first')];
+    const prPatch = envelopePatch(SPLIT_SHA_1, 1, 2, 'mypkg: first', 'utils/mypkg/Makefile') +
+`From ${SPLIT_SHA_2} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH 2/2] mypkg: fix the first
+
+Fixes the commit quoted below:
+
+From ${SPLIT_SHA_1} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Subject: [PATCH 1/2] mypkg: first
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/002-fix.patch | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/utils/mypkg/patches/002-fix.patch b/utils/mypkg/patches/002-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/mypkg/patches/002-fix.patch
+@@ -0,0 +1,3 @@
++--- a/src/main.c
+++++ b/src/main.c
++ another change with no Git headers
+--
+2.45.0
+
+`;
+
+    const { perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response(prPatch, { status: 200 })
+    });
+
+    assert.deepStrictEqual(perCommitFetches, []);
+    const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.ok(patchesRun.output.text.includes('Missing required Git header'), patchesRun.output.text);
+
+    // The finding has to sit under the commit that actually carries the patch
+    // file. Splitting on the quoted header would hand the first commit the
+    // second one's diff and leave the second with nothing.
+    const sectionFor = (sha) => {
+      const sections = patchesRun.output.text.split('#### Commit [');
+      const section = sections.find(part => part.startsWith(sha.slice(0, 7)));
+      assert.ok(section, `no section for commit ${sha.slice(0, 7)} in ${patchesRun.output.text}`);
+      return section;
+    };
+    assert.ok(sectionFor(SPLIT_SHA_2).includes('Missing required Git header'), 'reported under the second commit');
+    assert.ok(!sectionFor(SPLIT_SHA_1).includes('Missing required Git header'), 'not under the first commit');
+  });
+
+  test('falls back to per-commit patches when the pull request patch is unavailable', async () => {
+    const commits = [splitCommit(SPLIT_SHA_1, 'mypkg: first'), splitCommit(SPLIT_SHA_2, 'mypkg: second')];
+
+    const { prPatchFetches, perCommitFetches, checkRunsPosted } = await runPatchScenario({
+      commits,
+      prPatchResponse: () => new Response('Sorry, the diff exceeded the maximum number of lines', { status: 406 }),
+      perCommitPatches: {
+        [SPLIT_SHA_1]: envelopePatch(SPLIT_SHA_1, 1, 1, 'mypkg: first', 'utils/mypkg/Makefile'),
+        [SPLIT_SHA_2]: envelopePatch(SPLIT_SHA_2, 1, 1, 'mypkg: second', 'utils/mypkg/Makefile')
+      }
+    });
+
+    assert.strictEqual(prPatchFetches.length, 1);
+    assert.deepStrictEqual(perCommitFetches.sort(), [SPLIT_SHA_1, SPLIT_SHA_2]);
+    assert.strictEqual(checkRunsPosted.length, 3);
+  });
+
+  // Runs one webhook with the given comment thread and reports the REST
+  // comment listings the worker made itself (the setup query's re-entry into
+  // the mock is marked `_setup=1` and does not count).
+  async function commentListingsFor(thread) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: update to 1.2.3',
+        body: 'Update',
+        comments: thread.length,
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const commentListings = [];
+    const commentWrites = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: true,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123',
+          html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: {
+            message: 'mypkg: update to 1.2.3',
+            author: { name: 'John Doe', email: 'john@doe.com' },
+            committer: { name: 'John Doe', email: 'john@doe.com' }
+          }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response('diff --git a/README b/README\n--- a/README\n+++ b/README\n@@ -1 +1 @@\n-a\n+b\n', { status: 200 });
+      }
+      if (url.includes('/issues/123/comments?')) {
+        if (!url.includes('_setup=1')) commentListings.push(url);
+        return new Response(JSON.stringify(thread), { status: 200 });
+      }
+      if (url.includes('/issues/comments/') || url.endsWith('/issues/123/comments')) {
+        commentWrites.push(`${options?.method} ${url.replace('https://api.github.com', '')}`);
+        return new Response(JSON.stringify({ id: 7 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return { listings: commentListings, writes: commentWrites };
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  test('never lists comments separately on a pull request without any', async () => {
+    const { listings, writes } = await commentListingsFor([]);
+    assert.deepStrictEqual(listings, []);
+    assert.deepStrictEqual(writes, ['POST /repos/test/repo/issues/123/comments'], 'a fresh report is posted');
+  });
+
+  test('reads the comments that came with the setup query instead of listing them', async () => {
+    const thread = [{ id: 1, body: 'Thanks!', user: { login: 'someone', type: 'User' }, author_association: 'NONE' }];
+    const { listings } = await commentListingsFor(thread);
+    assert.deepStrictEqual(listings, []);
+  });
+
+  test('updates its own earlier report when the setup query marks it as the viewer\'s', async () => {
+    const thread = [{ id: 7, body: '## Formality Check: Failed\n\nold', user: { login: 'openwrt[bot]', type: 'Bot' }, author_association: 'NONE', performed_via_github_app: { id: 12345 } }];
+    const { listings, writes } = await commentListingsFor(thread);
+    assert.deepStrictEqual(listings, []);
+    assert.deepStrictEqual(writes, ['PATCH /repos/test/repo/issues/comments/7']);
+  });
+
+  test('looks up the files of every commit in one batched request', async () => {
+    const shas = [SPLIT_SHA_1, SPLIT_SHA_2, SPLIT_SHA_3];
+    const commits = shas.map((sha, i) => splitCommit(sha, `mypkg: patch ${i}`));
+    // Each commit refreshes a different downstream patch file, so the header
+    // check has to read all three files - one lookup per commit.
+    const prPatch = shas.map((sha, i) => `From ${sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Tue, 7 Jul 2026 20:09:55 +0300
+Subject: [PATCH ${i + 1}/3] mypkg: patch ${i}
+
+Signed-off-by: John Doe <john@doe.com>
+---
+ utils/mypkg/patches/00${i}-fix.patch | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-fix.patch
+--- a/utils/mypkg/patches/00${i}-fix.patch
++++ b/utils/mypkg/patches/00${i}-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+--
+2.45.0
+
+`).join('');
+
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'mypkg: refresh patches',
+        body: 'Refresh',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: SPLIT_SHA_3 },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const batchCalls = [];
+
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({
+          check_branch: false,
+          enable_comments: false,
+          require_linked_github_account: false,
+          require_body: false,
+          check_uci_config: false,
+          check_pkg_release: false
+        }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        const probes = groups.flatMap(g => g.probes.filter(p => p.path !== null));
+        if (probes.length > 0) batchCalls.push(probes.map(p => p.path));
+        return graphqlResponse(groups, () =>
+          'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix\n');
+      }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify(commits), { status: 200 });
+      }
+      if (url.endsWith('/pulls/123') && options?.headers?.Accept === 'application/vnd.github.patch') {
+        return new Response(prPatch, { status: 200 });
+      }
+      if (url.includes('/issues/123/comments')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+
+      assert.strictEqual(batchCalls.length, 1, `expected one batched lookup, got ${JSON.stringify(batchCalls)}`);
+      for (let i = 0; i < 3; i++) {
+        assert.ok(batchCalls[0].includes(`utils/mypkg/patches/00${i}-fix.patch`), `commit ${i}'s patch file is in the batch`);
+      }
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('lists the thread through REST when a report by some app is not marked as the viewer\'s own', async () => {
+    const thread = [{ id: 7, body: '## Formality Check: Failed\n\nold', user: { login: 'openwrt[bot]', type: 'Bot' }, author_association: 'NONE' }];
+    const { listings } = await commentListingsFor(thread);
+    assert.strictEqual(listings.length, 1, JSON.stringify(listings));
+  });
   // Drives one webhook whose deep-validation lookups and comment listing can be
   // made to fail, and reports how many times each was really fetched plus what
   // the run said about its own coverage.
@@ -4411,6 +5246,14 @@ index 123456..789012 100644
           { status: 200 });
       }
       if (url.includes('/issues/123/comments') && method === 'GET') {
+        // The setup query re-enters this listing to build its inline comments;
+        // that is not one of the worker's own requests, and it must see a
+        // report by some GitHub App so the run still takes the REST road.
+        if (url.includes('_setup=1')) {
+          return new Response(JSON.stringify([
+            { id: 7, body: '## Formality Check: Failed', user: { login: 'openwrt[bot]', type: 'Bot' }, author_association: 'NONE' }
+          ]), { status: 200 });
+        }
         commentFetches.push(url);
         const answer = commentAnswers[commentCall++];
         if (answer) return new Response(answer.body, { status: answer.status });
@@ -4463,7 +5306,7 @@ index 123456..789012 100644
     // The budget allows the first attempt of the batched lookup and nothing
     // more. Retrying it would spend the headroom kept for the closing writes,
     // which Cloudflare counts whether or not those writes still fit.
-    const { batchFetches, status } = await runWithBudget({ budgetLimit: 7, reserve: 1 });
+    const { batchFetches, status } = await runWithBudget({ budgetLimit: 6, reserve: 1 });
     assert.strictEqual(status, 200);
     assert.strictEqual(batchFetches.length, 1, `the 503 must not be retried into the reserve: ${batchFetches.length} attempts`);
   });
@@ -4482,7 +5325,7 @@ index 123456..789012 100644
       { status: 503, body: 'upstream hiccup' },
       { status: 200, body: '[]' }
     ];
-    const { commentFetches, batchFetches } = await runWithBudget({ budgetLimit: 10, reserve: 1, commentAnswers: answers });
+    const { commentFetches, batchFetches } = await runWithBudget({ budgetLimit: 9, reserve: 1, commentAnswers: answers });
     assert.strictEqual(commentFetches.length, 3, 'the listing really was retried twice');
     assert.strictEqual(batchFetches.length, 2,
       'with all three of those fetches on the bill, the lookup that follows has room for two attempts, not three');

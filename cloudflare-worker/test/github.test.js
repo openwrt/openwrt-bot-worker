@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, githubApiCall, GRAPHQL_URL } from '../src/github.js';
+import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -436,6 +436,93 @@ describe('fetchUserRepoPermission', { concurrency: 1 }, () => {
   test('returns null when the response body is not JSON', async () => {
     fetchMock = () => new Response('<html>gateway</html>', { status: 200 });
     assert.strictEqual(await fetchUserRepoPermission('test/repo', 'someone', 'token'), null);
+  });
+});
+
+describe('graphqlFetchRepoSetup with a pull request', { concurrency: 1 }, () => {
+  let originalFetch;
+  let fetchMock;
+  before(() => { originalFetch = globalThis.fetch; globalThis.fetch = async (url, options) => fetchMock(url, options); });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  const commitNode = (oid, extra = {}) => ({ commit: {
+    oid, url: `https://github.com/openwrt/openwrt/commit/${oid}`, message: `pkg: change ${oid.slice(0, 4)}`, changedFilesIfAvailable: 2,
+    author: { name: 'Jane Doe', email: 'jane@doe.com', user: { login: 'janedoe' } },
+    committer: { name: 'Jane Doe', email: 'jane@doe.com', user: null },
+    parents: { totalCount: 1 }, signature: null, ...extra
+  } });
+
+  test('returns the commits and comments in the shape the REST listings had', async () => {
+    let queries = 0;
+    fetchMock = (url, options) => {
+      queries++;
+      const body = JSON.parse(options.body);
+      assert.strictEqual(body.variables.pr, 24988);
+      assert.ok(body.query.includes('pullRequest(number: $pr)'));
+      return new Response(JSON.stringify({ data: { repository: {
+        labels: { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: false, endCursor: null } },
+        cfg: { text: '{}' }, labeler: null,
+        pullRequest: {
+          commits: { totalCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+            commitNode('a'.repeat(40)),
+            commitNode('b'.repeat(40), { parents: { totalCount: 2 }, signature: { isValid: true, state: 'VALID', signature: '-----BEGIN PGP SIGNATURE-----', keyId: 'ABCD' } })
+          ] },
+          comments: { totalCount: 1, pageInfo: { hasNextPage: false }, nodes: [
+            { databaseId: 5, body: '## Formality Check: Failed', authorAssociation: 'NONE', viewerDidAuthor: true, author: { login: 'openwrt', __typename: 'Bot' } }
+          ] }
+        }
+      } } }), { status: 200 });
+    };
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+    assert.strictEqual(queries, 1, 'one round trip for setup, commits and comments');
+    assert.strictEqual(setup.commitsTotal, 2);
+    const [first, merge] = setup.commits;
+    assert.strictEqual(first.sha, 'a'.repeat(40));
+    assert.strictEqual(first.html_url, `https://github.com/openwrt/openwrt/commit/${'a'.repeat(40)}`);
+    assert.deepStrictEqual(first.author, { login: 'janedoe' });
+    assert.strictEqual(first.committer, null, 'a committer email without a linked account');
+    assert.strictEqual(first.parents.length, 1);
+    assert.strictEqual(first.changed_files, 2);
+    assert.deepStrictEqual(first.commit.verification, { verified: false, reason: 'unsigned', signature: null });
+    assert.strictEqual(merge.parents.length, 2);
+    assert.deepStrictEqual(merge.commit.verification, { verified: true, reason: 'valid', signature: '-----BEGIN PGP SIGNATURE-----', key_id: 'ABCD' });
+    assert.deepStrictEqual(setup.comments, [{ id: 5, body: '## Formality Check: Failed', author_association: 'NONE', user: { login: 'openwrt[bot]', type: 'Bot' }, viewer_did_author: true }]);
+  });
+
+  test('leaves the comments to REST when the thread is longer than a page, and pages the commits', async () => {
+    const calls = [];
+    fetchMock = (url, options) => {
+      const body = JSON.parse(options.body);
+      calls.push(body.variables.after || 'first');
+      if (!body.variables.after) {
+        return new Response(JSON.stringify({ data: { repository: {
+          labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, cfg: null, labeler: null,
+          pullRequest: {
+            commits: { totalCount: 150, pageInfo: { hasNextPage: true, endCursor: 'C1' }, nodes: [commitNode('1'.repeat(40))] },
+            comments: { totalCount: 250, pageInfo: { hasNextPage: true }, nodes: [] }
+          }
+        } } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: { repository: { pullRequest: {
+        commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [commitNode('2'.repeat(40))] }
+      } } } }), { status: 200 });
+    };
+    let onCall = 0;
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', () => { onCall++; }, 24988);
+    assert.deepStrictEqual(calls, ['first', 'C1']);
+    assert.strictEqual(onCall, 2, 'every page counts against the budget');
+    assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['1', '2']);
+    assert.strictEqual(setup.commitsTotal, 150);
+    assert.strictEqual(setup.comments, null);
+  });
+
+  test('spells signature states the way REST did', () => {
+    const reason = (state) => restCommitFromGraphql({ oid: 'x', parents: { totalCount: 1 }, signature: { isValid: false, state, signature: 's' } }).commit.verification.reason;
+    assert.strictEqual(reason('MALFORMED_SIG'), 'malformed_signature');
+    assert.strictEqual(reason('UNKNOWN_SIG_TYPE'), 'unknown_signature_type');
+    assert.strictEqual(reason('BAD_EMAIL'), 'bad_email');
+    assert.deepStrictEqual(restCommentFromGraphql({ databaseId: 1, body: 'hi', authorAssociation: 'MEMBER', viewerDidAuthor: false, author: { login: 'jane', __typename: 'User' } }),
+      { id: 1, body: 'hi', author_association: 'MEMBER', user: { login: 'jane', type: 'User' }, viewer_did_author: false });
   });
 });
 

@@ -2,7 +2,7 @@ import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlFetchRepoSetup, ensureLabelExists, fetchUserRepoPermission } from './github.js';
-import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, validateUciConfigs, groupReleaseErrors, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
+import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, validateUciConfigs, groupReleaseErrors, collectPackageMakefiles, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
 
@@ -118,6 +118,33 @@ function parseEnvInt(value, fallback) {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
+// Reads one list of issue comments for the three facts a run needs: the id
+// of this app's own earlier report, and whether a maintainer left either
+// override command. Shared by the list that arrives with the setup query and
+// the paged REST listing below.
+async function scanCommentList(comments, isMaintainerUser, appId, scan = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null }) {
+  for (const c of comments) {
+    // Only adopt a comment this app wrote itself: matching on the header text
+    // alone would let anyone — another bot included — plant a comment this
+    // bot then edits or deletes (see isOwnAppComment). A comment from the
+    // setup query says so through GraphQL's viewerDidAuthor instead.
+    if ((c.viewer_did_author === true || isOwnAppComment(c, appId)) && c.body?.startsWith('## Formality Check:')) {
+      scan.existingCommentId = c.id;
+    }
+    const body = c.body || '';
+    const hasCherryPickPattern = ALLOW_CHERRY_PICK_PATTERN.test(body);
+    const hasBranchPattern = ALLOW_BRANCH_PATTERN.test(body);
+
+    // Only comments that actually carry an override command are worth
+    // resolving: for anyone outside the org that costs an extra subrequest.
+    if ((hasCherryPickPattern || hasBranchPattern) && await isMaintainerUser(c.user, c.author_association)) {
+      if (hasCherryPickPattern) scan.hasCherryPickBypassComment = true;
+      if (hasBranchPattern) scan.hasBranchBypassComment = true;
+    }
+  }
+  return scan;
+}
+
 // `hasHeadroom` is asked before every page after the first: a thread long
 // enough to page is also long enough to eat the headroom kept for the closing
 // writes, and losing those loses the whole report. Stopping counts as a failed
@@ -125,9 +152,7 @@ function parseEnvInt(value, fallback) {
 // a run without its comment than a run whose check-runs GitHub refuses.
 async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintainerUser, appId, hasHeadroom = () => true) {
   let page = 1;
-  let hasCherryPickBypassComment = false;
-  let hasBranchBypassComment = false;
-  let existingCommentId = null;
+  const scan = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null };
 
   while (true) {
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
@@ -136,26 +161,9 @@ async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintaine
       return null;
     }
 
-    for (const c of res.data) {
-      // Only adopt a comment this app wrote itself: matching on the header text
-      // alone would let anyone — another bot included — plant a comment this
-      // bot then edits or deletes (see isOwnAppComment).
-      if (isOwnAppComment(c, appId) && c.body?.startsWith('## Formality Check:')) {
-        existingCommentId = c.id;
-      }
-      const body = c.body || '';
-      const hasCherryPickPattern = ALLOW_CHERRY_PICK_PATTERN.test(body);
-      const hasBranchPattern = ALLOW_BRANCH_PATTERN.test(body);
+    await scanCommentList(res.data, isMaintainerUser, appId, scan);
 
-      // Only comments that actually carry an override command are worth
-      // resolving: for anyone outside the org that costs an extra subrequest.
-      if ((hasCherryPickPattern || hasBranchPattern) && await isMaintainerUser(c.user, c.author_association)) {
-        if (hasCherryPickPattern) hasCherryPickBypassComment = true;
-        if (hasBranchPattern) hasBranchBypassComment = true;
-      }
-    }
-
-    if (hasCherryPickBypassComment && hasBranchBypassComment && existingCommentId !== null) {
+    if (scan.hasCherryPickBypassComment && scan.hasBranchBypassComment && scan.existingCommentId !== null) {
       break;
     }
 
@@ -169,7 +177,7 @@ async function scanPrComments(repoFullname, prNumber, token, onCall, isMaintaine
     page++;
   }
 
-  return { hasCherryPickBypassComment, hasBranchBypassComment, existingCommentId };
+  return scan;
 }
 
 // --- UTILS ---
@@ -197,6 +205,60 @@ function getDiffFromPatch(patchText) {
   if (!patchText) return '';
   const idx = patchText.indexOf('diff --git ');
   return idx === -1 ? '' : patchText.slice(idx);
+}
+
+// A pull request's .patch is the mbox-style concatenation of its commits'
+// patches in commit order, each opening with git's
+// "From <sha> Mon Sep 17 00:00:00 2001" envelope line. Split it back into one
+// patch per commit, keyed by SHA, so one request stands in for one fetch per
+// commit. The diff bodies are byte-identical to what /commits/<sha> serves;
+// only the mail header lines differ (e.g. "[PATCH 2/3]" subjects), and
+// nothing downstream reads those from the patch text.
+//
+// A commit message may itself contain such a line - quoting the upstream mail
+// a change was taken from is common, and git passes the body through verbatim
+// (openwrt/openwrt commit bcd8d530 is one). Splitting on every envelope-shaped
+// line would cut that commit's patch in two and file its diff under the quoted
+// SHA, leaving the real commit with headers and no diff, which every check
+// then reports as clean. So only an envelope naming one of this pull request's
+// own commits counts, taken in the order the commits list gives them: a quoted
+// header names some other commit, and one naming a commit already passed is
+// behind the position the scan has reached.
+//
+// Each part is then checked against the number of files GitHub says the
+// commit changed: a part that swallowed a neighbour's diff has too many, one
+// cut short has too few, and either is left out so the commit is fetched on
+// its own. That closes the one gap the order rule leaves - a message quoting
+// a commit that comes later in the same pull request.
+function splitPrPatchByCommit(prPatch, commits) {
+  const byCommit = new Map();
+  if (!prPatch || !commits || commits.length === 0) return byCommit;
+
+  const expectedFiles = new Map(commits.map(c => [c.sha, Number.isInteger(c.changed_files) ? c.changed_files : null]));
+  let pending = commits.map(c => c.sha);
+  const starts = [];
+  const envelope = /^From ([0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$/gm;
+  let match;
+  while ((match = envelope.exec(prPatch)) !== null) {
+    const position = pending.indexOf(match[1]);
+    if (position === -1) continue;
+    pending = pending.slice(position + 1);
+    starts.push({ sha: match[1], index: match.index });
+  }
+
+  for (let i = 0; i < starts.length; i++) {
+    const end = i + 1 < starts.length ? starts[i + 1].index : prPatch.length;
+    const part = prPatch.slice(starts[i].index, end);
+    // Anything without a diff is not something the checks can be run against.
+    // Leaving it out sends the commit down its own fetch, which is what the
+    // handler did before, rather than passing an empty diff off as inspected.
+    const files = (part.match(/^diff --git /gm) || []).length;
+    const expected = expectedFiles.get(starts[i].sha);
+    if (files > 0 && (expected === null || files === expected)) {
+      byCommit.set(starts[i].sha, part);
+    }
+  }
+  return byCommit;
 }
 
 function normalizeDiff(diffText) {
@@ -670,24 +732,26 @@ async function handleWebhook(request, env) {
     return fileCache.get(key);
   };
 
-  const commitsUrl = data.pull_request.commits_url;
+  // The pull request's patch is the one fetch every multi-commit run needs
+  // whatever the setup query says, so it starts now and overlaps that query
+  // instead of waiting behind it. The payload's commit count decides: with a
+  // single commit, the commit's own patch is the same request and cannot be
+  // refused for being too large, so the detour is skipped.
+  let prPatchPromise = null;
+  const startPrPatchFetch = () => {
+    if (prPatchPromise === null) {
+      prPatchPromise = trackedApiCall(data.pull_request.url, token, 'GET', null, 'application/vnd.github.patch');
+    }
+    return prPatchPromise;
+  };
+  if ((data.pull_request.commits || 1) > 1) startPrPatchFetch();
 
-  const commitsCount = data.pull_request.commits || 1;
-  const pages = Math.ceil(commitsCount / 100);
-  const commitsPromises = [];
-  for (let p = 1; p <= Math.min(pages, 3); p++) {
-    commitsPromises.push(trackedApiCall(`${commitsUrl}?per_page=100&page=${p}`, token));
-  }
-
-  // OPTIMIZATION: One GraphQL query covers the repository config, the
-  // labeler config and the repository labels together (they used to be three
-  // separate requests), and it runs in parallel with the commits list pages.
-  // Every label page past the first counts against the budget too.
-  const [setup, ...commitsResList] = await Promise.all([
-    graphqlFetchRepoSetup(token, repoFullname, baseBranch, '.github/formalities.json', '.github/labeler.yml',
-      () => { subrequestBudget.used++; }),
-    ...commitsPromises
-  ]);
+  // One GraphQL query covers the repository config, the labeler config, the
+  // repository labels, and the pull request's commits and comments (they used
+  // to be three to five separate requests). Every page of labels or commits
+  // past the first counts against the budget too.
+  const setup = await graphqlFetchRepoSetup(token, repoFullname, baseBranch, '.github/formalities.json', '.github/labeler.yml',
+    () => { subrequestBudget.used++; }, prNumber);
 
   // A missing or malformed formalities.json falls back to the defaults, the
   // same way the REST 404 used to.
@@ -717,22 +781,28 @@ async function handleWebhook(request, env) {
   const existingLabels = setup.labels;
   const labelerText = setup.labelerText;
 
-  let commits = [];
-  for (let i = 0; i < commitsResList.length; i++) {
-    const res = commitsResList[i];
-    if (res.code !== 200) {
-      const cleanRaw = (res.raw || "").trim().slice(0, 200);
-      throw new Error(`GitHub API returned HTTP ${res.code} when fetching commits list page ${i + 1}: ${cleanRaw}`);
-    }
-    commits = commits.concat(res.data || []);
-  }
+  const commits = setup.commits || [];
+  // The listing stops at 300 commits; the query still says how many there are.
+  const commitsCount = setup.commitsTotal || commits.length;
+  const commitScanCapped = commitsCount > commits.length;
 
   let fetchCommentsPromise = null;
   let fetchCommentsRetried = false;
+  // The comments came with the setup query. The one thing they cannot settle
+  // on their own is whether a Formality Check comment left by some GitHub App
+  // is this app's: GraphQL's viewerDidAuthor should say so under the
+  // installation token, but until that has been seen in production a thread
+  // where it denies such a comment is listed through REST instead, which
+  // names the app outright. A thread longer than one page takes that road too.
+  const inlineComments = setup.comments;
+  const inlineCommentsSuffice = Array.isArray(inlineComments) && !inlineComments.some(c =>
+    c.user?.type === 'Bot' && c.viewer_did_author !== true && (c.body || '').startsWith('## Formality Check:'));
   const getCommentsScan = () => {
     if (fetchCommentsPromise === null) {
-      fetchCommentsPromise = scanPrComments(repoFullname, prNumber, token, countOptionalAttempt, isMaintainerUser, appId,
-        commentScanHasHeadroom).catch(() => null);
+      fetchCommentsPromise = inlineCommentsSuffice
+        ? scanCommentList(inlineComments, isMaintainerUser, appId).catch(() => null)
+        : scanPrComments(repoFullname, prNumber, token, countOptionalAttempt, isMaintainerUser, appId,
+          commentScanHasHeadroom).catch(() => null);
     }
     return fetchCommentsPromise;
   };
@@ -779,7 +849,7 @@ async function handleWebhook(request, env) {
     allPrWarnings.push(`**Repository Configuration**:\n- ⚠️ ${configWarning}`);
   }
 
-  if (pages > 3) {
+  if (commitScanCapped) {
     const cappedWarning = `Commit scan is capped at 300 commits for API safety. This PR has ${commitsCount} commits, so only the first 300 commit messages were audited.`;
     formalityOutputText += `⚠️ Warning: ${cappedWarning}\n\n`;
     allPrWarnings.push(`**Commit Audit Scope**:\n- ⚠️ ${cappedWarning}`);
@@ -825,19 +895,48 @@ async function handleWebhook(request, env) {
 
   let usePrWidePatch = commits.length > 15;
   let prPatch = null;
+  // Set when GitHub refused the pull request's patch and the run cannot
+  // afford one request per commit either: the diff-based checks then report
+  // neutral rather than a pass they never earned.
+  let patchUnavailable = false;
 
-  const fetchPrWidePatch = async () => {
-    const prPatchUrl = data.pull_request.url;
-    const prPatchRes = await trackedApiCall(prPatchUrl, token, 'GET', null, 'application/vnd.github.patch');
-    if (prPatchRes.code !== 200) {
-      const cleanRaw = (prPatchRes.raw || "").trim().slice(0, 200);
-      throw new Error(`Failed to fetch overall PR patch (HTTP ${prPatchRes.code}): ${cleanRaw}`);
+  let prWidePatchText = null;
+  if (commits.length > 1) {
+    const prPatchRes = await startPrPatchFetch();
+    if (prPatchRes.code === 200 && typeof prPatchRes.raw === 'string') {
+      prWidePatchText = prPatchRes.raw;
+    } else {
+      console.warn(`PR-wide patch unavailable (HTTP ${prPatchRes.code}).`);
     }
-    return prPatchRes.raw;
-  };
+  }
 
   if (usePrWidePatch) {
-    prPatch = await fetchPrWidePatch();
+    if (prWidePatchText !== null) {
+      prPatch = prWidePatchText;
+    } else if (commits.length <= subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used) {
+      // GitHub refuses the patch of a pull request past its diff limits but
+      // still serves each commit's own. Take that road when the budget has
+      // room for it; before, the run ended here with no status at all.
+      console.warn(`Fetching the ${commits.length} commit patches one by one instead.`);
+      usePrWidePatch = false;
+    } else {
+      patchUnavailable = true;
+    }
+  }
+
+  // One request for the whole pull request's patch replaces one request per
+  // commit: the PR patch is the concatenation of the per-commit patches (see
+  // splitPrPatchByCommit). Commits the split does not cover - a branch
+  // force-pushed while this run was in flight, or a part whose file count
+  // does not match the commit - still fall back to their own fetch below.
+  let splitCommitPatches = new Map();
+  if (!usePrWidePatch && prWidePatchText !== null) {
+    splitCommitPatches = splitPrPatchByCommit(prWidePatchText, commits);
+    // The base repo just served these commits, so file lookups at their
+    // SHAs never need the fork fallback (as after a per-commit fetch).
+    for (const sha of splitCommitPatches.keys()) {
+      if (!refSource.has(sha)) refSource.set(sha, 'base');
+    }
   }
 
   const mapCommitData = async (commitData, fetchPatch) => {
@@ -858,7 +957,17 @@ async function handleWebhook(request, env) {
     }
 
     let commitPatch = null;
-    if (fetchPatch) {
+    // A merge commit has no patch of its own. What GitHub serves for it is the
+    // diff against its first parent - everything the merged-in branch carries
+    // (a 460 KB, 160-file "patch" for a one-file pull request was measured) -
+    // and validating that reports the other branch's files as this pull
+    // request's. The merge itself is still judged by the commit message checks.
+    const isMergeCommit = (commitData.parents || []).length > 1;
+    if (fetchPatch && isMergeCommit) {
+      commitPatch = null;
+    } else if (fetchPatch && splitCommitPatches.has(sha)) {
+      commitPatch = splitCommitPatches.get(sha);
+    } else if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
       let patchRes = await trackedApiCall(detailUrl, token, 'GET', null, 'application/vnd.github.patch');
       if (patchRes.code === 200 && !refSource.has(sha)) {
@@ -945,7 +1054,16 @@ async function handleWebhook(request, env) {
     } catch (e) {
       console.warn(`Failed to fetch individual commit patches, falling back to PR-wide patch: ${e.message}`);
       usePrWidePatch = true;
-      prPatch = await fetchPrWidePatch();
+      if (prWidePatchText !== null) {
+        prPatch = prWidePatchText;
+      } else {
+        const prPatchRes = await startPrPatchFetch();
+        if (prPatchRes.code === 200 && typeof prPatchRes.raw === 'string') {
+          prPatch = prPatchRes.raw;
+        } else {
+          patchUnavailable = true;
+        }
+      }
     }
   }
 
@@ -953,31 +1071,47 @@ async function handleWebhook(request, env) {
     commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false)));
   }
 
-  // Pre-scan all commit patches to see if this PR introduces or drops any package Makefiles
-  if (!usePrWidePatch) {
-    for (const item of commitDetails) {
-      if (item.commitPatch) {
-        if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(item.commitPatch)) {
-          state.isNewPackage = true;
-        }
-        if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(item.commitPatch)) {
-          state.isDroppedPackage = true;
-        }
-      }
+  // Pre-scan all commit patches to see if this PR introduces or drops any
+  // package Makefiles. Only package Makefiles count: a new target, tool or
+  // toolchain Makefile is build infrastructure, not a package, and must not
+  // earn the PR an "add package" label (the same rule the Makefile checks
+  // apply, see isPackageMakefilePath).
+  const scannedPatches = usePrWidePatch
+    ? [prPatch]
+    : commitDetails.map(item => item.commitPatch);
+  for (const patch of scannedPatches) {
+    if (!patch) continue;
+    if (collectPackageMakefiles(patch, 'added').length > 0) {
+      state.isNewPackage = true;
     }
-  } else {
-    if (prPatch) {
-      if (/^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(?:.*\/)?Makefile\r?$/m.test(prPatch)) {
-        state.isNewPackage = true;
-      }
-      if (/^---\s+a\/(?:.*\/)?Makefile\r?\n\+\+\+\s+\/dev\/null\r?$/m.test(prPatch)) {
-        state.isDroppedPackage = true;
-      }
+    if (collectPackageMakefiles(patch, 'removed').length > 0) {
+      state.isDroppedPackage = true;
     }
   }
 
+  // The two validators that look files up (patch headers, UCI configs) are
+  // started for every commit before the reporting loop consumes them. Started
+  // together, their lookups land in the same batch and go out as one request
+  // instead of one per commit; the loop below still reports the commits in
+  // order. A rejection is marked handled here and surfaces at the await.
+  const settled = (promise) => { promise.catch(() => {}); return promise; };
+  const deepChecks = commitDetails.map(item => {
+    if (usePrWidePatch || item.isVerbatim) return null;
+    // A commit with no patch of its own (a merge commit) still goes through
+    // the validators, which answer for an empty diff the way they always did.
+    const fetchFileContent = (path) => fetchFileContentCached(path, item.sha);
+    const fetchUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
+    const hasUpstream = isBackportPr && item.upstreamPatch;
+    return {
+      uci: settled(validateUciConfigs(item.commitPatch, CONFIG, fetchFileContent)),
+      upstreamUci: hasUpstream ? settled(validateUciConfigs(item.upstreamPatch, CONFIG, fetchUpstream)) : null,
+      patches: settled(validateEmbeddedPatches(item.commitPatch, CONFIG, fetchFileContent)),
+      upstreamPatches: hasUpstream ? settled(validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchUpstream)) : null
+    };
+  });
+
   // RUN CHECKS ON COMMITS
-  for (const item of commitDetails) {
+  for (const [commitIndex, item] of commitDetails.entries()) {
     const { sha, html_url, fullCommit, commitPatch } = item;
 
     const commitMsgLines = (fullCommit.commit.message || '').split("\n");
@@ -1043,8 +1177,6 @@ async function handleWebhook(request, env) {
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (path) => fetchFileContentCached(path, sha);
-
         const reportMakefile = validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname);
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
@@ -1054,10 +1186,9 @@ async function handleWebhook(request, env) {
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
         }
 
-        const reportUci = await validateUciConfigs(commitPatch, CONFIG, fetchFileContent);
-        if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = (path) => fetchFileContentCached(path, item.upstreamSha);
-          const reportUpstreamUci = await validateUciConfigs(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+        const reportUci = await deepChecks[commitIndex].uci;
+        if (deepChecks[commitIndex].upstreamUci) {
+          const reportUpstreamUci = await deepChecks[commitIndex].upstreamUci;
           reportUci.errors = reportUci.errors.filter(err => !reportUpstreamUci.errors.includes(err));
           reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
         }
@@ -1084,12 +1215,10 @@ async function handleWebhook(request, env) {
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (patchFile) => fetchFileContentCached(patchFile, sha);
-        const reportPatches = await validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent);
-        
-        if (isBackportPr && item.upstreamPatch) {
-          const fetchFileContentForUpstream = (patchFile) => fetchFileContentCached(patchFile, item.upstreamSha);
-          const reportUpstreamPatches = await validateEmbeddedPatches(item.upstreamPatch, CONFIG, fetchFileContentForUpstream);
+        const reportPatches = await deepChecks[commitIndex].patches;
+
+        if (deepChecks[commitIndex].upstreamPatches) {
+          const reportUpstreamPatches = await deepChecks[commitIndex].upstreamPatches;
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
@@ -1287,6 +1416,13 @@ async function handleWebhook(request, env) {
   // writes below (labels, comment, check-runs), which is the whole point:
   // a PR too large to fully audit still gets a clear status instead of no
   // response at all.
+  if (patchUnavailable) {
+    const patchWarning = `GitHub did not serve this pull request's patch (it is past GitHub's diff limits), and fetching each of its ${commits.length} commits would not fit the API request budget, so the Makefile, configuration and patch-header checks could not run.`;
+    allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${patchWarning}`);
+    makefileOutputText += `⚠️ Warning: ${patchWarning}\n\n`;
+    patchesOutputText += `⚠️ Warning: ${patchWarning}\n\n`;
+  }
+
   if (budgetSkipCount > 0) {
     const budgetWarning = `Deep file-content validation skipped for ${budgetSkipCount} file lookup(s): PR too large for the available API subrequest budget (used ${subrequestBudget.used}/${subrequestBudget.limit}, ${subrequestBudget.reserve} reserved for status reporting). Some patch header, UCI config, or package-release checks may be incomplete.`;
     allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${budgetWarning}`);
@@ -1475,9 +1611,8 @@ async function handleWebhook(request, env) {
   // pull request, but it does not pretend the work was done either. A run
   // that found real problems still fails; incompleteness only downgrades a
   // pass.
-  const commitScanCapped = pages > 3;
   const formalityIncomplete = upstreamComparisonSkips > 0 || commitScanCapped;
-  const deepScanIncomplete = budgetSkipCount > 0;
+  const deepScanIncomplete = budgetSkipCount > 0 || patchUnavailable;
   const conclusionFor = (passed, incomplete) => (!passed ? 'failure' : (incomplete ? 'neutral' : 'success'));
   const INCOMPLETE_NOTE = ' Some of this pull request could not be inspected, so this check reports neutral instead of a pass — see the warnings in the details below.';
 

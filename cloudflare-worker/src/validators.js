@@ -749,7 +749,7 @@ export function isPackageMakefilePath(filePath) {
 // (`+++ /dev/null`), dropping the build-infrastructure paths rejected by
 // isPackageMakefilePath(). Everything else counts as a package Makefile, so
 // unlisted infrastructure trees are still reported as new/dropped packages.
-function collectPackageMakefiles(commitPatch, direction) {
+export function collectPackageMakefiles(commitPatch, direction) {
   const regex = direction === 'added'
     ? /^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(.*)\r?$/gm
     : /^---\s+a\/(.*)\r?\n\+\+\+\s+\/dev\/null\r?$/gm;
@@ -2257,15 +2257,19 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let isReleaseExempt = false;
 
     if (modifiedFiles.has(makefilePath)) {
-      const headContent = await fetchFileContentAtHead(makefilePath);
+      const isNew = addedFiles.has(makefilePath);
+      // Ask for both versions at once: the loader behind these callbacks
+      // (fetchFileContentCached in index.js) batches lookups that are in
+      // flight together into one request instead of one round trip each.
+      const [headContent, baseContent] = await Promise.all([
+        fetchFileContentAtHead(makefilePath),
+        isNew ? Promise.resolve(null) : fetchFileContentAtBase(makefilePath)
+      ]);
       headMakefileContent = headContent;
       if (headContent === null) {
         // Package was deleted/dropped, skip checks
         return empty;
       }
-
-      const isNew = addedFiles.has(makefilePath);
-      const baseContent = isNew ? null : await fetchFileContentAtBase(makefilePath);
 
       headRelease = resolveMakefileVar(headContent, 'PKG_RELEASE');
       isReleaseExempt = isReleaseExemptMakefile(headContent, headRelease);
