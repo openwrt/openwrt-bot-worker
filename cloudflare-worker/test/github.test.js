@@ -439,6 +439,50 @@ describe('fetchUserRepoPermission', { concurrency: 1 }, () => {
   });
 });
 
+describe('githubApiCall rate limits', () => {
+  test('waits out a Retry-After answer and tries again', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      if (calls === 1) {
+        return new Response('{"message":"You have exceeded a secondary rate limit"}', { status: 429, headers: { 'retry-after': '1' } });
+      }
+      return new Response('{"id":1}', { status: 201 });
+    };
+    const res = await githubApiCall('https://api.github.com/repos/o/r/check-runs', 'token', 'POST', { name: 'x' });
+    assert.strictEqual(calls, 2);
+    assert.strictEqual(res.code, 201);
+  });
+
+  test('takes a Retry-After it cannot wait out as final instead of retrying early', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return new Response('{"message":"You have exceeded a secondary rate limit"}', { status: 429, headers: { 'retry-after': '60' } });
+    };
+    const res = await githubApiCall('https://api.github.com/repos/o/r/check-runs', 'token', 'POST', { name: 'x' });
+    assert.strictEqual(calls, 1, 'retrying before the minute is up would only earn the same answer');
+    assert.strictEqual(res.code, 429);
+  });
+
+  test('does not retry a plain 403 refusal', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return new Response('{"message":"Resource not accessible by integration"}', { status: 403 });
+    };
+    const res = await githubApiCall('https://api.github.com/repos/o/r/check-runs', 'token', 'POST', { name: 'x' });
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(res.code, 403);
+  });
+});
+
 describe('graphqlFetchRepoSetup with a pull request', { concurrency: 1 }, () => {
   let originalFetch;
   let fetchMock;
@@ -600,6 +644,22 @@ describe('githubApiCall declined attempts', { concurrency: 1 }, () => {
     assert.strictEqual(res.code, 599);
     assert.strictEqual(res.data, null);
     assert.strictEqual(res.headers.get('retry-after'), null);
+  });
+
+  test('hands back the rate-limited answer when the retry after it is declined', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    let served = 0;
+    globalThis.fetch = async () => {
+      served++;
+      return new Response('{"message":"You have exceeded a secondary rate limit"}', { status: 429, headers: { 'retry-after': '1' } });
+    };
+
+    const res = await githubApiCall('https://api.github.com/x', 'token', 'POST', { name: 'x' },
+      'application/vnd.github+json', { onAttempt: (attempt) => attempt === 1 });
+
+    assert.strictEqual(served, 1);
+    assert.strictEqual(res.code, 429, 'the caller must see the rate limit, not a stale answer');
   });
 
   test('hands back the answer it already had when a retry is declined', async (t) => {

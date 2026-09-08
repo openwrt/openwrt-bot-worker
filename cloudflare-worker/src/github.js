@@ -9,6 +9,12 @@
 // when there was none, a 599 saying so - never null, because every caller
 // reads `.code`. That lets an optional lookup stop short of the headroom kept
 // for the writes that must always go out.
+
+// The longest Retry-After a webhook run waits out. GitHub expects the answer
+// to a delivery within ten seconds, and a run has other work left after a
+// rate-limited write.
+const MAX_RETRY_AFTER_SECONDS = 5;
+
 export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json', options = {}) {
   const headers = {
     'Authorization': `Bearer ${token}`,
@@ -27,7 +33,8 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   }
 
   const maxAttempts = 3;
-  let delay = (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') ? 1 : 500;
+  const isTestEnv = typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test';
+  let delay = isTestEnv ? 1 : 500;
 
   // What a declined attempt returns when nothing was tried yet. Shaped like
   // every other answer so callers can read it without a null check; 599 is the
@@ -55,6 +62,28 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
         await new Promise(resolve => setTimeout(resolve, delay));
         delay *= 2;
         continue;
+      }
+
+      // GitHub's secondary rate limits (too many writes in a short burst)
+      // answer with 403 or 429 and a Retry-After header. Retrying before that
+      // time has passed only earns the same answer again, so the wait is
+      // either honoured in full or, when it would not fit inside a webhook,
+      // the answer is taken as final. Without the header a 403 is a real
+      // refusal and is not retried.
+      const retryAfterSeconds = Number(response.headers?.get?.('retry-after'));
+      const isRateLimited = (response.status === 403 || response.status === 429) && retryAfterSeconds > 0;
+      if (isRateLimited && attempt < maxAttempts) {
+        if (retryAfterSeconds > MAX_RETRY_AFTER_SECONDS) {
+          console.warn(`GitHub API rate limited: ${method} ${url} -> HTTP ${response.status}, Retry-After ${retryAfterSeconds}s is longer than a webhook can wait. Giving up.`);
+        } else {
+          // Remember it before waiting: if the caller declines the retry that
+          // follows, this rate-limited answer is what it must be told about.
+          lastResult = { code: response.status, data: null, raw: text, headers: response.headers };
+          const wait = isTestEnv ? 1 : retryAfterSeconds * 1000;
+          console.warn(`GitHub API rate limited: ${method} ${url} -> HTTP ${response.status} (attempt ${attempt}/${maxAttempts}). Retrying in ${wait}ms...`);
+          await new Promise(resolve => setTimeout(resolve, wait));
+          continue;
+        }
       }
 
       if (response.status >= 400) {
