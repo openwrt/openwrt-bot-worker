@@ -2226,9 +2226,26 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     // and LuCI packages derive their version from git history inside luci.mk.
     // Don't demand a release convention these Makefiles never had.
     const RELEASE_EXEMPT_INCLUDES = ['u-boot.mk', 'trusted-firmware-a.mk', 'luci.mk'];
+
+    // Nor demand one where there is nothing at all to bump. A Makefile with no
+    // PKG_RELEASE and no version anyone could move cannot carry a release:
+    // package/kernel/linux is the kernel itself (PKG_NAME, PKG_FLAGS and
+    // nothing else), and package/kernel/bpf-headers takes its PKG_VERSION from
+    // the kernel's. A computed value counts as unmovable for the same reason -
+    // it follows whatever it is derived from. A package that still has a
+    // literal PKG_SOURCE_VERSION or PKG_SOURCE_DATE, like package/kernel/nat46,
+    // has something to bump and is asked for it as before.
+    const BUMPABLE_VARS = ['PKG_VERSION', 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE'];
+    const hasNothingToBump = (content) => BUMPABLE_VARS.every(name => {
+      const raw = parseMakefileVar(content, name);
+      return raw === null || raw.includes('$');
+    });
+
     const isReleaseExemptMakefile = (content, release) =>
-      release === null && !!content && RELEASE_EXEMPT_INCLUDES.some(mkFile =>
-        new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(content));
+      release === null && !!content &&
+      (RELEASE_EXEMPT_INCLUDES.some(mkFile =>
+        new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(content))
+        || hasNothingToBump(content));
 
     if (deletedFiles.has(makefilePath)) {
       // Package was deleted/dropped, skip checks
@@ -2284,7 +2301,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
           return { errors: [], successes: [`✅ New package \`${pkgRoot}\` is a host-side build tool without PKG_RELEASE, which tools/ and toolchain/ packages are not required to define`] };
         }
         if (isReleaseExempt) {
-          return { errors: [], successes: [`✅ New package \`${pkgRoot}\` builds on a shared helper (u-boot.mk / trusted-firmware-a.mk / luci.mk) that doesn't use PKG_RELEASE, no initialization required`] };
+          return { errors: [], successes: [`✅ New package \`${pkgRoot}\` has no PKG_RELEASE to initialize: it builds on a shared helper that does not use one, or defines no version anyone could bump`] };
         }
         if (headRelease !== '1') {
           return { errors: [`New package \`${pkgRoot}\` must start with PKG_RELEASE set to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
@@ -2411,7 +2428,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is a host-side build tool that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
       }
       if (isReleaseExempt) {
-        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` has no PKG_RELEASE and no version to bump (a shared build helper provides it, or the version follows the kernel), skipping release bump requirement`] };
       }
       if (isNewSubPackageAddition) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`] };
@@ -2430,7 +2447,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         isReleaseExempt = isReleaseExemptMakefile(headMakefileContent, headRelease);
       }
       if (isReleaseExempt) {
-        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` uses a shared build helper that doesn't follow the PKG_RELEASE convention (no PKG_RELEASE defined), skipping release bump requirement`] };
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` has no PKG_RELEASE and no version to bump (a shared build helper provides it, or the version follows the kernel), skipping release bump requirement`] };
       }
       return {
         errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],

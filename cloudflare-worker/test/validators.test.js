@@ -4558,7 +4558,60 @@ diff --git a/applications/luci-app-qosify/htdocs/luci-static/resources/view/qosi
     };
     const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes("doesn't follow the PKG_RELEASE convention")), `Successes: ${res.successes.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('skipping release bump requirement')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('does not ask for a bump from a package that has nothing to bump', async () => {
+    // package/kernel/linux is the kernel itself: PKG_NAME, PKG_FLAGS and
+    // nothing else. There is no PKG_RELEASE and no version to move, so the
+    // advice "increment PKG_RELEASE or bump the version" cannot be followed.
+    const kernelMakefile = 'include $(TOPDIR)/rules.mk\ninclude $(INCLUDE_DIR)/kernel.mk\n\nPKG_NAME:=kernel\nPKG_FLAGS:=hold\n\ninclude $(INCLUDE_DIR)/package.mk\n';
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/kernel/linux/modules/video.mk b/package/kernel/linux/modules/video.mk
+--- a/package/kernel/linux/modules/video.mk
++++ b/package/kernel/linux/modules/video.mk
++define KernelPackage/drm-something
+`
+    }];
+    const headFetch = async (path) => path === 'package/kernel/linux/Makefile' ? kernelMakefile : null;
+    const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('skipping release bump requirement')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('treats a version computed from something else as nothing to bump', async () => {
+    // package/kernel/bpf-headers takes its PKG_VERSION from the kernel's, so
+    // moving it is not something a contributor does either.
+    const derivedMakefile = 'include $(INCLUDE_DIR)/kernel.mk\n\nPKG_NAME:=linux\nPKG_VERSION:=$(PKG_PATCHVER)$(strip $(LINUX_VERSION-$(PKG_PATCHVER)))\n';
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/kernel/bpf-headers/files/something.h b/package/kernel/bpf-headers/files/something.h
+--- a/package/kernel/bpf-headers/files/something.h
++++ b/package/kernel/bpf-headers/files/something.h
++#define X 1
+`
+    }];
+    const headFetch = async (path) => path === 'package/kernel/bpf-headers/Makefile' ? derivedMakefile : null;
+    const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still asks a package whose source revision can be moved', async () => {
+    // package/kernel/nat46 has no PKG_RELEASE either, but its PKG_SOURCE_DATE
+    // and PKG_SOURCE_VERSION are literals a contributor can and should move.
+    const nat46Makefile = 'include $(INCLUDE_DIR)/kernel.mk\n\nPKG_NAME:=nat46\nPKG_SOURCE_DATE:=2022-09-19\nPKG_SOURCE_VERSION:=4c5beee236841724219598fabb1edc93d4f08ce5\n';
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/kernel/nat46/patches/001-fix.patch b/package/kernel/nat46/patches/001-fix.patch
+--- a/package/kernel/nat46/patches/001-fix.patch
++++ b/package/kernel/nat46/patches/001-fix.patch
++changed
+`
+    }];
+    const headFetch = async (path) => path === 'package/kernel/nat46/Makefile' ? nat46Makefile : null;
+    const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
+    assert.ok(res.errors.some(e => e.includes('without a PKG_RELEASE or version bump')), `Errors: ${res.errors.join(', ')}`);
   });
 
   test('release audit accepts a new LuCI package without PKG_RELEASE', async () => {
@@ -4576,7 +4629,7 @@ diff --git a/applications/luci-app-qosify/Makefile b/applications/luci-app-qosif
     };
     const res = await validatePkgReleaseBumps(commitDetails, { check_pkg_release: 'error' }, headFetch, async () => null);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes("doesn't use PKG_RELEASE")), `Successes: ${res.successes.join(', ')}`);
+    assert.ok(res.successes.some(s => s.includes('no PKG_RELEASE to initialize')), `Successes: ${res.successes.join(', ')}`);
   });
 });
 
