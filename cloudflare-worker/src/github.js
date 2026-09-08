@@ -270,35 +270,76 @@ export async function graphqlFetchRepoLabels(token, repoFullname) {
 }
 
 // --- GRAPHQL PR SETUP FETCH ---
-// Everything a pull_request event needs before validation starts — the
-// repository's labels, .github/formalities.json and .github/labeler.yml —
-// fetched in one GraphQL round trip instead of two REST calls plus a labels
-// query. Returns { labels, configText, labelerText }, where a missing file
-// yields null text (callers fall back to their defaults, like the REST 404
-// used to). Throws when the query itself fails, matching the strictness of
-// the config fetch this replaces; a failure while paging labels past the
-// first 100 degrades to labels: null instead, because label bookkeeping is
-// not worth failing the run over (see ensureLabelExists).
-export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath, labelerPath, onCall) {
+// Everything a pull_request event needs before validation starts, in one
+// round trip: the repository's labels, .github/formalities.json and
+// .github/labeler.yml, and - when a pull request number is given - that pull
+// request's commits and issue comments. The commits come back in the shape
+// the REST commits listing delivered (see restCommitFromGraphql), so the
+// checks that consume them did not have to learn a second vocabulary.
+//
+// Returns { labels, configText, labelerText, commits, commitsTotal, comments }.
+// A missing file yields null text (callers fall back to their defaults, like
+// the REST 404 used to). `comments` is null when the thread is longer than one
+// page, so the caller lists it through REST instead. Throws when the query
+// itself fails, matching the strictness of the config fetch this replaces; a
+// failure while paging labels past the first 100 degrades to labels: null
+// instead, because label bookkeeping is not worth failing the run over (see
+// ensureLabelExists).
+const COMMIT_FIELDS = `oid
+          url
+          message
+          changedFilesIfAvailable
+          author { name email user { login } }
+          committer { name email user { login } }
+          parents(first: 2) { totalCount }
+          signature {
+            isValid
+            state
+            signature
+            ... on GpgSignature { keyId }
+          }`;
+
+export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath, labelerPath, onCall, prNumber = null, maxCommitPages = 3) {
   const slashIndex = repoFullname.indexOf('/');
   const owner = repoFullname.slice(0, slashIndex);
   const name = repoFullname.slice(slashIndex + 1);
+  const withPr = Number.isInteger(prNumber);
 
-  const query = `query($owner: String!, $name: String!, $cfgExpr: String!, $labExpr: String!) {
+  const query = `query($owner: String!, $name: String!, $cfgExpr: String!, $labExpr: String!${withPr ? ', $pr: Int!' : ''}) {
   repository(owner: $owner, name: $name) {
     labels(first: 100) {
       nodes { name }
       pageInfo { hasNextPage endCursor }
     }
     cfg: object(expression: $cfgExpr) { ... on Blob { text } }
-    labeler: object(expression: $labExpr) { ... on Blob { text } }
+    labeler: object(expression: $labExpr) { ... on Blob { text } }${withPr ? `
+    pullRequest(number: $pr) {
+      commits(first: 100) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { commit {
+          ${COMMIT_FIELDS}
+        } }
+      }
+      comments(first: 100) {
+        totalCount
+        pageInfo { hasNextPage }
+        nodes {
+          databaseId
+          body
+          authorAssociation
+          viewerDidAuthor
+          author { login __typename }
+        }
+      }
+    }` : ''}
   }
 }`;
 
-  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', {
-    query,
-    variables: { owner, name, cfgExpr: `${ref}:${configPath}`, labExpr: `${ref}:${labelerPath}` }
-  }, 'application/vnd.github+json', { onAttempt: onCall });
+  const variables = { owner, name, cfgExpr: `${ref}:${configPath}`, labExpr: `${ref}:${labelerPath}` };
+  if (withPr) variables.pr = prNumber;
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables },
+    'application/vnd.github+json', { onAttempt: onCall });
 
   const repo = res.code === 200 ? res.data?.data?.repository : null;
   if (!repo) {
@@ -320,10 +361,110 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
     }
   }
 
-  return {
+  const setup = {
     labels,
     configText: typeof repo.cfg?.text === 'string' ? repo.cfg.text : null,
-    labelerText: typeof repo.labeler?.text === 'string' ? repo.labeler.text : null
+    labelerText: typeof repo.labeler?.text === 'string' ? repo.labeler.text : null,
+    commits: null,
+    commitsTotal: 0,
+    comments: null
+  };
+  if (!withPr) return setup;
+
+  const pr = repo.pullRequest;
+  if (!pr) {
+    throw new Error(`GraphQL repository setup fetch failed: pull request #${prNumber} not found in ${repoFullname}`);
+  }
+
+  const commits = (pr.commits?.nodes || []).map(node => restCommitFromGraphql(node.commit));
+  setup.commitsTotal = pr.commits?.totalCount ?? commits.length;
+  let commitsPage = pr.commits?.pageInfo;
+  let pagesFetched = 1;
+  while (commitsPage?.hasNextPage && pagesFetched < maxCommitPages) {
+    const pageRes = await githubApiCall(GRAPHQL_URL, token, 'POST', {
+      query: `query($owner: String!, $name: String!, $pr: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      commits(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { commit {
+          ${COMMIT_FIELDS}
+        } }
+      }
+    }
+  }
+}`,
+      variables: { owner, name, pr: prNumber, after: commitsPage.endCursor }
+    }, 'application/vnd.github+json', { onAttempt: onCall });
+    const page = pageRes.code === 200 ? pageRes.data?.data?.repository?.pullRequest?.commits : null;
+    if (!page) {
+      const cleanRaw = (pageRes.raw || '').trim().slice(0, 200);
+      throw new Error(`GraphQL commit listing failed past page ${pagesFetched} (HTTP ${pageRes.code}): ${cleanRaw}`);
+    }
+    for (const node of page.nodes || []) commits.push(restCommitFromGraphql(node.commit));
+    commitsPage = page.pageInfo;
+    pagesFetched++;
+  }
+  setup.commits = commits;
+
+  if (pr.comments && !pr.comments.pageInfo?.hasNextPage) {
+    setup.comments = (pr.comments.nodes || []).map(restCommentFromGraphql);
+  }
+  return setup;
+}
+
+// GraphQL names a signature's outcome with an enum; the REST listing spelled
+// the same states in lower case, which is what the commit checks print.
+const SIGNATURE_REASONS = {
+  MALFORMED_SIG: 'malformed_signature',
+  UNKNOWN_SIG_TYPE: 'unknown_signature_type'
+};
+
+// Reshapes one GraphQL commit into the object the REST commits listing used to
+// deliver - only the fields the checks read. `parents` keeps just its length,
+// `author`/`committer` the linked account (null when the email is not linked
+// to one), and `signature` becomes REST's `verification`. `changed_files` is
+// extra: it lets the caller verify a patch split against the commit.
+export function restCommitFromGraphql(commit) {
+  const linked = (identity) => identity?.user?.login ? { login: identity.user.login } : null;
+  const signature = commit.signature;
+  const verification = signature
+    ? {
+      verified: signature.isValid === true,
+      reason: SIGNATURE_REASONS[signature.state] || String(signature.state || '').toLowerCase(),
+      signature: signature.signature ?? null,
+      ...(signature.keyId ? { key_id: signature.keyId } : {})
+    }
+    : { verified: false, reason: 'unsigned', signature: null };
+  return {
+    sha: commit.oid,
+    html_url: commit.url,
+    parents: Array.from({ length: commit.parents?.totalCount ?? 1 }, () => ({})),
+    author: linked(commit.author),
+    committer: linked(commit.committer),
+    changed_files: Number.isInteger(commit.changedFilesIfAvailable) ? commit.changedFilesIfAvailable : null,
+    commit: {
+      message: commit.message || '',
+      author: { name: commit.author?.name || '', email: commit.author?.email || '' },
+      committer: { name: commit.committer?.name || '', email: commit.committer?.email || '' },
+      verification
+    }
+  };
+}
+
+// Reshapes one GraphQL issue comment into the REST shape scanPrComments reads.
+// GitHub Apps come back as `Bot` authors with a bare slug; REST spells them
+// `<slug>[bot]`, which the bot-account rule looks for. Whether the comment is
+// this app's own is answered by `viewerDidAuthor` - the viewer under an
+// installation token is the app itself - and exposed as `viewer_did_author`.
+export function restCommentFromGraphql(node) {
+  const isBot = node.author?.__typename === 'Bot';
+  return {
+    id: node.databaseId,
+    body: node.body || '',
+    author_association: node.authorAssociation || 'NONE',
+    user: node.author ? { login: isBot ? `${node.author.login}[bot]` : node.author.login, type: isBot ? 'Bot' : 'User' } : null,
+    viewer_did_author: node.viewerDidAuthor === true
   };
 }
 
