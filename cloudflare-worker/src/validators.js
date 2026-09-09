@@ -1029,20 +1029,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       // Makefile arrives in full, which is where a missing block is real.
       const isAddedMakefile = lines.some(line => /^---\s+\/dev\/null\r?$/.test(line));
 
-      // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
-      // since install blocks can appear after conffiles blocks in the diff)
-      const installedDirs = new Set();
-      for (const line of lines) {
-        if (line.startsWith('+')) {
-          const contentLine = line.slice(1);
-          const installDirMatch = contentLine.match(/\$\(INSTALL_DIR\)\s+\$\(1\)(\/[^\s]*)/);
-          if (installDirMatch) {
-            installedDirs.add(installDirMatch[1]);
-          }
-        }
-      }
-
-      // Pass 2: Validate conffiles and detect config installations
+      // Validate conffiles and detect config installations
       let MakefileInstallsConfig = false;
       let MakefileHasConffiles = false;
       let inConffiles = false;
@@ -1114,46 +1101,49 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (inConffiles) {
               conffilesCheckRun = true;
-              
-              // No indentation/spaces
-              if (/[ \t]/.test(contentLine)) {
+
+              const trimmedLine = contentLine.trim();
+              // A line holding a make expansion is not a path yet, and what it
+              // becomes is settled at build time. OpenWrt itself writes
+              // `$(CONF_DIR)/my.cnf`, `$(config_directory)`, whole blocks
+              // pulled in as `$(Package/busybox/conffiles/crond)` and
+              // conditionals like `$(if $(CONFIG_...),/etc/ssl/...)` here.
+              // Read as literal paths, every one of them was reported broken.
+              const hasMakeExpansion = /\$[({]/.test(trimmedLine);
+
+              // Entries are never indented, and a literal path holds no spaces.
+              // A make conditional legitimately does.
+              if (/^[ \t]/.test(contentLine) || (!hasMakeExpansion && /[ \t]/.test(contentLine))) {
                 conffilesCheckErrors++;
                 errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
               }
 
-              const trimmedLine = contentLine.trim();
-              if (trimmedLine.length > 0) {
+              if (trimmedLine.length > 0 && !hasMakeExpansion) {
                 // Absolute paths must start with '/'
                 if (!trimmedLine.startsWith('/')) {
                   conffilesCheckErrors++;
                   errors.push(`- ${currentPackage} line '${trimmedLine}' must be an absolute path starting with '/'`);
                 }
 
-                // Directories must end with a trailing slash '/'
-                // Individual files must NOT end with a trailing slash.
+                // A trailing slash on an individual file breaks it both ways
+                // the package can be built: `scripts/ipkg-build` runs `find`
+                // over the entry, which fails on `file/`, and package-pack.mk
+                // keeps only what `[ -f ]` accepts, which `file/` is not. The
+                // file is then silently left out and a sysupgrade overwrites
+                // whatever the user had changed.
+                //
+                // A directory is a different matter, and no slash is asked for
+                // there: `find` walks it either way, and `[ -f ]` skips it
+                // either way, so both spellings build the same package. The
+                // tree writes it both ways too - `/etc/ipsec.d` and
+                // `/etc/dnsmasq.d/` are both shipped today.
                 if (trimmedLine.endsWith('/')) {
-                  // If it has a file extension or is a file ending in '/', it's an error
-                  if (/\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine)) {
+                  const looksLikeFile =
+                    /\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine) ||
+                    (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length);
+                  if (looksLikeFile) {
                     conffilesCheckErrors++;
                     errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  } else if (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length) {
-                    // Files under /etc/config/ cannot end with / because there are no subdirectories in /etc/config
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  }
-                } else {
-                  // Determine if the path is a directory that should end with '/'
-                  // 1. Paths created by INSTALL_DIR in this Makefile are directories
-                  const isInstalledDir = installedDirs.has(trimmedLine);
-                  // 2. Paths ending with '.d' are directories by Unix convention
-                  //    (e.g., conf.d, init.d, cron.d, zabbix_agentd.conf.d, sudoers.d)
-                  const isDotDDir = /\.d$/.test(trimmedLine);
-                  // 3. Well-known top-level directory paths
-                  const isKnownDir = trimmedLine === '/etc' || trimmedLine === '/etc/config';
-
-                  if (isInstalledDir || isDotDDir || isKnownDir) {
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' must end with a trailing slash '/' (e.g., '${trimmedLine}/')`);
                   }
                 }
               }

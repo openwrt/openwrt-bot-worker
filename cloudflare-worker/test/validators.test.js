@@ -1509,7 +1509,11 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.ok(res.errors.some(e => e.includes("must be an absolute path starting with '/'")));
   });
 
-  test('rejects conffiles path for known directory missing trailing slash', () => {
+  test('accepts a conffiles directory written without a trailing slash', () => {
+    // `scripts/ipkg-build` runs `find` over each entry and package-pack.mk
+    // keeps what `[ -f ]` accepts. A directory reads the same to both with or
+    // without the slash, and openwrt ships `/etc/ipsec.d` next to
+    // `/etc/dnsmasq.d/`, so demanding one spelling rejected valid Makefiles.
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
@@ -1517,28 +1521,13 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
 +define Package/foo/conffiles
 +/etc/config
-+endef
-    `;
-    const state = { isNewPackage: false, isDroppedPackage: false };
-    const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
-  });
-
-  test('rejects conffiles path for .d directory missing trailing slash', () => {
-    const commit = { commit: { message: 'foo: test' } };
-    const patch = `
-diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
---- a/package/utils/foo/Makefile
-+++ b/package/utils/foo/Makefile
-+define Package/foo/conffiles
 +/etc/foo.conf
 +/etc/foo.d
 +endef
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
-    assert.ok(res.errors.some(e => e.includes("/etc/foo.d")));
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
   test('accepts conffiles .d directory with trailing slash', () => {
@@ -1557,7 +1546,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
-  test('rejects conffiles path for INSTALL_DIR directory missing trailing slash', () => {
+  test('accepts an INSTALL_DIR directory written without a trailing slash', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
@@ -1572,7 +1561,59 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts the make expansions openwrt writes in conffiles blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++$(CONF_DIR)/my.cnf
++$(config_directory)
++$(Package/busybox/conffiles/crond)
++$(call Package/tac_plus/Default/conffiles)
++$(if $(CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK),/etc/ssl/modules.cnf.d/padlock.cnf)
++/etc/$(PKG_NAME).conf
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still rejects an indented conffiles entry, expansion or not', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++  $(CONF_DIR)/my.cnf
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must not contain any spaces or indentation')),
+      `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still rejects a trailing slash on an individual config file', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config/foo/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must not end with a trailing slash')),
+      `Errors: ${res.errors.join(', ')}`);
   });
 
   test('does not leak conffiles block into install block when endef is in diff hunk header', () => {
