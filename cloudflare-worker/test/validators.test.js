@@ -3207,7 +3207,7 @@ new file mode 100644
       `Expected error for missing headers, got: ${JSON.stringify(res.errors)}`);
   });
 
-  test('skips validation for modified patches when fetch fails/not provided', async () => {
+  test('reports a modified patch it could not read instead of passing it', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
 --- a/package/utils/bash/patches/001-fix.patch
@@ -3218,7 +3218,35 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('unable to fetch full file')));
+    // Not looking is not the same as looking and finding it correct: the
+    // caller turns this count into the neutral conclusion.
+    assert.strictEqual(res.unreadableCount, 1);
+    assert.ok(res.successes.some(s => s.includes('could not be read')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('counts a patch file whose fetch throws, and still judges the rest', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+diff --git a/package/utils/bash/patches/002-new.patch b/package/utils/bash/patches/002-new.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/002-new.patch
+@@ -0,0 +1,2 @@
++a patch with no headers at all
++that nobody can apply
+    `;
+    const fetchFileContent = async (file) => {
+      if (file.endsWith('001-fix.patch')) throw new Error('GraphQL batch file fetch failed');
+      return null;
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
+    assert.strictEqual(res.unreadableCount, 1, 'the one that could not be read is counted');
+    assert.ok(res.errors.some(e => e.includes('002-new.patch')), `the readable one is still judged: ${res.errors.join(', ')}`);
   });
 
   test('accepts modified patches when fetched content has valid headers', async () => {

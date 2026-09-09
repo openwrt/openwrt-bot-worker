@@ -1705,7 +1705,8 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
           checked = true;
         }
       } catch (e) {
-        // Ignore fetch errors and fallback
+        // The lookup failed outright. `checked` stays false, which the branch
+        // below already treats as "this file was not read".
       }
     }
 
@@ -1713,7 +1714,12 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
       // Fallback: only validate if it is a new file
       const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
       if (!isNewFile) {
-        return { success: `✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)` };
+        // A patch this pull request only edits arrives as a few changed
+        // lines; its headers live in the part of the file the diff does not
+        // show. Without the file there is nothing to judge - which is not the
+        // same as judging it and finding it correct, so the run says it could
+        // not look and reports neutral rather than a pass.
+        return { unreadable: true, success: `⚠️ Embedded patch '${patchFile}' could not be read, so its Git headers were not checked` };
       }
       hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
       hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
@@ -1728,7 +1734,11 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   const results = await Promise.all(matches.map(checkPatchHeader));
+  // Files the run could not read at all. The caller turns this into the
+  // neutral conclusion it already uses for work the budget cut short.
+  let unreadableCount = 0;
   for (const result of results) {
+    if (result.unreadable) unreadableCount++;
     if (result.error) {
       errors.push(result.error);
     } else if (result.success) {
@@ -1736,7 +1746,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     }
   }
 
-  return { errors, successes };
+  return { errors, successes, unreadableCount };
 }
 
 // The two parsers below walk a whole patch line by line, and the validators
