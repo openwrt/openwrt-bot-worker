@@ -2951,6 +2951,108 @@ describe('isPackageMakefilePath', () => {
 
 // ─── Embedded Patches ────────────────────────────────────────────
 
+describe('Signed-off-by parsing', () => {
+  const commitWith = (message) => ({
+    commit: { message, author: { name: 'Jane Doe', email: 'jane@doe.com' }, committer: { name: 'Jane Doe', email: 'jane@doe.com' } },
+    parents: [{}]
+  });
+  const SIGNOFF_CONFIG = { ...CONFIG, check_signoff: true, require_body: false, check_signature: false, require_linked_github_account: false };
+
+  test('a trailer with an address but no name is not a sign-off', async () => {
+    for (const trailer of ['Signed-off-by:<jane@doe.com>', 'Signed-off-by:   <jane@doe.com>']) {
+      const res = await validateFormalities(commitWith(`pkg: update\n\n${trailer}`), SIGNOFF_CONFIG);
+      assert.ok(res.errors.some(e => e.includes("Missing 'Signed-off-by:' line")),
+        `${trailer} -> ${res.errors.join(', ')}`);
+    }
+  });
+
+  test('does not miss the URL on every second long line', async () => {
+    // The pattern that lets a long line off the width limit is shared; a
+    // global one would carry its cursor from the previous line and answer
+    // the next one wrongly.
+    const long = (n) => 'https://example.org/' + 'a'.repeat(140) + `#${n}`;
+    const message = ['pkg: update', '', long(1), long(2), long(3), '', 'Signed-off-by: Jane Doe <jane@doe.com>'].join('\n');
+    const res = await validateFormalities(commitWith(message), { ...SIGNOFF_CONFIG, max_body_line_len: 100 });
+    assert.strictEqual(res.errors.length, 0, `a line that is one URL is never too long: ${res.errors.join(', ')}`);
+    assert.ok(!res.warnings.some(w => w.includes('exceeds')), `Unexpected warnings: ${res.warnings.join(', ')}`);
+  });
+
+  test('answers promptly on a long line that is not a URL', async () => {
+    // 48 000 letters cost the old pattern about 5.5 seconds: it retried the
+    // whole run at every starting position looking for a scheme.
+    const message = 'pkg: update\n\n' + 'x'.repeat(48000) + '\n\nSigned-off-by: Jane Doe <jane@doe.com>';
+    const started = process.hrtime.bigint();
+    await validateFormalities(commitWith(message), SIGNOFF_CONFIG);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
+  });
+
+  test('reads the name and address whatever spacing the trailer uses', async () => {
+    const shapes = [
+      'Signed-off-by: Jane Doe <jane@doe.com>',
+      'Signed-off-by:Jane Doe <jane@doe.com>',
+      'signed-off-by:   Jane Doe   <jane@doe.com>'
+    ];
+    for (const trailer of shapes) {
+      const res = await validateFormalities(commitWith(`pkg: update\n\n${trailer}`), SIGNOFF_CONFIG);
+      assert.strictEqual(res.errors.length, 0, `${trailer} -> ${res.errors.join(', ')}`);
+    }
+  });
+
+  test('a trailer with no address is answered promptly, not by burning the invocation', async () => {
+    // A commit message anyone can write. The pattern used to let the space
+    // matcher and the name matcher compete for every space: 3000 of them cost
+    // about six seconds of CPU, past what any Worker invocation gets, so the
+    // run was killed and the pull request got no checks at all.
+    const message = 'pkg: update\n\nSigned-off-by:' + ' '.repeat(3000);
+    const started = process.hrtime.bigint();
+    const res = await validateFormalities(commitWith(message), SIGNOFF_CONFIG);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    // The bound is far above what the fixed pattern needs (hundredths of a
+    // millisecond) and far below what the old one did (about 6 500 ms), so a
+    // slow or loaded machine cannot turn this into a false alarm.
+    assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
+    assert.ok(res.errors.some(e => e.includes('Signed-off-by')), `an unsigned commit is still reported: ${res.errors.join(', ')}`);
+  });
+});
+
+describe('PKG_MAINTAINER parsing', () => {
+  test('answers promptly on a maintainer line full of angle brackets', async () => {
+    // 80 000 of them cost the old pattern about 5.5 seconds, from one added
+    // Makefile line - well inside what a pull request can carry.
+    const patch = [
+      'diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile',
+      '--- a/utils/mypkg/Makefile',
+      '+++ b/utils/mypkg/Makefile',
+      '@@ -1,2 +1,3 @@',
+      ' PKG_NAME:=mypkg',
+      '+PKG_MAINTAINER:=' + '<'.repeat(80000),
+      ' PKG_LICENSE:=MIT'
+    ].join('\n');
+    const commit = { commit: { message: 'mypkg: set maintainer' } };
+    const started = process.hrtime.bigint();
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, check_openwrt_meta: true }, { isNewPackage: false, isDroppedPackage: false }, 'openwrt/openwrt');
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
+    assert.ok(res.errors.some(e => e.includes('PKG_MAINTAINER')), `the malformed value is still reported: ${res.errors.join(', ')}`);
+  });
+
+  test('still reads the addresses out of a real maintainer line', () => {
+    const patch = [
+      'diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile',
+      '--- a/utils/mypkg/Makefile',
+      '+++ b/utils/mypkg/Makefile',
+      '@@ -1,2 +1,3 @@',
+      ' PKG_NAME:=mypkg',
+      '+PKG_MAINTAINER:=Jane Doe <jane@doe.com>, Bob <bob@example.org>',
+      ' PKG_LICENSE:=MIT'
+    ].join('\n');
+    const commit = { commit: { message: 'mypkg: set maintainer' } };
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, check_openwrt_meta: true }, { isNewPackage: false, isDroppedPackage: false }, 'openwrt/openwrt');
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+});
+
 describe('validateEmbeddedPatches', () => {
   test('catches patches missing From/Subject headers', async () => {
     const patch = `
