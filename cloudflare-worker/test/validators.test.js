@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED, SPDX_LICENSE_LIST_VERSION } from '../src/spdx-licenses.js';
-import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, checkSpdxIdentifier, findPkgRoot, validateUciConfigs, isPackageMakefilePath, groupReleaseErrors } from '../src/validators.js';
+import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, checkSpdxIdentifier, findPkgRoot, validateUciConfigs, isPackageMakefilePath, groupReleaseErrors, collectFileLineChanges } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -3338,6 +3338,75 @@ new file mode 100644
 });
 
 // ─── Package Release Bump Validation ─────────────────────────────
+
+describe('collectFileLineChanges', () => {
+  const trailer = '-- \n2.50.1\n\n';
+  const commentOnlyPatch = `From abc123 Mon Sep 17 00:00:00 2001
+From: Someone <someone@example.org>
+Date: Mon, 1 Sep 2026 10:00:00 +0200
+Subject: [PATCH] bash: fix a typo in a comment
+
+---
+ package/utils/bash/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+index 1111111..2222222 100644
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
+@@ -10,7 +10,7 @@ PKG_RELEASE:=3
+ 
+-# teh shell
++# the shell
+ include $(INCLUDE_DIR)/package.mk
+`;
+
+  test('leaves out the mail signature GitHub appends to every commit patch', () => {
+    const changes = collectFileLineChanges(commentOnlyPatch + trailer);
+    const makefile = changes['package/utils/bash/Makefile'];
+    assert.deepStrictEqual(makefile.deleted, ['# teh shell'], `Deleted: ${JSON.stringify(makefile.deleted)}`);
+    assert.deepStrictEqual(makefile.added, ['# the shell']);
+  });
+
+  test('a comment-only edit needs no PKG_RELEASE bump even with the signature attached', async () => {
+    const content = 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=3\n';
+    const fetchFile = async () => content;
+    const res = await validatePkgReleaseBumps(
+      [{ commitPatch: commentOnlyPatch + trailer }],
+      { check_pkg_release: true },
+      fetchFile,
+      fetchFile
+    );
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('keeps content lines that open like a file header', () => {
+    // Refreshing an embedded patch rewrites its own `---`/`+++` lines. Those
+    // are content here, and one collector used to drop every line opening that
+    // way wherever it sat.
+    const patch = `diff --git a/package/foo/patches/010-x.patch b/package/foo/patches/010-x.patch
+index 1111111..2222222 100644
+--- a/package/foo/patches/010-x.patch
++++ b/package/foo/patches/010-x.patch
+@@ -1,4 +1,4 @@
+---- a/src/old.c
+-+++ b/src/old.c
++--- a/src/new.c
+++++ b/src/new.c
+ @@ -1,3 +1,4 @@
+`;
+    const changes = collectFileLineChanges(patch);
+    const file = changes['package/foo/patches/010-x.patch'];
+    assert.deepStrictEqual(file.deleted, ['--- a/src/old.c', '+++ b/src/old.c']);
+    assert.deepStrictEqual(file.added, ['--- a/src/new.c', '+++ b/src/new.c']);
+  });
+
+  test('reads the same lines for the release audit and the hash audit', () => {
+    // Both audits once walked the patch themselves and had drifted apart.
+    const changes = collectFileLineChanges(commentOnlyPatch + trailer);
+    assert.deepStrictEqual(Object.keys(changes), ['package/utils/bash/Makefile']);
+  });
+});
 
 describe('validatePkgReleaseBumps', () => {
   const defaultConf = { ...CONFIG, check_pkg_release: 'warning' };

@@ -1749,7 +1749,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   return { errors, successes, unreadableCount };
 }
 
-// The two parsers below walk a whole patch line by line, and the validators
+// The three parsers below walk a whole patch line by line, and the validators
 // ask each of them more than once for the same commit patch: the UCI check,
 // the release audit and the hash audit all start from the same file lists.
 // Their results are remembered per patch text so the walk happens once. The
@@ -1808,6 +1808,55 @@ export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates
   }
 
   return Object.freeze({ addedFiles, deletedFiles });
+});
+
+// The added and deleted lines of a patch, per file. Two audits used to walk
+// the patch themselves and had drifted apart: one skipped the four file-header
+// spellings, the other skipped anything opening with `---` or `+++`, so a
+// removed line whose own text begins with `--` (the signature line of an
+// embedded patch, for one) was content to the first and invisible to the
+// second. Neither is right on its own: a header only appears before the first
+// hunk, so that is what decides here.
+export const collectFileLineChanges = rememberPerPatch(function collectFileLineChanges(patch) {
+  const changes = {};
+  if (!patch) return Object.freeze(changes);
+
+  let currentFile = null;
+  let inHeader = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      currentFile = match ? match[2].trim().replace(/\r$/, '') : null;
+      inHeader = true;
+      continue;
+    }
+    if (!currentFile) continue;
+    if (inHeader) {
+      // The preamble runs from `diff --git` to the end of the `--- `/`+++ `
+      // pair, or to the first hunk when git omits the pair (a mode change, a
+      // pure rename). Only here do `---` and `+++` name files; after it they
+      // are ordinary content.
+      if (line.startsWith('@@')) inHeader = false;
+      else if (line.startsWith('+++')) inHeader = false;
+      continue;
+    }
+    if (line.startsWith('@@')) continue;
+    // What GitHub serves for a commit is git's mail format, so the diff of the
+    // last file is followed by the signature `-- ` and a git version. Read as
+    // diff content that signature is a deleted line holding `- `, which is
+    // neither blank nor a comment, so a comment-only edit stopped counting as
+    // cosmetic and the release audit demanded a bump nobody owed.
+    if (line.replace(/\r$/, '') === '-- ') {
+      currentFile = null;
+      continue;
+    }
+    if (line.startsWith('+') || line.startsWith('-')) {
+      if (!changes[currentFile]) changes[currentFile] = { added: [], deleted: [] };
+      changes[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
+    }
+  }
+  for (const file of Object.keys(changes)) Object.freeze(changes[file]);
+  return Object.freeze(changes);
 });
 
 export function isHiddenOrSpecial(filePath) {
@@ -2188,32 +2237,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       states.addedFiles.forEach(f => addedFiles.add(f));
       states.deletedFiles.forEach(f => deletedFiles.add(f));
 
-      // Parse changes per file in this commit patch
-      const lines = item.commitPatch.split('\n');
-      let currentFile = null;
-      for (const line of lines) {
-        if (line.startsWith('diff --git ')) {
-          currentFile = null;
-          const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-          if (match) {
-            currentFile = match[2].trim().replace(/\r$/, '');
-          }
-        } else if (currentFile) {
-          if (line.startsWith('+++ b/') || line.startsWith('--- a/') || line.startsWith('+++ /dev/null') || line.startsWith('--- /dev/null')) {
-            continue;
-          }
-          if (line.startsWith('+')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].added.push(line.slice(1));
-          } else if (line.startsWith('-')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].deleted.push(line.slice(1));
-          }
+      // Changes per file in this commit patch
+      for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+        if (!fileChanges[file]) {
+          fileChanges[file] = { added: [], deleted: [] };
         }
+        fileChanges[file].added.push(...change.added);
+        fileChanges[file].deleted.push(...change.deleted);
       }
     }
 
@@ -2594,20 +2624,11 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       makefiles.add(file);
     }
 
-    let currentFile = null;
-    for (const line of item.commitPatch.split('\n')) {
-      if (line.startsWith('diff --git ')) {
-        currentFile = null;
-        const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-        if (match) currentFile = match[2].trim().replace(/\r$/, '');
-        continue;
-      }
-      if (!currentFile || !makefiles.has(currentFile)) continue;
-      if (line.startsWith('+++') || line.startsWith('---')) continue;
-      if (line.startsWith('+') || line.startsWith('-')) {
-        if (!makefileLineChanges[currentFile]) makefileLineChanges[currentFile] = { added: [], deleted: [] };
-        makefileLineChanges[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
-      }
+    for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+      if (!makefiles.has(file)) continue;
+      if (!makefileLineChanges[file]) makefileLineChanges[file] = { added: [], deleted: [] };
+      makefileLineChanges[file].added.push(...change.added);
+      makefileLineChanges[file].deleted.push(...change.deleted);
     }
   }
 
