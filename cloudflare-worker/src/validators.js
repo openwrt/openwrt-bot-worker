@@ -1410,7 +1410,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (!isEmpty && !isComment && !isContinuation && !isConditional) {
               if (inBlock === 'metadata') {
-                if (!/^ {2}[^ \t]/.test(contentLine)) {
+                // A bare make expansion is how a package inherits shared
+                // metadata - `$(call Package/foo/Default)` as the first line
+                // of the block - and the tree writes it at every indentation:
+                // counted over package/ and the packages feed, 769 of these
+                // lines use two spaces, 601 sit at column 0 and 148 start
+                // with a tab, the column-0 form being the majority inside
+                // openwrt/openwrt itself. There is no convention to enforce
+                // here, so its indentation is not judged.
+                const isExpansion = trimmed.startsWith('$(') && trimmed.endsWith(')');
+                if (!isExpansion && !/^ {2}[^ \t]/.test(contentLine)) {
                   indentationErrors++;
                   errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with exactly 2 spaces`);
                 }

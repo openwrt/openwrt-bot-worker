@@ -3053,6 +3053,38 @@ describe('PKG_MAINTAINER parsing', () => {
   });
 });
 
+describe('Makefile metadata indentation', () => {
+  const state = () => ({ isNewPackage: true, isDroppedPackage: false });
+  const commit = { commit: { message: 'mypkg: add package' } };
+  const asNewMakefile = (body) => [
+    'diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/utils/mypkg/Makefile',
+    '@@ -0,0 +1,9 @@',
+    ...body.split('\n').map(l => '+' + l)
+  ].join('\n');
+
+  test('accepts the inheritance idiom at any indentation', () => {
+    // openwrt/openwrt writes it at column 0 more often than not - see
+    // package/devel/gdb and package/kernel/mwlwifi - and the packages feed
+    // uses all three forms, so there is no convention to enforce.
+    for (const call of ['$(call Package/mypkg/Default)', '  $(call Package/mypkg/Default)', '\t$(call Package/mypkg/Default)']) {
+      const patch = asNewMakefile(`define Package/mypkg\n${call}\n  TITLE:=My package\nendef`);
+      const res = validateMakefileContext(commit, patch, { ...CONFIG, check_makefile_indentation: true }, state(), 'openwrt/openwrt');
+      assert.ok(!res.errors.some(e => e.includes('must be indented with exactly 2 spaces')),
+        `${JSON.stringify(call)} -> ${res.errors.join(', ')}`);
+    }
+  });
+
+  test('still asks for two spaces on an ordinary metadata line', () => {
+    const patch = asNewMakefile('define Package/mypkg\n\tTITLE:=My package\nendef');
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, check_makefile_indentation: true }, state(), 'openwrt/openwrt');
+    assert.ok(res.errors.some(e => e.includes("'TITLE:=My package'") && e.includes('exactly 2 spaces')),
+      `Errors: ${res.errors.join(', ')}`);
+  });
+});
+
 describe('validateEmbeddedPatches', () => {
   test('catches patches missing From/Subject headers', async () => {
     const patch = `
