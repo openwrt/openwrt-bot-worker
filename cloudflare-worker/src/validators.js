@@ -192,6 +192,14 @@ const VERBATIM_LINE_PATTERNS = [
 ];
 
 // --- ENGINE CHECKS ---
+// A URL inside prose. The scheme is bounded so the pattern cannot retry a
+// long letter run at every starting position, which is what turns a long
+// commit-message line into a denial of service. Two constants, because a
+// global regex carries lastIndex between calls and would make .test() answer
+// every second line wrongly.
+const URL_IN_TEXT_ALL = /[a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/\S+/g;
+const URL_IN_TEXT = /[a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/\S+/;
+
 export async function validateFormalities(fullCommit, CONFIG) {
   const errors = [];
   const successes = [];
@@ -432,8 +440,11 @@ export async function validateFormalities(fullCommit, CONFIG) {
         }
       }
 
-      // Remove URLs to avoid false positives inside links
-      const lineWithoutUrls = line.replace(/[a-zA-Z]+:\/\/\S+/g, '');
+      // Remove URLs to avoid false positives inside links. The line is only
+      // scanned when it can hold one at all: an unbounded `[a-zA-Z]+` retries
+      // the whole letter run at every position, and a commit message is
+      // written by whoever opens the pull request.
+      const lineWithoutUrls = line.includes('://') ? line.replace(URL_IN_TEXT_ALL, '') : line;
 
       let match;
       while ((match = incorrectCasingPattern.exec(lineWithoutUrls)) !== null) {
@@ -466,7 +477,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
     if (inCodeBlock) {
       return;
     }
-    if (/[a-zA-Z]+:\/\/\S+/.test(line)) {
+    if (line.includes('://') && URL_IN_TEXT.test(line)) {
       return;
     }
     if (line.length > CONFIG.max_body_line_len) {
@@ -497,13 +508,26 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   // Signed-off-by check
   if (CONFIG.check_signoff) {
-    const signoffPattern = /Signed-off-by:\s*([^<]+)\s*<([^>]+)>/i;
+    // No \s* around the name: it also matches a space, and so does [^<],
+    // so the two used to compete for every space in the line and the engine
+    // walked all the ways of splitting them. A trailer with no '<' at all -
+    // "Signed-off-by:" and three thousand spaces, which anyone can put in a
+    // commit message - took six seconds of CPU, and five thousand took half a
+    // minute, so the run was killed and the pull request got no checks at all.
+    // Reading everything up to '<' and trimming it in JS, as the code below
+    // already does, leaves nothing to backtrack over.
+    const signoffPattern = /Signed-off-by:([^<]*)<([^>]+)>/i;
     let hasSignoff = false;
     const signoffEntries = [];
     const noreplyErrors = [];
     lines.forEach(line => {
       const matches = line.match(signoffPattern);
-      if (matches) {
+      // A trailer with no name is not a sign-off: nobody signed it. The old
+      // pattern said so only when there was no space either, and accepted
+      // "Signed-off-by:  <a@b.c>" as a nameless entry that then failed the
+      // identity comparison with a confusing message. Both spellings now
+      // count as a missing trailer, which is what they are.
+      if (matches && matches[1].trim()) {
         hasSignoff = true;
         const entry = {
           name: matches[1].trim(),
@@ -897,7 +921,11 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       const match = line.match(/^\+\s*PKG_MAINTAINER\s*(?::=|=)\s*(.+)$/);
       if (match) {
         const value = match[1].trim();
-        const emails = (value.match(/<([^>]+)>/g) || []).map(m => m.slice(1, -1).trim());
+        // `[^>]` matches '<' too, so a run of them made the engine restart
+        // the scan at every position: 160 000 of them, well inside one added
+        // Makefile line, cost half a minute of CPU. An address cannot contain
+        // '<', and 320 characters is far past the longest real one.
+        const emails = (value.match(/<([^<>]{1,320})>/g) || []).map(m => m.slice(1, -1).trim());
         if (emails.length === 0) {
           errors.push(`- PKG_MAINTAINER format is invalid; it should contain an email address inside angle brackets '<>'`);
         } else {
