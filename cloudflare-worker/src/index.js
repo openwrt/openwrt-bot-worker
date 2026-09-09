@@ -838,6 +838,9 @@ async function handleWebhook(request, env) {
   const allPrWarnings = [];
   const allMakefileErrors = [];
   const allPatchesErrors = [];
+  // Warnings the Code Patches check reports without failing - the summary of
+  // a passing run must not claim every header is in place when they exist.
+  let patchWarningsReported = 0;
 
   let formalityOutputText = `### Checking PR #${prNumber}: ${prTitle} (Formalities Audit)\n\n`;
   let makefileOutputText = `### Checking PR #${prNumber}: ${prTitle} (Makefile Audit)\n\n`;
@@ -1220,14 +1223,21 @@ async function handleWebhook(request, env) {
         if (deepChecks[commitIndex].upstreamPatches) {
           const reportUpstreamPatches = await deepChecks[commitIndex].upstreamPatches;
           reportPatches.errors = reportPatches.errors.filter(err => !reportUpstreamPatches.errors.includes(err));
+          reportPatches.warnings = reportPatches.warnings.filter(warn => !reportUpstreamPatches.warnings.includes(warn));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
 
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+        if (reportPatches.warnings.length > 0) {
+          patchWarningsReported += reportPatches.warnings.length;
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.warnings.map(w => `- ⚠️ ${w}`).join("\n"));
+          reportPatches.warnings.forEach(w => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
+        }
         if (reportPatches.errors.length > 0) {
           const isPatchWarning = CONFIG.check_patch_headers === 'warning';
           if (isPatchWarning) {
+            patchWarningsReported += reportPatches.errors.length;
             allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.map(e => `- ⚠️ ${e}`).join("\n"));
             reportPatches.errors.forEach(err => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
           } else {
@@ -1271,9 +1281,15 @@ async function handleWebhook(request, env) {
     const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent);
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+    if (reportPatches.warnings.length > 0) {
+      patchWarningsReported += reportPatches.warnings.length;
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.warnings.map(w => `- ⚠️ ${w}`).join("\n"));
+      reportPatches.warnings.forEach(w => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
+    }
     if (reportPatches.errors.length > 0) {
       const isPatchWarning = CONFIG.check_patch_headers === 'warning';
       if (isPatchWarning) {
+        patchWarningsReported += reportPatches.errors.length;
         allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.map(e => `- ⚠️ ${e}`).join("\n"));
         reportPatches.errors.forEach(err => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
       } else {
@@ -1665,8 +1681,16 @@ async function handleWebhook(request, env) {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
       conclusion: patchesConclusion,
       output: {
-        title: patchesPassed ? (deepScanIncomplete ? 'Code Patches: Partially checked' : 'Code Patches: Passed') : 'Code Patches: Failed',
-        summary: (patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
+        title: patchesPassed
+          ? (deepScanIncomplete
+            ? 'Code Patches: Partially checked'
+            : (patchWarningsReported > 0 ? 'Code Patches: Passed with warnings' : 'Code Patches: Passed'))
+          : 'Code Patches: Failed',
+        summary: (patchesPassed
+          ? (patchWarningsReported > 0
+            ? 'No patch file blocks this pull request, but some carry warnings — open the details below to see what they are.'
+            : 'All downstream patch files contain correct Git tracking headers.')
+          : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
           (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(patchesOutputText)
       }
