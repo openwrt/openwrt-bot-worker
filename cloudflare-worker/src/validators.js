@@ -1029,20 +1029,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       // Makefile arrives in full, which is where a missing block is real.
       const isAddedMakefile = lines.some(line => /^---\s+\/dev\/null\r?$/.test(line));
 
-      // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
-      // since install blocks can appear after conffiles blocks in the diff)
-      const installedDirs = new Set();
-      for (const line of lines) {
-        if (line.startsWith('+')) {
-          const contentLine = line.slice(1);
-          const installDirMatch = contentLine.match(/\$\(INSTALL_DIR\)\s+\$\(1\)(\/[^\s]*)/);
-          if (installDirMatch) {
-            installedDirs.add(installDirMatch[1]);
-          }
-        }
-      }
-
-      // Pass 2: Validate conffiles and detect config installations
+      // Validate conffiles and detect config installations
       let MakefileInstallsConfig = false;
       let MakefileHasConffiles = false;
       let inConffiles = false;
@@ -1114,46 +1101,49 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (inConffiles) {
               conffilesCheckRun = true;
-              
-              // No indentation/spaces
-              if (/[ \t]/.test(contentLine)) {
+
+              const trimmedLine = contentLine.trim();
+              // A line holding a make expansion is not a path yet, and what it
+              // becomes is settled at build time. OpenWrt itself writes
+              // `$(CONF_DIR)/my.cnf`, `$(config_directory)`, whole blocks
+              // pulled in as `$(Package/busybox/conffiles/crond)` and
+              // conditionals like `$(if $(CONFIG_...),/etc/ssl/...)` here.
+              // Read as literal paths, every one of them was reported broken.
+              const hasMakeExpansion = /\$[({]/.test(trimmedLine);
+
+              // Entries are never indented, and a literal path holds no spaces.
+              // A make conditional legitimately does.
+              if (/^[ \t]/.test(contentLine) || (!hasMakeExpansion && /[ \t]/.test(contentLine))) {
                 conffilesCheckErrors++;
                 errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
               }
 
-              const trimmedLine = contentLine.trim();
-              if (trimmedLine.length > 0) {
+              if (trimmedLine.length > 0 && !hasMakeExpansion) {
                 // Absolute paths must start with '/'
                 if (!trimmedLine.startsWith('/')) {
                   conffilesCheckErrors++;
                   errors.push(`- ${currentPackage} line '${trimmedLine}' must be an absolute path starting with '/'`);
                 }
 
-                // Directories must end with a trailing slash '/'
-                // Individual files must NOT end with a trailing slash.
+                // A trailing slash on an individual file breaks it both ways
+                // the package can be built: `scripts/ipkg-build` runs `find`
+                // over the entry, which fails on `file/`, and package-pack.mk
+                // keeps only what `[ -f ]` accepts, which `file/` is not. The
+                // file is then silently left out and a sysupgrade overwrites
+                // whatever the user had changed.
+                //
+                // A directory is a different matter, and no slash is asked for
+                // there: `find` walks it either way, and `[ -f ]` skips it
+                // either way, so both spellings build the same package. The
+                // tree writes it both ways too - `/etc/ipsec.d` and
+                // `/etc/dnsmasq.d/` are both shipped today.
                 if (trimmedLine.endsWith('/')) {
-                  // If it has a file extension or is a file ending in '/', it's an error
-                  if (/\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine)) {
+                  const looksLikeFile =
+                    /\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine) ||
+                    (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length);
+                  if (looksLikeFile) {
                     conffilesCheckErrors++;
                     errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  } else if (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length) {
-                    // Files under /etc/config/ cannot end with / because there are no subdirectories in /etc/config
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  }
-                } else {
-                  // Determine if the path is a directory that should end with '/'
-                  // 1. Paths created by INSTALL_DIR in this Makefile are directories
-                  const isInstalledDir = installedDirs.has(trimmedLine);
-                  // 2. Paths ending with '.d' are directories by Unix convention
-                  //    (e.g., conf.d, init.d, cron.d, zabbix_agentd.conf.d, sudoers.d)
-                  const isDotDDir = /\.d$/.test(trimmedLine);
-                  // 3. Well-known top-level directory paths
-                  const isKnownDir = trimmedLine === '/etc' || trimmedLine === '/etc/config';
-
-                  if (isInstalledDir || isDotDDir || isKnownDir) {
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' must end with a trailing slash '/' (e.g., '${trimmedLine}/')`);
                   }
                 }
               }
@@ -1410,7 +1400,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (!isEmpty && !isComment && !isContinuation && !isConditional) {
               if (inBlock === 'metadata') {
-                if (!/^ {2}[^ \t]/.test(contentLine)) {
+                // A bare make expansion is how a package inherits shared
+                // metadata - `$(call Package/foo/Default)` as the first line
+                // of the block - and the tree writes it at every indentation:
+                // counted over package/ and the packages feed, 769 of these
+                // lines use two spaces, 601 sit at column 0 and 148 start
+                // with a tab, the column-0 form being the majority inside
+                // openwrt/openwrt itself. There is no convention to enforce
+                // here, so its indentation is not judged.
+                const isExpansion = trimmed.startsWith('$(') && trimmed.endsWith(')');
+                if (!isExpansion && !/^ {2}[^ \t]/.test(contentLine)) {
                   indentationErrors++;
                   errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with exactly 2 spaces`);
                 }
@@ -1696,7 +1695,8 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
           checked = true;
         }
       } catch (e) {
-        // Ignore fetch errors and fallback
+        // The lookup failed outright. `checked` stays false, which the branch
+        // below already treats as "this file was not read".
       }
     }
 
@@ -1704,7 +1704,12 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
       // Fallback: only validate if it is a new file
       const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
       if (!isNewFile) {
-        return { success: `✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)` };
+        // A patch this pull request only edits arrives as a few changed
+        // lines; its headers live in the part of the file the diff does not
+        // show. Without the file there is nothing to judge - which is not the
+        // same as judging it and finding it correct, so the run says it could
+        // not look and reports neutral rather than a pass.
+        return { unreadable: true, success: `⚠️ Embedded patch '${patchFile}' could not be read, so its Git headers were not checked` };
       }
       hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
       hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
@@ -1719,7 +1724,11 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   const results = await Promise.all(matches.map(checkPatchHeader));
+  // Files the run could not read at all. The caller turns this into the
+  // neutral conclusion it already uses for work the budget cut short.
+  let unreadableCount = 0;
   for (const result of results) {
+    if (result.unreadable) unreadableCount++;
     if (result.error) {
       errors.push(result.error);
     } else if (result.success) {
@@ -1727,10 +1736,10 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     }
   }
 
-  return { errors, successes };
+  return { errors, successes, unreadableCount };
 }
 
-// The two parsers below walk a whole patch line by line, and the validators
+// The three parsers below walk a whole patch line by line, and the validators
 // ask each of them more than once for the same commit patch: the UCI check,
 // the release audit and the hash audit all start from the same file lists.
 // Their results are remembered per patch text so the walk happens once. The
@@ -1791,6 +1800,55 @@ export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates
   return Object.freeze({ addedFiles, deletedFiles });
 });
 
+// The added and deleted lines of a patch, per file. Two audits used to walk
+// the patch themselves and had drifted apart: one skipped the four file-header
+// spellings, the other skipped anything opening with `---` or `+++`, so a
+// removed line whose own text begins with `--` (the signature line of an
+// embedded patch, for one) was content to the first and invisible to the
+// second. Neither is right on its own: a header only appears before the first
+// hunk, so that is what decides here.
+export const collectFileLineChanges = rememberPerPatch(function collectFileLineChanges(patch) {
+  const changes = {};
+  if (!patch) return Object.freeze(changes);
+
+  let currentFile = null;
+  let inHeader = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      currentFile = match ? match[2].trim().replace(/\r$/, '') : null;
+      inHeader = true;
+      continue;
+    }
+    if (!currentFile) continue;
+    if (inHeader) {
+      // The preamble runs from `diff --git` to the end of the `--- `/`+++ `
+      // pair, or to the first hunk when git omits the pair (a mode change, a
+      // pure rename). Only here do `---` and `+++` name files; after it they
+      // are ordinary content.
+      if (line.startsWith('@@')) inHeader = false;
+      else if (line.startsWith('+++')) inHeader = false;
+      continue;
+    }
+    if (line.startsWith('@@')) continue;
+    // What GitHub serves for a commit is git's mail format, so the diff of the
+    // last file is followed by the signature `-- ` and a git version. Read as
+    // diff content that signature is a deleted line holding `- `, which is
+    // neither blank nor a comment, so a comment-only edit stopped counting as
+    // cosmetic and the release audit demanded a bump nobody owed.
+    if (line.replace(/\r$/, '') === '-- ') {
+      currentFile = null;
+      continue;
+    }
+    if (line.startsWith('+') || line.startsWith('-')) {
+      if (!changes[currentFile]) changes[currentFile] = { added: [], deleted: [] };
+      changes[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
+    }
+  }
+  for (const file of Object.keys(changes)) Object.freeze(changes[file]);
+  return Object.freeze(changes);
+});
+
 export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
 }
@@ -1840,6 +1898,14 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return false;
   };
 
+  // A payload directory sits inside a package; a directory sitting directly
+  // under a category IS the package. `package/utils/ucode` is the ucode
+  // interpreter, not the ucode payload of a LuCI application, and treating it
+  // as payload walked up to the category and returned no package root at all,
+  // so every pull request touching it went unaudited without saying so.
+  const isPayloadDir = (dirParts) =>
+    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
+
   let parts = filePath.split('/');
   if (parts.length > 0) {
     // Remove filename
@@ -1849,8 +1915,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   // Traverse up skipping standard directories (including versioned
   // `patches-X.Y` / `files-X.Y` dirs used by `target/linux/<subtarget>/`).
   while (parts.length > 0) {
-    const last = parts[parts.length - 1];
-    if (isSkippableDir(last)) {
+    if (isPayloadDir(parts)) {
       parts.pop();
     } else {
       break;
@@ -1926,7 +1991,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   const viableCandidates = candidates.filter(candidate => {
     const candidateParts = candidate.split('/');
     const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || isSkippableDir(last)) return false;
+    if (last === 'package' || isPayloadDir(candidateParts)) return false;
     if (isCategoryLevel(candidateParts)) return false;
     return true;
   });
@@ -2169,32 +2234,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       states.addedFiles.forEach(f => addedFiles.add(f));
       states.deletedFiles.forEach(f => deletedFiles.add(f));
 
-      // Parse changes per file in this commit patch
-      const lines = item.commitPatch.split('\n');
-      let currentFile = null;
-      for (const line of lines) {
-        if (line.startsWith('diff --git ')) {
-          currentFile = null;
-          const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-          if (match) {
-            currentFile = match[2].trim().replace(/\r$/, '');
-          }
-        } else if (currentFile) {
-          if (line.startsWith('+++ b/') || line.startsWith('--- a/') || line.startsWith('+++ /dev/null') || line.startsWith('--- /dev/null')) {
-            continue;
-          }
-          if (line.startsWith('+')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].added.push(line.slice(1));
-          } else if (line.startsWith('-')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].deleted.push(line.slice(1));
-          }
+      // Changes per file in this commit patch
+      for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+        if (!fileChanges[file]) {
+          fileChanges[file] = { added: [], deleted: [] };
         }
+        fileChanges[file].added.push(...change.added);
+        fileChanges[file].deleted.push(...change.deleted);
       }
     }
 
@@ -2575,20 +2621,11 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       makefiles.add(file);
     }
 
-    let currentFile = null;
-    for (const line of item.commitPatch.split('\n')) {
-      if (line.startsWith('diff --git ')) {
-        currentFile = null;
-        const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-        if (match) currentFile = match[2].trim().replace(/\r$/, '');
-        continue;
-      }
-      if (!currentFile || !makefiles.has(currentFile)) continue;
-      if (line.startsWith('+++') || line.startsWith('---')) continue;
-      if (line.startsWith('+') || line.startsWith('-')) {
-        if (!makefileLineChanges[currentFile]) makefileLineChanges[currentFile] = { added: [], deleted: [] };
-        makefileLineChanges[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
-      }
+    for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+      if (!makefiles.has(file)) continue;
+      if (!makefileLineChanges[file]) makefileLineChanges[file] = { added: [], deleted: [] };
+      makefileLineChanges[file].added.push(...change.added);
+      makefileLineChanges[file].deleted.push(...change.deleted);
     }
   }
 

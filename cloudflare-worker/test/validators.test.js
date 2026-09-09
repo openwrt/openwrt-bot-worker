@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED, SPDX_LICENSE_LIST_VERSION } from '../src/spdx-licenses.js';
-import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, checkSpdxIdentifier, findPkgRoot, validateUciConfigs, isPackageMakefilePath, groupReleaseErrors } from '../src/validators.js';
+import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, checkSpdxIdentifier, findPkgRoot, validateUciConfigs, isPackageMakefilePath, groupReleaseErrors, collectFileLineChanges } from '../src/validators.js';
 
 // Mock Config Object
 const CONFIG = {
@@ -1509,7 +1509,11 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.ok(res.errors.some(e => e.includes("must be an absolute path starting with '/'")));
   });
 
-  test('rejects conffiles path for known directory missing trailing slash', () => {
+  test('accepts a conffiles directory written without a trailing slash', () => {
+    // `scripts/ipkg-build` runs `find` over each entry and package-pack.mk
+    // keeps what `[ -f ]` accepts. A directory reads the same to both with or
+    // without the slash, and openwrt ships `/etc/ipsec.d` next to
+    // `/etc/dnsmasq.d/`, so demanding one spelling rejected valid Makefiles.
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
@@ -1517,28 +1521,13 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
 +define Package/foo/conffiles
 +/etc/config
-+endef
-    `;
-    const state = { isNewPackage: false, isDroppedPackage: false };
-    const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
-  });
-
-  test('rejects conffiles path for .d directory missing trailing slash', () => {
-    const commit = { commit: { message: 'foo: test' } };
-    const patch = `
-diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
---- a/package/utils/foo/Makefile
-+++ b/package/utils/foo/Makefile
-+define Package/foo/conffiles
 +/etc/foo.conf
 +/etc/foo.d
 +endef
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
-    assert.ok(res.errors.some(e => e.includes("/etc/foo.d")));
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
   test('accepts conffiles .d directory with trailing slash', () => {
@@ -1557,7 +1546,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
-  test('rejects conffiles path for INSTALL_DIR directory missing trailing slash', () => {
+  test('accepts an INSTALL_DIR directory written without a trailing slash', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
@@ -1572,7 +1561,59 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts the make expansions openwrt writes in conffiles blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++$(CONF_DIR)/my.cnf
++$(config_directory)
++$(Package/busybox/conffiles/crond)
++$(call Package/tac_plus/Default/conffiles)
++$(if $(CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK),/etc/ssl/modules.cnf.d/padlock.cnf)
++/etc/$(PKG_NAME).conf
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still rejects an indented conffiles entry, expansion or not', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++  $(CONF_DIR)/my.cnf
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must not contain any spaces or indentation')),
+      `Errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still rejects a trailing slash on an individual config file', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config/foo/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must not end with a trailing slash')),
+      `Errors: ${res.errors.join(', ')}`);
   });
 
   test('does not leak conffiles block into install block when endef is in diff hunk header', () => {
@@ -3053,6 +3094,38 @@ describe('PKG_MAINTAINER parsing', () => {
   });
 });
 
+describe('Makefile metadata indentation', () => {
+  const state = () => ({ isNewPackage: true, isDroppedPackage: false });
+  const commit = { commit: { message: 'mypkg: add package' } };
+  const asNewMakefile = (body) => [
+    'diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/utils/mypkg/Makefile',
+    '@@ -0,0 +1,9 @@',
+    ...body.split('\n').map(l => '+' + l)
+  ].join('\n');
+
+  test('accepts the inheritance idiom at any indentation', () => {
+    // openwrt/openwrt writes it at column 0 more often than not - see
+    // package/devel/gdb and package/kernel/mwlwifi - and the packages feed
+    // uses all three forms, so there is no convention to enforce.
+    for (const call of ['$(call Package/mypkg/Default)', '  $(call Package/mypkg/Default)', '\t$(call Package/mypkg/Default)']) {
+      const patch = asNewMakefile(`define Package/mypkg\n${call}\n  TITLE:=My package\nendef`);
+      const res = validateMakefileContext(commit, patch, { ...CONFIG, check_makefile_indentation: true }, state(), 'openwrt/openwrt');
+      assert.ok(!res.errors.some(e => e.includes('must be indented with exactly 2 spaces')),
+        `${JSON.stringify(call)} -> ${res.errors.join(', ')}`);
+    }
+  });
+
+  test('still asks for two spaces on an ordinary metadata line', () => {
+    const patch = asNewMakefile('define Package/mypkg\n\tTITLE:=My package\nendef');
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, check_makefile_indentation: true }, state(), 'openwrt/openwrt');
+    assert.ok(res.errors.some(e => e.includes("'TITLE:=My package'") && e.includes('exactly 2 spaces')),
+      `Errors: ${res.errors.join(', ')}`);
+  });
+});
+
 describe('validateEmbeddedPatches', () => {
   test('catches patches missing From/Subject headers', async () => {
     const patch = `
@@ -3175,7 +3248,7 @@ new file mode 100644
       `Expected error for missing headers, got: ${JSON.stringify(res.errors)}`);
   });
 
-  test('skips validation for modified patches when fetch fails/not provided', async () => {
+  test('reports a modified patch it could not read instead of passing it', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
 --- a/package/utils/bash/patches/001-fix.patch
@@ -3186,7 +3259,35 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('unable to fetch full file')));
+    // Not looking is not the same as looking and finding it correct: the
+    // caller turns this count into the neutral conclusion.
+    assert.strictEqual(res.unreadableCount, 1);
+    assert.ok(res.successes.some(s => s.includes('could not be read')), `Successes: ${res.successes.join(', ')}`);
+  });
+
+  test('counts a patch file whose fetch throws, and still judges the rest', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+diff --git a/package/utils/bash/patches/002-new.patch b/package/utils/bash/patches/002-new.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/002-new.patch
+@@ -0,0 +1,2 @@
++a patch with no headers at all
++that nobody can apply
+    `;
+    const fetchFileContent = async (file) => {
+      if (file.endsWith('001-fix.patch')) throw new Error('GraphQL batch file fetch failed');
+      return null;
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
+    assert.strictEqual(res.unreadableCount, 1, 'the one that could not be read is counted');
+    assert.ok(res.errors.some(e => e.includes('002-new.patch')), `the readable one is still judged: ${res.errors.join(', ')}`);
   });
 
   test('accepts modified patches when fetched content has valid headers', async () => {
@@ -3278,6 +3379,75 @@ new file mode 100644
 });
 
 // ─── Package Release Bump Validation ─────────────────────────────
+
+describe('collectFileLineChanges', () => {
+  const trailer = '-- \n2.50.1\n\n';
+  const commentOnlyPatch = `From abc123 Mon Sep 17 00:00:00 2001
+From: Someone <someone@example.org>
+Date: Mon, 1 Sep 2026 10:00:00 +0200
+Subject: [PATCH] bash: fix a typo in a comment
+
+---
+ package/utils/bash/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+index 1111111..2222222 100644
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
+@@ -10,7 +10,7 @@ PKG_RELEASE:=3
+ 
+-# teh shell
++# the shell
+ include $(INCLUDE_DIR)/package.mk
+`;
+
+  test('leaves out the mail signature GitHub appends to every commit patch', () => {
+    const changes = collectFileLineChanges(commentOnlyPatch + trailer);
+    const makefile = changes['package/utils/bash/Makefile'];
+    assert.deepStrictEqual(makefile.deleted, ['# teh shell'], `Deleted: ${JSON.stringify(makefile.deleted)}`);
+    assert.deepStrictEqual(makefile.added, ['# the shell']);
+  });
+
+  test('a comment-only edit needs no PKG_RELEASE bump even with the signature attached', async () => {
+    const content = 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=3\n';
+    const fetchFile = async () => content;
+    const res = await validatePkgReleaseBumps(
+      [{ commitPatch: commentOnlyPatch + trailer }],
+      { check_pkg_release: true },
+      fetchFile,
+      fetchFile
+    );
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('keeps content lines that open like a file header', () => {
+    // Refreshing an embedded patch rewrites its own `---`/`+++` lines. Those
+    // are content here, and one collector used to drop every line opening that
+    // way wherever it sat.
+    const patch = `diff --git a/package/foo/patches/010-x.patch b/package/foo/patches/010-x.patch
+index 1111111..2222222 100644
+--- a/package/foo/patches/010-x.patch
++++ b/package/foo/patches/010-x.patch
+@@ -1,4 +1,4 @@
+---- a/src/old.c
+-+++ b/src/old.c
++--- a/src/new.c
+++++ b/src/new.c
+ @@ -1,3 +1,4 @@
+`;
+    const changes = collectFileLineChanges(patch);
+    const file = changes['package/foo/patches/010-x.patch'];
+    assert.deepStrictEqual(file.deleted, ['--- a/src/old.c', '+++ b/src/old.c']);
+    assert.deepStrictEqual(file.added, ['--- a/src/new.c', '+++ b/src/new.c']);
+  });
+
+  test('reads the same lines for the release audit and the hash audit', () => {
+    // Both audits once walked the patch themselves and had drifted apart.
+    const changes = collectFileLineChanges(commentOnlyPatch + trailer);
+    assert.deepStrictEqual(Object.keys(changes), ['package/utils/bash/Makefile']);
+  });
+});
 
 describe('validatePkgReleaseBumps', () => {
   const defaultConf = { ...CONFIG, check_pkg_release: 'warning' };
@@ -4332,6 +4502,47 @@ describe('findPkgRoot', () => {
 });
 
 // ─── Root-level Feed Packages ────────────────────────────────────
+
+describe('findPkgRoot for a package named after a payload directory', () => {
+  // `ucode`, `po`, `root` and the rest name the payload directories of a LuCI
+  // package, but `package/utils/ucode` is the ucode interpreter itself. It
+  // used to resolve to no package root at all, so its pull requests went
+  // unaudited and nothing said so.
+  test('resolves the ucode interpreter in the openwrt/openwrt layout', async () => {
+    assert.strictEqual(await findPkgRoot('package/utils/ucode/Makefile', null), 'package/utils/ucode');
+    assert.strictEqual(await findPkgRoot('package/utils/ucode/patches/001-fix.patch', null), 'package/utils/ucode');
+  });
+
+  test('resolves a file nested below it, the way it does for any other package', async () => {
+    const fetchFileContent = async (path) =>
+      (path === 'package/utils/ucode/Makefile' || path === 'package/utils/bash/Makefile'
+        ? 'PKG_NAME:=x\n'
+        : null);
+    assert.strictEqual(
+      await findPkgRoot('package/utils/ucode/tests/custom/00_lib.t', fetchFileContent, {}),
+      'package/utils/ucode'
+    );
+    assert.strictEqual(
+      await findPkgRoot('package/utils/bash/tests/custom/00_lib.t', fetchFileContent, {}),
+      'package/utils/bash'
+    );
+  });
+
+  test('resolves it in a feed layout with no package/ prefix', async () => {
+    assert.strictEqual(await findPkgRoot('utils/ucode/Makefile', null), 'utils/ucode');
+  });
+
+  test('still treats ucode/ inside a LuCI application as payload', async () => {
+    assert.strictEqual(
+      await findPkgRoot('applications/luci-app-firewall/ucode/dispatcher.uc', null),
+      'applications/luci-app-firewall'
+    );
+    assert.strictEqual(
+      await findPkgRoot('package/utils/bash/src/main.c', null),
+      'package/utils/bash'
+    );
+  });
+});
 
 describe('findPkgRoot for feeds without category directories', () => {
   const routingFetch = async (path) => {
