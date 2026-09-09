@@ -4462,6 +4462,47 @@ describe('findPkgRoot', () => {
 
 // ─── Root-level Feed Packages ────────────────────────────────────
 
+describe('findPkgRoot for a package named after a payload directory', () => {
+  // `ucode`, `po`, `root` and the rest name the payload directories of a LuCI
+  // package, but `package/utils/ucode` is the ucode interpreter itself. It
+  // used to resolve to no package root at all, so its pull requests went
+  // unaudited and nothing said so.
+  test('resolves the ucode interpreter in the openwrt/openwrt layout', async () => {
+    assert.strictEqual(await findPkgRoot('package/utils/ucode/Makefile', null), 'package/utils/ucode');
+    assert.strictEqual(await findPkgRoot('package/utils/ucode/patches/001-fix.patch', null), 'package/utils/ucode');
+  });
+
+  test('resolves a file nested below it, the way it does for any other package', async () => {
+    const fetchFileContent = async (path) =>
+      (path === 'package/utils/ucode/Makefile' || path === 'package/utils/bash/Makefile'
+        ? 'PKG_NAME:=x\n'
+        : null);
+    assert.strictEqual(
+      await findPkgRoot('package/utils/ucode/tests/custom/00_lib.t', fetchFileContent, {}),
+      'package/utils/ucode'
+    );
+    assert.strictEqual(
+      await findPkgRoot('package/utils/bash/tests/custom/00_lib.t', fetchFileContent, {}),
+      'package/utils/bash'
+    );
+  });
+
+  test('resolves it in a feed layout with no package/ prefix', async () => {
+    assert.strictEqual(await findPkgRoot('utils/ucode/Makefile', null), 'utils/ucode');
+  });
+
+  test('still treats ucode/ inside a LuCI application as payload', async () => {
+    assert.strictEqual(
+      await findPkgRoot('applications/luci-app-firewall/ucode/dispatcher.uc', null),
+      'applications/luci-app-firewall'
+    );
+    assert.strictEqual(
+      await findPkgRoot('package/utils/bash/src/main.c', null),
+      'package/utils/bash'
+    );
+  });
+});
+
 describe('findPkgRoot for feeds without category directories', () => {
   const routingFetch = async (path) => {
     if (path === 'babeld/Makefile' || path === 'batman-adv/Makefile') {

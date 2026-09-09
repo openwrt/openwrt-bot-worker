@@ -1908,6 +1908,14 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return false;
   };
 
+  // A payload directory sits inside a package; a directory sitting directly
+  // under a category IS the package. `package/utils/ucode` is the ucode
+  // interpreter, not the ucode payload of a LuCI application, and treating it
+  // as payload walked up to the category and returned no package root at all,
+  // so every pull request touching it went unaudited without saying so.
+  const isPayloadDir = (dirParts) =>
+    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
+
   let parts = filePath.split('/');
   if (parts.length > 0) {
     // Remove filename
@@ -1917,8 +1925,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   // Traverse up skipping standard directories (including versioned
   // `patches-X.Y` / `files-X.Y` dirs used by `target/linux/<subtarget>/`).
   while (parts.length > 0) {
-    const last = parts[parts.length - 1];
-    if (isSkippableDir(last)) {
+    if (isPayloadDir(parts)) {
       parts.pop();
     } else {
       break;
@@ -1994,7 +2001,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   const viableCandidates = candidates.filter(candidate => {
     const candidateParts = candidate.split('/');
     const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || isSkippableDir(last)) return false;
+    if (last === 'package' || isPayloadDir(candidateParts)) return false;
     if (isCategoryLevel(candidateParts)) return false;
     return true;
   });
