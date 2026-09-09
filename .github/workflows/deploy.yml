@@ -9,8 +9,31 @@ permissions:
   contents: read
 
 jobs:
+  # The tests also run from tests.yml on the same push, but a separate
+  # workflow cannot hold this one back: both start in the same second and the
+  # Worker would go live whether or not the suite ever went green. Running
+  # them here as well is what makes the deployment wait for an answer.
+  test:
+    name: Run Tests
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Run Unit Tests
+        run: npm test
+        working-directory: cloudflare-worker
+        env:
+          FORCE_COLOR: 1
+
   deploy:
     name: Deploy Worker
+    needs: test
     runs-on: ubuntu-slim
     environment:
       name: production

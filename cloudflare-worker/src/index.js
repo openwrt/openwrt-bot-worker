@@ -1472,11 +1472,16 @@ async function handleWebhook(request, env) {
   }
 
   const currentPrLabels = new Set((data.pull_request?.labels || []).map(l => l.name.toLowerCase()));
+  // Comparisons are case-insensitive, but a removal has to name the label the
+  // way the repository spells it: openwrt/packages calls it "Add package",
+  // and the constant here is lower case.
+  const currentPrLabelNames = new Map((data.pull_request?.labels || []).map(l => [l.name.toLowerCase(), l.name]));
+  const spelledAsOnPr = (name) => currentPrLabelNames.get(name.toLowerCase()) || name;
 
   // New commits or a reopen are contributor activity: drop the stale marker
   // right away instead of waiting for the nightly scan to notice it.
   if ((data.action === 'synchronize' || data.action === 'reopened') && currentPrLabels.has('stale')) {
-    labelOperations.push(() => removeLabel('stale'));
+    labelOperations.push(() => removeLabel(spelledAsOnPr('stale')));
   }
 
   if (!allPassed) {
@@ -1487,13 +1492,24 @@ async function handleWebhook(request, env) {
   } else {
     // Delete validation failure label if present
     if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(() => removeLabel(LABEL_GUIDELINES));
+      labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_GUIDELINES)));
     }
   }
 
+  // The three labels below are read straight off the pull request's own
+  // content, so the bot both applies and withdraws them: a branch that
+  // dropped its new package, or was retargeted to another release, would
+  // otherwise keep a label that stopped being true. Labels matched from
+  // labeler.yml are left alone, the way GitHub's own labeler action leaves
+  // them by default - a path label is as often put on by hand as derived,
+  // and taking those back would fight whoever set them.
   if (CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
     labelOperations.push(() => ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
     labelsToAdd.push(LABEL_ADD_PACKAGE);
+  }
+
+  if (CONFIG.add_package_label && !state.isNewPackage && currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
+    labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_ADD_PACKAGE)));
   }
 
   if (CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
@@ -1501,12 +1517,23 @@ async function handleWebhook(request, env) {
     labelsToAdd.push(LABEL_DROP_PACKAGE);
   }
 
-  if (CONFIG.branch_labeling && /^openwrt-\d{2}\.\d{2}$/.test(baseBranch)) {
-    const version = baseBranch.split('-')[1];
-    const labelName = `release/${version}`;
-    if (!currentPrLabels.has(labelName.toLowerCase())) {
+  if (CONFIG.drop_package_label && !state.isDroppedPackage && currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
+    labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_DROP_PACKAGE)));
+  }
+
+  if (CONFIG.branch_labeling) {
+    const releaseMatch = baseBranch.match(/^openwrt-(\d{2}\.\d{2})$/);
+    const labelName = releaseMatch ? `release/${releaseMatch[1]}` : null;
+    if (labelName && !currentPrLabels.has(labelName.toLowerCase())) {
       labelOperations.push(() => ensureLabel(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
       labelsToAdd.push(labelName);
+    }
+    // Retargeting a pull request to another branch leaves the old release
+    // label behind, saying it goes somewhere it no longer goes.
+    for (const existing of currentPrLabels) {
+      if (/^release\/\d{2}\.\d{2}$/.test(existing) && existing !== labelName?.toLowerCase()) {
+        labelOperations.push(() => removeLabel(spelledAsOnPr(existing)));
+      }
     }
   }
 
