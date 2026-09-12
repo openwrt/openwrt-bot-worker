@@ -3221,6 +3221,43 @@ describe('Makefile metadata indentation', () => {
 });
 
 describe('validateEmbeddedPatches', () => {
+  describe('in a whole pull request', () => {
+    const envelope = (sha) => `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] mypkg: refresh patch\n\nSigned-off-by: John Doe <john@doe.com>\n---\n`;
+    const modify = (p) => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -10,6 +10,6 @@\n-old\n+new\n\n`;
+    const remove = (p) => `diff --git a/${p} b/${p}\ndeleted file mode 100644\n--- a/${p}\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-new\n\n`;
+    const add = (p) => `diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,1 @@\n+x\n\n`;
+    const rename = (from, to) => `diff --git a/${from} b/${to}\nsimilarity index 100%\nrename from ${from}\nrename to ${to}\n\n`;
+    const P = 'utils/mypkg/patches/001-fix.patch';
+    const goodHeaders = 'From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\nFrom: A <a@b.c>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] fix\n';
+    const recording = (answer) => {
+      const lookups = [];
+      return { lookups, fetch: async (p) => { lookups.push(p); return answer; } };
+    };
+
+    test('does not look for a patch file a later commit deletes', async () => {
+      const { lookups, fetch } = recording(null);
+      const res = await validateEmbeddedPatches(envelope('a'.repeat(40)) + modify(P) + envelope('b'.repeat(40)) + remove(P), { check_patch_headers: true }, fetch);
+      assert.deepStrictEqual(lookups, []);
+      assert.strictEqual(res.incomplete, false);
+      assert.deepStrictEqual(res.skipped, []);
+    });
+
+    test('does not look for a patch file a later commit renames away', async () => {
+      const { lookups, fetch } = recording(null);
+      const res = await validateEmbeddedPatches(envelope('a'.repeat(40)) + modify(P) + envelope('b'.repeat(40)) + rename(P, 'utils/mypkg/patches/002-fix.patch'), { check_patch_headers: true }, fetch);
+      assert.deepStrictEqual(lookups, []);
+      assert.strictEqual(res.incomplete, false);
+    });
+
+    test('still checks a patch file that is deleted and then added back', async () => {
+      const { lookups, fetch } = recording(goodHeaders);
+      const res = await validateEmbeddedPatches(envelope('a'.repeat(40)) + modify(P) + envelope('b'.repeat(40)) + remove(P) + envelope('c'.repeat(40)) + add(P), { check_patch_headers: true }, fetch);
+      assert.ok(lookups.includes(P), JSON.stringify(lookups));
+      assert.ok(res.successes.some(s => s.includes('contains valid Git compliance headers')), res.successes.join(', '));
+      assert.strictEqual(res.incomplete, false);
+    });
+  });
+
   test('catches patches missing From/Subject headers', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
@@ -3342,7 +3379,7 @@ new file mode 100644
       `Expected error for missing headers, got: ${JSON.stringify(res.errors)}`);
   });
 
-  test('skips validation for modified patches when fetch fails/not provided', async () => {
+  test('reports a modified patch it could not read instead of passing it', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
 --- a/package/utils/bash/patches/001-fix.patch
@@ -3353,7 +3390,35 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('unable to fetch full file')));
+    // Not looking is not the same as looking and finding it correct: the
+    // caller turns this count into the neutral conclusion.
+    assert.strictEqual(res.incomplete, true);
+    assert.ok(res.skipped.some(s => s.includes('could not be read')), `Skipped: ${res.skipped.join(', ')}`);
+  });
+
+  test('counts a patch file whose fetch throws, and still judges the rest', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+diff --git a/package/utils/bash/patches/002-new.patch b/package/utils/bash/patches/002-new.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/002-new.patch
+@@ -0,0 +1,2 @@
++a patch with no headers at all
++that nobody can apply
+    `;
+    const fetchFileContent = async (file) => {
+      if (file.endsWith('001-fix.patch')) throw new Error('GraphQL batch file fetch failed');
+      return null;
+    };
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
+    assert.strictEqual(res.skipped.length, 1, 'the one that could not be read is skipped');
+    assert.ok(res.errors.some(e => e.includes('002-new.patch')), `the readable one is still judged: ${res.errors.join(', ')}`);
   });
 
   test('accepts modified patches when fetched content has valid headers', async () => {

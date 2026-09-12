@@ -563,6 +563,8 @@ async function handleWebhook(request, env) {
   // subrequest budget ran out before they could be queried — surfaced later
   // as one friendly PR-facing warning instead of silently under-reporting.
   let budgetSkipCount = 0;
+  // Set when a patch check could not read a file it had to judge.
+  let patchChecksIncomplete = false;
   // Same idea for the per-commit upstream lookups on backport PRs: counted
   // here, reported once, never allowed to starve the terminal writes.
   let upstreamComparisonSkips = 0;
@@ -1216,6 +1218,7 @@ async function handleWebhook(request, env) {
         patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
         const reportPatches = await deepChecks[commitIndex].patches;
+        if (reportPatches.incomplete) patchChecksIncomplete = true;
 
         if (deepChecks[commitIndex].upstreamPatches) {
           const reportUpstreamPatches = await deepChecks[commitIndex].upstreamPatches;
@@ -1225,6 +1228,7 @@ async function handleWebhook(request, env) {
 
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+        (reportPatches.skipped || []).forEach(s => { patchesOutputText += `  ${s}\n`; });
         if (reportPatches.errors.length > 0) {
           const isPatchWarning = CONFIG.check_patch_headers === 'warning';
           if (isPatchWarning) {
@@ -1269,8 +1273,10 @@ async function handleWebhook(request, env) {
 
     // 3. Patches (PR-Wide)
     const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent);
+    if (reportPatches.incomplete) patchChecksIncomplete = true;
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+    (reportPatches.skipped || []).forEach(s => { patchesOutputText += `  ${s}\n`; });
     if (reportPatches.errors.length > 0) {
       const isPatchWarning = CONFIG.check_patch_headers === 'warning';
       if (isPatchWarning) {
@@ -1633,12 +1639,14 @@ async function handleWebhook(request, env) {
   // pass.
   const formalityIncomplete = upstreamComparisonSkips > 0 || commitScanCapped;
   const deepScanIncomplete = budgetSkipCount > 0 || patchUnavailable;
+  // An unreadable patch file leaves only the Code Patches check incomplete.
+  const patchesIncomplete = deepScanIncomplete || patchChecksIncomplete;
   const conclusionFor = (passed, incomplete) => (!passed ? 'failure' : (incomplete ? 'neutral' : 'success'));
   const INCOMPLETE_NOTE = ' Some of this pull request could not be inspected, so this check reports neutral instead of a pass — see the warnings in the details below.';
 
   const formalityConclusion = conclusionFor(formalityPassed, formalityIncomplete);
   const makefileConclusion = conclusionFor(makefilePassed, deepScanIncomplete);
-  const patchesConclusion = conclusionFor(patchesPassed, deepScanIncomplete);
+  const patchesConclusion = conclusionFor(patchesPassed, patchesIncomplete);
 
   const checkRunWrites = [
     ['check-run "Git & Commits"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
@@ -1665,8 +1673,8 @@ async function handleWebhook(request, env) {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
       conclusion: patchesConclusion,
       output: {
-        title: patchesPassed ? (deepScanIncomplete ? 'Code Patches: Partially checked' : 'Code Patches: Passed') : 'Code Patches: Failed',
-        summary: (patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
+        title: patchesPassed ? (patchesIncomplete ? 'Code Patches: Partially checked' : 'Code Patches: Passed') : 'Code Patches: Failed',
+        summary: (patchesPassed ? (patchesIncomplete ? 'No problems were found in the patch files that could be read.' : 'All downstream patch files contain correct Git tracking headers.') : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
           (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
         text: safeTruncate(patchesOutputText)
       }
