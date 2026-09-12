@@ -1509,7 +1509,11 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.ok(res.errors.some(e => e.includes("must be an absolute path starting with '/'")));
   });
 
-  test('rejects conffiles path for known directory missing trailing slash', () => {
+  test('accepts a conffiles directory written without a trailing slash', () => {
+    // `scripts/ipkg-build` and sysupgrade both hand the entry to `find`, which
+    // walks a directory the same with or without the slash, and openwrt ships
+    // `/etc/ipsec.d` next to `/etc/dnsmasq.d/`, so demanding one spelling
+    // rejected valid Makefiles.
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
@@ -1517,28 +1521,13 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 +++ b/package/utils/foo/Makefile
 +define Package/foo/conffiles
 +/etc/config
-+endef
-    `;
-    const state = { isNewPackage: false, isDroppedPackage: false };
-    const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
-  });
-
-  test('rejects conffiles path for .d directory missing trailing slash', () => {
-    const commit = { commit: { message: 'foo: test' } };
-    const patch = `
-diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
---- a/package/utils/foo/Makefile
-+++ b/package/utils/foo/Makefile
-+define Package/foo/conffiles
 +/etc/foo.conf
 +/etc/foo.d
 +endef
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
-    assert.ok(res.errors.some(e => e.includes("/etc/foo.d")));
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
   test('accepts conffiles .d directory with trailing slash', () => {
@@ -1557,7 +1546,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
   });
 
-  test('rejects conffiles path for INSTALL_DIR directory missing trailing slash', () => {
+  test('accepts an INSTALL_DIR directory written without a trailing slash', () => {
     const commit = { commit: { message: 'foo: test' } };
     const patch = `
 diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
@@ -1572,7 +1561,153 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
     `;
     const state = { isNewPackage: false, isDroppedPackage: false };
     const res = validateMakefileContext(commit, patch, CONFIG, state);
-    assert.ok(res.errors.some(e => e.includes("must end with a trailing slash '/'")));
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('accepts the make expansions openwrt writes in conffiles blocks', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++$(CONF_DIR)/my.cnf
++$(config_directory)
++$(Package/busybox/conffiles/crond)
++$(call Package/tac_plus/Default/conffiles)
++$(if $(CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK),/etc/ssl/modules.cnf.d/padlock.cnf)
++/etc/$(PKG_NAME).conf
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+  });
+
+  test('still rejects an indented conffiles entry, expansion or not', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++  $(CONF_DIR)/my.cnf
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must not contain any spaces or indentation')),
+      `Errors: ${res.errors.join(', ')}`);
+  });
+
+  // What an entry may look like, judged by what the build does with it:
+  // scripts/ipkg-build rewrites the first word of each line and hands the
+  // list to find, and whatever package-pack.mk does not checksum as a regular
+  // file goes to /lib/upgrade/keep.d, which sysupgrade expands with find.
+  const conffilesErrorsFor = (lines) => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
+${lines.map(l => '+' + l).join('\n')}
++endef
+    `;
+    const res = validateMakefileContext({ commit: { message: 'foo: test' } }, patch, CONFIG, { isNewPackage: false, isDroppedPackage: false });
+    return res.errors;
+  };
+
+  test('rejects a relative path however many expansions follow it', () => {
+    const errors = conffilesErrorsFor(['foo$(WHATEVER)']);
+    assert.ok(errors.some(e => e.includes("must be an absolute path starting with '/'")), `Errors: ${errors.join(', ')}`);
+  });
+
+  test('rejects two words on a line even when the second is an expansion', () => {
+    const errors = conffilesErrorsFor(['not/a/path $(FOO)']);
+    assert.ok(errors.some(e => e.includes('must not contain any spaces or indentation')), `Errors: ${errors.join(', ')}`);
+    assert.ok(errors.some(e => e.includes("must be an absolute path starting with '/'")), `Errors: ${errors.join(', ')}`);
+  });
+
+  test('accepts a literal path with an expansion in the middle or at the end', () => {
+    // gkrellmd, openvpn-easy-rsa and prometheus-node-exporter-ucode write these
+    assert.deepStrictEqual(conffilesErrorsFor(['/etc/$(PKG_NAME).conf', '/etc/profile.d/50-$(PKG_NAME).sh', '/etc/config/$(PKG_NAME)']), []);
+  });
+
+  test('accepts a path that begins with an expansion', () => {
+    // mariadb and postfix: the leading slash, if any, is decided at build time
+    assert.deepStrictEqual(conffilesErrorsFor(['$(CONF_DIR)/my.cnf', '$(config_directory)']), []);
+  });
+
+  test('accepts a whole-line make call, nested expansions and interior spaces included', () => {
+    assert.deepStrictEqual(conffilesErrorsFor([
+      '$(if $(CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK),/etc/ssl/modules.cnf.d/padlock.cnf)',
+      '$(call Package/tac_plus/Default/conffiles)',
+      '$(call $(TARGET)/conffiles)',
+      '$(Package/busybox/conffiles/crond)',
+    ]), []);
+  });
+
+  test('rejects whitespace outside a call even when a call is present', () => {
+    for (const line of ['$(call Package/x/Default/conffiles) ', '/etc/a /etc/b', '/etc/a.conf $(B)']) {
+      const errors = conffilesErrorsFor([line]);
+      assert.ok(errors.some(e => e.includes('must not contain any spaces or indentation')), `${JSON.stringify(line)}: ${errors.join(', ')}`);
+    }
+  });
+
+  test('rejects indentation with either whitespace character, expansion or not', () => {
+    // uboot-envtools indents with a tab, bluez-tools with two spaces
+    for (const line of ['\t/etc/config/ubootenv', '  /etc/config/btagent', '  $(CONF_DIR)/my.cnf']) {
+      const errors = conffilesErrorsFor([line]);
+      assert.ok(errors.some(e => e.includes('must not contain any spaces or indentation')), `${JSON.stringify(line)}: ${errors.join(', ')}`);
+    }
+  });
+
+  test('rejects a trailing slash on a file even with an expansion in the path', () => {
+    const errors = conffilesErrorsFor(['/etc/config/$(PKG_NAME)/']);
+    assert.ok(errors.some(e => e.includes('must not end with a trailing slash')), `Errors: ${errors.join(', ')}`);
+    assert.deepStrictEqual(conffilesErrorsFor(['/etc/dnsmasq.d/', '/etc/ipsec.d']), []);
+  });
+
+  test('stays silent on an unterminated expansion, which make itself refuses', () => {
+    // Anywhere on the line: one that begins with literal text would otherwise
+    // be judged as a relative path.
+    assert.deepStrictEqual(conffilesErrorsFor(['$(unclosed/foo', 'etc$(unclosed/foo']), []);
+  });
+
+  test('accepts whitespace only as the separator after a make function name', () => {
+    assert.deepStrictEqual(conffilesErrorsFor([
+      '$(if $(filter y,$(CONFIG_X)),/etc/a.conf)',
+      '${call Package/tac_plus/Default/conffiles}',
+    ]), []);
+    // Each of these puts whitespace into what the line expands to.
+    for (const line of ['$(if $(CONFIG_X),/etc/a /etc/b)', '$(foreach f,a b,/etc/$(f).conf)', '$(FOO BAR)/etc/x.conf', '$(if $(CONFIG_X), /etc/a)']) {
+      const errors = conffilesErrorsFor([line]);
+      assert.ok(errors.some(e => e.includes('must not contain any spaces or indentation')), `${JSON.stringify(line)}: ${errors.join(', ')}`);
+    }
+  });
+
+  test('rejects a trailing slash on the file extensions the tree uses', () => {
+    for (const line of ['/etc/mysql/my.cnf/', '/etc/fw_env.config/', '/etc/nftables.d/10-custom.nft/', '/etc/firewall.user/']) {
+      const errors = conffilesErrorsFor([line]);
+      assert.ok(errors.some(e => e.includes('must not end with a trailing slash')), `${JSON.stringify(line)}: ${errors.join(', ')}`);
+    }
+    assert.deepStrictEqual(conffilesErrorsFor(['/etc/nftables.d/', '/etc/luci-uploads/']), []);
+  });
+
+  test('still rejects a trailing slash on an individual config file', () => {
+    const commit = { commit: { message: 'foo: test' } };
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
++define Package/foo/conffiles
++/etc/config/foo/
++endef
+    `;
+    const state = { isNewPackage: false, isDroppedPackage: false };
+    const res = validateMakefileContext(commit, patch, CONFIG, state);
+    assert.ok(res.errors.some(e => e.includes('must not end with a trailing slash')),
+      `Errors: ${res.errors.join(', ')}`);
   });
 
   test('does not leak conffiles block into install block when endef is in diff hunk header', () => {
@@ -3053,6 +3188,38 @@ describe('PKG_MAINTAINER parsing', () => {
   });
 });
 
+describe('Makefile metadata indentation', () => {
+  const state = () => ({ isNewPackage: true, isDroppedPackage: false });
+  const commit = { commit: { message: 'mypkg: add package' } };
+  const asNewMakefile = (body) => [
+    'diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/utils/mypkg/Makefile',
+    '@@ -0,0 +1,9 @@',
+    ...body.split('\n').map(l => '+' + l)
+  ].join('\n');
+
+  test('accepts the inheritance idiom at any indentation', () => {
+    // openwrt/openwrt writes it at column 0 more often than not - see
+    // package/devel/gdb and package/kernel/mwlwifi - and the packages feed
+    // uses all three forms, so there is no convention to enforce.
+    for (const call of ['$(call Package/mypkg/Default)', '  $(call Package/mypkg/Default)', '\t$(call Package/mypkg/Default)']) {
+      const patch = asNewMakefile(`define Package/mypkg\n${call}\n  TITLE:=My package\nendef`);
+      const res = validateMakefileContext(commit, patch, { ...CONFIG, check_makefile_indentation: true }, state(), 'openwrt/openwrt');
+      assert.ok(!res.errors.some(e => e.includes('must be indented with exactly 2 spaces')),
+        `${JSON.stringify(call)} -> ${res.errors.join(', ')}`);
+    }
+  });
+
+  test('still asks for two spaces on an ordinary metadata line', () => {
+    const patch = asNewMakefile('define Package/mypkg\n\tTITLE:=My package\nendef');
+    const res = validateMakefileContext(commit, patch, { ...CONFIG, check_makefile_indentation: true }, state(), 'openwrt/openwrt');
+    assert.ok(res.errors.some(e => e.includes("'TITLE:=My package'") && e.includes('exactly 2 spaces')),
+      `Errors: ${res.errors.join(', ')}`);
+  });
+});
+
 describe('validateEmbeddedPatches', () => {
   test('catches patches missing From/Subject headers', async () => {
     const patch = `
@@ -4308,9 +4475,11 @@ describe('findPkgRoot', () => {
     assert.strictEqual(await findPkgRoot('lang/lua/lua-foo/patches/001-fix.patch', null), 'lang/lua/lua-foo');
     assert.strictEqual(await findPkgRoot('package/lang/lua/lua-foo/Makefile', null), 'package/lang/lua/lua-foo');
 
-    // Non-nested languages (e.g. golang)
-    assert.strictEqual(await findPkgRoot('lang/golang/Makefile', null), 'lang/golang');
-    assert.strictEqual(await findPkgRoot('lang/golang/src/subfolder/file.c', null), 'lang/golang');
+    // lang/golang is a group like lang/python: its packages sit one level
+    // deeper (golang, golang-bootstrap, golang1.26), and there is no Makefile
+    // in the group directory itself.
+    assert.strictEqual(await findPkgRoot('lang/golang/golang1.26/Makefile', null), 'lang/golang/golang1.26');
+    assert.strictEqual(await findPkgRoot('lang/golang/golang/patches/001-fix.patch', null), 'lang/golang/golang');
 
     // Hidden directories and special folders
     assert.strictEqual(await findPkgRoot('.github/workflows/check.yml', null), null);
@@ -4332,6 +4501,124 @@ describe('findPkgRoot', () => {
 });
 
 // ─── Root-level Feed Packages ────────────────────────────────────
+
+describe('findPkgRoot resolves every layout the bot meets', () => {
+  // Every path below was taken from a real checkout of openwrt/openwrt or one
+  // of its feeds. The fixture answers the Makefile probe the way the tree
+  // would, because production always resolves through a fetch - the no-fetch
+  // path is a unit-test convenience the handler never takes.
+  const PKG_ROOTS = new Set([
+    'package/base-files', 'package/utils/busybox', 'package/utils/ucode',
+    'package/network/config/firewall4', 'package/libs/xcrypt/libxcrypt',
+    'utils/htop', 'utils/ucode', 'net/aardvark-dns', 'lang/python/Flask',
+    'applications/luci-app-firewall', 'modules/luci-base', 'themes/luci-theme-bootstrap',
+    'protocols/luci-proto-wireguard', 'libs/luci-lib-uqr',
+    'babeld', 'node-serialport', 'frameworks/gstreamer1', 'games/prboom',
+    'gui/foris', 'hardware/turris-version',
+    'libs/protobuf/protobuf-compat', 'utils/bigclown/bigclown-gateway',
+    'lang/golang/golang1.26', 'lang/golang/golang',
+  ]);
+  const LUCI_ROOTS = new Set(['applications/luci-app-firewall', 'modules/luci-base',
+    'themes/luci-theme-bootstrap', 'protocols/luci-proto-wireguard', 'libs/luci-lib-uqr']);
+  // Packages whose Makefile has no PKG_NAME of its own: a shared helper
+  // supplies it, or PKG_DISTNAME names the source instead.
+  const HELPER_ROOTS = {
+    'package/boot/uboot-mvebu': 'include $(TOPDIR)/rules.mk\ninclude $(INCLUDE_DIR)/kernel.mk\n\nPKG_VERSION:=2026.07\n\ninclude $(INCLUDE_DIR)/u-boot.mk\ninclude $(INCLUDE_DIR)/package.mk\n',
+    'package/boot/arm-trusted-firmware-airoha': 'include $(TOPDIR)/rules.mk\n\nPKG_VERSION:=2025.07\n\ninclude $(INCLUDE_DIR)/trusted-firmware-a.mk\ninclude $(INCLUDE_DIR)/package.mk\n',
+    'package/boot/optee-os-stm32': 'include $(TOPDIR)/rules.mk\ninclude $(INCLUDE_DIR)/kernel.mk\n\nPKG_VERSION:=4.7.0\n\ninclude $(INCLUDE_DIR)/optee-os.mk\ninclude $(INCLUDE_DIR)/package.mk\n',
+    'package/boot/uboot-tools': 'include $(TOPDIR)/rules.mk\n\nPKG_DISTNAME:=u-boot\nPKG_VERSION:=2026.07\nPKG_RELEASE:=2\n\ninclude $(INCLUDE_DIR)/package.mk\n',
+  };
+  const fetchFileContent = async (path) => {
+    if (!path.endsWith('/Makefile')) return null;
+    const dir = path.slice(0, -'/Makefile'.length);
+    if (HELPER_ROOTS[dir]) return HELPER_ROOTS[dir];
+    if (!PKG_ROOTS.has(dir)) return null;
+    return LUCI_ROOTS.has(dir)
+      ? 'include $(TOPDIR)/rules.mk\nLUCI_TITLE:=x\ninclude ../../luci.mk\n'
+      : `PKG_NAME:=${dir.split('/').pop()}\nPKG_RELEASE:=1\n`;
+  };
+
+  const CASES = [
+    ['core 3-level',                  'package/utils/busybox/Makefile',                    'package/utils/busybox'],
+    ['core 3-level patches/',         'package/utils/busybox/patches/001-fix.patch',       'package/utils/busybox'],
+    ['core 3-level files/',           'package/utils/busybox/files/busybox.init',          'package/utils/busybox'],
+    ['core 3-level src/',             'package/utils/busybox/src/main.c',                  'package/utils/busybox'],
+    ['core 3-level nested src/',      'package/utils/busybox/src/a/b/c.c',                 'package/utils/busybox'],
+    ['core 3-level unlisted subdir',  'package/utils/busybox/tests/custom/00.t',           'package/utils/busybox'],
+    ['core versioned patches-X.Y',    'package/utils/busybox/patches-1.36/001.patch',      'package/utils/busybox'],
+    ['core category-less',            'package/base-files/Makefile',                       'package/base-files'],
+    ['core category-less files/',     'package/base-files/files/etc/banner',               'package/base-files'],
+    ['core 4-level',                  'package/network/config/firewall4/Makefile',         'package/network/config/firewall4'],
+    ['core 4-level patches/',         'package/libs/xcrypt/libxcrypt/patches/001.patch',   'package/libs/xcrypt/libxcrypt'],
+    // `ucode` also names a LuCI payload directory; directly under a category
+    // it is the ucode interpreter and used to resolve to nothing at all.
+    ['payload-named package',         'package/utils/ucode/Makefile',                      'package/utils/ucode'],
+    ['payload-named package patches/','package/utils/ucode/patches/100-pad.patch',         'package/utils/ucode'],
+    ['payload-named package subdir',  'package/utils/ucode/tests/custom/00_lib.t',         'package/utils/ucode'],
+    ['payload-named package in a feed','utils/ucode/Makefile',                             'utils/ucode'],
+    ['feed 2-level',                  'utils/htop/Makefile',                               'utils/htop'],
+    ['feed 2-level patches/',         'utils/htop/patches/010-fix.patch',                  'utils/htop'],
+    ['feed 2-level files/',           'net/aardvark-dns/files/aardvark.init',              'net/aardvark-dns'],
+    ['feed nested lang',              'lang/python/Flask/Makefile',                        'lang/python/Flask'],
+    ['feed nested lang patches/',     'lang/python/Flask/patches/001.patch',               'lang/python/Flask'],
+    ['feed lang/golang group',        'lang/golang/golang1.26/Makefile',                   'lang/golang/golang1.26'],
+    ['feed lang/golang patches/',     'lang/golang/golang/patches/001.patch',              'lang/golang/golang'],
+    // <category>/<group>/<pkgname>: the fast path used to answer the group,
+    // a directory with no Makefile in it.
+    ['feed 3-level group',            'libs/protobuf/protobuf-compat/Makefile',            'libs/protobuf/protobuf-compat'],
+    ['feed 3-level group patches/',   'libs/protobuf/protobuf-compat/patches/010-rpath.patch', 'libs/protobuf/protobuf-compat'],
+    ['feed 3-level group files/',     'utils/bigclown/bigclown-gateway/files/init',        'utils/bigclown/bigclown-gateway'],
+    // PKG_NAME supplied by a shared helper, or PKG_DISTNAME in its place. Only
+    // a path deep enough to need the probe exercises that.
+    ['u-boot package subdir',         'package/boot/uboot-mvebu/scripts/x.sh',             'package/boot/uboot-mvebu'],
+    ['ATF package subdir',            'package/boot/arm-trusted-firmware-airoha/scripts/airoha_pack_bl2.sh', 'package/boot/arm-trusted-firmware-airoha'],
+    ['optee-os package subdir',       'package/boot/optee-os-stm32/scripts/x',             'package/boot/optee-os-stm32'],
+    ['uboot-tools nested files/',     'package/boot/uboot-tools/uboot-envtools/files/mvebu_cortexa9', 'package/boot/uboot-tools'],
+    ['luci application',              'applications/luci-app-firewall/Makefile',           'applications/luci-app-firewall'],
+    ['luci root/ payload',            'applications/luci-app-firewall/root/etc/uci-defaults/x', 'applications/luci-app-firewall'],
+    ['luci htdocs/ payload',          'applications/luci-app-firewall/htdocs/luci-static/resources/view/firewall/rules.js', 'applications/luci-app-firewall'],
+    ['luci luasrc/ payload',          'applications/luci-app-firewall/luasrc/controller/firewall.lua', 'applications/luci-app-firewall'],
+    ['luci po/ payload',              'applications/luci-app-firewall/po/cs/firewall.po',  'applications/luci-app-firewall'],
+    ['luci ucode/ payload',           'modules/luci-base/ucode/dispatcher.uc',             'modules/luci-base'],
+    ['luci module',                   'modules/luci-base/Makefile',                        'modules/luci-base'],
+    ['luci theme',                    'themes/luci-theme-bootstrap/Makefile',              'themes/luci-theme-bootstrap'],
+    ['luci protocol',                 'protocols/luci-proto-wireguard/Makefile',           'protocols/luci-proto-wireguard'],
+    ['luci lib under a category name','libs/luci-lib-uqr/Makefile',                        'libs/luci-lib-uqr'],
+    ['root feed Makefile',            'babeld/Makefile',                                   'babeld'],
+    ['root feed patches/',            'babeld/patches/001.patch',                          'babeld'],
+    ['root feed files/',              'node-serialport/files/etc/config/x',                'node-serialport'],
+    ['video feed frameworks',         'frameworks/gstreamer1/Makefile',                    'frameworks/gstreamer1'],
+    ['video feed games',              'games/prboom/patches/001.patch',                    'games/prboom'],
+    ['unknown category',              'gui/foris/Makefile',                                'gui/foris'],
+    ['unknown category files/',       'hardware/turris-version/files/x',                   'hardware/turris-version'],
+    ['category Makefile',             'package/utils/Makefile',                            null],
+    ['feed category Makefile',        'utils/Makefile',                                    null],
+    ['top-level Makefile',            'package/Makefile',                                  null],
+    ['repository root Makefile',      'Makefile',                                          null],
+    ['hidden directory',              '.github/workflows/check.yml',                       null],
+    ['build script',                  'scripts/dl_cleanup.py',                             null],
+    ['kernel patch',                  'target/linux/mpc85xx/patches-6.12/001.patch',       null],
+    ['include fragment',              'include/package.mk',                                null],
+  ];
+  for (const [layout, path, expected] of CASES) {
+    test(`${layout}: ${path}`, async () => {
+      assert.strictEqual(await findPkgRoot(path, fetchFileContent, {}), expected);
+    });
+  }
+
+  test('answers the plain depths without a probe, and lang/golang with them', async () => {
+    // Every probe is a subrequest on the Worker. The two-level feed layout
+    // and the three-level core layout are answered from the path alone; so
+    // is a lang/<group>/<pkg> layout, golang included.
+    for (const path of ['utils/htop/Makefile', 'package/utils/busybox/patches/001-fix.patch',
+                        'lang/python/Flask/Makefile', 'lang/golang/golang1.26/Makefile']) {
+      let probes = 0;
+      const counting = async (p) => { probes++; return fetchFileContent(p); };
+      await findPkgRoot(path, counting, {});
+      assert.strictEqual(probes, 0, `${path} probed ${probes} time(s)`);
+    }
+  });
+});
 
 describe('findPkgRoot for feeds without category directories', () => {
   const routingFetch = async (path) => {
