@@ -1,14 +1,14 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
-import { collectFileLineChanges, validatePkgReleaseBumps } from '../src/validators.js';
+import { collectFileLineChanges, validatePkgReleaseBumps } from '../../src/validators.js';
 
 // Patches exactly as GitHub serves them for the application/vnd.github.patch
 // media type. single-commit.patch is openwrt/openwrt commit 3c1066f4, and
 // multi-commit.patch is a three-commit openwrt/packages pull request whose
 // second commit has a bulleted message. The expected counts are GitHub's own
 // files[].additions and files[].deletions, summed over the commits.
-const readFixture = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
+const readFixture = (name) => readFileSync(new URL(`../fixtures/${name}`, import.meta.url), 'utf8');
 
 const lineCounts = (changes, file) => {
   const change = changes[file];
