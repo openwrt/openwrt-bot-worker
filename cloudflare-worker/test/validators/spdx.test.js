@@ -2,7 +2,9 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED, SPDX_LICENSE_LIST_VERSION } from '../../src/spdx-licenses.js';
 import { validateMakefileContext, checkSpdxIdentifier } from '../../src/validators.js';
-import { CONFIG } from './helpers.js';
+import { CONFIG, makeCommit, existingPackage, assertSomeIncludes } from './helpers.js';
+
+const assertNoWarnings = (res) => assert.deepStrictEqual(res.warnings, []);
 
 describe('generated SPDX data', () => {
   test('records the SPDX release it was generated from', () => {
@@ -106,57 +108,43 @@ describe('checkSpdxIdentifier', () => {
 
 describe('validateMakefileContext SPDX licenses', () => {
   const SPDX_CONFIG = { ...CONFIG, check_spdx_license: true };
-  const state = () => ({ isNewPackage: false, isDroppedPackage: false });
-  const patchWith = (license) => `
+  // The leading newline and the indented last line are what these patches have
+  // always looked like; the validator keeps seeing exactly that.
+  const patchWith = (line) => `
 --- a/package/utils/mypkg/Makefile
 +++ b/package/utils/mypkg/Makefile
-+PKG_LICENSE:=${license}
++${line}
     `;
-  const commit = { commit: { message: 'mypkg: set license' } };
+  const commit = makeCommit('mypkg: set license');
+  const check = (line, config = SPDX_CONFIG) => validateMakefileContext(commit, patchWith(line), config, existingPackage());
 
-  test('warns about the deprecated GPL-2.0 identifier', () => {
-    const res = validateMakefileContext(commit, patchWith('GPL-2.0'), SPDX_CONFIG, state());
-    assert.ok(res.warnings.some(w => w.includes("'GPL-2.0-only' or 'GPL-2.0-or-later'")), `Warnings: ${res.warnings.join(', ')}`);
-  });
-
-  test('warns about informal spellings like GPLv2+', () => {
-    const res = validateMakefileContext(commit, patchWith('GPLv2+'), SPDX_CONFIG, state());
-    assert.ok(res.warnings.some(w => w.includes("'GPL-2.0-or-later'")), `Warnings: ${res.warnings.join(', ')}`);
-  });
-
-  test('warns about a bare BSD license', () => {
-    const res = validateMakefileContext(commit, patchWith('BSD'), SPDX_CONFIG, state());
-    assert.ok(res.warnings.some(w => w.includes('BSD-3-Clause')), `Warnings: ${res.warnings.join(', ')}`);
-  });
+  const WARNINGS = [
+    ['warns about the deprecated GPL-2.0 identifier', 'PKG_LICENSE:=GPL-2.0', "'GPL-2.0-only' or 'GPL-2.0-or-later'"],
+    ['warns about informal spellings like GPLv2+', 'PKG_LICENSE:=GPLv2+', "'GPL-2.0-or-later'"],
+    ['warns about a bare BSD license', 'PKG_LICENSE:=BSD', 'BSD-3-Clause'],
+    ['checks licenses appended with +=', 'PKG_LICENSE += GPLv2', "'GPL-2.0-only' or 'GPL-2.0-or-later'"]
+  ];
+  for (const [name, line, suggestion] of WARNINGS) {
+    test(name, () => {
+      assertSomeIncludes(check(line).warnings, suggestion, 'warnings');
+    });
+  }
 
   test('accepts valid SPDX expressions', () => {
-    const res = validateMakefileContext(commit, patchWith('GPL-2.0-only OR MIT'), SPDX_CONFIG, state());
-    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('SPDX')), `Successes: ${res.successes.join(', ')}`);
+    const res = check('PKG_LICENSE:=GPL-2.0-only OR MIT');
+    assertNoWarnings(res);
+    assertSomeIncludes(res.successes, 'SPDX', 'successes');
   });
 
   test('leaves dynamic license values alone', () => {
-    const res = validateMakefileContext(commit, patchWith('$(BASE_LICENSE)'), SPDX_CONFIG, state());
-    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
-  });
-
-  test('checks licenses appended with +=', () => {
-    const patch = `
---- a/package/utils/mypkg/Makefile
-+++ b/package/utils/mypkg/Makefile
-+PKG_LICENSE += GPLv2
-    `;
-    const res = validateMakefileContext(commit, patch, SPDX_CONFIG, state());
-    assert.ok(res.warnings.some(w => w.includes("'GPL-2.0-only' or 'GPL-2.0-or-later'")), `Warnings: ${res.warnings.join(', ')}`);
+    assertNoWarnings(check('PKG_LICENSE:=$(BASE_LICENSE)'));
   });
 
   test('ignores trailing comments after the license expression', () => {
-    const res = validateMakefileContext(commit, patchWith('MIT # formerly GPLv2'), SPDX_CONFIG, state());
-    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assertNoWarnings(check('PKG_LICENSE:=MIT # formerly GPLv2'));
   });
 
   test('does nothing when disabled', () => {
-    const res = validateMakefileContext(commit, patchWith('GPLv2'), { ...CONFIG, check_spdx_license: false }, state());
-    assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assertNoWarnings(check('PKG_LICENSE:=GPLv2', { ...CONFIG, check_spdx_license: false }));
   });
 });

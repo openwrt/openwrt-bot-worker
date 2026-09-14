@@ -1,186 +1,129 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities } from '../../src/validators.js';
-import { CONFIG } from './helpers.js';
+import {
+  CONFIG, JOHN, makeCommit, commitBy,
+  assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes
+} from './helpers.js';
+
+const JANE = Object.freeze({ name: 'Jane Smith', email: 'jane@smith.com' });
+const JANE_AT_EXAMPLE = Object.freeze({ name: 'Jane Smith', email: 'jane@example.com' });
+const ALICE = Object.freeze({ name: 'Alice B. Cooper', email: 'alice@example.com' });
+// The committer GitHub records for a commit made in its web interface.
+const GITHUB = Object.freeze({ name: 'GitHub', email: 'noreply@github.com' });
+const VERIFIED = Object.freeze({ verified: true, key_id: 'GPGKEYID' });
+
+// A commit whose message ends with the author's own sign-off. The author also
+// commits it unless fields name someone else.
+const signedOff = (text, author = JOHN, fields = {}) =>
+  makeCommit(`${text}\n\nSigned-off-by: ${author.name} <${author.email}>`, { author, committer: author, ...fields });
+
+// A signed commit made in the GitHub web interface on the author's behalf.
+const webCommit = (text, author) => ({
+  parents: [{ sha: 'parent-sha' }],
+  ...signedOff(text, author, { committer: GITHUB, verification: VERIFIED })
+});
+
+const assertWarningIncludes = (res, text) => assertSomeIncludes(res.warnings, text, 'warnings');
+const assertNoWarningIncludes = (res, text) => assertNoneIncludes(res.warnings, text, 'warnings');
+const assertSuccessIncludes = (res, text) => assertSomeIncludes(res.successes, text, 'successes');
 
 describe('isValidName', () => {
-  test('accepts standard two-word names', () => {
-    assert.strictEqual(isValidName('John Doe'), true);
-  });
+  const cases = [
+    ['accepts standard two-word names', true, ['John Doe']],
+    ['accepts hyphenated names (e.g. Asian naming)', true, ['Wei-Ting Yang', 'Jean-Luc Picard']],
+    ['accepts names with apostrophes', true, ["Brian O'Connor"]],
+    ['accepts names with dots', true, ['J. Doe']],
+    ['accepts Unicode characters (e.g. Nordic)', true, ['Øyvind Sivertsen']],
+    ['rejects single-word names', false, ['Linus']],
+    ['rejects names with underscores', false, ['john_doe']],
+    ['rejects double spaces', false, ['John  Doe']],
+    ['rejects leading/trailing whitespace', false, [' John Doe', 'John Doe ']],
+    ['rejects invalid characters (slashes, etc.)', false, ['John/Doe']]
+  ];
 
-  test('accepts hyphenated names (e.g. Asian naming)', () => {
-    assert.strictEqual(isValidName('Wei-Ting Yang'), true);
-    assert.strictEqual(isValidName('Jean-Luc Picard'), true);
-  });
-
-  test('accepts names with apostrophes', () => {
-    assert.strictEqual(isValidName("Brian O'Connor"), true);
-  });
-
-  test('accepts names with dots', () => {
-    assert.strictEqual(isValidName('J. Doe'), true);
-  });
-
-  test('accepts Unicode characters (e.g. Nordic)', () => {
-    assert.strictEqual(isValidName('Øyvind Sivertsen'), true);
-  });
-
-  test('rejects single-word names', () => {
-    assert.strictEqual(isValidName('Linus'), false);
-  });
-
-  test('rejects names with underscores', () => {
-    assert.strictEqual(isValidName('john_doe'), false);
-  });
-
-  test('rejects double spaces', () => {
-    assert.strictEqual(isValidName('John  Doe'), false);
-  });
-
-  test('rejects leading/trailing whitespace', () => {
-    assert.strictEqual(isValidName(' John Doe'), false);
-    assert.strictEqual(isValidName('John Doe '), false);
-  });
-
-  test('rejects invalid characters (slashes, etc.)', () => {
-    assert.strictEqual(isValidName('John/Doe'), false);
-  });
+  for (const [title, valid, names] of cases) {
+    test(title, () => {
+      for (const name of names) {
+        assert.strictEqual(isValidName(name), valid, `isValidName(${JSON.stringify(name)})`);
+      }
+    });
+  }
 });
 
 describe('validateFormalities', () => {
+  // Every body-width case shares the subject and varies only the body.
+  const fixBuild = (body) => signedOff(`bash: fix build issue\n\n${body}`);
+
+  // `author` is the GitHub account the author email resolved to, or null.
+  const accountCommit = (author) => ({ author, ...signedOff('mypkg: fix bug\n\nSome description text', JANE) });
+
   test('passes a fully valid commit', async () => {
     const commit = {
       parents: [{ sha: 'parent-sha' }],
-      commit: {
-        message: 'bash: update to 5.3 patch level 15\n\nAdd support for new upstream features.\nhttps://lists.gnu.org/archive/html/bug-bash/\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' },
-        verification: { verified: true, key_id: 'GPGKEYID' }
-      }
+      ...signedOff('bash: update to 5.3 patch level 15\n\nAdd support for new upstream features.\nhttps://lists.gnu.org/archive/html/bug-bash/', JOHN, { verification: VERIFIED })
     };
     const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assertNoErrors(res);
     assert.ok(res.successes.length > 0);
   });
 
   test('catches empty commit message', async () => {
-    const commit = {
-      commit: {
-        message: '',
-        author: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('empty')));
+    const res = await validateFormalities(makeCommit('', { author: JOHN }), CONFIG);
+    assertErrorIncludes(res, 'empty');
   });
 
   test('catches noreply email and missing Signed-off-by', async () => {
-    const commit = {
-      commit: {
-        message: 'bash: test subject line',
-        author: { name: 'John Doe', email: 'john@noreply.github.com' },
-        committer: { name: 'John Doe', email: 'john@noreply.github.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('noreply address')));
-    assert.ok(res.errors.some(e => e.includes('Signed-off-by')));
+    const res = await validateFormalities(commitBy('bash: test subject line', { name: 'John Doe', email: 'john@noreply.github.com' }), CONFIG);
+    assertErrorIncludes(res, 'noreply address');
+    assertErrorIncludes(res, 'Signed-off-by');
   });
 
   test('passes GitHub web UI commit with valid author identity', async () => {
-    const commit = {
-      parents: [{ sha: 'parent-sha' }],
-      commit: {
-        message: 'mwan3: add configurable nslookup name\n\nAllow the config to specify a name.\n\nSigned-off-by: Alice B. Cooper <alice@example.com>',
-        author: { name: 'Alice B. Cooper', email: 'alice@example.com' },
-        committer: { name: 'GitHub', email: 'noreply@github.com' },
-        verification: { verified: true, key_id: 'GPGKEYID' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(!res.errors.some(e => e.includes('Committer name format is invalid')), `Should not reject GitHub web commit committer name, got: ${res.errors.join(', ')}`);
-    assert.ok(!res.errors.some(e => e.includes('noreply address')), `Should not reject GitHub web commit noreply email, got: ${res.errors.join(', ')}`);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    const res = await validateFormalities(webCommit('mwan3: add configurable nslookup name\n\nAllow the config to specify a name.', ALICE), CONFIG);
+    assertNoErrorIncludes(res, 'Committer name format is invalid');
+    assertNoErrorIncludes(res, 'noreply address');
+    assertNoErrors(res);
   });
 
   test('still catches invalid author name in GitHub web UI commit', async () => {
-    const commit = {
-      parents: [{ sha: 'parent-sha' }],
-      commit: {
-        message: 'mwan3: test\n\nSigned-off-by: badname <bad@example.com>',
-        author: { name: 'badname', email: 'bad@example.com' },
-        committer: { name: 'GitHub', email: 'noreply@github.com' },
-        verification: { verified: true, key_id: 'GPGKEYID' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('Author name format is invalid')), `Should still reject invalid author name in web commit`);
-    assert.ok(!res.errors.some(e => e.includes('Committer name format is invalid')), `Should not reject GitHub web commit committer name`);
+    const res = await validateFormalities(webCommit('mwan3: test', { name: 'badname', email: 'bad@example.com' }), CONFIG);
+    assertErrorIncludes(res, 'Author name format is invalid');
+    assertNoErrorIncludes(res, 'Committer name format is invalid');
   });
 
   test('recognizes a web commit by the account GitHub resolved the committer to', async () => {
     const commit = {
-      parents: [{ sha: 'parent-sha' }],
       author: { login: 'alice' },
       committer: { login: 'web-flow' },
-      commit: {
-        message: 'mwan3: add configurable nslookup name\n\nAllow the config to specify a name.\n\nSigned-off-by: Alice B. Cooper <alice@example.com>',
-        author: { name: 'Alice B. Cooper', email: 'alice@example.com' },
-        committer: { name: 'GitHub', email: 'noreply@github.com' },
-        verification: { verified: true, key_id: 'GPGKEYID' }
-      }
+      ...webCommit('mwan3: add configurable nslookup name\n\nAllow the config to specify a name.', ALICE)
     };
     const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('committed through the GitHub web interface')));
+    assertNoErrors(res);
+    assertSuccessIncludes(res, 'committed through the GitHub web interface');
   });
 
   test('GitHub web commit SOB matches only against author, not committer', async () => {
-    const commit = {
-      parents: [{ sha: 'parent-sha' }],
-      commit: {
-        message: 'mwan3: add test feature\n\nSome body text.\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'GitHub', email: 'noreply@github.com' },
-        verification: { verified: true, key_id: 'GPGKEYID' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(e => e.includes('Signed-off-by')));
+    const res = await validateFormalities(webCommit('mwan3: add test feature\n\nSome body text.', JOHN), CONFIG);
+    assertNoErrors(res);
+    assertSuccessIncludes(res, 'Signed-off-by');
   });
 
   test('rejects merge commits', async () => {
     const commit = {
       parents: [{ sha: 'parent-sha-1' }, { sha: 'parent-sha-2' }],
-      commit: {
-        message: 'bash: test subject line\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
+      ...signedOff('bash: test subject line')
     };
     const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('Merge commits are not allowed')));
+    assertErrorIncludes(res, 'Merge commits are not allowed');
   });
 
   test('enforces soft and hard subject length limits', async () => {
-    const commitHard = {
-      commit: {
-        message: 'bash: ' + 'a'.repeat(85),
-        author: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resHard = await validateFormalities(commitHard, CONFIG);
-    assert.ok(resHard.errors.some(e => e.includes('exceeds hard limit')));
+    const resHard = await validateFormalities(makeCommit('bash: ' + 'a'.repeat(85), { author: JOHN }), CONFIG);
+    assertErrorIncludes(resHard, 'exceeds hard limit');
 
-    const commitSoft = {
-      commit: {
-        message: 'bash: ' + 'a'.repeat(65),
-        author: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resSoft = await validateFormalities(commitSoft, CONFIG);
-    assert.ok(resSoft.warnings.some(w => w.includes('exceeds soft limit')));
+    const resSoft = await validateFormalities(makeCommit('bash: ' + 'a'.repeat(65), { author: JOHN }), CONFIG);
+    assertWarningIncludes(resSoft, 'exceeds soft limit');
   });
 
   test('measures the subject length without the autosquash marker', async () => {
@@ -188,62 +131,24 @@ describe('validateFormalities', () => {
     // subject it is applied to keeps the full length budget.
     const subject = 'bash: ' + 'a'.repeat(54);
     assert.strictEqual(subject.length, CONFIG.max_subject_len_soft);
-    const commit = {
-      commit: {
-        message: 'fixup! ' + subject + '\n\nCorrects the build flags.\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(!res.warnings.some(w => w.includes('exceeds soft limit')), `Unexpected warnings: ${res.warnings.join(', ')}`);
+    const res = await validateFormalities(signedOff(`fixup! ${subject}\n\nCorrects the build flags.`), CONFIG);
+    assertNoErrors(res);
+    assertNoWarningIncludes(res, 'exceeds soft limit');
   });
 
   test('enforces body line length limit but ignores code blocks and URLs', async () => {
-    // 1. Commit body line exceeds limit (CONFIG.max_body_line_len is 100)
-    // with ordinary words, so wrapping it under the limit is possible
-    const commitLongLine = {
-      commit: {
-        message: 'bash: fix build issue\n\n' + 'wrappable words '.repeat(8) + '\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resLongLine = await validateFormalities(commitLongLine, CONFIG);
-    assert.ok(resLongLine.errors.some(e => e.includes('exceeds max width')), 'Should reject too long line in body');
+    // CONFIG.max_body_line_len is 100. A line of ordinary words can be wrapped
+    // under it, so it is rejected.
+    assertErrorIncludes(await validateFormalities(fixBuild('wrappable words '.repeat(8)), CONFIG), 'exceeds max width');
 
-    // 2. Commit body line exceeds limit but is inside a code block
-    const commitCodeBlock = {
-      commit: {
-        message: 'bash: fix build issue\n\nOtherwise we get\n```\n' + 'a'.repeat(105) + '\n```\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resCodeBlock = await validateFormalities(commitCodeBlock, CONFIG);
-    assert.ok(!resCodeBlock.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line in code block');
+    // A long line inside a code block is not.
+    assertNoErrorIncludes(await validateFormalities(fixBuild('Otherwise we get\n```\n' + 'a'.repeat(105) + '\n```'), CONFIG), 'exceeds max width');
 
-    // 3. Commit body line exceeds limit but contains a URL (checking uppercase HTTPS and git protocols)
-    const commitWithUrl = {
-      commit: {
-        message: 'bash: fix build issue\n\nThis is a long line containing a URL: HTTPS://github.com/openwrt/openwrt-bot-worker/blob/4c90a2854344d1174d3c28a7b94c4ca324f13ce1/cloudflare-worker/src/validators.js#L1 which should be ignored\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resWithUrl = await validateFormalities(commitWithUrl, CONFIG);
-    assert.ok(!resWithUrl.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line containing an uppercase HTTPS URL');
-
-    const commitWithGitUrl = {
-      commit: {
-        message: 'bash: fix build issue\n\nThis is a long line containing a git URL: git://git.openwrt.org/feed/packages.git/some/path/which/is/very/long/and/exceeds/the/limit/completely\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resWithGitUrl = await validateFormalities(commitWithGitUrl, CONFIG);
-    assert.ok(!resWithGitUrl.errors.some(e => e.includes('exceeds max width')), 'Should ignore long line containing a git:// URL');
+    // Nor is one containing a URL, with an upper-case HTTPS or a git scheme.
+    const httpsLine = 'This is a long line containing a URL: HTTPS://github.com/openwrt/openwrt-bot-worker/blob/4c90a2854344d1174d3c28a7b94c4ca324f13ce1/cloudflare-worker/src/validators.js#L1 which should be ignored';
+    assertNoErrorIncludes(await validateFormalities(fixBuild(httpsLine), CONFIG), 'exceeds max width');
+    const gitLine = 'This is a long line containing a git URL: git://git.openwrt.org/feed/packages.git/some/path/which/is/very/long/and/exceeds/the/limit/completely';
+    assertNoErrorIncludes(await validateFormalities(fixBuild(gitLine), CONFIG), 'exceeds max width');
   });
 
   test('allows long body lines that cannot be wrapped under the limit', async () => {
@@ -251,37 +156,15 @@ describe('validateFormalities', () => {
     // break can bring it under 100 chars, and breaking inside the path would
     // corrupt the quoted log (openwrt/openwrt#21794).
     const logLine = "ERROR: module '/home/user/Development/OpenWrt/openwrt/build_dir/target-powerpc64_e5500_musl/linux-qoriq_generic/linux-6.12.67/net/ipv6/netfilter/ip6_tables.ko' is missing.";
-    const commitLogLine = {
-      commit: {
-        message: `netfilter: add missing symbol\n\nBuild fails with:\n\n${logLine}\n\nSigned-off-by: John Doe <john@doe.com>`,
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resLogLine = await validateFormalities(commitLogLine, CONFIG);
-    assert.ok(!resLogLine.errors.some(e => e.includes('exceeds max width')), 'Should ignore a line whose overflow comes from an unbreakable token');
+    const resLogLine = await validateFormalities(signedOff(`netfilter: add missing symbol\n\nBuild fails with:\n\n${logLine}`), CONFIG);
+    assertNoErrorIncludes(resLogLine, 'exceeds max width');
 
     // A single token longer than the limit is unbreakable on its own too.
-    const commitLongToken = {
-      commit: {
-        message: 'bash: fix build issue\n\n' + 'a'.repeat(105) + '\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resLongToken = await validateFormalities(commitLongToken, CONFIG);
-    assert.ok(!resLongToken.errors.some(e => e.includes('exceeds max width')), 'Should ignore a single token longer than the limit');
+    assertNoErrorIncludes(await validateFormalities(fixBuild('a'.repeat(105)), CONFIG), 'exceeds max width');
 
     // But a long line of ordinary words next to a long token elsewhere in the
     // body is still held to the limit.
-    const commitMixed = {
-      commit: {
-        message: `bash: fix build issue\n\n${logLine}\n${'wrappable words '.repeat(8)}\n\nSigned-off-by: John Doe <john@doe.com>`,
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resMixed = await validateFormalities(commitMixed, CONFIG);
+    const resMixed = await validateFormalities(fixBuild(`${logLine}\n${'wrappable words '.repeat(8)}`), CONFIG);
     assert.strictEqual(resMixed.errors.filter(e => e.includes('exceeds max width')).length, 1, 'Only the wrappable line should be flagged');
   });
 
@@ -298,14 +181,7 @@ describe('validateFormalities', () => {
     ];
     for (const vline of verbatimLines) {
       assert.ok(vline.length > 100, `fixture must exceed the limit: ${vline.slice(0, 40)}`);
-      const commit = {
-        commit: {
-          message: `bash: fix build issue\n\nContext follows:\n\n${vline}\n\nSigned-off-by: John Doe <john@doe.com>`,
-          author: { name: 'John Doe', email: 'john@doe.com' },
-          committer: { name: 'John Doe', email: 'john@doe.com' }
-        }
-      };
-      const res = await validateFormalities(commit, CONFIG);
+      const res = await validateFormalities(fixBuild(`Context follows:\n\n${vline}`), CONFIG);
       assert.ok(!res.errors.some(e => e.includes('exceeds max width')), `should allow verbatim line: ${vline.slice(0, 40)}...`);
     }
 
@@ -313,134 +189,44 @@ describe('validateFormalities', () => {
     // those must keep wrapping like any other prose.
     const bullet = ' - This is only working if the first partition is active because recovery images are always flashed to the active partition';
     assert.ok(bullet.length > 100);
-    const bulletCommit = {
-      commit: {
-        message: `bash: fix build issue\n\n${bullet}\n\nSigned-off-by: John Doe <john@doe.com>`,
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const resBullet = await validateFormalities(bulletCommit, CONFIG);
-    assert.ok(resBullet.errors.some(e => e.includes('exceeds max width')), 'a single-space prose bullet must still be flagged');
+    assertErrorIncludes(await validateFormalities(fixBuild(bullet), CONFIG), 'exceeds max width');
   });
 
   test('rejects commit with only Signed-off-by and no description', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: fix build issue\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('description body is empty')),
-      `Expected empty body error but got: ${JSON.stringify(res.errors)}`);
+    const res = await validateFormalities(signedOff('mypkg: fix build issue', JANE_AT_EXAMPLE), CONFIG);
+    assertErrorIncludes(res, 'description body is empty');
   });
 
-  test('warns when subject and body are semantically identical (e.g. mypkg: update to 1.2.3)', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: update to 1.2.3\n\n- Update MyPkg to v1.2.3\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
+  // Whether the body only restates the subject.
+  const duplicateBodies = [
+    ['warns when subject and body are semantically identical (e.g. mypkg: update to 1.2.3)', true, 'mypkg: update to 1.2.3\n\n- Update MyPkg to v1.2.3'],
+    ['warns when subject and body are virtually identical (e.g. my-agent bump version to 2026.27)', true, 'my-agent: bump version to 2026.27\n\nUpgrade my-agent to the newest version'],
+    ['warns when subject and body are virtually identical (e.g. my-cli update to 29.6.1)', true, 'my-cli: update to 29.6.1\n\nBump my-cli CLI from 29.4.1 to 29.6.1.'],
+    ['warns when body only qualifies the kind of release (e.g. bird3: bump to v3.3.2)', true, 'bird3: bump to v3.3.2\n\nUpdate to latest upstream bugfix release.'],
+    ['warns when body only claims bugs were fixed', true, 'mypkg: update to 2.4.0\n\nStable maintenance release, fixes bugs.'],
+    ['does not warn when the body names what was fixed', false, 'bird3: bump to v3.3.2\n\nUpstream bugfix release, fixes a crash in the BGP reconfiguration path.'],
+    ['does not warn when body has meaningful context beyond subject', false, 'my-cli: update to 29.6.1\n\nBump my-cli CLI to 29.6.1.\nThis release fixes a CVE in the CLI implementation.']
+  ];
 
-  test('warns when subject and body are virtually identical (e.g. my-agent bump version to 2026.27)', async () => {
-    const commit = {
-      commit: {
-        message: 'my-agent: bump version to 2026.27\n\nUpgrade my-agent to the newest version\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
+  for (const [title, duplicate, text] of duplicateBodies) {
+    test(title, async () => {
+      const res = await validateFormalities(signedOff(text, JANE_AT_EXAMPLE), CONFIG);
+      if (duplicate) {
+        assertWarningIncludes(res, 'identical or virtually identical');
+      } else {
+        assertNoWarningIncludes(res, 'identical or virtually identical');
       }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
-
-  test('warns when subject and body are virtually identical (e.g. my-cli update to 29.6.1)', async () => {
-    const commit = {
-      commit: {
-        message: 'my-cli: update to 29.6.1\n\nBump my-cli CLI from 29.4.1 to 29.6.1.\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
-
-  test('warns when body only qualifies the kind of release (e.g. bird3: bump to v3.3.2)', async () => {
-    const commit = {
-      commit: {
-        message: 'bird3: bump to v3.3.2\n\nUpdate to latest upstream bugfix release.\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
-
-  test('warns when body only claims bugs were fixed', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: update to 2.4.0\n\nStable maintenance release, fixes bugs.\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Expected duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
-
-  test('does not warn when the body names what was fixed', async () => {
-    const commit = {
-      commit: {
-        message: 'bird3: bump to v3.3.2\n\nUpstream bugfix release, fixes a crash in the BGP reconfiguration path.\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(!res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Did not expect duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
-
-  test('does not warn when body has meaningful context beyond subject', async () => {
-    const commit = {
-      commit: {
-        message: 'my-cli: update to 29.6.1\n\nBump my-cli CLI to 29.6.1.\nThis release fixes a CVE in the CLI implementation.\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(!res.warnings.some(w => w.includes('identical or virtually identical')),
-      `Did not expect duplicate warning but got: ${JSON.stringify(res.warnings)}`);
-  });
+    });
+  }
 
   test('correctly extracts SSH key signature fingerprint without the footer tag', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: fix build issue\n\nSome description body text\n\nSigned-off-by: Jane Smith <jane@example.com>',
-        author: { name: 'Jane Smith', email: 'jane@example.com' },
-        committer: { name: 'Jane Smith', email: 'jane@example.com' },
-        verification: {
-          verified: true,
-          reason: 'valid',
-          signature: '-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAAtteSBwdWJsaWNrZXk=\n-----END SSH SIGNATURE-----'
-        }
+    const commit = signedOff('mypkg: fix build issue\n\nSome description body text', JANE_AT_EXAMPLE, {
+      verification: {
+        verified: true,
+        reason: 'valid',
+        signature: '-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAAtteSBwdWJsaWNrZXk=\n-----END SSH SIGNATURE-----'
       }
-    };
+    });
     const res = await validateFormalities(commit, CONFIG);
     const successStr = res.successes.find(s => s.includes('cryptographic signature'));
     assert.ok(successStr, 'Expected cryptographic signature success message');
@@ -449,274 +235,123 @@ describe('validateFormalities', () => {
   });
 
   test('passes when require_linked_github_account is true and author is linked to GitHub user', async () => {
-    const commit = {
-      author: { login: 'johndoe' }, // linked GitHub account
-      commit: {
-        message: 'mypkg: fix bug\n\nSome description text\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const customConfig = { ...CONFIG, require_linked_github_account: true };
-    const res = await validateFormalities(commit, customConfig);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    const res = await validateFormalities(accountCommit({ login: 'johndoe' }), { ...CONFIG, require_linked_github_account: true });
+    assertNoErrors(res);
   });
 
   test('fails when require_linked_github_account is true and author is not linked to GitHub user', async () => {
-    const commit = {
-      author: null, // not linked to GitHub account
-      commit: {
-        message: 'mypkg: fix bug\n\nSome description text\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const customConfig = { ...CONFIG, require_linked_github_account: true };
-    const res = await validateFormalities(commit, customConfig);
-    assert.ok(res.errors.some(e => e.includes('is not linked to any registered GitHub account')));
+    const res = await validateFormalities(accountCommit(null), { ...CONFIG, require_linked_github_account: true });
+    assertErrorIncludes(res, 'is not linked to any registered GitHub account');
   });
 
   test('warns instead of failing when require_linked_github_account is "warning" and author is not linked', async () => {
-    const commit = {
-      author: null, // not linked to GitHub account
-      commit: {
-        message: 'mypkg: fix bug\n\nSome description text\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const customConfig = { ...CONFIG, require_linked_github_account: 'warning' };
-    const res = await validateFormalities(commit, customConfig);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.warnings.some(w => w.includes('is not linked to any registered GitHub account')));
+    const res = await validateFormalities(accountCommit(null), { ...CONFIG, require_linked_github_account: 'warning' });
+    assertNoErrors(res);
+    assertWarningIncludes(res, 'is not linked to any registered GitHub account');
   });
 
   test('passes spelling check when OpenWrt or openwrt is used correctly', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: support OpenWrt properly\n\nWe love OpenWrt. Make sure it runs well under openwrt.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
+    const res = await validateFormalities(signedOff('mypkg: support OpenWrt properly\n\nWe love OpenWrt. Make sure it runs well under openwrt.', JANE), CONFIG);
+    assertNoWarningIncludes(res, "Incorrect capitalization of 'OpenWrt'");
   });
 
   test('warns on incorrect casing of OpenWrt (e.g. OpenWRT, Openwrt, OPENWRT)', async () => {
-    const commit1 = {
-      commit: {
-        message: 'mypkg: support OpenWRT\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res1 = await validateFormalities(commit1, CONFIG);
-    assert.ok(res1.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\' detected: \'OpenWRT\'')));
-
-    const commit2 = {
-      commit: {
-        message: 'mypkg: fix compatibility\n\nThis is an Openwrt package.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res2 = await validateFormalities(commit2, CONFIG);
-    assert.ok(res2.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\' detected: \'Openwrt\'')));
-
-    const commit3 = {
-      commit: {
-        message: 'mypkg: fix compatibility\n\nThis is for OPENWRT.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res3 = await validateFormalities(commit3, CONFIG);
-    assert.ok(res3.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\' detected: \'OPENWRT\'')));
+    const misspellings = [
+      ['mypkg: support OpenWRT', 'OpenWRT'],
+      ['mypkg: fix compatibility\n\nThis is an Openwrt package.', 'Openwrt'],
+      ['mypkg: fix compatibility\n\nThis is for OPENWRT.', 'OPENWRT']
+    ];
+    for (const [text, detected] of misspellings) {
+      const res = await validateFormalities(signedOff(text, JANE), CONFIG);
+      assertWarningIncludes(res, `Incorrect capitalization of 'OpenWrt' detected: '${detected}'`);
+    }
   });
 
   test('ignores spelling check inside code blocks and URLs', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: fix spelling in code blocks\n\nLook at this error:\n```\nOpenWRT compiler error: Openwrt is missing\n```\nAlso check out https://github.com/OpenWRT/packages\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
+    const res = await validateFormalities(signedOff('mypkg: fix spelling in code blocks\n\nLook at this error:\n```\nOpenWRT compiler error: Openwrt is missing\n```\nAlso check out https://github.com/OpenWRT/packages', JANE), CONFIG);
+    assertNoWarningIncludes(res, "Incorrect capitalization of 'OpenWrt'");
   });
 
   test('does not perform spelling check when disabled in config', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: support OpenWRT\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const customConfig = { ...CONFIG, check_openwrt_spelling: false };
-    const res = await validateFormalities(commit, customConfig);
-    assert.ok(!res.warnings.some(w => w.includes('Incorrect capitalization of \'OpenWrt\'')));
+    const res = await validateFormalities(signedOff('mypkg: support OpenWRT', JANE), { ...CONFIG, check_openwrt_spelling: false });
+    assertNoWarningIncludes(res, "Incorrect capitalization of 'OpenWrt'");
   });
 
   test('rejects a description that follows the subject without a blank line', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: update to 1.2.3\nUpdate to the latest upstream release.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('followed by a blank line')), `Errors: ${res.errors.join(', ')}`);
+    const res = await validateFormalities(signedOff('mypkg: update to 1.2.3\nUpdate to the latest upstream release.', JANE), CONFIG);
+    assertErrorIncludes(res, 'followed by a blank line');
   });
 
   test('accepts a subject separated from the description by a blank line', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: update to 1.2.3\n\nUpdate to the latest upstream release.\nhttps://example.com/changelog\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(!res.errors.some(e => e.includes('followed by a blank line')), `Errors: ${res.errors.join(', ')}`);
+    const res = await validateFormalities(signedOff('mypkg: update to 1.2.3\n\nUpdate to the latest upstream release.\nhttps://example.com/changelog', JANE), CONFIG);
+    assertNoErrorIncludes(res, 'followed by a blank line');
   });
 
   test('warns when the subject uses past tense instead of imperative mood', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, { ...CONFIG, warn_imperative_mood: true });
-    assert.ok(res.warnings.some(w => w.includes("write 'add ...'")), `Warnings: ${res.warnings.join(', ')}`);
+    const res = await validateFormalities(signedOff('mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/', JANE), { ...CONFIG, warn_imperative_mood: true });
+    assertWarningIncludes(res, "write 'add ...'");
   });
 
   test('does not warn about imperative subjects', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: add support for foo\n\nAdd the foo feature.\nhttps://example.com/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, { ...CONFIG, warn_imperative_mood: true });
-    assert.ok(!res.warnings.some(w => w.includes('imperative mood')), `Warnings: ${res.warnings.join(', ')}`);
+    const res = await validateFormalities(signedOff('mypkg: add support for foo\n\nAdd the foo feature.\nhttps://example.com/', JANE), { ...CONFIG, warn_imperative_mood: true });
+    assertNoWarningIncludes(res, 'imperative mood');
   });
 
   test('does not warn about mood when disabled', async () => {
-    const commit = {
-      commit: {
-        message: 'mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, { ...CONFIG, warn_imperative_mood: false });
-    assert.ok(!res.warnings.some(w => w.includes('imperative mood')), `Warnings: ${res.warnings.join(', ')}`);
+    const res = await validateFormalities(signedOff('mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/', JANE), { ...CONFIG, warn_imperative_mood: false });
+    assertNoWarningIncludes(res, 'imperative mood');
   });
 
-  test('accepts tools/cmake prefix format for build tool commits', async () => {
-    const commit = {
-      commit: {
-        message: 'tools/cmake: backport bootstrap fix for GCC 16\n\nApply upstream fix for bootstrap with GCC 16.\nhttps://cmake.org/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
+  // Source tree paths as the subject prefix. A row with an `error` is rejected
+  // with it; every other row is accepted.
+  const prefixedSubjects = [
+    {
+      title: 'accepts tools/cmake prefix format for build tool commits',
+      commit: signedOff('tools/cmake: backport bootstrap fix for GCC 16\n\nApply upstream fix for bootstrap with GCC 16.\nhttps://cmake.org/', JANE)
+    },
+    {
+      title: 'accepts tools/bison prefix format for build tool commits',
+      commit: signedOff('tools/bison: update to 3.8.2\n\nUpdate bison to latest stable release.\nhttps://ftp.gnu.org/gnu/bison/')
+    },
+    {
+      title: 'rejects tools/cmake with uppercase after prefix',
+      commit: signedOff('tools/cmake: Backport bootstrap fix for GCC 16\n\nApply upstream fix.', JANE),
+      error: 'lower-case word after the prefix'
+    },
+    {
+      title: 'rejects tools/cmake with period at end of subject',
+      commit: signedOff('tools/cmake: backport bootstrap fix for GCC 16.\n\nApply upstream fix.', JANE),
+      error: 'must not end with a period'
+    },
+    {
+      title: 'accepts toolchain/musl prefix format',
+      commit: signedOff('toolchain/musl: update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html', JANE)
+    },
+    {
+      title: 'accepts a deeper source tree path as prefix',
+      commit: signedOff('package/network/services/hostapd: fix build\n\nFix build against wolfssl.\nhttps://w1.fi/', JANE)
+    },
+    {
+      title: 'rejects toolchain/musl with uppercase after prefix',
+      commit: signedOff('toolchain/musl: Update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html', JANE),
+      error: 'lower-case word after the prefix'
+    }
+  ];
+
+  for (const { title, commit, error } of prefixedSubjects) {
+    test(title, async () => {
+      const res = await validateFormalities(commit, CONFIG);
+      if (error) {
+        assertErrorIncludes(res, error);
+      } else {
+        assertNoErrors(res);
+        assertSuccessIncludes(res, 'Commit subject layout and length are valid');
       }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid')));
-  });
-
-  test('accepts tools/bison prefix format for build tool commits', async () => {
-    const commit = {
-      commit: {
-        message: 'tools/bison: update to 3.8.2\n\nUpdate bison to latest stable release.\nhttps://ftp.gnu.org/gnu/bison/\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid')));
-  });
-
-  test('rejects tools/cmake with uppercase after prefix', async () => {
-    const commit = {
-      commit: {
-        message: 'tools/cmake: Backport bootstrap fix for GCC 16\n\nApply upstream fix.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('lower-case word after the prefix')));
-  });
-
-  test('rejects tools/cmake with period at end of subject', async () => {
-    const commit = {
-      commit: {
-        message: 'tools/cmake: backport bootstrap fix for GCC 16.\n\nApply upstream fix.\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('must not end with a period')));
-  });
-
-  test('accepts toolchain/musl prefix format', async () => {
-    const commit = {
-      commit: {
-        message: 'toolchain/musl: update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid')));
-  });
-
-  test('accepts a deeper source tree path as prefix', async () => {
-    const commit = {
-      commit: {
-        message: 'package/network/services/hostapd: fix build\n\nFix build against wolfssl.\nhttps://w1.fi/\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-  });
-
-  test('rejects toolchain/musl with uppercase after prefix', async () => {
-    const commit = {
-      commit: {
-        message: 'toolchain/musl: Update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html\n\nSigned-off-by: Jane Smith <jane@smith.com>',
-        author: { name: 'Jane Smith', email: 'jane@smith.com' },
-        committer: { name: 'Jane Smith', email: 'jane@smith.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('lower-case word after the prefix')));
-  });
-});
-
-const revertBody = (sha) => `\n\nThis reverts commit ${sha}.\nIt broke the build on several targets.\n\nSigned-off-by: John Doe <john@doe.com>`;
-
-const revertCommit = (subject) => ({
-  commit: {
-    message: subject + revertBody('9fceb02d0ae598e95dc970b74767f19372d61af8'),
-    author: { name: 'John Doe', email: 'john@doe.com' },
-    committer: { name: 'John Doe', email: 'john@doe.com' }
+    });
   }
 });
+
+const REVERTED_SHA = '9fceb02d0ae598e95dc970b74767f19372d61af8';
 
 describe('parseRevertSubject', () => {
   test('parses the plain git revert format', () => {
@@ -745,18 +380,21 @@ describe('parseRevertSubject', () => {
   });
 
   test('rejects subjects that only mention a revert', () => {
-    assert.strictEqual(parseRevertSubject('mypkg: revert the broken change'), null);
-    assert.strictEqual(parseRevertSubject('Revert the broken change'), null);
-    assert.strictEqual(parseRevertSubject('Reverted "mypkg: update to 1.2.3"'), null);
-    assert.strictEqual(parseRevertSubject('toolchain: binutils: partially revert commit 525a1e94b343 "fix update to 2.45.1"'), null);
+    const subjects = [
+      'mypkg: revert the broken change',
+      'Revert the broken change',
+      'Reverted "mypkg: update to 1.2.3"',
+      'toolchain: binutils: partially revert commit 525a1e94b343 "fix update to 2.45.1"'
+    ];
+    for (const subject of subjects) {
+      assert.strictEqual(parseRevertSubject(subject), null, subject);
+    }
   });
 });
 
 describe('parseRevertCommit', () => {
-  const sha = '9fceb02d0ae598e95dc970b74767f19372d61af8';
-
   test('accepts the reference `git revert` writes into the body', () => {
-    const res = parseRevertCommit(`Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${sha}.`);
+    const res = parseRevertCommit(`Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${REVERTED_SHA}.`);
     assert.deepStrictEqual(res, { prefix: '', original: 'mypkg: update to 1.2.3', depth: 1 });
   });
 
@@ -769,93 +407,72 @@ describe('parseRevertCommit', () => {
     assert.strictEqual(parseRevertCommit('Revert "mypkg: update to 1.2.3"'), null);
     assert.strictEqual(parseRevertCommit('Revert "mypkg: update to 1.2.3"\n\nThis broke the build.'), null);
     // The reference belongs in the body, so a subject claiming it is not enough.
-    assert.strictEqual(parseRevertCommit(`Revert "mypkg: update to 1.2.3" This reverts commit ${sha}.`), null);
+    assert.strictEqual(parseRevertCommit(`Revert "mypkg: update to 1.2.3" This reverts commit ${REVERTED_SHA}.`), null);
   });
 
   test('rejects a body reference under a subject that is not a revert', () => {
-    assert.strictEqual(parseRevertCommit(`mypkg: update to 1.2.3\n\nThis reverts commit ${sha}.`), null);
+    assert.strictEqual(parseRevertCommit(`mypkg: update to 1.2.3\n\nThis reverts commit ${REVERTED_SHA}.`), null);
   });
 
   test('looks past an autosquash marker', () => {
-    const res = parseRevertCommit(`fixup! Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${sha}.`);
+    const res = parseRevertCommit(`fixup! Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${REVERTED_SHA}.`);
     assert.strictEqual(res.original, 'mypkg: update to 1.2.3');
   });
 });
 
 describe('validateFormalities revert subjects', () => {
-  test('accepts the plain git revert format without a package prefix', async () => {
-    const res = await validateFormalities(revertCommit('Revert "generic: permit support of standalone PCS for external kernel module"'), CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('Commit subject layout and length are valid (revert of')));
-  });
+  const revertCommit = (subject) => signedOff(`${subject}\n\nThis reverts commit ${REVERTED_SHA}.\nIt broke the build on several targets.`);
+  const unreferencedRevert = (subject) => signedOff(`${subject}\n\nIt broke the build on several targets.`);
 
-  test('accepts a revert of a revert', async () => {
-    const res = await validateFormalities(revertCommit('Revert "Revert "ramips: mt7620: fix patching mac address in caldata""'), CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-  });
-
-  test('accepts an upper-case Revert after a package prefix', async () => {
-    const res = await validateFormalities(revertCommit('irqbalance: Revert "irqbalance: update to 1.9.5"'), CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-  });
-
-  test('excludes the Revert wrapper from the subject length limits', async () => {
+  const acceptedReverts = [
+    ['accepts the plain git revert format without a package prefix', 'Revert "generic: permit support of standalone PCS for external kernel module"'],
+    ['accepts a revert of a revert', 'Revert "Revert "ramips: mt7620: fix patching mac address in caldata""'],
+    ['accepts an upper-case Revert after a package prefix', 'irqbalance: Revert "irqbalance: update to 1.9.5"'],
     // 86 chars as written, 77 without the wrapper.
-    const res = await validateFormalities(revertCommit('Revert "base-files: handle name collision between kernel UBI volume and MTD partition"'), CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-  });
+    ['excludes the Revert wrapper from the subject length limits', 'Revert "base-files: handle name collision between kernel UBI volume and MTD partition"']
+  ];
+
+  for (const [title, subject] of acceptedReverts) {
+    test(title, async () => {
+      const res = await validateFormalities(revertCommit(subject), CONFIG);
+      assertNoErrors(res);
+      assertSuccessIncludes(res, 'Commit subject layout and length are valid (revert of');
+    });
+  }
 
   test('still enforces the hard limit on the reverted subject itself', async () => {
     const original = 'base-files: handle a name collision between the kernel UBI volume and the MTD partition';
     assert.ok(original.length > CONFIG.max_subject_len_hard);
     const res = await validateFormalities(revertCommit(`Revert "${original}"`), CONFIG);
-    assert.ok(res.errors.some(e => e.includes('exceeds hard limit') && e.includes('excluding the `Revert "..."` wrapper')));
+    assert.ok(res.errors.some(e => e.includes('exceeds hard limit') && e.includes('excluding the `Revert "..."` wrapper')), `Errors: ${JSON.stringify(res.errors)}`);
   });
 
   test('still rejects a revert-like subject without the quoted original', async () => {
     const res = await validateFormalities(revertCommit('Revert the broken PCS support'), CONFIG);
-    assert.ok(res.errors.some(e => e.includes('must start with `<package name or prefix>: `')));
+    assertErrorIncludes(res, 'must start with `<package name or prefix>: `');
   });
 
   test('enforces the regular subject rules when allow_revert is disabled', async () => {
-    const customConfig = { ...CONFIG, allow_revert: false };
-    const res = await validateFormalities(revertCommit('Revert "generic: permit support of standalone PCS for external kernel module"'), customConfig);
-    assert.ok(res.errors.some(e => e.includes('must start with `<package name or prefix>: `')));
+    const res = await validateFormalities(revertCommit('Revert "generic: permit support of standalone PCS for external kernel module"'), { ...CONFIG, allow_revert: false });
+    assertErrorIncludes(res, 'must start with `<package name or prefix>: `');
   });
 
   test('enforces the regular subject rules when the body does not reference the reverted commit', async () => {
-    const commit = {
-      commit: {
-        message: 'Revert "generic: permit support of standalone PCS for external kernel module"\n\nIt broke the build on several targets.\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('must start with `<package name or prefix>: `')));
-    assert.ok(res.errors.some(e => e.includes('body does not reference the reverted commit')));
+    const res = await validateFormalities(unreferencedRevert('Revert "generic: permit support of standalone PCS for external kernel module"'), CONFIG);
+    assertErrorIncludes(res, 'must start with `<package name or prefix>: `');
+    assertErrorIncludes(res, 'body does not reference the reverted commit');
   });
 
   test('does not hint at a missing reference when the subject passes the regular rules', async () => {
     // `mypkg: revert "..."` already satisfies the prefix and lower-case rules,
     // so an unreferenced revert stays valid rather than becoming an error.
-    const commit = {
-      commit: {
-        message: 'mypkg: revert "the broken PCS support"\n\nIt broke the build on several targets.\n\nSigned-off-by: John Doe <john@doe.com>',
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' }
-      }
-    };
-    const res = await validateFormalities(commit, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    const res = await validateFormalities(unreferencedRevert('mypkg: revert "the broken PCS support"'), CONFIG);
+    assertNoErrors(res);
   });
 });
 
 describe('Signed-off-by parsing', () => {
-  const commitWith = (message) => ({
-    commit: { message, author: { name: 'Jane Doe', email: 'jane@doe.com' }, committer: { name: 'Jane Doe', email: 'jane@doe.com' } },
-    parents: [{}]
-  });
+  const commitWith = (message) => ({ ...commitBy(message, { name: 'Jane Doe', email: 'jane@doe.com' }), parents: [{}] });
   const SIGNOFF_CONFIG = { ...CONFIG, check_signoff: true, require_body: false, check_signature: false, require_linked_github_account: false };
 
   test('a trailer with an address but no name is not a sign-off', async () => {
@@ -869,12 +486,12 @@ describe('Signed-off-by parsing', () => {
   test('does not miss the URL on every second long line', async () => {
     // The pattern that lets a long line off the width limit is shared; a
     // global one would carry its cursor from the previous line and answer
-    // the next one wrongly.
+    // the next one wrongly. A line that is one URL is never too long.
     const long = (n) => 'https://example.org/' + 'a'.repeat(140) + `#${n}`;
     const message = ['pkg: update', '', long(1), long(2), long(3), '', 'Signed-off-by: Jane Doe <jane@doe.com>'].join('\n');
     const res = await validateFormalities(commitWith(message), { ...SIGNOFF_CONFIG, max_body_line_len: 100 });
-    assert.strictEqual(res.errors.length, 0, `a line that is one URL is never too long: ${res.errors.join(', ')}`);
-    assert.ok(!res.warnings.some(w => w.includes('exceeds')), `Unexpected warnings: ${res.warnings.join(', ')}`);
+    assertNoErrors(res);
+    assertNoWarningIncludes(res, 'exceeds');
   });
 
   test('answers promptly on a long line that is not a URL', async () => {
@@ -895,7 +512,7 @@ describe('Signed-off-by parsing', () => {
     ];
     for (const trailer of shapes) {
       const res = await validateFormalities(commitWith(`pkg: update\n\n${trailer}`), SIGNOFF_CONFIG);
-      assert.strictEqual(res.errors.length, 0, `${trailer} -> ${res.errors.join(', ')}`);
+      assert.deepStrictEqual(res.errors, [], `${trailer} -> ${res.errors.join(', ')}`);
     }
   });
 
@@ -912,6 +529,6 @@ describe('Signed-off-by parsing', () => {
     // millisecond) and far below what the old one did (about 6 500 ms), so a
     // slow or loaded machine cannot turn this into a false alarm.
     assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
-    assert.ok(res.errors.some(e => e.includes('Signed-off-by')), `an unsigned commit is still reported: ${res.errors.join(', ')}`);
+    assertErrorIncludes(res, 'Signed-off-by');
   });
 });

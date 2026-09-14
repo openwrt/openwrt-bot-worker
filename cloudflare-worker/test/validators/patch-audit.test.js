@@ -1,25 +1,51 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { validateEmbeddedPatches } from '../../src/validators.js';
-import { CONFIG } from './helpers.js';
+import { CONFIG, assertSomeIncludes, assertNoErrors, assertErrorIncludes } from './helpers.js';
 
 describe('validateEmbeddedPatches', () => {
+  // A lookup that answers every path the same way and remembers what it was
+  // asked for.
+  const recording = (answer) => {
+    const lookups = [];
+    return { lookups, fetch: async (p) => { lookups.push(p); return answer; } };
+  };
+
+  // A new patch file shows its whole content in the diff, so it can be judged
+  // without a lookup.
+  const newPatchWithoutHeaders = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++Some diff without from and subject headers
+    `;
+
+  // An edited patch file shows only a few changed lines; its headers are out
+  // of view unless the file is looked up.
+  const modifiedPatch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+    `;
+
   describe('in a whole pull request', () => {
     const envelope = (sha) => `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] mypkg: refresh patch\n\nSigned-off-by: John Doe <john@doe.com>\n---\n`;
     const modify = (p) => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -10,6 +10,6 @@\n-old\n+new\n\n`;
     const remove = (p) => `diff --git a/${p} b/${p}\ndeleted file mode 100644\n--- a/${p}\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-new\n\n`;
     const add = (p) => `diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,1 @@\n+x\n\n`;
     const rename = (from, to) => `diff --git a/${from} b/${to}\nsimilarity index 100%\nrename from ${from}\nrename to ${to}\n\n`;
+    // One commit per change, in order, each in its own mbox envelope.
+    const pullRequest = (...changes) => changes.map((change, i) => envelope('abc'[i].repeat(40)) + change).join('');
     const P = 'utils/mypkg/patches/001-fix.patch';
     const goodHeaders = 'From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\nFrom: A <a@b.c>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] fix\n';
-    const recording = (answer) => {
-      const lookups = [];
-      return { lookups, fetch: async (p) => { lookups.push(p); return answer; } };
-    };
 
     test('does not look for a patch file a later commit deletes', async () => {
       const { lookups, fetch } = recording(null);
-      const res = await validateEmbeddedPatches(envelope('a'.repeat(40)) + modify(P) + envelope('b'.repeat(40)) + remove(P), { check_patch_headers: true }, fetch);
+      const res = await validateEmbeddedPatches(pullRequest(modify(P), remove(P)), { check_patch_headers: true }, fetch);
       assert.deepStrictEqual(lookups, []);
       assert.strictEqual(res.incomplete, false);
       assert.deepStrictEqual(res.skipped, []);
@@ -27,30 +53,23 @@ describe('validateEmbeddedPatches', () => {
 
     test('does not look for a patch file a later commit renames away', async () => {
       const { lookups, fetch } = recording(null);
-      const res = await validateEmbeddedPatches(envelope('a'.repeat(40)) + modify(P) + envelope('b'.repeat(40)) + rename(P, 'utils/mypkg/patches/002-fix.patch'), { check_patch_headers: true }, fetch);
+      const res = await validateEmbeddedPatches(pullRequest(modify(P), rename(P, 'utils/mypkg/patches/002-fix.patch')), { check_patch_headers: true }, fetch);
       assert.deepStrictEqual(lookups, []);
       assert.strictEqual(res.incomplete, false);
     });
 
     test('still checks a patch file that is deleted and then added back', async () => {
       const { lookups, fetch } = recording(goodHeaders);
-      const res = await validateEmbeddedPatches(envelope('a'.repeat(40)) + modify(P) + envelope('b'.repeat(40)) + remove(P) + envelope('c'.repeat(40)) + add(P), { check_patch_headers: true }, fetch);
+      const res = await validateEmbeddedPatches(pullRequest(modify(P), remove(P), add(P)), { check_patch_headers: true }, fetch);
       assert.ok(lookups.includes(P), JSON.stringify(lookups));
-      assert.ok(res.successes.some(s => s.includes('contains valid Git compliance headers')), res.successes.join(', '));
+      assertSomeIncludes(res.successes, 'contains valid Git compliance headers', 'successes');
       assert.strictEqual(res.incomplete, false);
     });
   });
 
   test('catches patches missing From/Subject headers', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
-new file mode 100644
---- /dev/null
-+++ b/package/utils/bash/patches/001-fix.patch
-+Some diff without from and subject headers
-    `;
-    const res = await validateEmbeddedPatches(patch, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
+    const res = await validateEmbeddedPatches(newPatchWithoutHeaders, CONFIG);
+    assertErrorIncludes(res, 'Missing required Git header');
   });
 
   test('accepts patches with valid From/Subject headers', async () => {
@@ -67,7 +86,7 @@ new file mode 100644
 +Details of the fix
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assertNoErrors(res);
     assert.ok(res.successes.length > 0);
   });
 
@@ -92,15 +111,11 @@ diff --git a/utils/mypkg/patches/002-b.patch b/utils/mypkg/patches/002-b.patch
 -old_code
 +new_code
 `;
-    const fetched = [];
-    const fetchFileContent = async (file) => {
-      fetched.push(file);
-      // Neither file carries the mbox envelope, so each one is one finding.
-      return 'From: John Doe <john@doe.com>\nSubject: [PATCH] Fix\n';
-    };
-    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
+    // Neither file carries the mbox envelope, so each one is one finding.
+    const { lookups, fetch } = recording('From: John Doe <john@doe.com>\nSubject: [PATCH] Fix\n');
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetch);
 
-    assert.deepStrictEqual(fetched.sort(), [
+    assert.deepStrictEqual(lookups.sort(), [
       'utils/mypkg/patches/001-a.patch',
       'utils/mypkg/patches/002-b.patch'
     ], 'one lookup per changed patch file');
@@ -116,12 +131,11 @@ new file mode 100644
 +a backup file with no Git headers
 +that nobody applies
 `;
-    const fetched = [];
-    const res = await validateEmbeddedPatches(patch, CONFIG, async (file) => { fetched.push(file); return null; });
-    assert.deepStrictEqual(fetched, [], 'nothing to look up');
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(m => m.includes('No downstream raw embedded patch files')),
-      `Unexpected successes: ${res.successes.join(', ')}`);
+    const { lookups, fetch } = recording(null);
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetch);
+    assert.deepStrictEqual(lookups, [], 'nothing to look up');
+    assertNoErrors(res);
+    assertSomeIncludes(res.successes, 'No downstream raw embedded patch files', 'successes');
   });
 
   test('checks every patch file of a large refresh exactly once', async () => {
@@ -138,14 +152,10 @@ new file mode 100644
 +Subject: [PATCH] Fix ${i}
 `;
     }).join('');
-    const fetched = [];
-    const fetchFileContent = async (file) => {
-      fetched.push(file);
-      return 'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix\n';
-    };
-    const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.strictEqual(new Set(fetched).size, fetched.length, 'no patch file looked up twice');
+    const { lookups, fetch } = recording('From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix\n');
+    const res = await validateEmbeddedPatches(patch, CONFIG, fetch);
+    assertNoErrors(res);
+    assert.strictEqual(new Set(lookups).size, lookups.length, 'no patch file looked up twice');
   });
 
   test('rejects patches missing From hash or Date headers (user example)', async () => {
@@ -158,25 +168,16 @@ new file mode 100644
 +Subject: [PATCH] commit
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
-    assert.ok(res.errors.some(e => e.includes('Missing required Git header')),
-      `Expected error for missing headers, got: ${JSON.stringify(res.errors)}`);
+    assertErrorIncludes(res, 'Missing required Git header');
   });
 
   test('reports a modified patch it could not read instead of passing it', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
---- a/package/utils/bash/patches/001-fix.patch
-+++ b/package/utils/bash/patches/001-fix.patch
-@@ -10,6 +10,6 @@
--old_code
-+new_code
-    `;
-    const res = await validateEmbeddedPatches(patch, CONFIG);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    const res = await validateEmbeddedPatches(modifiedPatch, CONFIG);
+    assertNoErrors(res);
     // Not looking is not the same as looking and finding it correct: the
     // caller turns this count into the neutral conclusion.
     assert.strictEqual(res.incomplete, true);
-    assert.ok(res.skipped.some(s => s.includes('could not be read')), `Skipped: ${res.skipped.join(', ')}`);
+    assertSomeIncludes(res.skipped, 'could not be read', 'skipped');
   });
 
   test('counts a patch file whose fetch throws, and still judges the rest', async () => {
@@ -201,93 +202,38 @@ new file mode 100644
     };
     const res = await validateEmbeddedPatches(patch, CONFIG, fetchFileContent);
     assert.strictEqual(res.skipped.length, 1, 'the one that could not be read is skipped');
-    assert.ok(res.errors.some(e => e.includes('002-new.patch')), `the readable one is still judged: ${res.errors.join(', ')}`);
+    // The readable one is still judged.
+    assertErrorIncludes(res, '002-new.patch');
   });
 
   test('accepts modified patches when fetched content has valid headers', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
---- a/package/utils/bash/patches/001-fix.patch
-+++ b/package/utils/bash/patches/001-fix.patch
-@@ -10,6 +10,6 @@
--old_code
-+new_code
-    `;
-    const mockFetch = async (path) => {
-      return `From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix compilation issue\n\nCode content`;
-    };
-    const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
-    assert.ok(res.successes.some(s => s.includes('contains valid Git compliance headers')));
+    const fetch = async () => 'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Tue, 7 Jul 2026 20:09:55 +0300\nSubject: [PATCH] Fix compilation issue\n\nCode content';
+    const res = await validateEmbeddedPatches(modifiedPatch, CONFIG, fetch);
+    assertNoErrors(res);
+    assertSomeIncludes(res.successes, 'contains valid Git compliance headers', 'successes');
   });
 
   test('catches missing headers in modified patches when fetched content lacks them', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
---- a/package/utils/bash/patches/001-fix.patch
-+++ b/package/utils/bash/patches/001-fix.patch
-@@ -10,6 +10,6 @@
--old_code
-+new_code
-    `;
-    const mockFetch = async (path) => {
-      return `Some content without headers`;
-    };
-    const res = await validateEmbeddedPatches(patch, CONFIG, mockFetch);
-    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
+    const res = await validateEmbeddedPatches(modifiedPatch, CONFIG, async () => 'Some content without headers');
+    assertErrorIncludes(res, 'Missing required Git header');
   });
 
-  test('skips validation entirely when check_patch_headers is false', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
-new file mode 100644
---- /dev/null
-+++ b/package/utils/bash/patches/001-fix.patch
-+Some diff without from and subject headers
-    `;
-    const disabledConf = { ...CONFIG, check_patch_headers: false };
-    const res = await validateEmbeddedPatches(patch, disabledConf);
-    assert.strictEqual(res.errors.length, 0);
-    assert.strictEqual(res.successes.length, 0);
-  });
-
-  test('skips validation entirely when check_patch_headers is disabled string', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
-new file mode 100644
---- /dev/null
-+++ b/package/utils/bash/patches/001-fix.patch
-+Some diff without from and subject headers
-    `;
-    const disabledConf = { ...CONFIG, check_patch_headers: 'disabled' };
-    const res = await validateEmbeddedPatches(patch, disabledConf);
-    assert.strictEqual(res.errors.length, 0);
-    assert.strictEqual(res.successes.length, 0);
-  });
-
-  test('returns errors normally when check_patch_headers is warning (caller handles severity)', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
-new file mode 100644
---- /dev/null
-+++ b/package/utils/bash/patches/001-fix.patch
-+Some diff without from and subject headers
-    `;
-    const warningConf = { ...CONFIG, check_patch_headers: 'warning' };
-    const res = await validateEmbeddedPatches(patch, warningConf);
-    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
-  });
-
-  test('returns errors normally when check_patch_headers is true', async () => {
-    const patch = `
-diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
-new file mode 100644
---- /dev/null
-+++ b/package/utils/bash/patches/001-fix.patch
-+Some diff without from and subject headers
-    `;
-    const errorConf = { ...CONFIG, check_patch_headers: true };
-    const res = await validateEmbeddedPatches(patch, errorConf);
-    assert.ok(res.errors.some(e => e.includes('Missing required Git header')));
-  });
+  // Only the two off switches change what comes back; how loudly a finding is
+  // reported is left to the caller.
+  for (const [title, level, reported] of [
+    ['skips validation entirely when check_patch_headers is false', false, false],
+    ['skips validation entirely when check_patch_headers is disabled string', 'disabled', false],
+    ['returns errors normally when check_patch_headers is warning (caller handles severity)', 'warning', true],
+    ['returns errors normally when check_patch_headers is true', true, true]
+  ]) {
+    test(title, async () => {
+      const res = await validateEmbeddedPatches(newPatchWithoutHeaders, { ...CONFIG, check_patch_headers: level });
+      if (reported) {
+        assertErrorIncludes(res, 'Missing required Git header');
+      } else {
+        assertNoErrors(res);
+        assert.deepStrictEqual(res.successes, []);
+      }
+    });
+  }
 });

@@ -1,14 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
 import { collectFileLineChanges, validatePkgReleaseBumps } from '../../src/validators.js';
-
-// Patches exactly as GitHub serves them for the application/vnd.github.patch
-// media type. single-commit.patch is openwrt/openwrt commit 3c1066f4, and
-// multi-commit.patch is a three-commit openwrt/packages pull request whose
-// second commit has a bulleted message. The expected counts are GitHub's own
-// files[].additions and files[].deletions, summed over the commits.
-const readFixture = (name) => readFileSync(new URL(`../fixtures/${name}`, import.meta.url), 'utf8');
+import { readFixture, assertNoErrors } from './helpers.js';
 
 const lineCounts = (changes, file) => {
   const change = changes[file];
@@ -19,6 +12,11 @@ const lineCounts = (changes, file) => {
 const mail = (sha, subject, body = 'Change it.') =>
   `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] ${subject}\n\n${body}\n\nSigned-off-by: John Doe <john@doe.com>\n---\n`;
 
+// Patches exactly as GitHub serves them for the application/vnd.github.patch
+// media type. single-commit.patch is openwrt/openwrt commit 3c1066f4, and
+// multi-commit.patch is a three-commit openwrt/packages pull request whose
+// second commit has a bulleted message. The expected counts are GitHub's own
+// files[].additions and files[].deletions, summed over the commits.
 describe('collectFileLineChanges on patches captured from GitHub', () => {
   test('counts a single commit the way GitHub does', () => {
     const changes = collectFileLineChanges(readFixture('single-commit.patch'));
@@ -109,6 +107,6 @@ describe('release audit on a multi-commit patch', () => {
     const content = 'PKG_NAME:=foo\nPKG_VERSION:=1.0\nPKG_RELEASE:=1\n';
     const fetchFile = async () => content;
     const res = await validatePkgReleaseBumps([{ commitPatch: patch }], { check_pkg_release: true }, fetchFile, fetchFile);
-    assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+    assertNoErrors(res);
   });
 });

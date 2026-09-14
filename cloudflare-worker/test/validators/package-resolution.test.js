@@ -4,50 +4,55 @@ import { findPkgRoot } from '../../src/validators.js';
 
 describe('findPkgRoot', () => {
   test('ignores category-level Makefiles and non-package paths but parses package paths correctly', async () => {
-    // Category level Makefiles should be ignored (return null)
-    assert.strictEqual(await findPkgRoot('package/utils/Makefile', null), null);
-    assert.strictEqual(await findPkgRoot('utils/Makefile', null), null);
-    assert.strictEqual(await findPkgRoot('package/Makefile', null), null);
-    assert.strictEqual(await findPkgRoot('Makefile', null), null);
+    const CASES = [
+      // Category level Makefiles should be ignored (return null)
+      ['package/utils/Makefile', null],
+      ['utils/Makefile', null],
+      ['package/Makefile', null],
+      ['Makefile', null],
 
-    // Standard package directories
-    assert.strictEqual(await findPkgRoot('package/utils/bash/Makefile', null), 'package/utils/bash');
-    assert.strictEqual(await findPkgRoot('package/utils/bash/src/main.c', null), 'package/utils/bash');
-    assert.strictEqual(await findPkgRoot('package/utils/bash/patches/001-fix.patch', null), 'package/utils/bash');
+      // Standard package directories
+      ['package/utils/bash/Makefile', 'package/utils/bash'],
+      ['package/utils/bash/src/main.c', 'package/utils/bash'],
+      ['package/utils/bash/patches/001-fix.patch', 'package/utils/bash'],
 
-    // Category-less package layout
-    assert.strictEqual(await findPkgRoot('package/iozone/Makefile', null), 'package/iozone');
-    assert.strictEqual(await findPkgRoot('package/iozone/files/iozone.init', null), 'package/iozone');
+      // Category-less package layout
+      ['package/iozone/Makefile', 'package/iozone'],
+      ['package/iozone/files/iozone.init', 'package/iozone'],
 
-    // Normal feed layout
-    assert.strictEqual(await findPkgRoot('utils/bash/Makefile', null), 'utils/bash');
+      // Normal feed layout
+      ['utils/bash/Makefile', 'utils/bash'],
 
-    // Deeply nested feed layouts (luci/libs/<pkg>)
-    assert.strictEqual(await findPkgRoot('luci/libs/luci-lib-uqr/Makefile', null), 'luci/libs/luci-lib-uqr');
-    assert.strictEqual(await findPkgRoot('luci/libs/luci-lib-uqr/patches/001-fix.patch', null), 'luci/libs/luci-lib-uqr');
+      // Deeply nested feed layouts (luci/libs/<pkg>)
+      ['luci/libs/luci-lib-uqr/Makefile', 'luci/libs/luci-lib-uqr'],
+      ['luci/libs/luci-lib-uqr/patches/001-fix.patch', 'luci/libs/luci-lib-uqr'],
 
-    // Nested python, perl, php, ruby packages under lang/
-    assert.strictEqual(await findPkgRoot('lang/python/python-selinux/Makefile', null), 'lang/python/python-selinux');
-    assert.strictEqual(await findPkgRoot('lang/python/python-selinux/patches/001-fix.patch', null), 'lang/python/python-selinux');
-    assert.strictEqual(await findPkgRoot('lang/python/python-selinux/src/subfolder/file.c', null), 'lang/python/python-selinux');
-    assert.strictEqual(await findPkgRoot('package/lang/python/python-selinux/Makefile', null), 'package/lang/python/python-selinux');
-    assert.strictEqual(await findPkgRoot('lang/python/Makefile', null), 'lang/python');
+      // Nested python, perl, php, ruby packages under lang/
+      ['lang/python/python-selinux/Makefile', 'lang/python/python-selinux'],
+      ['lang/python/python-selinux/patches/001-fix.patch', 'lang/python/python-selinux'],
+      ['lang/python/python-selinux/src/subfolder/file.c', 'lang/python/python-selinux'],
+      ['package/lang/python/python-selinux/Makefile', 'package/lang/python/python-selinux'],
+      ['lang/python/Makefile', 'lang/python'],
 
-    assert.strictEqual(await findPkgRoot('lang/perl/perl-libxml/Makefile', null), 'lang/perl/perl-libxml');
-    assert.strictEqual(await findPkgRoot('lang/php/php8-pecl-redis/Makefile', null), 'lang/php/php8-pecl-redis');
-    assert.strictEqual(await findPkgRoot('lang/ruby/ruby-sass-listen/Makefile', null), 'lang/ruby/ruby-sass-listen');
-    assert.strictEqual(await findPkgRoot('lang/lua/lua-foo/Makefile', null), 'lang/lua/lua-foo');
-    assert.strictEqual(await findPkgRoot('lang/lua/lua-foo/patches/001-fix.patch', null), 'lang/lua/lua-foo');
-    assert.strictEqual(await findPkgRoot('package/lang/lua/lua-foo/Makefile', null), 'package/lang/lua/lua-foo');
+      ['lang/perl/perl-libxml/Makefile', 'lang/perl/perl-libxml'],
+      ['lang/php/php8-pecl-redis/Makefile', 'lang/php/php8-pecl-redis'],
+      ['lang/ruby/ruby-sass-listen/Makefile', 'lang/ruby/ruby-sass-listen'],
+      ['lang/lua/lua-foo/Makefile', 'lang/lua/lua-foo'],
+      ['lang/lua/lua-foo/patches/001-fix.patch', 'lang/lua/lua-foo'],
+      ['package/lang/lua/lua-foo/Makefile', 'package/lang/lua/lua-foo'],
 
-    // lang/golang is a group like lang/python: its packages sit one level
-    // deeper (golang, golang-bootstrap, golang1.26), and there is no Makefile
-    // in the group directory itself.
-    assert.strictEqual(await findPkgRoot('lang/golang/golang1.26/Makefile', null), 'lang/golang/golang1.26');
-    assert.strictEqual(await findPkgRoot('lang/golang/golang/patches/001-fix.patch', null), 'lang/golang/golang');
+      // lang/golang is a group like lang/python: its packages sit one level
+      // deeper (golang, golang-bootstrap, golang1.26), and there is no Makefile
+      // in the group directory itself.
+      ['lang/golang/golang1.26/Makefile', 'lang/golang/golang1.26'],
+      ['lang/golang/golang/patches/001-fix.patch', 'lang/golang/golang'],
 
-    // Hidden directories and special folders
-    assert.strictEqual(await findPkgRoot('.github/workflows/check.yml', null), null);
+      // Hidden directories and special folders
+      ['.github/workflows/check.yml', null],
+    ];
+    for (const [path, expected] of CASES) {
+      assert.strictEqual(await findPkgRoot(path, null), expected, `findPkgRoot(${JSON.stringify(path)}, null)`);
+    }
   });
 
   test('resolves uncommon package category layout via Makefile fallback', async () => {
