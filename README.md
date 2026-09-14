@@ -134,6 +134,7 @@ The GitHub App requires the following permissions and event subscriptions:
 
 The repository includes a GitHub Actions workflow in [`.github/workflows/deploy.yml`](file:///.github/workflows/deploy.yml) that builds and deploys the Worker automatically on every push to `main`:
 *   Runs on a lightweight `ubuntu-slim` container.
+*   Deploys only after the shared test and dry-run build workflow passes, and runs one deployment at a time.
 *   Automatically injects the build commit hash (`DEPLOY_HASH`) and deploy timestamp in Prague timezone (`DEPLOY_DATE`) into the wrangler variables before deployment.
 *   To enable deployment, add your **`CLOUDFLARE_API_TOKEN`** (with edit permissions for Workers) as a secret in your GitHub repository's **Settings -> Secrets and variables -> Actions**.
 
