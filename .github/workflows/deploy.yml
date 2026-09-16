@@ -8,9 +8,19 @@ on:
 permissions:
   contents: read
 
+# One run at a time, tests included: a push waits for the run in progress,
+# and a newer push replaces one that is still waiting.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
+  ci:
+    uses: ./.github/workflows/reusable_test-and-build.yml
+
   deploy:
     name: Deploy Worker
+    needs: ci
     runs-on: ubuntu-slim
     environment:
       name: production
