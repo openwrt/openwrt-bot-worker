@@ -563,6 +563,12 @@ async function handleWebhook(request, env) {
   // subrequest budget ran out before they could be queried — surfaced later
   // as one friendly PR-facing warning instead of silently under-reporting.
   let budgetSkipCount = 0;
+  // Set when a patch check could not read a file it had to judge.
+  let patchChecksIncomplete = false;
+  const unreadPatchNotes = new Set();
+  // Lookups the repository serving the ref answered cleanly with "no such
+  // file". Any other empty answer does not prove the file is gone.
+  const missingFiles = new Set();
   // Same idea for the per-commit upstream lookups on backport PRs: counted
   // here, reported once, never allowed to starve the terminal writes.
   let upstreamComparisonSkips = 0;
@@ -712,6 +718,15 @@ async function handleWebhook(request, env) {
         // Every source we probed responded cleanly, and none had the file —
         // a genuine "not found", not a transport error.
         if (baseRes?.skipped || forkRes?.skipped) budgetSkipCount++;
+        // Only a repository that serves the ref can say the file is not
+        // there: asking one that cannot resolve the ref comes back empty too.
+        // Without a fork, the base repository holds every commit of the pull
+        // request.
+        const source = hasForkRepo ? refSource.get(item.ref) : 'base';
+        const answer = source === 'base' ? baseRes : (source === 'fork' ? forkRes : null);
+        if (answer && !answer.error && !answer.skipped && !answer.failed && answer.exists === false) {
+          missingFiles.add(item.key);
+        }
         item.resolve(null);
       } else {
         const err = (forkRes && forkRes.error) || (baseRes && baseRes.error) ||
@@ -731,6 +746,7 @@ async function handleWebhook(request, env) {
     }
     return fileCache.get(key);
   };
+  const isFileMissing = (path, ref) => missingFiles.has(`${ref}:${path}`);
 
   // The pull request's patch is the one fetch every multi-commit run needs
   // whatever the setup query says, so it starts now and overlaps that query
@@ -841,7 +857,8 @@ async function handleWebhook(request, env) {
 
   let formalityOutputText = `### Checking PR #${prNumber}: ${prTitle} (Formalities Audit)\n\n`;
   let makefileOutputText = `### Checking PR #${prNumber}: ${prTitle} (Makefile Audit)\n\n`;
-  let patchesOutputText = `### Checking PR #${prNumber}: ${prTitle} (Embedded Patches Compliance)\n\n`;
+  const patchesHeading = `### Checking PR #${prNumber}: ${prTitle} (Embedded Patches Compliance)\n\n`;
+  let patchesOutputText = '';
 
   if (configParseError) {
     const configWarning = `\`.github/formalities.json\` in this repository could not be read (${configParseError}), so every check ran with its default setting instead of the configured one. Fix the file on the default branch — this pull request is not the cause.`;
@@ -1079,8 +1096,12 @@ async function handleWebhook(request, env) {
   const scannedPatches = usePrWidePatch
     ? [prPatch]
     : commitDetails.map(item => item.commitPatch);
+  // Stays false when no patch was read, e.g. GitHub refused the diff or every
+  // commit is a merge: the package state is then unknown, not empty.
+  let packageStateKnown = false;
   for (const patch of scannedPatches) {
     if (!patch) continue;
+    packageStateKnown = true;
     if (collectPackageMakefiles(patch, 'added').length > 0) {
       state.isNewPackage = true;
     }
@@ -1216,6 +1237,7 @@ async function handleWebhook(request, env) {
         patchesOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
         const reportPatches = await deepChecks[commitIndex].patches;
+        if (reportPatches.incomplete) patchChecksIncomplete = true;
 
         if (deepChecks[commitIndex].upstreamPatches) {
           const reportUpstreamPatches = await deepChecks[commitIndex].upstreamPatches;
@@ -1225,6 +1247,7 @@ async function handleWebhook(request, env) {
 
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+        for (const note of reportPatches.skipped) { unreadPatchNotes.add(note); patchesOutputText += `  ${note}\n`; }
         if (reportPatches.errors.length > 0) {
           const isPatchWarning = CONFIG.check_patch_headers === 'warning';
           if (isPatchWarning) {
@@ -1268,9 +1291,14 @@ async function handleWebhook(request, env) {
     makefileOutputText += "\n";
 
     // 3. Patches (PR-Wide)
-    const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent);
+    // Merge commits are not in the whole patch, so it can name a patch file
+    // that one of them deleted.
+    const isMissingAtHead = (path) => isFileMissing(path, data.pull_request.head.sha);
+    const reportPatches = await validateEmbeddedPatches(prPatch, CONFIG, fetchFileContent, isMissingAtHead);
+    if (reportPatches.incomplete) patchChecksIncomplete = true;
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach(s => { patchesOutputText += `  ${s}\n`; });
+    for (const note of reportPatches.skipped) { unreadPatchNotes.add(note); patchesOutputText += `  ${note}\n`; }
     if (reportPatches.errors.length > 0) {
       const isPatchWarning = CONFIG.check_patch_headers === 'warning';
       if (isPatchWarning) {
@@ -1466,42 +1494,80 @@ async function handleWebhook(request, env) {
     await ensureLabelExists(token, repoFullname, name, color, description, existingLabels, () => { subrequestBudget.used++; });
   }
 
-  const currentPrLabels = new Set((data.pull_request?.labels || []).map(l => l.name.toLowerCase()));
+  // The payload shows the pull request as it was when the event was sent. A
+  // run for another event may have changed its labels since, or the branch
+  // may have moved on, so it is read again right before labelling. Without an
+  // answer, the payload is all there is.
+  let livePr = data.pull_request;
+  if (subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used > 0) {
+    const liveRes = await optionalApiCall(data.pull_request.url, token);
+    if (liveRes.code === 200 && Array.isArray(liveRes.data?.labels)) livePr = liveRes.data;
+  }
+  // Package and release labels follow the branch, so a run for an event the
+  // branch has since moved past leaves them to the run for the newer one.
+  const branchMoved = livePr.head?.sha !== headSha || livePr.base?.ref !== baseBranch;
+  // The guidelines verdict also reads the description, which can carry an
+  // override, so an edit since the event leaves that label to the newer run.
+  const verdictMoved = branchMoved || (livePr.body ?? '') !== (data.pull_request.body ?? '');
+
+  const currentPrLabels = new Set((livePr.labels || []).map(l => l.name.toLowerCase()));
+  // A removal must use the repository's spelling, e.g. "Add package".
+  const currentPrLabelNames = new Map((livePr.labels || []).map(l => [l.name.toLowerCase(), l.name]));
+  const spelledAsOnPr = (name) => currentPrLabelNames.get(name.toLowerCase()) || name;
 
   // New commits or a reopen are contributor activity: drop the stale marker
   // right away instead of waiting for the nightly scan to notice it.
   if ((data.action === 'synchronize' || data.action === 'reopened') && currentPrLabels.has('stale')) {
-    labelOperations.push(() => removeLabel('stale'));
+    labelOperations.push(() => removeLabel(spelledAsOnPr('stale')));
   }
 
   if (!allPassed) {
-    if (!currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
+    if (!verdictMoved && !currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       labelOperations.push(() => ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
       labelsToAdd.push(LABEL_GUIDELINES);
     }
   } else {
     // Delete validation failure label if present
-    if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(() => removeLabel(LABEL_GUIDELINES));
+    if (!verdictMoved && currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
+      labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_GUIDELINES)));
     }
   }
 
-  if (CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
+  // Package and release labels describe the pull request's current content, so
+  // they come off when it no longer matches, whatever the flag that adds them
+  // says. Package labels only come off after a patch was actually read. Labels
+  // from labeler.yml are only ever added.
+  if (!branchMoved && CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
     labelOperations.push(() => ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
     labelsToAdd.push(LABEL_ADD_PACKAGE);
   }
 
-  if (CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
+  if (!branchMoved && packageStateKnown && !state.isNewPackage && currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
+    labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_ADD_PACKAGE)));
+  }
+
+  if (!branchMoved && CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
     labelOperations.push(() => ensureLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
     labelsToAdd.push(LABEL_DROP_PACKAGE);
   }
 
-  if (CONFIG.branch_labeling && /^openwrt-\d{2}\.\d{2}$/.test(baseBranch)) {
-    const version = baseBranch.split('-')[1];
-    const labelName = `release/${version}`;
-    if (!currentPrLabels.has(labelName.toLowerCase())) {
-      labelOperations.push(() => ensureLabel(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
-      labelsToAdd.push(labelName);
+  if (!branchMoved && packageStateKnown && !state.isDroppedPackage && currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
+    labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_DROP_PACKAGE)));
+  }
+
+  const releaseMatch = baseBranch.match(/^openwrt-(\d{2}\.\d{2})$/);
+  const releaseLabel = releaseMatch ? `release/${releaseMatch[1]}` : null;
+
+  if (!branchMoved && CONFIG.branch_labeling && releaseLabel && !currentPrLabels.has(releaseLabel.toLowerCase())) {
+    labelOperations.push(() => ensureLabel(releaseLabel, '6b7280', `Pull request targets the stable release branch ${releaseLabel}`));
+    labelsToAdd.push(releaseLabel);
+  }
+
+  // Retargeting a pull request to another branch leaves the old release
+  // label behind, saying it goes somewhere it no longer goes.
+  for (const existing of currentPrLabels) {
+    if (!branchMoved && /^release\/\d{2}\.\d{2}$/.test(existing) && existing !== releaseLabel?.toLowerCase()) {
+      labelOperations.push(() => removeLabel(spelledAsOnPr(existing)));
     }
   }
 
@@ -1633,12 +1699,26 @@ async function handleWebhook(request, env) {
   // pass.
   const formalityIncomplete = upstreamComparisonSkips > 0 || commitScanCapped;
   const deepScanIncomplete = budgetSkipCount > 0 || patchUnavailable;
+  // An unreadable patch file leaves only the Code Patches check incomplete.
+  const patchesIncomplete = deepScanIncomplete || patchChecksIncomplete;
   const conclusionFor = (passed, incomplete) => (!passed ? 'failure' : (incomplete ? 'neutral' : 'success'));
   const INCOMPLETE_NOTE = ' Some of this pull request could not be inspected, so this check reports neutral instead of a pass — see the warnings in the details below.';
-
   const formalityConclusion = conclusionFor(formalityPassed, formalityIncomplete);
   const makefileConclusion = conclusionFor(makefilePassed, deepScanIncomplete);
-  const patchesConclusion = conclusionFor(patchesPassed, deepScanIncomplete);
+  const patchesConclusion = conclusionFor(patchesPassed, patchesIncomplete);
+
+  // A neutral Code Patches summary sends the reader to the unread files. When
+  // the details are too long to post whole, the first of them are also named
+  // right below the heading, where the cut cannot reach. A failed check keeps
+  // that room for its findings.
+  const UNREAD_PATCHES_LISTED = 20;
+  let patchesText = patchesHeading + patchesOutputText;
+  if (patchesConclusion === 'neutral' && unreadPatchNotes.size > 0 && safeTruncate(patchesText) !== patchesText) {
+    const listed = [...unreadPatchNotes].slice(0, UNREAD_PATCHES_LISTED);
+    const more = unreadPatchNotes.size - listed.length;
+    if (more > 0) listed.push(`⚠️ ${more} more patch file${more === 1 ? '' : 's'} could not be read`);
+    patchesText = `${patchesHeading}${listed.join('\n')}\n\n${patchesOutputText}`;
+  }
 
   const checkRunWrites = [
     ['check-run "Git & Commits"', () => trackedApiCall(checkRunsUrl, token, 'POST', {
@@ -1665,10 +1745,10 @@ async function handleWebhook(request, env) {
       name: 'FormalityCheck / Code Patches', head_sha: headSha, status: 'completed',
       conclusion: patchesConclusion,
       output: {
-        title: patchesPassed ? (deepScanIncomplete ? 'Code Patches: Partially checked' : 'Code Patches: Passed') : 'Code Patches: Failed',
-        summary: (patchesPassed ? 'All downstream patch files contain correct Git tracking headers.' : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
+        title: patchesPassed ? (patchesIncomplete ? 'Code Patches: Partially checked' : 'Code Patches: Passed') : 'Code Patches: Failed',
+        summary: (patchesPassed ? (patchesIncomplete ? 'No problems were found in the patch files that could be read.' : 'All downstream patch files contain correct Git tracking headers.') : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
           (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
-        text: safeTruncate(patchesOutputText)
+        text: safeTruncate(patchesText)
       }
     })]
   ];

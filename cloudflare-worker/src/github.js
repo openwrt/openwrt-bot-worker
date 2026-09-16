@@ -223,12 +223,18 @@ export async function graphqlBatchFetchFiles(token, probes, onCall) {
     return results;
   }
 
+  // Where the partial errors happened: a repository alias, a field under it,
+  // or '*' when GitHub did not say.
+  const failedAt = new Set();
   if (Array.isArray(res.data.errors) && res.data.errors.length > 0) {
     // Partial errors (e.g. a single expression failing to parse) still come
     // back with HTTP 200 and a top-level `data` object for the fields that
     // did resolve. Treat the affected fields as "not found" below rather
     // than failing the whole batch, and log once for visibility.
     console.warn(`GraphQL batch file fetch returned partial errors: ${res.data.errors.map(e => e.message).join('; ').slice(0, 500)}`);
+    for (const error of res.data.errors) {
+      failedAt.add(Array.isArray(error.path) ? error.path.slice(0, 2).join('.') : '*');
+    }
   }
 
   for (const meta of probeMeta) {
@@ -241,7 +247,13 @@ export async function graphqlBatchFetchFiles(token, probes, onCall) {
         isBinary: field.isBinary === true
       });
     } else {
-      results.set(meta.key, { content: null, exists: false, isBinary: false });
+      const result = { content: null, exists: false, isBinary: false };
+      // A field lost to an error is empty too, so it is marked: only an
+      // unmarked empty field says the file is not there.
+      if (failedAt.has('*') || failedAt.has(meta.repoAlias) || failedAt.has(`${meta.repoAlias}.${meta.fieldAlias}`)) {
+        result.failed = true;
+      }
+      results.set(meta.key, result);
     }
   }
 

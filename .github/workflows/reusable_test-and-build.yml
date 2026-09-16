@@ -1,0 +1,30 @@
+name: Test and build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Test and build
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Run Unit Tests
+        run: npm test
+        working-directory: cloudflare-worker
+        env:
+          FORCE_COLOR: 1
+
+      - name: Dry Run Wrangler Deploy
+        run: npx wrangler deploy --dry-run
+        working-directory: cloudflare-worker

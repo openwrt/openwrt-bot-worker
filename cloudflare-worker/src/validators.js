@@ -803,6 +803,68 @@ function isMainRepo(repoFullname) {
     repoFullname.toLowerCase() === MAIN_REPO_FULLNAME.toLowerCase();
 }
 
+// A make expansion is `$(...)` or `${...}`, and it nests: `$(if $(CONFIG_X),/x)`
+// is one expansion, not two. Returns the top-level spans as [start, end) in
+// order, or null when a `$(` is never closed and the line cannot be read.
+export function makeExpansionSpans(text) {
+  const spans = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '$') continue;
+    const open = text[i + 1];
+    if (open !== '(' && open !== '{') continue;
+    const close = open === '(' ? ')' : '}';
+    let depth = 0;
+    let j = i + 1;
+    for (; j < text.length; j++) {
+      if (text[j] === open) depth++;
+      else if (text[j] === close && --depth === 0) break;
+    }
+    if (depth !== 0) return null;
+    spans.push([i, j + 1]);
+    i = j;
+  }
+  return spans;
+}
+
+// Just the literal text, with every expansion cut out. Cutting can only ever
+// remove characters, so whitespace left here is whitespace the author typed
+// outside any expansion - never a seam introduced by the cut.
+export function literalOutsideExpansions(text, spans) {
+  let out = '';
+  let at = 0;
+  for (const [s, e] of spans) {
+    out += text.slice(at, s);
+    at = e;
+  }
+  return out + text.slice(at);
+}
+
+// Make functions: their name is followed by whitespace that separates it from
+// the arguments and never reaches the expanded text.
+const MAKE_FUNCTIONS = new Set([
+  'abspath', 'addprefix', 'addsuffix', 'and', 'basename', 'call', 'dir', 'error',
+  'eval', 'file', 'filter', 'filter-out', 'findstring', 'firstword', 'flavor',
+  'foreach', 'guile', 'if', 'info', 'intcmp', 'join', 'lastword', 'let', 'notdir',
+  'or', 'origin', 'patsubst', 'realpath', 'shell', 'sort', 'strip', 'subst',
+  'suffix', 'value', 'warning', 'wildcard', 'word', 'wordlist', 'words',
+]);
+
+// Whether a line holds whitespace that can end up in what it expands to: any
+// in the literal text, and inside an expansion any but the separator after a
+// function name, at every level of nesting. An unterminated `$(` cannot be
+// read, so only its indentation is judged.
+function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
+  if (spans === null) return /^[ \t]/.test(text);
+  if (/[ \t]/.test(literalOutsideExpansions(text, spans))) return true;
+  for (const [start, end] of spans) {
+    let inner = text.slice(start + 2, end - 1);
+    const fn = inner.match(/^([a-z-]+)[ \t]+/);
+    if (fn && MAKE_FUNCTIONS.has(fn[1])) inner = inner.slice(fn[0].length);
+    if (hasStrayWhitespace(inner)) return true;
+  }
+  return false;
+}
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname) {
   const errors = [];
   const successes = [];
@@ -1029,20 +1091,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       // Makefile arrives in full, which is where a missing block is real.
       const isAddedMakefile = lines.some(line => /^---\s+\/dev\/null\r?$/.test(line));
 
-      // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
-      // since install blocks can appear after conffiles blocks in the diff)
-      const installedDirs = new Set();
-      for (const line of lines) {
-        if (line.startsWith('+')) {
-          const contentLine = line.slice(1);
-          const installDirMatch = contentLine.match(/\$\(INSTALL_DIR\)\s+\$\(1\)(\/[^\s]*)/);
-          if (installDirMatch) {
-            installedDirs.add(installDirMatch[1]);
-          }
-        }
-      }
-
-      // Pass 2: Validate conffiles and detect config installations
+      // Validate conffiles and detect config installations
       let MakefileInstallsConfig = false;
       let MakefileHasConffiles = false;
       let inConffiles = false;
@@ -1060,10 +1109,14 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           const hunkContext = hunkContextMatch ? hunkContextMatch[1].trim() : '';
 
           if (hunkContext) {
-            // Only a conffiles define keeps us inside the block. Lines *inside*
-            // a conffiles block ('/etc/config/foo') never qualify as git's
-            // function context, so any other context ('endef', another define,
-            // 'CONFIGURE_VARS += \') means this hunk starts outside the block.
+            // Only a conffiles define keeps us inside the block; any other
+            // context ('endef', another define, 'CONFIGURE_VARS += \') means
+            // this hunk starts outside it. git also takes an entry that begins
+            // with a make expansion ('$(CONF_DIR)/my.cnf') as context, and that
+            // one does sit inside the block - but the diff alone cannot tell it
+            // from a `$(call ...)` line opening an install or build recipe, so
+            // such a hunk is treated as outside and its added entries go
+            // unchecked rather than judged against the wrong rules.
             const hunkDefineMatch = hunkContext.match(/^define\s+(Package\/\S+)/);
             if (hunkDefineMatch && /conffiles$/.test(hunkDefineMatch[1])) {
               inConffiles = true;
@@ -1114,46 +1167,69 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (inConffiles) {
               conffilesCheckRun = true;
-              
-              // No indentation/spaces
-              if (/[ \t]/.test(contentLine)) {
+
+              const trimmedLine = contentLine.trim();
+
+              // A make expansion is `$(...)` or `${...}`, and it nests, so
+              // `$(if $(CONFIG_X),/x)` is one expansion and not two. An
+              // unterminated `$(` returns null: make will refuse the Makefile
+              // itself, so only the indentation rule is applied to such a line.
+              const spans = makeExpansionSpans(contentLine);
+
+              // An entry is one path per line. Whitespace splits it into two
+              // words, and `scripts/ipkg-build` rewrites only the first: its
+              // `sed -e "s!^/!$pkg_dir/!"` anchors at the start of the line,
+              // leaving every later word an absolute *host* path. Inside a make
+              // expansion only the separator after a function name cannot reach
+              // the expanded text, so that is the only whitespace accepted -
+              // `$(call Package/tac_plus/Default/conffiles)` passes,
+              // `$(if $(CONFIG_X),/etc/a /etc/b)` does not. Indentation is never
+              // legitimate, expansion or not.
+              const strayWhitespace = hasStrayWhitespace(contentLine, spans);
+              if (strayWhitespace) {
                 conffilesCheckErrors++;
                 errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
               }
 
-              const trimmedLine = contentLine.trim();
-              if (trimmedLine.length > 0) {
-                // Absolute paths must start with '/'
-                if (!trimmedLine.startsWith('/')) {
+              if (trimmedLine.length > 0 && spans !== null) {
+                // A line that *begins* with an expansion is not a path yet and
+                // cannot be judged for a leading slash: `$(CONF_DIR)/my.cnf`
+                // and `$(config_directory)` are settled at build time. A line
+                // that begins with literal text can be judged, however many
+                // expansions follow it - `/etc/$(PKG_NAME).conf` is fine,
+                // `foo$(WHATEVER)` is not.
+                if (!/^\$[({]/.test(trimmedLine) && !trimmedLine.startsWith('/')) {
                   conffilesCheckErrors++;
                   errors.push(`- ${currentPackage} line '${trimmedLine}' must be an absolute path starting with '/'`);
                 }
 
-                // Directories must end with a trailing slash '/'
-                // Individual files must NOT end with a trailing slash.
+                // A trailing slash on an individual file leaves it untracked.
+                // package-pack.mk gives a checksum only to an entry that is a
+                // regular file of the package, and writes every other entry - a
+                // directory, or `file/` - to /lib/upgrade/keep.d, which
+                // sysupgrade expands with `find`. `find` fails on `file/` with
+                // "Not a directory", and so does the `find` scripts/ipkg-build
+                // runs over the list, so the file is never kept and a sysupgrade
+                // overwrites whatever the user had changed.
+                //
+                // A directory is a different matter, and no slash is asked for
+                // there: `find` walks it the same with or without one. The tree
+                // writes it both ways too - `/etc/ipsec.d` and `/etc/dnsmasq.d/`
+                // are both shipped today.
+                //
+                // Whether a path names a file cannot be known from the Makefile,
+                // so this looks for what makes one recognisable: a place under
+                // /etc/config/, which holds no directories, or an extension the
+                // tree's configuration files carry. A trailing slash also means
+                // the tail is literal, so this reads real text whether or not an
+                // expansion sits earlier.
                 if (trimmedLine.endsWith('/')) {
-                  // If it has a file extension or is a file ending in '/', it's an error
-                  if (/\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine)) {
+                  const looksLikeFile =
+                    /\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml|cnf|config|toml|nft|lua|list|user|rules)\/$/i.test(trimmedLine) ||
+                    (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length);
+                  if (looksLikeFile) {
                     conffilesCheckErrors++;
                     errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  } else if (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length) {
-                    // Files under /etc/config/ cannot end with / because there are no subdirectories in /etc/config
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  }
-                } else {
-                  // Determine if the path is a directory that should end with '/'
-                  // 1. Paths created by INSTALL_DIR in this Makefile are directories
-                  const isInstalledDir = installedDirs.has(trimmedLine);
-                  // 2. Paths ending with '.d' are directories by Unix convention
-                  //    (e.g., conf.d, init.d, cron.d, zabbix_agentd.conf.d, sudoers.d)
-                  const isDotDDir = /\.d$/.test(trimmedLine);
-                  // 3. Well-known top-level directory paths
-                  const isKnownDir = trimmedLine === '/etc' || trimmedLine === '/etc/config';
-
-                  if (isInstalledDir || isDotDDir || isKnownDir) {
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' must end with a trailing slash '/' (e.g., '${trimmedLine}/')`);
                   }
                 }
               }
@@ -1410,7 +1486,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (!isEmpty && !isComment && !isContinuation && !isConditional) {
               if (inBlock === 'metadata') {
-                if (!/^ {2}[^ \t]/.test(contentLine)) {
+                // A bare make expansion is how a package inherits shared
+                // metadata - `$(call Package/foo/Default)` as the first line
+                // of the block - and the tree writes it at every indentation:
+                // counted over package/ and the packages feed, 769 of these
+                // lines use two spaces, 601 sit at column 0 and 148 start
+                // with a tab, the column-0 form being the majority inside
+                // openwrt/openwrt itself. There is no convention to enforce
+                // here, so its indentation is not judged.
+                const isExpansion = trimmed.startsWith('$(') && trimmed.endsWith(')');
+                if (!isExpansion && !/^ {2}[^ \t]/.test(contentLine)) {
                   indentationErrors++;
                   errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with exactly 2 spaces`);
                 }
@@ -1630,16 +1715,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
   return { errors, successes, warnings };
 }
 
-export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent) {
+export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent, isMissing) {
   const errors = [];
   const successes = [];
 
   if (CONFIG.check_patch_headers === false || CONFIG.check_patch_headers === 'disabled') {
-    return { errors: [], successes: [] };
+    return { errors: [], successes: [], skipped: [], incomplete: false };
   }
 
   if (!commitPatch) {
-    return { errors: [], successes: ["✅ No diff footprint present for patches validation"] };
+    return { errors: [], successes: ["✅ No diff footprint present for patches validation"], skipped: [], incomplete: false };
   }
 
   // Anchored at the end of the line: without that, the greedy match reads
@@ -1654,7 +1739,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   if (patchFiles.length === 0) {
-    return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
+    return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"], skipped: [], incomplete: false };
   }
 
   // Collect (chunk, patchFile) matches upfront rather than checking each
@@ -1664,19 +1749,12 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   // fetchFileContentCached in index.js) can combine them into a single
   // GraphQL request instead of one HTTP call per patch file.
   //
-  // Each chunk is paired with the patch file its own `+++ b/` header names.
-  // Testing every chunk against every patch file instead is quadratic in the
-  // number of files: a kernel bump that refreshes 800 patches would spend
-  // ~180 ms of CPU here alone, far past what a Worker invocation gets.
-  const wantedPatchFiles = new Set(patchFiles);
-  const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
-  const matches = [];
-  for (const chunk of fileChunks) {
-    const header = chunk.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
-    if (header && wantedPatchFiles.has(header[1])) {
-      matches.push({ chunk, patchFile: header[1] });
-    }
-  }
+  // Each chunk is paired with the patch file its own `+++ b/` header names,
+  // followed through later renames (see followPatchFiles). Testing every
+  // chunk against every patch file instead is quadratic in the number of
+  // files: a kernel bump that refreshes 800 patches would spend ~180 ms of
+  // CPU here alone, far past what a Worker invocation gets.
+  const matches = followPatchFiles(commitPatch.split(/^diff\s+--git\s+/m));
 
   async function checkPatchHeader({ chunk, patchFile }) {
     let hasFromHash = false;
@@ -1696,7 +1774,8 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
           checked = true;
         }
       } catch (e) {
-        // Ignore fetch errors and fallback
+        // The lookup failed outright. `checked` stays false, which the branch
+        // below already treats as "this file was not read".
       }
     }
 
@@ -1704,7 +1783,14 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
       // Fallback: only validate if it is a new file
       const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
       if (!isNewFile) {
-        return { success: `✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)` };
+        // A file that is not there is not unreadable, e.g. a merge commit,
+        // which the whole patch leaves out, deleted it.
+        if (isMissing?.(patchFile)) {
+          return { success: `✅ Embedded patch '${patchFile}' is no longer in the pull request, so there is nothing to check` };
+        }
+        // An edited patch shows only its changed lines, not its headers, so
+        // without the file there is nothing to judge.
+        return { skipped: `⚠️ Embedded patch '${patchFile}' could not be read, so its Git headers were not checked` };
       }
       hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
       hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
@@ -1719,18 +1805,22 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   const results = await Promise.all(matches.map(checkPatchHeader));
+  const skipped = [];
   for (const result of results) {
     if (result.error) {
       errors.push(result.error);
+    } else if (result.skipped) {
+      skipped.push(result.skipped);
     } else if (result.success) {
       successes.push(result.success);
     }
   }
 
-  return { errors, successes };
+  // A file that was skipped was not checked, so the result is not a pass.
+  return { errors, successes, skipped, incomplete: skipped.length > 0 };
 }
 
-// The two parsers below walk a whole patch line by line, and the validators
+// The parsers below walk a whole patch line by line, and the validators
 // ask each of them more than once for the same commit patch: the UCI check,
 // the release audit and the hash audit all start from the same file lists.
 // Their results are remembered per patch text so the walk happens once. The
@@ -1791,6 +1881,85 @@ export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates
   return Object.freeze({ addedFiles, deletedFiles });
 });
 
+// Pairs each chunk that changes a patch file with the name the file has once
+// the whole diff is applied. A pull request is its commits in order, so a
+// later commit can delete the file, leaving nothing to check, or rename it.
+// A rename that keeps the content has no `+++` line, so it is followed here.
+function followPatchFiles(fileChunks) {
+  const matches = [];
+  const heldAt = new Map();
+  for (const chunk of fileChunks) {
+    // File headers end where the first hunk starts, and hunk lines can say
+    // anything.
+    const hunkStart = chunk.indexOf('\n@@');
+    const head = hunkStart === -1 ? chunk : chunk.slice(0, hunkStart);
+    const renamedFrom = head.match(/^rename from (.*?)\r?$/m);
+    const renamedTo = head.match(/^rename to (.*?)\r?$/m);
+    if (renamedFrom && renamedTo && heldAt.has(renamedFrom[1])) {
+      const moved = heldAt.get(renamedFrom[1]);
+      heldAt.delete(renamedFrom[1]);
+      heldAt.set(renamedTo[1], (heldAt.get(renamedTo[1]) || []).concat(moved));
+    }
+    if (/^deleted file mode /m.test(head)) {
+      const deleted = head.match(/^a\/(.+) b\/\1\r?\n/);
+      if (deleted) heldAt.delete(deleted[1]);
+    }
+    const header = head.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
+    if (header) {
+      const match = { chunk, patchFile: null };
+      matches.push(match);
+      heldAt.set(header[1], (heldAt.get(header[1]) || []).concat(match));
+    }
+  }
+  for (const [path, held] of heldAt) {
+    for (const match of held) match.patchFile = path;
+  }
+  return matches.filter(match => match.patchFile !== null);
+}
+
+// The added and deleted lines of a patch, per file. The input is GitHub's
+// application/vnd.github.patch text for a commit or a whole pull request,
+// which repeats git's mail format per commit, so a file's lines end at the
+// next `diff --git` or at the next commit's `From <sha>` envelope.
+const MAIL_ENVELOPE = /^From [0-9a-f]{40,64} Mon Sep 17 00:00:00 2001\r?$/;
+
+export const collectFileLineChanges = rememberPerPatch(function collectFileLineChanges(patch) {
+  const changes = {};
+  if (!patch) return Object.freeze(changes);
+
+  let currentFile = null;
+  let inHeader = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      currentFile = match ? match[2].trim().replace(/\r$/, '') : null;
+      inHeader = true;
+      continue;
+    }
+    if (line.startsWith('From ') && MAIL_ENVELOPE.test(line)) {
+      currentFile = null;
+      continue;
+    }
+    if (!currentFile) continue;
+    if (inHeader) {
+      // The preamble runs from `diff --git` to the end of the `--- `/`+++ `
+      // pair, or to the first hunk when git omits the pair (a mode change, a
+      // pure rename). Only here do `---` and `+++` name files; after it they
+      // are ordinary content.
+      if (line.startsWith('@@')) inHeader = false;
+      else if (line.startsWith('+++')) inHeader = false;
+      continue;
+    }
+    if (line.startsWith('@@')) continue;
+    if (line.startsWith('+') || line.startsWith('-')) {
+      if (!changes[currentFile]) changes[currentFile] = { added: [], deleted: [] };
+      changes[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
+    }
+  }
+  for (const file of Object.keys(changes)) Object.freeze(changes[file]);
+  return Object.freeze(changes);
+});
+
 export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
 }
@@ -1814,7 +1983,9 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
     'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
   ]);
-  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua']);
+  // Language groups whose packages sit one level deeper: lang/python/Flask.
+  // golang keeps its compiler builds the same way (lang/golang/golang1.26).
+  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua', 'golang']);
 
   const hasPkgName = async (dir) => {
     if (!fetchFileContent) return false;
@@ -1822,11 +1993,15 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
 
     const makefilePath = `${dir}/Makefile`;
     const content = await fetchFileContent(makefilePath);
-    // LuCI packages leave PKG_NAME to luci.mk (`PKG_NAME?=$(LUCI_NAME)`), so
-    // the include line is what marks their directory as a package root.
+    // Some packages leave PKG_NAME to a shared helper: luci.mk supplies
+    // `PKG_NAME?=$(LUCI_NAME)`, and u-boot.mk, trusted-firmware-a.mk and
+    // optee-os.mk each carry a `PKG_NAME ?=` of their own. For those the
+    // include line is what marks the directory as a package root. uboot-tools
+    // names its source with PKG_DISTNAME instead and defines its packages
+    // itself, so that variable marks a package root too.
     const ok = !!(content && (
-      /^PKG_NAME\s*(?::=|=)/m.test(content) ||
-      /^\s*include\s+.*\bluci\.mk\s*$/m.test(content)
+      /^PKG_(?:NAME|DISTNAME)\s*(?::=|=)/m.test(content) ||
+      /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m.test(content)
     ));
     cache[dir] = ok;
     return ok;
@@ -1840,6 +2015,14 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return false;
   };
 
+  // A payload directory sits inside a package; a directory sitting directly
+  // under a category IS the package. `package/utils/ucode` is the ucode
+  // interpreter, not the ucode payload of a LuCI application, and treating it
+  // as payload walked up to the category and returned no package root at all,
+  // so every pull request touching it went unaudited without saying so.
+  const isPayloadDir = (dirParts) =>
+    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
+
   let parts = filePath.split('/');
   if (parts.length > 0) {
     // Remove filename
@@ -1849,8 +2032,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   // Traverse up skipping standard directories (including versioned
   // `patches-X.Y` / `files-X.Y` dirs used by `target/linux/<subtarget>/`).
   while (parts.length > 0) {
-    const last = parts[parts.length - 1];
-    if (isSkippableDir(last)) {
+    if (isPayloadDir(parts)) {
       parts.pop();
     } else {
       break;
@@ -1888,7 +2070,15 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
       }
       return `lang/${parts[1]}`;
     }
-    return `${parts[0]}/${parts[1]}`;
+    // Only the exact <category>/<pkgname> depth is safe without a probe, the
+    // same way the package/ branch above stops at three levels. A deeper path
+    // is either payload of that package or a <category>/<group>/<pkgname>
+    // layout - libs/protobuf/protobuf-compat, utils/bigclown/bigclown-gateway -
+    // and answering <category>/<group> for the latter named a directory with
+    // no Makefile in it, which the audits then fetched and silently skipped.
+    if (parts.length === 2) {
+      return `${parts[0]}/${parts[1]}`;
+    }
   }
 
   if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
@@ -1926,7 +2116,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   const viableCandidates = candidates.filter(candidate => {
     const candidateParts = candidate.split('/');
     const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || isSkippableDir(last)) return false;
+    if (last === 'package' || isPayloadDir(candidateParts)) return false;
     if (isCategoryLevel(candidateParts)) return false;
     return true;
   });
@@ -2169,32 +2359,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       states.addedFiles.forEach(f => addedFiles.add(f));
       states.deletedFiles.forEach(f => deletedFiles.add(f));
 
-      // Parse changes per file in this commit patch
-      const lines = item.commitPatch.split('\n');
-      let currentFile = null;
-      for (const line of lines) {
-        if (line.startsWith('diff --git ')) {
-          currentFile = null;
-          const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-          if (match) {
-            currentFile = match[2].trim().replace(/\r$/, '');
-          }
-        } else if (currentFile) {
-          if (line.startsWith('+++ b/') || line.startsWith('--- a/') || line.startsWith('+++ /dev/null') || line.startsWith('--- /dev/null')) {
-            continue;
-          }
-          if (line.startsWith('+')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].added.push(line.slice(1));
-          } else if (line.startsWith('-')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].deleted.push(line.slice(1));
-          }
+      // Changes per file in this commit patch
+      for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+        if (!fileChanges[file]) {
+          fileChanges[file] = { added: [], deleted: [] };
         }
+        for (const line of change.added) fileChanges[file].added.push(line);
+        for (const line of change.deleted) fileChanges[file].deleted.push(line);
       }
     }
 
@@ -2575,20 +2746,11 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       makefiles.add(file);
     }
 
-    let currentFile = null;
-    for (const line of item.commitPatch.split('\n')) {
-      if (line.startsWith('diff --git ')) {
-        currentFile = null;
-        const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-        if (match) currentFile = match[2].trim().replace(/\r$/, '');
-        continue;
-      }
-      if (!currentFile || !makefiles.has(currentFile)) continue;
-      if (line.startsWith('+++') || line.startsWith('---')) continue;
-      if (line.startsWith('+') || line.startsWith('-')) {
-        if (!makefileLineChanges[currentFile]) makefileLineChanges[currentFile] = { added: [], deleted: [] };
-        makefileLineChanges[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
-      }
+    for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+      if (!makefiles.has(file)) continue;
+      if (!makefileLineChanges[file]) makefileLineChanges[file] = { added: [], deleted: [] };
+      for (const line of change.added) makefileLineChanges[file].added.push(line);
+      for (const line of change.deleted) makefileLineChanges[file].deleted.push(line);
     }
   }
 
