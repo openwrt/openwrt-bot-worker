@@ -1,0 +1,166 @@
+From 8943cecb626f556c576013d27dbe62c5526731e1 Mon Sep 17 00:00:00 2001
+From: Josef Schlehofer <pepe.schlehofer@gmail.com>
+Date: Fri, 21 Aug 2026 08:53:50 +0200
+Subject: [PATCH 1/3] tvheadend: update to 2026-08-17
+
+Update to git master ddb984f4, 124 commits on from the previously
+packaged 395afb85. Most of that is web UI work and translation updates,
+with smaller fixes in the build system, mpegts and dvr code.
+
+Signed-off-by: Josef Schlehofer <pepe.schlehofer@gmail.com>
+---
+ multimedia/tvheadend/Makefile | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/multimedia/tvheadend/Makefile b/multimedia/tvheadend/Makefile
+index a55cd8a8c24fc1..7d81c27d7d1ee7 100644
+--- a/multimedia/tvheadend/Makefile
++++ b/multimedia/tvheadend/Makefile
+@@ -5,9 +5,9 @@ PKG_RELEASE:=1
+ 
+ PKG_SOURCE_PROTO:=git
+ PKG_SOURCE_URL:=https://github.com/tvheadend/tvheadend
+-PKG_MIRROR_HASH:=68fda4d7563550fda07a81222fa371b8b42c6ee9517c2a7f5a374aa025301c52
+-PKG_SOURCE_VERSION:=395afb8512d0d636ef223db4cccf722b70992e76
+-PKG_SOURCE_DATE:=2026-04-03
++PKG_MIRROR_HASH:=fbb1341e2c032c6750e03434c3358c231307331975321ef9ee7af1c9a9528c29
++PKG_SOURCE_VERSION:=ddb984f4c17f4a26fd34f3e1b24e3323f9641b75
++PKG_SOURCE_DATE:=2026-08-17
+ 
+ PKG_LICENSE:=GPL-3.0
+ PKG_LICENSE_FILES:=LICENSE.md
+
+From 8657667115960d8ef7b51275bb0b7501e6f74642 Mon Sep 17 00:00:00 2001
+From: Josef Schlehofer <pepe.schlehofer@gmail.com>
+Date: Fri, 21 Aug 2026 08:54:05 +0200
+Subject: [PATCH 2/3] tvheadend: require GNU libiconv and drop the iconv
+ self-test patch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tvheadend has no transliteration of its own.  It asks iconv for
+"<charset>//TRANSLIT//IGNORE", a GNU extension that musl does not
+implement.  Converting "ŽluťoučkýKůň" to ASCII on mpc85xx/p2020
+(Turris 1.x), musl 1.2.6:
+
+    charset                   musl             GNU libiconv
+    ASCII//TRANSLIT//IGNORE   EINVAL           "Zlutouck'yKun"
+    ASCII//TRANSLIT           EINVAL           "Zlutouck'yKun"
+    ASCII                     "*lu*ou*k*K**"   EILSEQ
+
+050-iconv-test-continue.patch removed the abort() from the startup
+self-test that reports this, so the package could be built against
+musl's iconv.  That silenced the check without fixing anything:
+intlconv_utf8() still returns -EIO, so cleanup_filename() in
+src/dvr/dvr_rec.c cannot build a recording file name and
+pvr_generate_filename() fails.  The charset cannot be avoided either,
+because intlconv_filesystem_charset() returns "ASCII" unless $LANG
+names a UTF-8 locale, which OpenWrt does not set by default.
+
+Depend on libiconv-full instead of $(ICONV_DEPENDS), which pulls it in
+only when BUILD_NLS is set, and point the compiler at its staging prefix
+when nls.mk has not already done so.  The binary then links against
+libiconv.so.2, the self-test passes and the patch can be dropped.
+
+Signed-off-by: Josef Schlehofer <pepe.schlehofer@gmail.com>
+---
+ multimedia/tvheadend/Makefile                       | 11 ++++++++++-
+ .../tvheadend/patches/050-iconv-test-continue.patch | 13 -------------
+ 2 files changed, 10 insertions(+), 14 deletions(-)
+ delete mode 100644 multimedia/tvheadend/patches/050-iconv-test-continue.patch
+
+diff --git a/multimedia/tvheadend/Makefile b/multimedia/tvheadend/Makefile
+index 7d81c27d7d1ee7..c68eb12c174f18 100644
+--- a/multimedia/tvheadend/Makefile
++++ b/multimedia/tvheadend/Makefile
+@@ -20,6 +20,15 @@ PKG_BUILD_DEPENDS:=gettext-full/host
+ include $(INCLUDE_DIR)/package.mk
+ include $(INCLUDE_DIR)/nls.mk
+ 
++# tvheadend needs iconv //TRANSLIT to build recording file names, which musl
++# does not implement, so always build against GNU libiconv.
++# With BUILD_NLS set, nls.mk already adds these for the same prefix.
++ifneq ($(CONFIG_BUILD_NLS),y)
++	ICONV_FULL_PREFIX:=$(STAGING_DIR)/usr/lib/libiconv-full
++	TARGET_CFLAGS += -I$(ICONV_FULL_PREFIX)/include
++	TARGET_LDFLAGS += -L$(ICONV_FULL_PREFIX)/lib -Wl,-rpath-link=$(ICONV_FULL_PREFIX)/lib
++endif
++
+ define Package/tvheadend
+   SECTION:=multimedia
+   CATEGORY:=Multimedia
+@@ -32,7 +41,7 @@ define Package/tvheadend
+ 	+librt \
+ 	+libffi \
+ 	+libopenssl \
+-	$(ICONV_DEPENDS) \
++	+libiconv-full \
+ 	+zlib \
+ 	+TVHEADEND_AVAHI_SUPPORT:libavahi-client \
+ 	+TVHEADEND_REGEX_PCRE2:libpcre2 \
+diff --git a/multimedia/tvheadend/patches/050-iconv-test-continue.patch b/multimedia/tvheadend/patches/050-iconv-test-continue.patch
+deleted file mode 100644
+index bdfc4359c49e61..00000000000000
+--- a/multimedia/tvheadend/patches/050-iconv-test-continue.patch
++++ /dev/null
+@@ -1,13 +0,0 @@
+---- a/src/intlconv.c
+-+++ b/src/intlconv.c
+-@@ -37,9 +37,8 @@ intlconv_test( void )
+-       (strcmp(s, "ZlutouckyKun") &&
+-        strcmp(s, "Zlutouck'yKun") &&
+-        strcmp(s, "?lu?ou?k?K??"))) {
+--    tvherror(LS_MAIN, "iconv() routine is not working properly (%s), aborting!", s);
+-+    tvherror(LS_MAIN, "iconv() routine is not working properly (%s)", s);
+-     tvh_safe_usleep(2000000);
+--    abort();
+-   }
+-   free(s);
+- }
+
+From 2192be7c70f9e4ed78f068e1a015cc3a44eecce6 Mon Sep 17 00:00:00 2001
+From: Josef Schlehofer <pepe.schlehofer@gmail.com>
+Date: Fri, 21 Aug 2026 11:39:59 +0200
+Subject: [PATCH 3/3] tvheadend: drop the handwritten version override
+
+The handwritten debian/changelog is only used to override the version
+reported by support/version, but it is unnecessary and causes a version
+mismatch:
+
+- Build/Prepare feeds the raw git hash into debian/changelog, so the
+  binary reports ddb984f4c17f4a26fd34f3e1b24e3323f9641b75~openwrt1
+  instead of the package version 2026.08.17~ddb984f4.
+- The CI package test then fails because it cannot find the package
+  version in the output of any installed executable.
+- Without .git, debian/changelog or rpm/version, support/version falls
+  back to the source directory name.
+- OpenWrt already names the source directory tvheadend-$(PKG_VERSION),
+  so the binary correctly reports 2026.08.17~ddb984f4 without any
+  override.
+
+Alpine uses rpm/version in the same way and does not encode its own
+package release into the version either.
+
+Signed-off-by: Josef Schlehofer <pepe.schlehofer@gmail.com>
+---
+ multimedia/tvheadend/Makefile | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/multimedia/tvheadend/Makefile b/multimedia/tvheadend/Makefile
+index c68eb12c174f18..34fc12daac5a8b 100644
+--- a/multimedia/tvheadend/Makefile
++++ b/multimedia/tvheadend/Makefile
+@@ -261,12 +261,6 @@ CONFIGURE_ARGS += \
+ ##	--disable-libfdkaac_static \
+ ##	--disable-pcloud_cache \
+ 
+-define Build/Prepare
+-	$(call Build/Prepare/Default)
+-	echo 'Tvheadend $(shell echo $(PKG_SOURCE_VERSION) | sed "s/^v//")~openwrt$(PKG_RELEASE)' \
+-		> $(PKG_BUILD_DIR)/debian/changelog
+-endef
+-
+ define Package/tvheadend/conffiles
+ /etc/config/tvheadend
+ /etc/tvheadend

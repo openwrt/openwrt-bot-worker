@@ -1,0 +1,82 @@
+From 3458b4c43139049c63e9e5102b482bf654194b7e Mon Sep 17 00:00:00 2001
+From: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Date: Thu, 30 Jul 2026 08:37:58 +0200
+Subject: [PATCH] generic: backport-6.18: fix naming of rtl8365mb patches
+
+Rename all 942-* backport patches for the Realtek rtl8365mb DSA driver
+to prefix the kernel version with "v" (e.g. v7.2 instead of 7.2),
+matching the naming convention used elsewhere for backport patches.
+
+Affected patches:
+- 942-01: use ERR_PTR
+- 942-02: reject unsupported topology
+- 942-03: use dsa helpers for port isolation
+- 942-04: prepare for multiple sources
+- 942-05: add table lookup interface
+- 942-06: add VLAN support
+- 942-07: add FDB support
+- 942-08: add port_bridge_join/leave
+- 942-09: add bridge port flags
+
+No functional changes.
+
+Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Link: https://github.com/openwrt/openwrt/pull/24483
+Signed-off-by: Jonas Jelonek <jelonek.jonas@gmail.com>
+---
+ ...ch => 942-01-v7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch} | 0
+ ....2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch} | 0
+ ....2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch} | 0
+ ....2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch} | 0
+ ....2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch} | 0
+ ... 942-06-v7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch} | 0
+ ...> 942-07-v7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch} | 0
+ ....2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch} | 0
+ ...09-v7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch} | 0
+ 9 files changed, 0 insertions(+), 0 deletions(-)
+ rename target/linux/generic/backport-6.18/{942-01-7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch => 942-01-v7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-02-7.2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch => 942-02-v7.2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-03-7.2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch => 942-03-v7.2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-04-7.2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch => 942-04-v7.2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-05-7.2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch => 942-05-v7.2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-06-7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch => 942-06-v7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-07-7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch => 942-07-v7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-08-7.2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch => 942-08-v7.2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch} (100%)
+ rename target/linux/generic/backport-6.18/{942-09-7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch => 942-09-v7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch} (100%)
+
+diff --git a/target/linux/generic/backport-6.18/942-01-7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch b/target/linux/generic/backport-6.18/942-01-v7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-01-7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch
+rename to target/linux/generic/backport-6.18/942-01-v7.2-net-dsa-realtek-rtl8365mb-use-ERR_PTR.patch
+diff --git a/target/linux/generic/backport-6.18/942-02-7.2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch b/target/linux/generic/backport-6.18/942-02-v7.2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-02-7.2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch
+rename to target/linux/generic/backport-6.18/942-02-v7.2-net-dsa-realtek-rtl8365mb-reject-unsupported-topolog.patch
+diff --git a/target/linux/generic/backport-6.18/942-03-7.2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch b/target/linux/generic/backport-6.18/942-03-v7.2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-03-7.2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch
+rename to target/linux/generic/backport-6.18/942-03-v7.2-net-dsa-realtek-rtl8365mb-use-dsa-helpers-for-port-i.patch
+diff --git a/target/linux/generic/backport-6.18/942-04-7.2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch b/target/linux/generic/backport-6.18/942-04-v7.2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-04-7.2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch
+rename to target/linux/generic/backport-6.18/942-04-v7.2-net-dsa-realtek-rtl8365mb-prepare-for-multiple-sourc.patch
+diff --git a/target/linux/generic/backport-6.18/942-05-7.2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch b/target/linux/generic/backport-6.18/942-05-v7.2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-05-7.2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch
+rename to target/linux/generic/backport-6.18/942-05-v7.2-net-dsa-realtek-rtl8365mb-add-table-lookup-interface.patch
+diff --git a/target/linux/generic/backport-6.18/942-06-7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch b/target/linux/generic/backport-6.18/942-06-v7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-06-7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch
+rename to target/linux/generic/backport-6.18/942-06-v7.2-net-dsa-realtek-rtl8365mb-add-VLAN-support.patch
+diff --git a/target/linux/generic/backport-6.18/942-07-7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch b/target/linux/generic/backport-6.18/942-07-v7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-07-7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch
+rename to target/linux/generic/backport-6.18/942-07-v7.2-net-dsa-realtek-rtl8365mb-add-FDB-support.patch
+diff --git a/target/linux/generic/backport-6.18/942-08-7.2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch b/target/linux/generic/backport-6.18/942-08-v7.2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-08-7.2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch
+rename to target/linux/generic/backport-6.18/942-08-v7.2-net-dsa-realtek-rtl8365mb-add-port_bridge_-join-leav.patch
+diff --git a/target/linux/generic/backport-6.18/942-09-7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch b/target/linux/generic/backport-6.18/942-09-v7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch
+similarity index 100%
+rename from target/linux/generic/backport-6.18/942-09-7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch
+rename to target/linux/generic/backport-6.18/942-09-v7.2-net-dsa-realtek-rtl8365mb-add-bridge-port-flags.patch

@@ -5607,6 +5607,236 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
     assert.strictEqual(commentBody, null, 'a scan that stopped short must not be acted on');
   });
 
+  test('reports neutral when a patch file could not be read, not a pass', async () => {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123, title: 'mypkg: refresh patch', body: 'Refresh',
+        base: { ref: 'main', sha: 'basesha' }, head: { ref: 'feature-branch', sha: 'headsha' },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 }, repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const checkRunsPosted = [];
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({ check_branch: false, enable_comments: false, require_linked_github_account: false, require_body: false, check_uci_config: false, check_pkg_release: false }), { status: 200 });
+      }
+      if (url.includes('/graphql') && options?.body && !JSON.parse(options.body).query.includes('labels(first:')) {
+        // The batched file lookup fails, so the patch file cannot be read.
+        return new Response('upstream hiccup', { status: 503 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) {
+        return new Response(JSON.stringify([{
+          sha: 'sha123', html_url: 'https://github.com/test/repo/commit/sha123',
+          commit: { message: 'mypkg: refresh patch\n\nSigned-off-by: John Doe <john@doe.com>', author: { name: 'John Doe', email: 'john@doe.com' }, committer: { name: 'John Doe', email: 'john@doe.com' } }
+        }]), { status: 200 });
+      }
+      if (url.match(/\/repos\/test\/repo\/commits\/sha123/)) {
+        return new Response(
+          'diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch\n' +
+          '--- a/utils/mypkg/patches/001-fix.patch\n+++ b/utils/mypkg/patches/001-fix.patch\n@@ -10,6 +10,6 @@\n-old\n+new\n',
+          { status: 200 });
+      }
+      if (url.includes('/check-runs') && method === 'POST') { checkRunsPosted.push(JSON.parse(options.body)); return new Response('{}', { status: 201 }); }
+      if (url.includes('/issues/123/comments')) return new Response(JSON.stringify([]), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) =>
+      algorithm.name === 'RSASSA-PKCS1-v1_5' ? { type: 'private', extractable: false, algorithm, usages: keyUsages }
+        : originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) =>
+      algorithm === 'RSASSA-PKCS1-v1_5' ? new ArrayBuffer(256) : originalSign.call(crypto.subtle, algorithm, key, data);
+
+    try {
+      const response = await worker.fetch(new Request('http://localhost/webhook', {
+        method: 'POST', body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      }), { WEBHOOK_SECRET: secret, APP_ID: '12345', PRIVATE_KEY: 'YW55Y29udGVudA==' }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+
+      const patches = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
+      assert.ok(patches, 'the Code Patches check is published');
+      assert.strictEqual(patches.conclusion, 'neutral', 'a file the run never read must not be reported as a pass');
+      assert.match(patches.output.title, /Partially checked/);
+      assert.match(patches.output.text, /could not be read, so its Git headers were not checked/, 'the details name the file that was skipped');
+      assert.doesNotMatch(patches.output.summary, /All downstream patch files contain correct/, 'the summary must not vouch for the file it could not read');
+      const makefiles = checkRunsPosted.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
+      assert.strictEqual(makefiles.conclusion, 'success', 'the Makefile audit read everything it needed');
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  // Runs one webhook on a pull request with the given patch and returns the
+  // check-runs it posted. More than 15 commits are judged from the whole
+  // patch, fewer from each commit's own. Every file lookup fails unless
+  // `lookup` answers it, the way graphqlResponse's resolver does.
+  async function checkRunsForPatch(patchText, { commitCount = 16, lookup = null, headRepo = null } = {}) {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 123, title: 'mypkg: refresh patches', body: 'Refresh',
+        base: { ref: 'main', sha: 'basesha' },
+        head: { ref: 'feature-branch', sha: 'headsha', ...(headRepo ? { repo: { full_name: headRepo } } : {}) },
+        user: { login: 'johndoe', type: 'User' },
+        commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
+        url: 'https://api.github.com/repos/test/repo/pulls/123'
+      },
+      installation: { id: 456 }, repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const checkRunsPosted = [];
+    const commits = Array.from({ length: commitCount }, (_, i) => ({
+      sha: `sha${i}`, html_url: `https://github.com/test/repo/commit/sha${i}`, parents: [{ sha: `p${i}` }],
+      commit: { message: `mypkg: refresh patch ${i}\n\nRefresh it.\n\nSigned-off-by: John Doe <john@doe.com>`, author: { name: 'John Doe', email: 'john@doe.com' }, committer: { name: 'John Doe', email: 'john@doe.com' } }
+    }));
+
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      if (url.includes('/access_tokens')) return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      if (url.includes('/formalities.json')) {
+        return new Response(JSON.stringify({ check_branch: false, enable_comments: false, require_linked_github_account: false, require_body: false, check_uci_config: false, check_pkg_release: false }), { status: 200 });
+      }
+      if (url.includes('/graphql') && options?.body && !JSON.parse(options.body).query.includes('labels(first:')) {
+        if (!lookup) return new Response('upstream hiccup', { status: 503 });
+        return graphqlResponse(parseGraphqlRequest(options).groups, lookup, { reportOmitted: true });
+      }
+      { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/pulls/123/commits')) return new Response(JSON.stringify(commits), { status: 200 });
+      if (url === 'https://api.github.com/repos/test/repo/pulls/123') return new Response(patchText, { status: 200 });
+      if (/^https:\/\/api\.github\.com\/repos\/test\/repo\/commits\/sha\d+$/.test(url)) return new Response(patchText, { status: 200 });
+      if (url.includes('/check-runs') && method === 'POST') { checkRunsPosted.push(JSON.parse(options.body)); return new Response('{}', { status: 201 }); }
+      if (url.includes('/issues/123/comments')) return new Response(JSON.stringify([]), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) =>
+      algorithm.name === 'RSASSA-PKCS1-v1_5' ? { type: 'private', extractable: false, algorithm, usages: keyUsages }
+        : originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) =>
+      algorithm === 'RSASSA-PKCS1-v1_5' ? new ArrayBuffer(256) : originalSign.call(crypto.subtle, algorithm, key, data);
+
+    try {
+      const response = await worker.fetch(new Request('http://localhost/webhook', {
+        method: 'POST', body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+      }), { WEBHOOK_SECRET: secret, APP_ID: '12345', PRIVATE_KEY: 'YW55Y29udGVudA==' }, {});
+      assert.strictEqual(response.status, 200, await response.text());
+      return checkRunsPosted;
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  }
+
+  const mailEnvelope = (sha) => `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: John Doe <john@doe.com>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] mypkg: refresh patch\n\nSigned-off-by: John Doe <john@doe.com>\n---\n`;
+  const modifyPatchFile = 'diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch\n--- a/utils/mypkg/patches/001-fix.patch\n+++ b/utils/mypkg/patches/001-fix.patch\n@@ -10,6 +10,6 @@\n-old\n+new\n\n';
+  const deletePatchFile = 'diff --git a/utils/mypkg/patches/001-fix.patch b/utils/mypkg/patches/001-fix.patch\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/utils/mypkg/patches/001-fix.patch\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-new\n\n';
+
+  test('reports neutral for an unreadable patch file when judging the whole patch too', async () => {
+    const runs = await checkRunsForPatch(mailEnvelope('a'.repeat(40)) + modifyPatchFile);
+    const patches = runs.find(r => r.name === 'FormalityCheck / Code Patches');
+    const makefiles = runs.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.strictEqual(patches.conclusion, 'neutral', patches.output.text);
+    assert.strictEqual(makefiles.conclusion, 'success', makefiles.output.text);
+    assert.match(patches.output.text, /could not be read, so its Git headers were not checked/, 'the details name the file that was skipped');
+    // Details short enough to post whole need no list above them.
+    assert.ok(patches.output.text.startsWith('### Checking PR #123: mypkg: refresh patches (Embedded Patches Compliance)\n\n#### '), patches.output.text);
+  });
+
+  // A refresh of `readable` patch files, long enough that the Code Patches
+  // details are cut, plus patch files whose lookups fail (`unread`) or whose
+  // content has no Git headers (`bad`). Returns the Code Patches check-run.
+  const patchName = (i) => `target/linux/generic/pending-6.12/${String(i).padStart(3, '0')}-net-a-long-descriptive-name-for-a-refreshed-patch.patch`;
+  async function codePatchesFor({ readable = 800, unread = [], bad = [], commitCount = 16 }) {
+    const files = [...Array.from({ length: readable }, (_, i) => patchName(i)), ...bad, ...unread];
+    const modify = (p) => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -10,6 +10,6 @@\n-old\n+new\n\n`;
+    const headers = 'From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\nFrom: A <a@b.c>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] fix\n';
+    const runs = await checkRunsForPatch(mailEnvelope('a'.repeat(40)) + files.map(modify).join(''), {
+      commitCount,
+      lookup: (owner, name, ref, path) => (unread.includes(path) ? undefined : (bad.includes(path) ? 'no headers' : headers))
+    });
+    return runs.find(r => r.name === 'FormalityCheck / Code Patches');
+  }
+  // The Code Patches details before the first commit or diff section.
+  const listedAboveDetails = (text) => text.slice(0, text.indexOf('\n#### '));
+
+  test('names an unread patch file above details that are too long to post whole', async () => {
+    const patches = await codePatchesFor({ unread: [patchName(900)] });
+    assert.strictEqual(patches.conclusion, 'neutral');
+    assert.match(patches.output.text, /Output truncated/, 'the details are long enough to be cut');
+    assert.ok(listedAboveDetails(patches.output.text).includes(`'${patchName(900)}' could not be read`), 'the neutral conclusion points at a file the details still name');
+    assert.strictEqual(patches.output.text.split('(Embedded Patches Compliance)').length, 2, 'the heading appears once');
+  });
+
+  test('names an unread patch file once above the details, whatever the number of commits changing it', async () => {
+    const patches = await codePatchesFor({ readable: 400, unread: [patchName(900)], commitCount: 2 });
+    assert.strictEqual(listedAboveDetails(patches.output.text).split(`'${patchName(900)}' could not be read`).length - 1, 1, listedAboveDetails(patches.output.text));
+  });
+
+  for (const [count, more] of [[21, '⚠️ 1 more patch file could not be read'], [25, '⚠️ 5 more patch files could not be read']]) {
+    test(`lists only the first 20 of ${count} unread patch files above the details`, async () => {
+      const above = listedAboveDetails((await codePatchesFor({ unread: Array.from({ length: count }, (_, i) => patchName(900 + i)) })).output.text);
+      assert.strictEqual(above.split('could not be read, so').length - 1, 20, above);
+      assert.ok(above.split('\n').includes(more), above);
+    });
+  }
+
+  test('lists no unread patch files above the details of a failed check', async () => {
+    const patches = await codePatchesFor({ unread: [patchName(900)], bad: [patchName(901)] });
+    assert.strictEqual(patches.conclusion, 'failure');
+    assert.ok(!listedAboveDetails(patches.output.text).includes('could not be read'), listedAboveDetails(patches.output.text));
+  });
+
+  test('does not call a patch file that a later commit deletes unreadable', async () => {
+    // It is not at the head commit, so no run could ever read it.
+    const runs = await checkRunsForPatch(mailEnvelope('a'.repeat(40)) + modifyPatchFile + mailEnvelope('b'.repeat(40)) + deletePatchFile);
+    const patches = runs.find(r => r.name === 'FormalityCheck / Code Patches');
+    assert.strictEqual(patches.conclusion, 'success', patches.output.text);
+  });
+
+  // The whole patch leaves merge commits out, so a patch file that a merge
+  // deleted is still named in it, and only the lookup at the head finds it
+  // gone. Each case is a different answer to that lookup.
+  for (const [title, options, conclusion] of [
+    ['has nothing to check in a patch file that is not in the head commit',
+      { lookup: () => null }, 'success'],
+    ['still calls a patch file unreadable when an error hid the answer',
+      { lookup: () => undefined }, 'neutral'],
+    ["does not take an empty answer at a commit's own head as the file being gone",
+      // That commit changes the file, so the file is there at that commit.
+      { commitCount: 1, lookup: () => null }, 'neutral'],
+    ['takes an empty answer from the fork that serves the head commit',
+      { headRepo: 'fork/repo', lookup: (owner, name, ref, path) => (path === null && owner === 'fork' ? 'resolves' : null) }, 'success'],
+    ['does not take an empty answer while no repository is known to serve the head commit',
+      { headRepo: 'fork/repo', lookup: (owner, name, ref, path) => (path === null ? undefined : null) }, 'neutral']
+  ]) {
+    test(title, async () => {
+      const runs = await checkRunsForPatch(mailEnvelope('a'.repeat(40)) + modifyPatchFile, options);
+      const patches = runs.find(r => r.name === 'FormalityCheck / Code Patches');
+      assert.strictEqual(patches.conclusion, conclusion, patches.output.text);
+      if (conclusion === 'success') assert.match(patches.output.text, /no longer in the pull request/);
+    });
+  }
+
   test('labeler.yml integration: handles missing (404) .github/labeler.yml gracefully', async () => {
     const originalImportKey = crypto.subtle.importKey;
     crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {

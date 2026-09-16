@@ -1715,16 +1715,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
   return { errors, successes, warnings };
 }
 
-export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent) {
+export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent, isMissing) {
   const errors = [];
   const successes = [];
 
   if (CONFIG.check_patch_headers === false || CONFIG.check_patch_headers === 'disabled') {
-    return { errors: [], successes: [] };
+    return { errors: [], successes: [], skipped: [], incomplete: false };
   }
 
   if (!commitPatch) {
-    return { errors: [], successes: ["✅ No diff footprint present for patches validation"] };
+    return { errors: [], successes: ["✅ No diff footprint present for patches validation"], skipped: [], incomplete: false };
   }
 
   // Anchored at the end of the line: without that, the greedy match reads
@@ -1739,7 +1739,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   if (patchFiles.length === 0) {
-    return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"] };
+    return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"], skipped: [], incomplete: false };
   }
 
   // Collect (chunk, patchFile) matches upfront rather than checking each
@@ -1749,19 +1749,12 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   // fetchFileContentCached in index.js) can combine them into a single
   // GraphQL request instead of one HTTP call per patch file.
   //
-  // Each chunk is paired with the patch file its own `+++ b/` header names.
-  // Testing every chunk against every patch file instead is quadratic in the
-  // number of files: a kernel bump that refreshes 800 patches would spend
-  // ~180 ms of CPU here alone, far past what a Worker invocation gets.
-  const wantedPatchFiles = new Set(patchFiles);
-  const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
-  const matches = [];
-  for (const chunk of fileChunks) {
-    const header = chunk.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
-    if (header && wantedPatchFiles.has(header[1])) {
-      matches.push({ chunk, patchFile: header[1] });
-    }
-  }
+  // Each chunk is paired with the patch file its own `+++ b/` header names,
+  // followed through later renames (see followPatchFiles). Testing every
+  // chunk against every patch file instead is quadratic in the number of
+  // files: a kernel bump that refreshes 800 patches would spend ~180 ms of
+  // CPU here alone, far past what a Worker invocation gets.
+  const matches = followPatchFiles(commitPatch.split(/^diff\s+--git\s+/m));
 
   async function checkPatchHeader({ chunk, patchFile }) {
     let hasFromHash = false;
@@ -1781,7 +1774,8 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
           checked = true;
         }
       } catch (e) {
-        // Ignore fetch errors and fallback
+        // The lookup failed outright. `checked` stays false, which the branch
+        // below already treats as "this file was not read".
       }
     }
 
@@ -1789,7 +1783,14 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
       // Fallback: only validate if it is a new file
       const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
       if (!isNewFile) {
-        return { success: `✅ Embedded patch '${patchFile}' is an existing patch modification, header validation skipped (unable to fetch full file)` };
+        // A file that is not there is not unreadable, e.g. a merge commit,
+        // which the whole patch leaves out, deleted it.
+        if (isMissing?.(patchFile)) {
+          return { success: `✅ Embedded patch '${patchFile}' is no longer in the pull request, so there is nothing to check` };
+        }
+        // An edited patch shows only its changed lines, not its headers, so
+        // without the file there is nothing to judge.
+        return { skipped: `⚠️ Embedded patch '${patchFile}' could not be read, so its Git headers were not checked` };
       }
       hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
       hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
@@ -1804,18 +1805,22 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   const results = await Promise.all(matches.map(checkPatchHeader));
+  const skipped = [];
   for (const result of results) {
     if (result.error) {
       errors.push(result.error);
+    } else if (result.skipped) {
+      skipped.push(result.skipped);
     } else if (result.success) {
       successes.push(result.success);
     }
   }
 
-  return { errors, successes };
+  // A file that was skipped was not checked, so the result is not a pass.
+  return { errors, successes, skipped, incomplete: skipped.length > 0 };
 }
 
-// The two parsers below walk a whole patch line by line, and the validators
+// The parsers below walk a whole patch line by line, and the validators
 // ask each of them more than once for the same commit patch: the UCI check,
 // the release audit and the hash audit all start from the same file lists.
 // Their results are remembered per patch text so the walk happens once. The
@@ -1874,6 +1879,85 @@ export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates
   }
 
   return Object.freeze({ addedFiles, deletedFiles });
+});
+
+// Pairs each chunk that changes a patch file with the name the file has once
+// the whole diff is applied. A pull request is its commits in order, so a
+// later commit can delete the file, leaving nothing to check, or rename it.
+// A rename that keeps the content has no `+++` line, so it is followed here.
+function followPatchFiles(fileChunks) {
+  const matches = [];
+  const heldAt = new Map();
+  for (const chunk of fileChunks) {
+    // File headers end where the first hunk starts, and hunk lines can say
+    // anything.
+    const hunkStart = chunk.indexOf('\n@@');
+    const head = hunkStart === -1 ? chunk : chunk.slice(0, hunkStart);
+    const renamedFrom = head.match(/^rename from (.*?)\r?$/m);
+    const renamedTo = head.match(/^rename to (.*?)\r?$/m);
+    if (renamedFrom && renamedTo && heldAt.has(renamedFrom[1])) {
+      const moved = heldAt.get(renamedFrom[1]);
+      heldAt.delete(renamedFrom[1]);
+      heldAt.set(renamedTo[1], (heldAt.get(renamedTo[1]) || []).concat(moved));
+    }
+    if (/^deleted file mode /m.test(head)) {
+      const deleted = head.match(/^a\/(.+) b\/\1\r?\n/);
+      if (deleted) heldAt.delete(deleted[1]);
+    }
+    const header = head.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
+    if (header) {
+      const match = { chunk, patchFile: null };
+      matches.push(match);
+      heldAt.set(header[1], (heldAt.get(header[1]) || []).concat(match));
+    }
+  }
+  for (const [path, held] of heldAt) {
+    for (const match of held) match.patchFile = path;
+  }
+  return matches.filter(match => match.patchFile !== null);
+}
+
+// The added and deleted lines of a patch, per file. The input is GitHub's
+// application/vnd.github.patch text for a commit or a whole pull request,
+// which repeats git's mail format per commit, so a file's lines end at the
+// next `diff --git` or at the next commit's `From <sha>` envelope.
+const MAIL_ENVELOPE = /^From [0-9a-f]{40,64} Mon Sep 17 00:00:00 2001\r?$/;
+
+export const collectFileLineChanges = rememberPerPatch(function collectFileLineChanges(patch) {
+  const changes = {};
+  if (!patch) return Object.freeze(changes);
+
+  let currentFile = null;
+  let inHeader = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      currentFile = match ? match[2].trim().replace(/\r$/, '') : null;
+      inHeader = true;
+      continue;
+    }
+    if (line.startsWith('From ') && MAIL_ENVELOPE.test(line)) {
+      currentFile = null;
+      continue;
+    }
+    if (!currentFile) continue;
+    if (inHeader) {
+      // The preamble runs from `diff --git` to the end of the `--- `/`+++ `
+      // pair, or to the first hunk when git omits the pair (a mode change, a
+      // pure rename). Only here do `---` and `+++` name files; after it they
+      // are ordinary content.
+      if (line.startsWith('@@')) inHeader = false;
+      else if (line.startsWith('+++')) inHeader = false;
+      continue;
+    }
+    if (line.startsWith('@@')) continue;
+    if (line.startsWith('+') || line.startsWith('-')) {
+      if (!changes[currentFile]) changes[currentFile] = { added: [], deleted: [] };
+      changes[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
+    }
+  }
+  for (const file of Object.keys(changes)) Object.freeze(changes[file]);
+  return Object.freeze(changes);
 });
 
 export function isHiddenOrSpecial(filePath) {
@@ -2275,32 +2359,13 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       states.addedFiles.forEach(f => addedFiles.add(f));
       states.deletedFiles.forEach(f => deletedFiles.add(f));
 
-      // Parse changes per file in this commit patch
-      const lines = item.commitPatch.split('\n');
-      let currentFile = null;
-      for (const line of lines) {
-        if (line.startsWith('diff --git ')) {
-          currentFile = null;
-          const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-          if (match) {
-            currentFile = match[2].trim().replace(/\r$/, '');
-          }
-        } else if (currentFile) {
-          if (line.startsWith('+++ b/') || line.startsWith('--- a/') || line.startsWith('+++ /dev/null') || line.startsWith('--- /dev/null')) {
-            continue;
-          }
-          if (line.startsWith('+')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].added.push(line.slice(1));
-          } else if (line.startsWith('-')) {
-            if (!fileChanges[currentFile]) {
-              fileChanges[currentFile] = { added: [], deleted: [] };
-            }
-            fileChanges[currentFile].deleted.push(line.slice(1));
-          }
+      // Changes per file in this commit patch
+      for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+        if (!fileChanges[file]) {
+          fileChanges[file] = { added: [], deleted: [] };
         }
+        for (const line of change.added) fileChanges[file].added.push(line);
+        for (const line of change.deleted) fileChanges[file].deleted.push(line);
       }
     }
 
@@ -2681,20 +2746,11 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       makefiles.add(file);
     }
 
-    let currentFile = null;
-    for (const line of item.commitPatch.split('\n')) {
-      if (line.startsWith('diff --git ')) {
-        currentFile = null;
-        const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-        if (match) currentFile = match[2].trim().replace(/\r$/, '');
-        continue;
-      }
-      if (!currentFile || !makefiles.has(currentFile)) continue;
-      if (line.startsWith('+++') || line.startsWith('---')) continue;
-      if (line.startsWith('+') || line.startsWith('-')) {
-        if (!makefileLineChanges[currentFile]) makefileLineChanges[currentFile] = { added: [], deleted: [] };
-        makefileLineChanges[currentFile][line.startsWith('+') ? 'added' : 'deleted'].push(line.slice(1));
-      }
+    for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+      if (!makefiles.has(file)) continue;
+      if (!makefileLineChanges[file]) makefileLineChanges[file] = { added: [], deleted: [] };
+      for (const line of change.added) makefileLineChanges[file].added.push(line);
+      for (const line of change.deleted) makefileLineChanges[file].deleted.push(line);
     }
   }
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
 
 // Configuration shared by the validator tests.
 // Mock Config Object
@@ -68,6 +69,9 @@ export const added = (path) => ['--- /dev/null', `+++ b/${path}`];
 export const removed = (path) => [`--- a/${path}`, '+++ /dev/null'];
 export const gitModified = (path) => [`diff --git a/${path} b/${path}`, ...modified(path)];
 export const gitAdded = (path) => [`diff --git a/${path} b/${path}`, ...added(path)];
+
+// A file from test/fixtures.
+export const readFixture = (name) => readFileSync(new URL(`../fixtures/${name}`, import.meta.url), 'utf8');
 
 // Assertions that print what the validator actually reported when they fail.
 export const assertSomeIncludes = (list, text, what = 'entries') =>

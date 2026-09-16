@@ -48,16 +48,21 @@ export function parseGraphqlRequest(options) {
 }
 
 // resolver(owner, name, ref, path) => string (found) | null (not found) |
-// undefined (omit the field, simulating a partial GraphQL error). For
+// undefined (omit the field, simulating a partial GraphQL error, which
+// `reportOmitted` also lists in errors[] the way GitHub does). For
 // ref-existence probes (path === null) a string return means "the repo
 // resolves this ref" — the value itself is not used as file content.
-export function graphqlResponse(groups, resolver) {
+export function graphqlResponse(groups, resolver, { reportOmitted = false } = {}) {
   const data = {};
+  const errors = [];
   for (const group of groups) {
     data[group.repoAlias] = {};
     for (const probe of group.probes) {
       const value = resolver(group.owner, group.name, probe.ref, probe.path);
-      if (value === undefined) continue;
+      if (value === undefined) {
+        if (reportOmitted) errors.push({ message: 'Something went wrong while executing your query.', path: [group.repoAlias, probe.fieldAlias] });
+        continue;
+      }
       if (value === null) {
         data[group.repoAlias][probe.fieldAlias] = null;
       } else if (probe.path === null) {
@@ -68,7 +73,7 @@ export function graphqlResponse(groups, resolver) {
       }
     }
   }
-  return new Response(JSON.stringify({ data }), { status: 200 });
+  return new Response(JSON.stringify(errors.length > 0 ? { data, errors } : { data }), { status: 200 });
 }
 
 // Helper: detect and respond to GraphQL labels queries in mocks.
