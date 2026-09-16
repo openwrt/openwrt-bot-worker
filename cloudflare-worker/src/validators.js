@@ -803,6 +803,68 @@ function isMainRepo(repoFullname) {
     repoFullname.toLowerCase() === MAIN_REPO_FULLNAME.toLowerCase();
 }
 
+// A make expansion is `$(...)` or `${...}`, and it nests: `$(if $(CONFIG_X),/x)`
+// is one expansion, not two. Returns the top-level spans as [start, end) in
+// order, or null when a `$(` is never closed and the line cannot be read.
+export function makeExpansionSpans(text) {
+  const spans = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '$') continue;
+    const open = text[i + 1];
+    if (open !== '(' && open !== '{') continue;
+    const close = open === '(' ? ')' : '}';
+    let depth = 0;
+    let j = i + 1;
+    for (; j < text.length; j++) {
+      if (text[j] === open) depth++;
+      else if (text[j] === close && --depth === 0) break;
+    }
+    if (depth !== 0) return null;
+    spans.push([i, j + 1]);
+    i = j;
+  }
+  return spans;
+}
+
+// Just the literal text, with every expansion cut out. Cutting can only ever
+// remove characters, so whitespace left here is whitespace the author typed
+// outside any expansion - never a seam introduced by the cut.
+export function literalOutsideExpansions(text, spans) {
+  let out = '';
+  let at = 0;
+  for (const [s, e] of spans) {
+    out += text.slice(at, s);
+    at = e;
+  }
+  return out + text.slice(at);
+}
+
+// Make functions: their name is followed by whitespace that separates it from
+// the arguments and never reaches the expanded text.
+const MAKE_FUNCTIONS = new Set([
+  'abspath', 'addprefix', 'addsuffix', 'and', 'basename', 'call', 'dir', 'error',
+  'eval', 'file', 'filter', 'filter-out', 'findstring', 'firstword', 'flavor',
+  'foreach', 'guile', 'if', 'info', 'intcmp', 'join', 'lastword', 'let', 'notdir',
+  'or', 'origin', 'patsubst', 'realpath', 'shell', 'sort', 'strip', 'subst',
+  'suffix', 'value', 'warning', 'wildcard', 'word', 'wordlist', 'words',
+]);
+
+// Whether a line holds whitespace that can end up in what it expands to: any
+// in the literal text, and inside an expansion any but the separator after a
+// function name, at every level of nesting. An unterminated `$(` cannot be
+// read, so only its indentation is judged.
+function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
+  if (spans === null) return /^[ \t]/.test(text);
+  if (/[ \t]/.test(literalOutsideExpansions(text, spans))) return true;
+  for (const [start, end] of spans) {
+    let inner = text.slice(start + 2, end - 1);
+    const fn = inner.match(/^([a-z-]+)[ \t]+/);
+    if (fn && MAKE_FUNCTIONS.has(fn[1])) inner = inner.slice(fn[0].length);
+    if (hasStrayWhitespace(inner)) return true;
+  }
+  return false;
+}
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname) {
   const errors = [];
   const successes = [];
@@ -1029,20 +1091,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       // Makefile arrives in full, which is where a missing block is real.
       const isAddedMakefile = lines.some(line => /^---\s+\/dev\/null\r?$/.test(line));
 
-      // Pass 1: Collect INSTALL_DIR targets (must be done before conffiles validation
-      // since install blocks can appear after conffiles blocks in the diff)
-      const installedDirs = new Set();
-      for (const line of lines) {
-        if (line.startsWith('+')) {
-          const contentLine = line.slice(1);
-          const installDirMatch = contentLine.match(/\$\(INSTALL_DIR\)\s+\$\(1\)(\/[^\s]*)/);
-          if (installDirMatch) {
-            installedDirs.add(installDirMatch[1]);
-          }
-        }
-      }
-
-      // Pass 2: Validate conffiles and detect config installations
+      // Validate conffiles and detect config installations
       let MakefileInstallsConfig = false;
       let MakefileHasConffiles = false;
       let inConffiles = false;
@@ -1060,10 +1109,14 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           const hunkContext = hunkContextMatch ? hunkContextMatch[1].trim() : '';
 
           if (hunkContext) {
-            // Only a conffiles define keeps us inside the block. Lines *inside*
-            // a conffiles block ('/etc/config/foo') never qualify as git's
-            // function context, so any other context ('endef', another define,
-            // 'CONFIGURE_VARS += \') means this hunk starts outside the block.
+            // Only a conffiles define keeps us inside the block; any other
+            // context ('endef', another define, 'CONFIGURE_VARS += \') means
+            // this hunk starts outside it. git also takes an entry that begins
+            // with a make expansion ('$(CONF_DIR)/my.cnf') as context, and that
+            // one does sit inside the block - but the diff alone cannot tell it
+            // from a `$(call ...)` line opening an install or build recipe, so
+            // such a hunk is treated as outside and its added entries go
+            // unchecked rather than judged against the wrong rules.
             const hunkDefineMatch = hunkContext.match(/^define\s+(Package\/\S+)/);
             if (hunkDefineMatch && /conffiles$/.test(hunkDefineMatch[1])) {
               inConffiles = true;
@@ -1114,46 +1167,69 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (inConffiles) {
               conffilesCheckRun = true;
-              
-              // No indentation/spaces
-              if (/[ \t]/.test(contentLine)) {
+
+              const trimmedLine = contentLine.trim();
+
+              // A make expansion is `$(...)` or `${...}`, and it nests, so
+              // `$(if $(CONFIG_X),/x)` is one expansion and not two. An
+              // unterminated `$(` returns null: make will refuse the Makefile
+              // itself, so only the indentation rule is applied to such a line.
+              const spans = makeExpansionSpans(contentLine);
+
+              // An entry is one path per line. Whitespace splits it into two
+              // words, and `scripts/ipkg-build` rewrites only the first: its
+              // `sed -e "s!^/!$pkg_dir/!"` anchors at the start of the line,
+              // leaving every later word an absolute *host* path. Inside a make
+              // expansion only the separator after a function name cannot reach
+              // the expanded text, so that is the only whitespace accepted -
+              // `$(call Package/tac_plus/Default/conffiles)` passes,
+              // `$(if $(CONFIG_X),/etc/a /etc/b)` does not. Indentation is never
+              // legitimate, expansion or not.
+              const strayWhitespace = hasStrayWhitespace(contentLine, spans);
+              if (strayWhitespace) {
                 conffilesCheckErrors++;
                 errors.push(`- ${currentPackage} line '${contentLine}' must not contain any spaces or indentation`);
               }
 
-              const trimmedLine = contentLine.trim();
-              if (trimmedLine.length > 0) {
-                // Absolute paths must start with '/'
-                if (!trimmedLine.startsWith('/')) {
+              if (trimmedLine.length > 0 && spans !== null) {
+                // A line that *begins* with an expansion is not a path yet and
+                // cannot be judged for a leading slash: `$(CONF_DIR)/my.cnf`
+                // and `$(config_directory)` are settled at build time. A line
+                // that begins with literal text can be judged, however many
+                // expansions follow it - `/etc/$(PKG_NAME).conf` is fine,
+                // `foo$(WHATEVER)` is not.
+                if (!/^\$[({]/.test(trimmedLine) && !trimmedLine.startsWith('/')) {
                   conffilesCheckErrors++;
                   errors.push(`- ${currentPackage} line '${trimmedLine}' must be an absolute path starting with '/'`);
                 }
 
-                // Directories must end with a trailing slash '/'
-                // Individual files must NOT end with a trailing slash.
+                // A trailing slash on an individual file leaves it untracked.
+                // package-pack.mk gives a checksum only to an entry that is a
+                // regular file of the package, and writes every other entry - a
+                // directory, or `file/` - to /lib/upgrade/keep.d, which
+                // sysupgrade expands with `find`. `find` fails on `file/` with
+                // "Not a directory", and so does the `find` scripts/ipkg-build
+                // runs over the list, so the file is never kept and a sysupgrade
+                // overwrites whatever the user had changed.
+                //
+                // A directory is a different matter, and no slash is asked for
+                // there: `find` walks it the same with or without one. The tree
+                // writes it both ways too - `/etc/ipsec.d` and `/etc/dnsmasq.d/`
+                // are both shipped today.
+                //
+                // Whether a path names a file cannot be known from the Makefile,
+                // so this looks for what makes one recognisable: a place under
+                // /etc/config/, which holds no directories, or an extension the
+                // tree's configuration files carry. A trailing slash also means
+                // the tail is literal, so this reads real text whether or not an
+                // expansion sits earlier.
                 if (trimmedLine.endsWith('/')) {
-                  // If it has a file extension or is a file ending in '/', it's an error
-                  if (/\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml)\/$/i.test(trimmedLine)) {
+                  const looksLikeFile =
+                    /\.(conf|json|cfg|txt|crt|key|pem|sh|ini|xml|yaml|yml|cnf|config|toml|nft|lua|list|user|rules)\/$/i.test(trimmedLine) ||
+                    (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length);
+                  if (looksLikeFile) {
                     conffilesCheckErrors++;
                     errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  } else if (trimmedLine.startsWith('/etc/config/') && trimmedLine.length > '/etc/config/'.length) {
-                    // Files under /etc/config/ cannot end with / because there are no subdirectories in /etc/config
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' is an individual file and must not end with a trailing slash`);
-                  }
-                } else {
-                  // Determine if the path is a directory that should end with '/'
-                  // 1. Paths created by INSTALL_DIR in this Makefile are directories
-                  const isInstalledDir = installedDirs.has(trimmedLine);
-                  // 2. Paths ending with '.d' are directories by Unix convention
-                  //    (e.g., conf.d, init.d, cron.d, zabbix_agentd.conf.d, sudoers.d)
-                  const isDotDDir = /\.d$/.test(trimmedLine);
-                  // 3. Well-known top-level directory paths
-                  const isKnownDir = trimmedLine === '/etc' || trimmedLine === '/etc/config';
-
-                  if (isInstalledDir || isDotDDir || isKnownDir) {
-                    conffilesCheckErrors++;
-                    errors.push(`- ${currentPackage} line '${trimmedLine}' must end with a trailing slash '/' (e.g., '${trimmedLine}/')`);
                   }
                 }
               }
@@ -1410,7 +1486,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
             if (!isEmpty && !isComment && !isContinuation && !isConditional) {
               if (inBlock === 'metadata') {
-                if (!/^ {2}[^ \t]/.test(contentLine)) {
+                // A bare make expansion is how a package inherits shared
+                // metadata - `$(call Package/foo/Default)` as the first line
+                // of the block - and the tree writes it at every indentation:
+                // counted over package/ and the packages feed, 769 of these
+                // lines use two spaces, 601 sit at column 0 and 148 start
+                // with a tab, the column-0 form being the majority inside
+                // openwrt/openwrt itself. There is no convention to enforce
+                // here, so its indentation is not judged.
+                const isExpansion = trimmed.startsWith('$(') && trimmed.endsWith(')');
+                if (!isExpansion && !/^ {2}[^ \t]/.test(contentLine)) {
                   indentationErrors++;
                   errors.push(`- Makefile line '${contentLine.trim()}' inside '${blockName}' must be indented with exactly 2 spaces`);
                 }
@@ -1814,7 +1899,9 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
     'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
   ]);
-  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua']);
+  // Language groups whose packages sit one level deeper: lang/python/Flask.
+  // golang keeps its compiler builds the same way (lang/golang/golang1.26).
+  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua', 'golang']);
 
   const hasPkgName = async (dir) => {
     if (!fetchFileContent) return false;
@@ -1822,11 +1909,15 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
 
     const makefilePath = `${dir}/Makefile`;
     const content = await fetchFileContent(makefilePath);
-    // LuCI packages leave PKG_NAME to luci.mk (`PKG_NAME?=$(LUCI_NAME)`), so
-    // the include line is what marks their directory as a package root.
+    // Some packages leave PKG_NAME to a shared helper: luci.mk supplies
+    // `PKG_NAME?=$(LUCI_NAME)`, and u-boot.mk, trusted-firmware-a.mk and
+    // optee-os.mk each carry a `PKG_NAME ?=` of their own. For those the
+    // include line is what marks the directory as a package root. uboot-tools
+    // names its source with PKG_DISTNAME instead and defines its packages
+    // itself, so that variable marks a package root too.
     const ok = !!(content && (
-      /^PKG_NAME\s*(?::=|=)/m.test(content) ||
-      /^\s*include\s+.*\bluci\.mk\s*$/m.test(content)
+      /^PKG_(?:NAME|DISTNAME)\s*(?::=|=)/m.test(content) ||
+      /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m.test(content)
     ));
     cache[dir] = ok;
     return ok;
@@ -1840,6 +1931,14 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return false;
   };
 
+  // A payload directory sits inside a package; a directory sitting directly
+  // under a category IS the package. `package/utils/ucode` is the ucode
+  // interpreter, not the ucode payload of a LuCI application, and treating it
+  // as payload walked up to the category and returned no package root at all,
+  // so every pull request touching it went unaudited without saying so.
+  const isPayloadDir = (dirParts) =>
+    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
+
   let parts = filePath.split('/');
   if (parts.length > 0) {
     // Remove filename
@@ -1849,8 +1948,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   // Traverse up skipping standard directories (including versioned
   // `patches-X.Y` / `files-X.Y` dirs used by `target/linux/<subtarget>/`).
   while (parts.length > 0) {
-    const last = parts[parts.length - 1];
-    if (isSkippableDir(last)) {
+    if (isPayloadDir(parts)) {
       parts.pop();
     } else {
       break;
@@ -1888,7 +1986,15 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
       }
       return `lang/${parts[1]}`;
     }
-    return `${parts[0]}/${parts[1]}`;
+    // Only the exact <category>/<pkgname> depth is safe without a probe, the
+    // same way the package/ branch above stops at three levels. A deeper path
+    // is either payload of that package or a <category>/<group>/<pkgname>
+    // layout - libs/protobuf/protobuf-compat, utils/bigclown/bigclown-gateway -
+    // and answering <category>/<group> for the latter named a directory with
+    // no Makefile in it, which the audits then fetched and silently skipped.
+    if (parts.length === 2) {
+      return `${parts[0]}/${parts[1]}`;
+    }
   }
 
   if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
@@ -1926,7 +2032,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   const viableCandidates = candidates.filter(candidate => {
     const candidateParts = candidate.split('/');
     const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || isSkippableDir(last)) return false;
+    if (last === 'package' || isPayloadDir(candidateParts)) return false;
     if (isCategoryLevel(candidateParts)) return false;
     return true;
   });

@@ -2,7 +2,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { validateMakefileContext, validatePkgReleaseBumps, findPkgRoot, isPackageMakefilePath } from '../../src/validators.js';
 import {
-  CONFIG, makeCommit, existingPackage, diff, modified, added, removed, gitModified, gitAdded,
+  CONFIG, makeCommit, existingPackage, newPackage, diff, modified, added, removed, gitModified, gitAdded,
   assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes
 } from './helpers.js';
 
@@ -1023,6 +1023,39 @@ describe('PKG_MAINTAINER parsing', () => {
 
   test('still reads the addresses out of a real maintainer line', () => {
     assertNoErrors(validate('mypkg: set maintainer', settingMaintainer('Jane Doe <jane@doe.com>, Bob <bob@example.org>'), options));
+  });
+});
+
+describe('Makefile metadata indentation', () => {
+  const asNewMakefile = (body) => [
+    'diff --git a/utils/mypkg/Makefile b/utils/mypkg/Makefile',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/utils/mypkg/Makefile',
+    '@@ -0,0 +1,9 @@',
+    ...body.split('\n').map(l => '+' + l)
+  ].join('\n');
+  const validateNewMakefile = (body) => validate('mypkg: add package', asNewMakefile(body), {
+    config: { ...CONFIG, check_makefile_indentation: true },
+    state: newPackage(),
+    repo: 'openwrt/openwrt'
+  });
+
+  test('accepts the inheritance idiom at any indentation', () => {
+    // openwrt/openwrt writes it at column 0 more often than not - see
+    // package/devel/gdb and package/kernel/mwlwifi - and the packages feed
+    // uses all three forms, so there is no convention to enforce.
+    for (const call of ['$(call Package/mypkg/Default)', '  $(call Package/mypkg/Default)', '\t$(call Package/mypkg/Default)']) {
+      const res = validateNewMakefile(`define Package/mypkg\n${call}\n  TITLE:=My package\nendef`);
+      assert.ok(!res.errors.some(e => e.includes('must be indented with exactly 2 spaces')),
+        `${JSON.stringify(call)} -> ${res.errors.join(', ')}`);
+    }
+  });
+
+  test('still asks for two spaces on an ordinary metadata line', () => {
+    const res = validateNewMakefile('define Package/mypkg\n\tTITLE:=My package\nendef');
+    assert.ok(res.errors.some(e => e.includes("'TITLE:=My package'") && e.includes('exactly 2 spaces')),
+      `Errors: ${res.errors.join(', ')}`);
   });
 });
 

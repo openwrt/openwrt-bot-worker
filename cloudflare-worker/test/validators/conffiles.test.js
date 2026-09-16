@@ -78,6 +78,18 @@ describe('validateMakefileContext', () => {
       )
     },
     {
+      title: 'accepts an INSTALL_DIR directory written without a trailing slash',
+      patch: diff(
+        gitModified(FOO),
+        '+define Package/foo/conffiles',
+        '+/etc/foo.d',
+        '+endef',
+        '+define Package/foo/install',
+        '+\t$(INSTALL_DIR) $(1)/etc/foo.d',
+        '+endef'
+      )
+    },
+    {
       title: 'closes conffiles block on a define that is not a conffiles block',
       patch: diff(
         gitModified('net/foo/Makefile'),
@@ -110,6 +122,7 @@ describe('validateMakefileContext', () => {
 
   const INDENTED = 'must not contain any spaces or indentation';
   const RELATIVE = "must be an absolute path starting with '/'";
+  const TRAILING_SLASH = 'must not end with a trailing slash';
 
   test('does not leak conffiles block into install block when endef is in diff hunk header', () => {
     const res = validate('foo: test', diff(
@@ -182,6 +195,10 @@ describe('validateMakefileContext', () => {
     for (const text of ['Build/Configure', 'autoreconf', INDENTED, 'must be an absolute path']) assertNoErrorIncludes(res, text);
   });
 
+  // What an entry may look like, judged by what the build does with it:
+  // scripts/ipkg-build rewrites the first word of each line and hands the
+  // list to find, and whatever package-pack.mk does not checksum as a regular
+  // file goes to /lib/upgrade/keep.d, which sysupgrade expands with find.
   const conffilesBlock = (entries) =>
     validate('foo: test', diff(gitModified(FOO), '+define Package/foo/conffiles', entries.map(e => '+' + e), '+endef'));
   const conffilesErrorsFor = (entries) => conffilesBlock(entries).errors;
@@ -195,6 +212,14 @@ describe('validateMakefileContext', () => {
   // Blocks that must pass as they are.
   for (const { title, entries } of [
     {
+      // `scripts/ipkg-build` and sysupgrade both hand the entry to `find`, which
+      // walks a directory the same with or without the slash, and openwrt ships
+      // `/etc/ipsec.d` next to `/etc/dnsmasq.d/`, so demanding one spelling
+      // rejected valid Makefiles.
+      title: 'accepts a conffiles directory written without a trailing slash',
+      entries: ['/etc/config', '/etc/foo.conf', '/etc/foo.d']
+    },
+    {
       title: 'accepts conffiles .d directory with trailing slash',
       entries: ['/etc/foo.conf', '/etc/foo.d/']
     },
@@ -202,34 +227,47 @@ describe('validateMakefileContext', () => {
       title: 'accepts conffiles directory with trailing slash',
       entries: ['/etc/config/', '/etc/ssl/certs/']
     },
+    {
+      title: 'accepts the make expansions openwrt writes in conffiles blocks',
+      entries: [
+        '$(CONF_DIR)/my.cnf',
+        '$(config_directory)',
+        '$(Package/busybox/conffiles/crond)',
+        '$(call Package/tac_plus/Default/conffiles)',
+        '$(if $(CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK),/etc/ssl/modules.cnf.d/padlock.cnf)',
+        '/etc/$(PKG_NAME).conf'
+      ]
+    },
+    {
+      // gkrellmd, openvpn-easy-rsa and prometheus-node-exporter-ucode write these
+      title: 'accepts a literal path with an expansion in the middle or at the end',
+      entries: ['/etc/$(PKG_NAME).conf', '/etc/profile.d/50-$(PKG_NAME).sh', '/etc/config/$(PKG_NAME)']
+    },
+    {
+      // mariadb and postfix: the leading slash, if any, is decided at build time
+      title: 'accepts a path that begins with an expansion',
+      entries: ['$(CONF_DIR)/my.cnf', '$(config_directory)']
+    },
+    {
+      title: 'accepts a whole-line make call, nested expansions and interior spaces included',
+      entries: [
+        '$(if $(CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK),/etc/ssl/modules.cnf.d/padlock.cnf)',
+        '$(call Package/tac_plus/Default/conffiles)',
+        '$(call $(TARGET)/conffiles)',
+        '$(Package/busybox/conffiles/crond)',
+      ]
+    },
+    {
+      // Anywhere on the line: one that begins with literal text would otherwise
+      // be judged as a relative path.
+      title: 'stays silent on an unterminated expansion, which make itself refuses',
+      entries: ['$(unclosed/foo', 'etc$(unclosed/foo']
+    },
   ]) {
     test(title, () => {
       assert.deepStrictEqual(conffilesErrorsFor(entries), []);
     });
   }
-
-  test('rejects conffiles path for known directory missing trailing slash', () => {
-    assertErrorIncludes(conffilesBlock(['/etc/config']), "must end with a trailing slash '/'");
-  });
-
-  test('rejects conffiles path for .d directory missing trailing slash', () => {
-    const res = conffilesBlock(['/etc/foo.conf', '/etc/foo.d']);
-    assertErrorIncludes(res, "must end with a trailing slash '/'");
-    assertErrorIncludes(res, '/etc/foo.d');
-  });
-
-  test('rejects conffiles path for INSTALL_DIR directory missing trailing slash', () => {
-    const res = validate('foo: test', diff(
-      gitModified(FOO),
-      '+define Package/foo/conffiles',
-      '+/etc/foo.d',
-      '+endef',
-      '+define Package/foo/install',
-      '+\t$(INSTALL_DIR) $(1)/etc/foo.d',
-      '+endef'
-    ));
-    assertErrorIncludes(res, "must end with a trailing slash '/'");
-  });
 
   // Each entry goes into a block of its own, so one cannot hide behind another's error.
   for (const { title, entries, errors } of [
@@ -237,6 +275,21 @@ describe('validateMakefileContext', () => {
     { title: 'rejects conffiles block with tab indentation', entries: ['\t/etc/foo.json'], errors: [INDENTED] },
     { title: 'rejects conffiles block with spaces inside a line', entries: ['/etc/foo.json '], errors: [INDENTED] },
     { title: 'rejects conffiles path that is not an absolute path', entries: ['etc/foo.json'], errors: [RELATIVE] },
+    { title: 'still rejects an indented conffiles entry, expansion or not', entries: ['  $(CONF_DIR)/my.cnf'], errors: [INDENTED] },
+    { title: 'rejects a relative path however many expansions follow it', entries: ['foo$(WHATEVER)'], errors: [RELATIVE] },
+    { title: 'rejects two words on a line even when the second is an expansion', entries: ['not/a/path $(FOO)'], errors: [INDENTED, RELATIVE] },
+    {
+      title: 'rejects whitespace outside a call even when a call is present',
+      entries: ['$(call Package/x/Default/conffiles) ', '/etc/a /etc/b', '/etc/a.conf $(B)'],
+      errors: [INDENTED]
+    },
+    {
+      // uboot-envtools indents with a tab, bluez-tools with two spaces
+      title: 'rejects indentation with either whitespace character, expansion or not',
+      entries: ['\t/etc/config/ubootenv', '  /etc/config/btagent', '  $(CONF_DIR)/my.cnf'],
+      errors: [INDENTED]
+    },
+    { title: 'still rejects a trailing slash on an individual config file', entries: ['/etc/config/foo/'], errors: [TRAILING_SLASH] },
     {
       title: 'rejects conffiles path for individual file ending with trailing slash',
       entries: ['/etc/config/foo/'],
@@ -255,4 +308,27 @@ describe('validateMakefileContext', () => {
       }
     });
   }
+
+  test('rejects a trailing slash on a file even with an expansion in the path', () => {
+    assertSomeIncludes(conffilesErrorsFor(['/etc/config/$(PKG_NAME)/']), TRAILING_SLASH, 'errors');
+    assert.deepStrictEqual(conffilesErrorsFor(['/etc/dnsmasq.d/', '/etc/ipsec.d']), []);
+  });
+
+  test('accepts whitespace only as the separator after a make function name', () => {
+    assert.deepStrictEqual(conffilesErrorsFor([
+      '$(if $(filter y,$(CONFIG_X)),/etc/a.conf)',
+      '${call Package/tac_plus/Default/conffiles}',
+    ]), []);
+    // Each of these puts whitespace into what the line expands to.
+    for (const entry of ['$(if $(CONFIG_X),/etc/a /etc/b)', '$(foreach f,a b,/etc/$(f).conf)', '$(FOO BAR)/etc/x.conf', '$(if $(CONFIG_X), /etc/a)']) {
+      assertSomeIncludes(conffilesErrorsFor([entry]), INDENTED, `errors for ${JSON.stringify(entry)}`);
+    }
+  });
+
+  test('rejects a trailing slash on the file extensions the tree uses', () => {
+    for (const entry of ['/etc/mysql/my.cnf/', '/etc/fw_env.config/', '/etc/nftables.d/10-custom.nft/', '/etc/firewall.user/']) {
+      assertSomeIncludes(conffilesErrorsFor([entry]), TRAILING_SLASH, `errors for ${JSON.stringify(entry)}`);
+    }
+    assert.deepStrictEqual(conffilesErrorsFor(['/etc/nftables.d/', '/etc/luci-uploads/']), []);
+  });
 });
