@@ -1096,8 +1096,12 @@ async function handleWebhook(request, env) {
   const scannedPatches = usePrWidePatch
     ? [prPatch]
     : commitDetails.map(item => item.commitPatch);
+  // Stays false when no patch was read, e.g. GitHub refused the diff or every
+  // commit is a merge: the package state is then unknown, not empty.
+  let packageStateKnown = false;
   for (const patch of scannedPatches) {
     if (!patch) continue;
+    packageStateKnown = true;
     if (collectPackageMakefiles(patch, 'added').length > 0) {
       state.isNewPackage = true;
     }
@@ -1490,42 +1494,80 @@ async function handleWebhook(request, env) {
     await ensureLabelExists(token, repoFullname, name, color, description, existingLabels, () => { subrequestBudget.used++; });
   }
 
-  const currentPrLabels = new Set((data.pull_request?.labels || []).map(l => l.name.toLowerCase()));
+  // The payload shows the pull request as it was when the event was sent. A
+  // run for another event may have changed its labels since, or the branch
+  // may have moved on, so it is read again right before labelling. Without an
+  // answer, the payload is all there is.
+  let livePr = data.pull_request;
+  if (subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used > 0) {
+    const liveRes = await optionalApiCall(data.pull_request.url, token);
+    if (liveRes.code === 200 && Array.isArray(liveRes.data?.labels)) livePr = liveRes.data;
+  }
+  // Package and release labels follow the branch, so a run for an event the
+  // branch has since moved past leaves them to the run for the newer one.
+  const branchMoved = livePr.head?.sha !== headSha || livePr.base?.ref !== baseBranch;
+  // The guidelines verdict also reads the description, which can carry an
+  // override, so an edit since the event leaves that label to the newer run.
+  const verdictMoved = branchMoved || (livePr.body ?? '') !== (data.pull_request.body ?? '');
+
+  const currentPrLabels = new Set((livePr.labels || []).map(l => l.name.toLowerCase()));
+  // A removal must use the repository's spelling, e.g. "Add package".
+  const currentPrLabelNames = new Map((livePr.labels || []).map(l => [l.name.toLowerCase(), l.name]));
+  const spelledAsOnPr = (name) => currentPrLabelNames.get(name.toLowerCase()) || name;
 
   // New commits or a reopen are contributor activity: drop the stale marker
   // right away instead of waiting for the nightly scan to notice it.
   if ((data.action === 'synchronize' || data.action === 'reopened') && currentPrLabels.has('stale')) {
-    labelOperations.push(() => removeLabel('stale'));
+    labelOperations.push(() => removeLabel(spelledAsOnPr('stale')));
   }
 
   if (!allPassed) {
-    if (!currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
+    if (!verdictMoved && !currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       labelOperations.push(() => ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines'));
       labelsToAdd.push(LABEL_GUIDELINES);
     }
   } else {
     // Delete validation failure label if present
-    if (currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      labelOperations.push(() => removeLabel(LABEL_GUIDELINES));
+    if (!verdictMoved && currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
+      labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_GUIDELINES)));
     }
   }
 
-  if (CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
+  // Package and release labels describe the pull request's current content, so
+  // they come off when it no longer matches, whatever the flag that adds them
+  // says. Package labels only come off after a patch was actually read. Labels
+  // from labeler.yml are only ever added.
+  if (!branchMoved && CONFIG.add_package_label && state.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
     labelOperations.push(() => ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script'));
     labelsToAdd.push(LABEL_ADD_PACKAGE);
   }
 
-  if (CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
+  if (!branchMoved && packageStateKnown && !state.isNewPackage && currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
+    labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_ADD_PACKAGE)));
+  }
+
+  if (!branchMoved && CONFIG.drop_package_label && state.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
     labelOperations.push(() => ensureLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree'));
     labelsToAdd.push(LABEL_DROP_PACKAGE);
   }
 
-  if (CONFIG.branch_labeling && /^openwrt-\d{2}\.\d{2}$/.test(baseBranch)) {
-    const version = baseBranch.split('-')[1];
-    const labelName = `release/${version}`;
-    if (!currentPrLabels.has(labelName.toLowerCase())) {
-      labelOperations.push(() => ensureLabel(labelName, '6b7280', `Pull request targets the stable release branch ${labelName}`));
-      labelsToAdd.push(labelName);
+  if (!branchMoved && packageStateKnown && !state.isDroppedPackage && currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
+    labelOperations.push(() => removeLabel(spelledAsOnPr(LABEL_DROP_PACKAGE)));
+  }
+
+  const releaseMatch = baseBranch.match(/^openwrt-(\d{2}\.\d{2})$/);
+  const releaseLabel = releaseMatch ? `release/${releaseMatch[1]}` : null;
+
+  if (!branchMoved && CONFIG.branch_labeling && releaseLabel && !currentPrLabels.has(releaseLabel.toLowerCase())) {
+    labelOperations.push(() => ensureLabel(releaseLabel, '6b7280', `Pull request targets the stable release branch ${releaseLabel}`));
+    labelsToAdd.push(releaseLabel);
+  }
+
+  // Retargeting a pull request to another branch leaves the old release
+  // label behind, saying it goes somewhere it no longer goes.
+  for (const existing of currentPrLabels) {
+    if (!branchMoved && /^release\/\d{2}\.\d{2}$/.test(existing) && existing !== releaseLabel?.toLowerCase()) {
+      labelOperations.push(() => removeLabel(spelledAsOnPr(existing)));
     }
   }
 
