@@ -135,12 +135,45 @@ describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
       ]);
 
       assert.deepStrictEqual(result.get('ok'), { content: 'ok', exists: true, isBinary: false });
-      assert.deepStrictEqual(result.get('broken'), { content: null, exists: false, isBinary: false });
+      assert.deepStrictEqual(result.get('broken'), { content: null, exists: false, isBinary: false, failed: true });
       assert.strictEqual(warned, true);
     } finally {
       console.warn = originalWarn;
     }
   });
+
+  // An empty field is either a file that is not there or a field an error
+  // took away, and only the first may be read as the file being missing.
+  for (const [title, data, errors, expected] of [
+    ['marks the fields of a repository a partial error names',
+      { repo0: { f0: null }, repo1: null },
+      [{ message: "Could not resolve to a Repository with the name 'someuser/gone'.", path: ['repo1'] }],
+      { missing: { content: null, exists: false, isBinary: false }, lost: { content: null, exists: false, isBinary: false, failed: true } }],
+    ['marks only the field a partial error names, not the empty fields beside it',
+      { repo0: { f0: null }, repo1: { f0: null } },
+      [{ message: 'Something went wrong while executing your query.', path: ['repo0', 'f1'] }],
+      { missing: { content: null, exists: false, isBinary: false }, lost: { content: null, exists: false, isBinary: false } }],
+    ['marks every empty field when a partial error names no place',
+      { repo0: { f0: null }, repo1: { f0: { text: 'ok' } } },
+      [{ message: 'Something went wrong while executing your query.' }],
+      { missing: { content: null, exists: false, isBinary: false, failed: true }, lost: { content: 'ok', exists: true, isBinary: false } }]
+  ]) {
+    test(title, async () => {
+      const originalWarn = console.warn;
+      console.warn = () => {};
+      try {
+        fetchMock = () => new Response(JSON.stringify({ data, errors }), { status: 200 });
+        const result = await graphqlBatchFetchFiles('token', [
+          { key: 'missing', repoFullname: 'openwrt/openwrt', ref: 'sha', path: 'a' },
+          { key: 'lost', repoFullname: 'someuser/gone', ref: 'sha', path: 'a' }
+        ]);
+        assert.deepStrictEqual(result.get('missing'), expected.missing);
+        assert.deepStrictEqual(result.get('lost'), expected.lost);
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+  }
 
   test('resolves every probe to an error when the HTTP call itself fails', async () => {
     fetchMock = () => new Response('Too many subrequests', { status: 500 });
