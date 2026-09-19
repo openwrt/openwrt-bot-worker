@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from './config.js';
+import { DEFAULT_CONFIG, LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE, LABEL_SKIP_BOT } from './config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from './labeler.js';
 import { verifySignature, getInstallationToken } from './crypto.js';
 import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlFetchRepoSetup, ensureLabelExists, fetchUserRepoPermission } from './github.js';
@@ -324,6 +324,14 @@ async function handleWebhook(request, env) {
     return new Response("Not a pull request or issue comment event", { status: 200 });
   }
 
+  // PR comments carry labels on the issue object. Honor the opt-out before
+  // minting a token or doing any repository work, but still verify signatures.
+  const payloadPr = event === 'pull_request' ? data.pull_request
+    : (event === 'issue_comment' && data.issue?.pull_request ? data.issue : null);
+  if (payloadPr?.labels?.some(l => l.name.toLowerCase() === LABEL_SKIP_BOT)) {
+    return new Response(`Ignored pull request with ${LABEL_SKIP_BOT} label`, { status: 200 });
+  }
+
   if (event === "issue_comment") {
     if (data.action !== "created") {
       return new Response("Ignored issue comment action", { status: 200 });
@@ -501,6 +509,10 @@ async function handleWebhook(request, env) {
     const prRes = await trackedApiCall(prUrl, token);
     if (prRes.code !== 200) {
       throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes.code})`);
+    }
+    // The label may have been added since the comment webhook was delivered.
+    if (prRes.data?.labels?.some(l => l.name.toLowerCase() === LABEL_SKIP_BOT)) {
+      return new Response(`Ignored pull request with ${LABEL_SKIP_BOT} label`, { status: 200 });
     }
     // Nothing about a closed pull request can be fixed by re-validating it:
     // a merged one is already in the history, and a rejected one is not going

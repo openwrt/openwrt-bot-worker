@@ -73,6 +73,7 @@ export const DEFAULT_CONFIG = {
 export const LABEL_GUIDELINES = 'not following guidelines';
 export const LABEL_ADD_PACKAGE = 'add package';
 export const LABEL_DROP_PACKAGE = 'drop package';
+export const LABEL_SKIP_BOT = 'bot:skip';
 
 // Default wording for everything the issue labeller says. The text is English
 // and the hints name OpenWrt's own commands, which suits openwrt/openwrt and
