@@ -1,6 +1,6 @@
 import { githubApiCall, GRAPHQL_URL } from './github.js';
 import { generateJWT } from './crypto.js';
-import { LABEL_GUIDELINES, DEFAULT_CONFIG } from './config.js';
+import { LABEL_GUIDELINES, LABEL_SKIP_BOT, DEFAULT_CONFIG } from './config.js';
 
 // Bot accounts cannot rescue a stale PR: the app's own comments, other GitHub
 // Apps and *[bot] accounts are recognized by shape, and automation that runs
@@ -218,7 +218,7 @@ async function fetchStalePullRequests(token, repo, labelNames) {
       nodes {
         number
         updatedAt
-        labels(first: 50) { nodes { name } }
+        labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
         timelineItems(last: ${STALE_TIMELINE_WINDOW}, itemTypes: [LABELED_EVENT, ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT, REOPENED_EVENT]) {
           totalCount
           nodes {
@@ -251,6 +251,7 @@ async function fetchStalePullRequests(token, repo, labelNames) {
         number: node.number,
         updated_at: node.updatedAt,
         labels: (node.labels?.nodes || []).map(l => ({ name: l.name })),
+        labelsTruncated: node.labels?.pageInfo?.hasNextPage === true,
         timeline: timelineFromGraphql(node.timelineItems?.nodes),
         // True when the window did not reach back far enough to hold the whole
         // history, which is what makes a missing stale-labelling event
@@ -373,6 +374,11 @@ export async function handleScheduled(env) {
           console.log(`[Stale Bot] Found ${prs.length} open PRs to verify in ${repo}`);
 
           for (const pr of prs) {
+            // An incomplete label list cannot rule out bot:skip. Leave such
+            // PRs alone as well, including any existing stale marker.
+            if (pr.labelsTruncated || pr.labels.some(l => l.name.toLowerCase() === LABEL_SKIP_BOT)) {
+              continue;
+            }
             const prNumber = pr.number;
             const updatedAt = new Date(pr.updated_at);
             const hasStaleLabel = pr.labels.some(l => l.name.toLowerCase() === 'stale');

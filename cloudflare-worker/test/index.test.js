@@ -55,7 +55,10 @@ function staleGraphqlHandler(url, options, { config = null, staleLabelExists = t
             nodes: prs.map(pr => ({
               number: pr.number,
               updatedAt: pr.updatedAt,
-              labels: { nodes: (pr.labels || []).map(name => ({ name })) },
+              labels: {
+                nodes: (pr.labels || []).map(name => ({ name })),
+                pageInfo: { hasNextPage: pr.labelsTruncated || false }
+              },
               timelineItems: {
                 totalCount: pr.timelineTotalCount ?? (pr.timeline || []).length,
                 nodes: staleTimelineNodes(pr.timeline)
@@ -104,6 +107,131 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
 
   after(() => {
     globalThis.fetch = originalFetch;
+  });
+
+  for (const [event, action] of [
+    ['pull_request', 'opened'], ['pull_request', 'synchronize'],
+    ['pull_request', 'reopened'], ['pull_request', 'edited'],
+    ['issue_comment', 'created']
+  ]) {
+    test(`bot:skip ignores ${event}/${action} without API calls`, async () => {
+      const pr = { number: 123, labels: [{ name: 'bug' }, { name: 'Bot:Skip' }] };
+      const payload = JSON.stringify({
+        action,
+        ...(event === 'pull_request' ? { pull_request: pr } : {
+          issue: { ...pr, pull_request: {} },
+          comment: { user: { login: 'maintainer' }, author_association: 'MEMBER' }
+        }),
+        changes: { body: { from: '' } }
+      });
+      const secret = 'mysecret';
+      const signature = await calculateHmac(secret, payload);
+      const calls = [];
+      fetchMock = async (url) => {
+        calls.push(url);
+        throw new Error(`Unexpected API call: ${url}`);
+      };
+      try {
+        const request = (sig) => new Request('http://localhost/webhook', {
+          method: 'POST', body: payload,
+          headers: { 'x-hub-signature-256': sig, 'x-github-event': event }
+        });
+        const response = await worker.fetch(request(signature), { WEBHOOK_SECRET: secret }, {});
+        assert.strictEqual(response.status, 200);
+        assert.match(await response.text(), /Ignored pull request with bot:skip label/);
+        const invalid = await worker.fetch(request('sha256=' + '0'.repeat(64)), { WEBHOOK_SECRET: secret }, {});
+        assert.strictEqual(invalid.status, 403);
+        assert.deepStrictEqual(calls, []);
+      } finally {
+        fetchMock = null;
+      }
+    });
+  }
+
+  test('bot:skip requires an exact PR label and does not suppress regular issues', async () => {
+    const secret = 'mysecret';
+    for (const [event, data] of [
+      ['pull_request', { pull_request: { labels: [{ name: 'bot:skip-later' }] } }],
+      ['pull_request', { pull_request: { labels: [] } }],
+      ['pull_request', { pull_request: {} }],
+      ['issues', { issue: { labels: [{ name: 'bot:skip' }] } }]
+    ]) {
+      const payload = JSON.stringify({ action: 'opened', ...data });
+      const signature = await calculateHmac(secret, payload);
+      const response = await worker.fetch(new Request('http://localhost/webhook', {
+        method: 'POST', body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': event }
+      }), { WEBHOOK_SECRET: secret }, {});
+      // These deliveries must proceed to the normal installation check.
+      assert.strictEqual(response.status, 400);
+      assert.strictEqual(await response.text(), 'Missing installation ID');
+    }
+  });
+
+  test('bot:skip also checks current PR labels before a comment-triggered recheck', async () => {
+    const calls = [];
+    fetchMock = async (url) => {
+      calls.push(url);
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }));
+      }
+      if (url.endsWith('/pulls/123')) {
+        return new Response(JSON.stringify({ labels: [{ name: 'BOT:SKIP' }] }));
+      }
+      throw new Error(`Unexpected API call: ${url}`);
+    };
+    const payload = JSON.stringify({
+      action: 'created',
+      issue: { number: 123, pull_request: {}, labels: [] },
+      comment: { user: { login: 'maintainer' }, author_association: 'MEMBER' },
+      installation: { id: 456 }, repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    try {
+      const response = await worker.fetch(new Request('http://localhost/webhook', {
+        method: 'POST', body: payload,
+        headers: { 'x-hub-signature-256': signature, 'x-github-event': 'issue_comment' }
+      }), { WEBHOOK_SECRET: secret, APP_ID: '12345', PRIVATE_KEY: privateKeyPEM }, {});
+      assert.strictEqual(response.status, 200);
+      assert.match(await response.text(), /Ignored pull request with bot:skip label/);
+      assert.strictEqual(calls.length, 2);
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('bot:skip leaves every stale cleanup action untouched, while other PRs still run', async () => {
+    const writes = [];
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const prs = [
+      { number: 1, labels: ['bot:skip', 'not following guidelines'] },
+      { number: 2, labels: ['BOT:SKIP', 'stale', 'not following guidelines'],
+        timeline: [{ kind: 'labeled', label: 'stale', at: old }] },
+      { number: 3, labels: ['Bot:Skip', 'stale'] },
+      { number: 4, labels: ['not following guidelines'], labelsTruncated: true },
+      { number: 5, labels: ['bot:skip-later', 'not following guidelines'] }
+    ].map(pr => ({ updatedAt: old, ...pr }));
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) return new Response(JSON.stringify({ token: 'inst-token' }));
+      if (url.includes('/app/installations')) return new Response(JSON.stringify([{ id: 101 }]));
+      if (url.includes('/installation/repositories')) {
+        return new Response(JSON.stringify({ repositories: [{ full_name: 'test/repo' }] }));
+      }
+      const result = staleGraphqlHandler(url, options, { config: { enable_stale_bot: true }, prs });
+      if (result) return result;
+      if (options?.method && options.method !== 'GET') writes.push({ url, method: options.method });
+      return new Response(JSON.stringify({}));
+    };
+    try {
+      await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM });
+      assert.deepStrictEqual(writes, [
+        { url: 'https://api.github.com/repos/test/repo/issues/5/labels', method: 'POST' },
+        { url: 'https://api.github.com/repos/test/repo/issues/5/comments', method: 'POST' }
+      ]);
+    } finally {
+      fetchMock = null;
+    }
   });
 
   test('returns 400 for non-webhook path', async () => {
@@ -6068,4 +6196,3 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
     }
   });
 });
-
