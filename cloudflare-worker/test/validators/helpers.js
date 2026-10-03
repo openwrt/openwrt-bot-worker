@@ -20,6 +20,7 @@ export const CONFIG = {
   require_release_notes: true,
   require_body: true,
   check_pkg_version: true,
+  check_binary_files: true,
   check_crlf: true,
   check_trailing_newline: true,
   add_package_label: true,

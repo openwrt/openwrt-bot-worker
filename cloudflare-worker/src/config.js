@@ -23,6 +23,7 @@ export const DEFAULT_CONFIG = {
 
   // Makefile Check features
   check_pkg_version: true,
+  check_binary_files: true,
   check_crlf: true,
   check_trailing_newline: true,
   add_package_label: true,

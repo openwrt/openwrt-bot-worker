@@ -146,6 +146,7 @@ Some configuration keys offer advanced options:
 *   `check_openwrt_meta`: Can be `true` (enforces standard `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` for new packages), `false` (disabled), or an array of custom required fields (e.g., `["PKG_MAINTAINER", "PKG_LICENSE"]`).
 *   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
+*   `check_binary_files`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable. Rejects a file git carries as binary, in any encoding, since such a file reaches none of the content checks and cannot be reviewed in a diff. Deleting one is always allowed.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
 *   `check_pkg_hash`: `"warning"` (default) reports checksum findings without blocking, `"error"` enforces them, `false` disables the check. While it is enabled, a checksum value the build cannot use is an error at either level.
 *   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
@@ -187,6 +188,7 @@ Here is a comprehensive example containing all available toggle options:
   "require_release_notes": true,
   "require_body": true,
   "check_pkg_version": true,
+  "check_binary_files": true,
   "check_crlf": true,
   "check_trailing_newline": true,
   "add_package_label": true,
