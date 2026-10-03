@@ -1666,6 +1666,23 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     }
   }
 
+  if (CONFIG.check_binary_files && CONFIG.check_binary_files !== 'disabled') {
+    const binaryFiles = collectBinaryFiles(commitPatch);
+    const isWarning = CONFIG.check_binary_files === 'warning';
+    if (binaryFiles.length > 0) {
+      binaryFiles.forEach(file => {
+        const msg = `- File '${file}' is not text. Commit the source it is generated from and have the build generate it`;
+        if (isWarning) {
+          warnings.push(msg);
+        } else {
+          errors.push(msg);
+        }
+      });
+    } else {
+      successes.push("✅ File additions are text");
+    }
+  }
+
   if (CONFIG.check_crlf) {
     if (/^\+.*\r$/m.test(commitPatch)) {
       errors.push("- Windows style line endings (CRLF) detected inside added source lines. Use UNIX (LF) formatting exclusively");
@@ -1958,6 +1975,47 @@ export const collectFileLineChanges = rememberPerPatch(function collectFileLineC
   }
   for (const file of Object.keys(changes)) Object.freeze(changes[file]);
   return Object.freeze(changes);
+});
+
+// Files whose content git could not express as hunks, which it marks in the
+// file header and then carries as a base85 payload or not at all. Such a file
+// has no `+++ b/` line, so every parser above walks straight past it and none
+// of the content checks ever see it. Deletions are left out: removing one is
+// the remedy, not the offence.
+export const collectBinaryFiles = rememberPerPatch(function collectBinaryFiles(patch) {
+  const files = [];
+  if (!patch) return Object.freeze(files);
+
+  let currentFile = null;
+  let deleted = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      currentFile = match ? match[2].trim().replace(/\r$/, '') : null;
+      deleted = false;
+      continue;
+    }
+    if (line.startsWith('From ') && MAIL_ENVELOPE.test(line)) {
+      currentFile = null;
+      continue;
+    }
+    if (!currentFile) continue;
+    // Past the file header the markers below are ordinary content, and an
+    // in-tree .patch file legitimately carries them.
+    if (line.startsWith('@@')) {
+      currentFile = null;
+      continue;
+    }
+    if (line.startsWith('deleted file mode ')) {
+      deleted = true;
+      continue;
+    }
+    if (line === 'GIT binary patch' || /^Binary files .* differ\r?$/.test(line)) {
+      if (!deleted) files.push(currentFile);
+      currentFile = null;
+    }
+  }
+  return Object.freeze(files);
 });
 
 export function isHiddenOrSpecial(filePath) {
