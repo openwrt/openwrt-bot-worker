@@ -236,18 +236,26 @@ async function fetchStalePullRequests(token, repo, labelNames) {
   }
 }`;
 
-  const prs = [];
+  const { outcome, items } = await fetchLabelledWithTimeline(
+    token, query, { owner, name, labels: labelNames }, 'pullRequests',
+    `querying pull requests for ${repo}`);
+  return { outcome, prs: items };
+}
+
+// Walks one labelled connection (pullRequests or issues) page by page.
+async function fetchLabelledWithTimeline(token, query, variables, connection, label) {
+  const items = [];
   let after = null;
   while (true) {
     const res = await githubApiCall(GRAPHQL_URL, token, 'POST', {
       query,
-      variables: { owner, name, labels: labelNames, after }
+      variables: { ...variables, after }
     });
-    const outcome = graphqlOutcome(res, `querying pull requests for ${repo}`);
-    if (outcome !== 'ok') return { outcome, prs };
-    const page = res.data.data.repository.pullRequests;
+    const outcome = graphqlOutcome(res, label);
+    if (outcome !== 'ok') return { outcome, items };
+    const page = res.data.data.repository[connection];
     for (const node of page?.nodes || []) {
-      prs.push({
+      items.push({
         number: node.number,
         updated_at: node.updatedAt,
         labels: (node.labels?.nodes || []).map(l => ({ name: l.name })),
@@ -258,9 +266,111 @@ async function fetchStalePullRequests(token, repo, labelNames) {
         timelineTruncated: (node.timelineItems?.totalCount || 0) > STALE_TIMELINE_WINDOW
       });
     }
-    if (!page?.pageInfo?.hasNextPage) return { outcome: 'ok', prs };
+    if (!page?.pageInfo?.hasNextPage) return { outcome: 'ok', items };
     after = page.pageInfo.endCursor;
   }
+}
+
+// Open issues carrying any of the given labels, least recently updated first,
+// each with the recent slice of its timeline.
+async function fetchStaleIssues(token, repo, labelNames) {
+  const slashIndex = repo.indexOf('/');
+  const query = `query($owner: String!, $name: String!, $labels: [String!], $after: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: OPEN, labels: $labels, first: 50, after: $after, orderBy: { field: UPDATED_AT, direction: ASC }) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        updatedAt
+        labels(first: 50) { nodes { name } }
+        timelineItems(last: ${STALE_TIMELINE_WINDOW}, itemTypes: [LABELED_EVENT, ISSUE_COMMENT, REOPENED_EVENT]) {
+          totalCount
+          nodes {
+            __typename
+            ... on LabeledEvent { createdAt label { name } }
+            ... on IssueComment { createdAt author { login __typename } }
+            ... on ReopenedEvent { createdAt actor { login __typename } }
+          }
+        }
+      }
+    }
+  }
+}`;
+  return fetchLabelledWithTimeline(token, query,
+    { owner: repo.slice(0, slashIndex), name: repo.slice(slashIndex + 1), labels: labelNames },
+    'issues', `querying issues for ${repo}`);
+}
+
+async function ensureStaleLabel(token, repo, state) {
+  if (state.staleLabelExists) return;
+  await githubApiCall(`https://api.github.com/repos/${repo}/labels`, token, 'POST', {
+    name: 'stale',
+    color: '6b7280',
+    description: 'This PR has been marked stale due to inactivity'
+  });
+  state.staleLabelExists = true;
+}
+
+// Issues reported against a release that no longer gets updates, imported
+// from an old tracker or flagged invalid rarely get another look. An issue
+// carrying one of `issue_stale_labels` is asked once whether the problem
+// still happens, marked stale after 14 idle days, and closed 14 days later
+// unless a person replies. A reply keeps it open for good: the label that
+// made it a candidate usually stays, so asking again would repeat forever.
+async function scanStaleIssues(token, repo, repoConfig, ignoredLogins, state, staleThresholdDate) {
+  const triggers = Array.isArray(repoConfig.issue_stale_labels)
+    ? repoConfig.issue_stale_labels.map(String)
+    : DEFAULT_CONFIG.issue_stale_labels;
+  if (triggers.length === 0) return 'ok';
+  const maxNotices = Number.isInteger(repoConfig.issue_stale_max_per_run)
+    ? repoConfig.issue_stale_max_per_run
+    : DEFAULT_CONFIG.issue_stale_max_per_run;
+
+  const result = await fetchStaleIssues(token, repo, [...triggers, 'stale']);
+  if (result.outcome !== 'ok') return result.outcome;
+
+  const triggerSet = new Set(triggers.map(l => l.toLowerCase()));
+  let notices = 0;
+  for (const issue of result.items) {
+    const n = issue.number;
+    const issueUrl = `https://api.github.com/repos/${repo}/issues/${n}`;
+    const hasStaleLabel = issue.labels.some(l => l.name.toLowerCase() === 'stale');
+    const trigger = issue.labels.find(l => triggerSet.has(l.name.toLowerCase()))?.name;
+    const staleEvents = issue.timeline
+      .filter(e => e.event === 'labeled' && e.label?.name === 'stale')
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    if (hasStaleLabel) {
+      // A stale label someone set by hand, or one whose labelling fell out of
+      // the fetched window, is not this bot's to act on.
+      if (staleEvents.length === 0) continue;
+      const labeledAt = new Date(staleEvents[0].created_at);
+      if (!trigger || hasRealActivitySince(issue.timeline, labeledAt, ignoredLogins)) {
+        console.log(`[Stale Bot] Issue #${n} is no longer stale. Removing stale label.`);
+        await githubApiCall(`${issueUrl}/labels/stale`, token, 'DELETE');
+      } else if (labeledAt < staleThresholdDate) {
+        console.log(`[Stale Bot] Closing stale issue #${n}`);
+        await githubApiCall(`${issueUrl}/comments`, token, 'POST', {
+          body: 'This issue was closed because it had been marked stale for 14 days with no reply.\n\nIf the problem still happens on a supported release or a snapshot, comment with the version you tested and ask a maintainer to reopen it.'
+        });
+        await githubApiCall(issueUrl, token, 'PATCH', { state: 'closed', state_reason: 'not_planned' });
+      }
+      continue;
+    }
+
+    if (!trigger || notices >= maxNotices) continue;
+    if (staleEvents.length > 0 || issue.timelineTruncated) continue;
+    if (new Date(issue.updated_at) >= staleThresholdDate) continue;
+
+    console.log(`[Stale Bot] Marking issue #${n} as stale`);
+    await ensureStaleLabel(token, repo, state);
+    await githubApiCall(`${issueUrl}/labels`, token, 'POST', { labels: ['stale'] });
+    await githubApiCall(`${issueUrl}/comments`, token, 'POST', {
+      body: `This issue has been marked stale because it has the "${trigger}" label and has seen no activity for 14 days.\nIf the problem still happens on a supported release or a snapshot, comment with the version you tested and the stale label will be removed. Otherwise this issue will be closed in 14 days.`
+    });
+    notices++;
+  }
+  return 'ok';
 }
 
 export async function handleScheduled(env) {
@@ -344,7 +454,8 @@ export async function handleScheduled(env) {
             }
           }
 
-          if (!enableStaleBot) {
+          const enableIssueStaleBot = repoConfig?.enable_issue_stale_bot === true;
+          if (!enableStaleBot && !enableIssueStaleBot) {
             console.log(`[Stale Bot] Stale bot is disabled for repository: ${repo}. Skipping.`);
             continue;
           }
@@ -353,7 +464,21 @@ export async function handleScheduled(env) {
             ? repoConfig.stale_ignored_users
             : DEFAULT_CONFIG.stale_ignored_users;
           const ignoredLogins = new Set(ignoredUserList.map(u => String(u).toLowerCase()));
-          let staleLabelExists = setup.staleLabelExists;
+          const labelState = { staleLabelExists: setup.staleLabelExists };
+
+          if (enableIssueStaleBot) {
+            const issueOutcome = await scanStaleIssues(token, repo, repoConfig, ignoredLogins, labelState, staleThresholdDate);
+            if (issueOutcome === 'fatal') {
+              return;
+            }
+            if (issueOutcome !== 'ok') {
+              console.warn(`[Stale Bot] Skipping issues of repository ${repo}.`);
+            }
+          }
+          if (!enableStaleBot) {
+            continue;
+          }
+          let staleLabelExists = labelState.staleLabelExists;
 
           // 4. The open pull requests carrying either label, each with its
           // recent timeline attached. GraphQL reads the label list as "any

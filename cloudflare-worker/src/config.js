@@ -64,6 +64,15 @@ export const DEFAULT_CONFIG = {
   // full set of keys a repository can set.
   enable_stale_bot: false,
 
+  // Stale issues: issues carrying one of `issue_stale_labels` (an unsupported
+  // release, an old tracker import, "invalid") are asked once whether the
+  // problem still happens and closed if nobody replies. At most
+  // `issue_stale_max_per_run` issues are marked per daily scan, so turning it
+  // on does not post on a whole backlog at once.
+  enable_issue_stale_bot: false,
+  issue_stale_labels: [],
+  issue_stale_max_per_run: 10,
+
   // Stale bot: machine accounts whose comments and reviews must not reset the
   // stale countdown. GitHub Apps and *[bot] accounts are always ignored by
   // shape; automation running on a plain User account (an AI reviewer such as
