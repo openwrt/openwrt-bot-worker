@@ -51,4 +51,59 @@ describe('GitHubWriteQueue', () => {
     assert.strictEqual(response.status, 502);
     assert.strictEqual(queue.statusWrites[0].code, 599);
   });
+
+  test('executes all writes when subrequest budget has sufficient headroom', async () => {
+    const queue = new GitHubWriteQueue(101);
+    const executed = [];
+    const budget = { limit: 50, used: 40, reserve: 5 }; // 10 remaining > 2 critical + 1 non-critical
+
+    queue.enqueue('label-add', async () => {
+      executed.push('label-add');
+      budget.used++;
+      return { code: 200 };
+    });
+    queue.enqueue('check-run-1', async () => {
+      executed.push('check-run-1');
+      budget.used++;
+      return { code: 201 };
+    }, { isCritical: true });
+    queue.enqueue('check-run-2', async () => {
+      executed.push('check-run-2');
+      budget.used++;
+      return { code: 201 };
+    }, { isCritical: true });
+
+    const result = await queue.execute(budget);
+    assert.strictEqual(result, null);
+    assert.deepStrictEqual(executed, ['label-add', 'check-run-1', 'check-run-2']);
+  });
+
+  test('skips non-critical writes when remaining budget is reserved for critical check-runs', async () => {
+    const queue = new GitHubWriteQueue(102);
+    const executed = [];
+    // 50 - 48 = 2 remaining calls, but there are 2 critical operations pending!
+    const budget = { limit: 50, used: 48, reserve: 2 };
+
+    queue.enqueue('label-add', async () => {
+      executed.push('label-add');
+      budget.used++;
+      return { code: 200 };
+    });
+    queue.enqueue('check-run-1', async () => {
+      executed.push('check-run-1');
+      budget.used++;
+      return { code: 201 };
+    }, { isCritical: true });
+    queue.enqueue('check-run-2', async () => {
+      executed.push('check-run-2');
+      budget.used++;
+      return { code: 201 };
+    }, { isCritical: true });
+
+    const result = await queue.execute(budget);
+    assert.strictEqual(result, null);
+    // Non-critical write 'label-add' must be skipped to protect budget for the 2 check-runs
+    assert.deepStrictEqual(executed, ['check-run-1', 'check-run-2']);
+    assert.strictEqual(queue.statusWrites.length, 2);
+  });
 });

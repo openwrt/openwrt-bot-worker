@@ -7,9 +7,10 @@ import { syncPrComment } from './comment-report.ts';
 import { enqueueCheckRuns } from './check-run-report.ts';
 import { GitHubWriteQueue } from '../../core/github-write-queue.ts';
 import type { Env } from '../../types/env.ts';
+import type { PullRequestEventPayload, IssueCommentEventPayload } from '../../types/github.ts';
 
 export async function handlePullRequestEvent(
-  data: any,
+  data: unknown,
   event: string,
   env: Env,
   token: string,
@@ -17,8 +18,13 @@ export async function handlePullRequestEvent(
   appId: number | null,
   tokenMintAttempts: number
 ): Promise<Response> {
+  if (!data || typeof data !== 'object') {
+    return new Response("Invalid payload: expected JSON object", { status: 400 });
+  }
+  const payload = data as PullRequestEventPayload | IssueCommentEventPayload;
+
   // 1. Context loading & early bot filtering
-  const contextResult = await loadPullRequestContext(data, event, env, token, repoFullname, appId, tokenMintAttempts);
+  const contextResult = await loadPullRequestContext(payload, event, env, token, repoFullname, appId, tokenMintAttempts);
   if (contextResult.kind === 'response') {
     return contextResult.response;
   }
@@ -40,7 +46,7 @@ export async function handlePullRequestEvent(
   enqueueCheckRuns(ctx, report, queue);
 
   // 6. Execute writes sequentially & check results
-  const errorResponse = await queue.execute();
+  const errorResponse = await queue.execute(ctx.client.budget);
   if (errorResponse) {
     return errorResponse;
   }

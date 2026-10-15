@@ -117,6 +117,6 @@ export function enqueueCheckRuns(
   const runs = buildCheckRunPayloads(report, headSha);
 
   for (const { label, payload } of runs) {
-    queue.enqueue(label, () => client.trackedApiCall(checkRunsUrl, 'POST', payload));
+    queue.enqueue(label, () => client.trackedApiCall(checkRunsUrl, 'POST', payload), { isCritical: true });
   }
 }

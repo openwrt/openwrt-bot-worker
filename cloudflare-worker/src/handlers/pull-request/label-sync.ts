@@ -1,4 +1,3 @@
-import { ensureLabelExists } from '../../github.js';
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from '../../config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from '../../labeler.js';
 import type { PullRequestContext } from './context.ts';
@@ -18,9 +17,13 @@ export async function syncLabels(
 
   const prLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/labels`;
   const labelsToAdd: string[] = [];
+  const labelsToEnsure: Array<{ name: string; color: string; description: string }> = [];
 
-  const ensureLabel = async (name: string, color: string, description: string) => {
-    await ensureLabelExists(ctx.token, repoFullname, name, color, description, existingLabels, () => { client.budget.used++; });
+  const requestLabel = (name: string, color: string, description: string) => {
+    if (!existingLabels?.has(name.toLowerCase())) {
+      labelsToEnsure.push({ name, color, description });
+    }
+    labelsToAdd.push(name);
   };
 
   let livePr = prData;
@@ -51,8 +54,7 @@ export async function syncLabels(
 
   if (!allPassed) {
     if (!verdictMoved && !currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
-      await ensureLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines');
-      labelsToAdd.push(LABEL_GUIDELINES);
+      requestLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines');
     }
   } else {
     if (!verdictMoved && currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
@@ -61,8 +63,7 @@ export async function syncLabels(
   }
 
   if (!branchMoved && config.add_package_label && packageState.isNewPackage && !currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
-    await ensureLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script');
-    labelsToAdd.push(LABEL_ADD_PACKAGE);
+    requestLabel(LABEL_ADD_PACKAGE, '0e7490', 'Introduces a new package Makefile build script');
   }
 
   if (!branchMoved && packageStateKnown && !packageState.isNewPackage && currentPrLabels.has(LABEL_ADD_PACKAGE.toLowerCase())) {
@@ -70,8 +71,7 @@ export async function syncLabels(
   }
 
   if (!branchMoved && config.drop_package_label && packageState.isDroppedPackage && !currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
-    await ensureLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree');
-    labelsToAdd.push(LABEL_DROP_PACKAGE);
+    requestLabel(LABEL_DROP_PACKAGE, '3b82f6', 'Removes an existing package Makefile from the tracking tree');
   }
 
   if (!branchMoved && packageStateKnown && !packageState.isDroppedPackage && currentPrLabels.has(LABEL_DROP_PACKAGE.toLowerCase())) {
@@ -82,8 +82,7 @@ export async function syncLabels(
   const releaseLabel = releaseMatch ? `release/${releaseMatch[1]}` : null;
 
   if (!branchMoved && config.branch_labeling && releaseLabel && !currentPrLabels.has(releaseLabel.toLowerCase())) {
-    await ensureLabel(releaseLabel, '6b7280', `Pull request targets the stable release branch ${releaseLabel}`);
-    labelsToAdd.push(releaseLabel);
+    requestLabel(releaseLabel, '6b7280', `Pull request targets the stable release branch ${releaseLabel}`);
   }
 
   for (const existing of currentPrLabels) {
@@ -114,13 +113,36 @@ export async function syncLabels(
       const matchedLabels = getLabelsForChangedFiles(changedFiles, parsedLabeler);
       for (const label of matchedLabels) {
         if (!currentPrLabels.has(label.toLowerCase())) {
-          await ensureLabel(label, 'bfd4f2', '');
-          labelsToAdd.push(label);
+          requestLabel(label, 'bfd4f2', '');
         }
       }
     } catch (e: any) {
       console.error(`Failed to parse or process labeler.yml: ${e.message}`);
     }
+  }
+
+  // Ensure labels exist before adding them to the PR
+  for (const lbl of labelsToEnsure) {
+    queue.enqueue(`ensure label "${lbl.name}"`, async () => {
+      if (existingLabels?.has(lbl.name.toLowerCase())) {
+        return { code: 200 };
+      }
+      const url = `https://api.github.com/repos/${repoFullname}/labels`;
+      const res = await client.trackedApiCall(url, 'POST', {
+        name: lbl.name,
+        color: lbl.color || 'ededed',
+        description: lbl.description || ''
+      });
+      if (res.code === 422) {
+        existingLabels?.add(lbl.name.toLowerCase());
+        return { code: 200 };
+      }
+      if (res.code >= 200 && res.code < 300) {
+        existingLabels?.add(lbl.name.toLowerCase());
+        return { code: 200 };
+      }
+      return res;
+    });
   }
 
   if (labelsToAdd.length > 0) {

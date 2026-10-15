@@ -1,5 +1,6 @@
 import { parseAndValidateConfig } from '../../types/config.ts';
-import { graphqlFetchRepoSetup, ensureLabelExists } from '../../github.js';
+import { graphqlFetchRepoSetup } from '../../github.js';
+import { GitHubWriteQueue } from '../../core/github-write-queue.ts';
 import { parseEnvInt } from '../../core/utils.ts';
 import { createMaintainerResolver } from '../../core/maintainer-resolver.ts';
 import { scanCommentList, scanPrComments } from '../../core/comment-scanner.ts';
@@ -13,7 +14,7 @@ import {
   isProtectedHeadBranch
 } from '../../core/policy.ts';
 import type { Env, SubrequestBudget } from '../../types/env.ts';
-import type { PullRequestData, GitHubApiResponse } from '../../types/github.ts';
+import type { PullRequestData, GitHubApiResponse, CommitData, GitHubUser, PullRequestEventPayload, IssueCommentEventPayload } from '../../types/github.ts';
 import type { FormalitiesConfig } from '../../types/config.ts';
 import type { FileBatchLoader } from '../../core/file-batch-loader.ts';
 import type { GitHubClient } from '../../core/github-client.ts';
@@ -35,7 +36,7 @@ export interface PullRequestContext {
   configError: string | null;
   existingLabels: Set<string> | null;
   labelerText: string | null;
-  commits: any[];
+  commits: CommitData[];
   commitsCount: number;
   commitScanCapped: boolean;
   fileBatchLoader: FileBatchLoader;
@@ -43,7 +44,7 @@ export interface PullRequestContext {
   prData: PullRequestData;
   startPrPatchFetch: () => Promise<GitHubApiResponse<string>>;
   getCommentsScanWithRetry: () => Promise<CommentScanResult | null>;
-  isMaintainerUser: (user: any, assoc?: string) => Promise<boolean>;
+  isMaintainerUser: (user: GitHubUser | null | undefined, assoc?: string | null) => Promise<boolean>;
   isAuthorMaintainer: (bodyRequestsBypass: boolean) => Promise<boolean>;
   bodyRequestsCherryPickBypass: boolean;
   branchCheckViolated: boolean;
@@ -57,7 +58,7 @@ export type ContextResult =
   | { kind: 'context'; context: PullRequestContext };
 
 export async function loadPullRequestContext(
-  data: any,
+  data: PullRequestEventPayload | IssueCommentEventPayload,
   event: string,
   env: Env,
   token: string,
@@ -75,13 +76,14 @@ export async function loadPullRequestContext(
   const isMaintainerUser = createMaintainerResolver(repoFullname, token, subrequestBudget);
 
   if (event === "issue_comment") {
-    const prNumberFromIssue = data.issue?.number;
+    const commentPayload = data as IssueCommentEventPayload;
+    const prNumberFromIssue = commentPayload.issue?.number;
     if (!prNumberFromIssue) {
       console.error("Webhook processing failed: Missing pull request number in issue_comment payload.");
       return { kind: 'response', response: new Response("Missing pull request number", { status: 400 }) };
     }
 
-    if (!await isMaintainerUser(data.comment?.user, data.comment?.author_association)) {
+    if (!await isMaintainerUser(commentPayload.comment?.user, commentPayload.comment?.author_association)) {
       return { kind: 'response', response: new Response("Ignored non-maintainer issue comment", { status: 200 }) };
     }
 
@@ -125,20 +127,42 @@ export async function loadPullRequestContext(
       const labelsToEnsure = dependabotLabels.filter(lbl => !currentPrLabels.has(lbl.name.toLowerCase()));
 
       if (labelsToEnsure.length > 0) {
-        await Promise.all(
-          labelsToEnsure.map(lbl =>
-            ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, null, () => { subrequestBudget.used++; })
-          )
-        );
+        const prNumber = data.pull_request?.number || 0;
+        const queue = new GitHubWriteQueue(prNumber);
 
-        const prNumber = data.pull_request?.number;
+        for (const lbl of labelsToEnsure) {
+          queue.enqueue(`ensure label "${lbl.name}"`, async () => {
+            const url = `https://api.github.com/repos/${repoFullname}/labels`;
+            const res = await client.trackedApiCall(url, 'POST', {
+              name: lbl.name,
+              color: lbl.color,
+              description: lbl.description
+            });
+            if (res.code === 422 || (res.code >= 200 && res.code < 300)) {
+              return { code: 200 };
+            }
+            return res;
+          });
+        }
+
         if (prNumber) {
           const prLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/labels`;
-          await client.trackedApiCall(prLabelUrl, 'POST', { labels: labelsToEnsure.map(l => l.name) });
+          queue.enqueue('apply Dependabot labels', () =>
+            client.trackedApiCall(prLabelUrl, 'POST', { labels: labelsToEnsure.map(l => l.name) })
+          );
+        }
+
+        const writeError = await queue.execute();
+        if (writeError) {
+          return { kind: 'response', response: writeError };
         }
       }
     }
     return { kind: 'response', response: new Response(`Success: Ignored PR from bot/system user (@${prAuthor})`, { status: 200 }) };
+  }
+
+  if (!data.pull_request) {
+    return { kind: 'response', response: new Response("Missing pull request data in payload", { status: 400 }) };
   }
 
   const prData: PullRequestData = data.pull_request;

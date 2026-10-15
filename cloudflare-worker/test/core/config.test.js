@@ -49,4 +49,34 @@ describe('parseAndValidateConfig', () => {
     assert.match(resPrimitive.error, /does not contain a JSON object \(got string\)/);
     assert.deepStrictEqual(resPrimitive.config, DEFAULT_CONFIG);
   });
+
+  test('validates field types and rejects invalid values with descriptive error', () => {
+    // String "false" instead of boolean false
+    const resStringBool = parseAndValidateConfig(JSON.stringify({ enable_comments: 'false' }));
+    assert.match(resStringBool.error, /field "enable_comments" must be a boolean \(got string\)/);
+    assert.deepStrictEqual(resStringBool.config, DEFAULT_CONFIG);
+
+    // String "50" instead of number 50
+    const resStringNum = parseAndValidateConfig(JSON.stringify({ max_subject_len_soft: '50' }));
+    assert.match(resStringNum.error, /field "max_subject_len_soft" must be a non-negative number \(got string\)/);
+
+    // Negative number
+    const resNegative = parseAndValidateConfig(JSON.stringify({ max_subject_len_hard: -10 }));
+    assert.match(resNegative.error, /field "max_subject_len_hard" must be a non-negative number/);
+
+    // Invalid tristate
+    const resTristate = parseAndValidateConfig(JSON.stringify({ check_pkg_release: 123 }));
+    assert.match(resTristate.error, /field "check_pkg_release" must be a boolean or string/);
+
+    // Invalid string array
+    const resArray = parseAndValidateConfig(JSON.stringify({ stale_ignored_users: 'not-an-array' }));
+    assert.match(resArray.error, /field "stale_ignored_users" must be an array of strings/);
+
+    const resArrayItems = parseAndValidateConfig(JSON.stringify({ stale_ignored_users: [123, 456] }));
+    assert.match(resArrayItems.error, /field "stale_ignored_users" must be an array of strings/);
+
+    // Null field value
+    const resNullField = parseAndValidateConfig(JSON.stringify({ check_signoff: null }));
+    assert.match(resNullField.error, /field "check_signoff" must not be null/);
+  });
 });
