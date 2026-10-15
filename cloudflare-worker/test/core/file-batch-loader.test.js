@@ -138,4 +138,46 @@ describe('FileBatchLoader', () => {
       /GraphQL batch file fetch failed \(HTTP 500\)/
     );
   });
+
+  test('enforces safe chunk size when graphqlChunkSize is 0, negative, or invalid to prevent infinite loops', async () => {
+    let callCount = 0;
+    globalThis.fetch = async (url, options) => {
+      callCount++;
+      return new Response(JSON.stringify({
+        data: {
+          repo0: {
+            f0: { oid: 'blob1', text: 'content\n', isBinary: false }
+          }
+        }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const budget = { limit: 50, used: 0, reserve: 5 };
+    // Passing 0 would cause i += 0 infinite loop without safeChunkSize clamp
+    const loaderZero = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => true,
+      graphqlChunkSize: 0
+    });
+
+    const resZero = await loaderZero.fetchFileContentCached('test.txt', 'main');
+    assert.strictEqual(resZero, 'content\n');
+    assert.strictEqual(callCount, 1);
+
+    // Negative number
+    const loaderNegative = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => true,
+      graphqlChunkSize: -10
+    });
+
+    const resNeg = await loaderNegative.fetchFileContentCached('test2.txt', 'main');
+    assert.strictEqual(resNeg, 'content\n');
+    assert.strictEqual(callCount, 2);
+  });
 });
+

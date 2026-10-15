@@ -190,7 +190,7 @@ export async function loadPullRequestContext(
     headRepoFullname: prData.head?.repo?.full_name,
     subrequestBudget,
     countOptionalAttempt: client.countOptionalAttempt,
-    graphqlChunkSize: parseEnvInt(env.GRAPHQL_CHUNK_SIZE, 50),
+    graphqlChunkSize: parseEnvInt(env.GRAPHQL_CHUNK_SIZE, 50, 1),
     initialBaseSha: baseSha
   });
 

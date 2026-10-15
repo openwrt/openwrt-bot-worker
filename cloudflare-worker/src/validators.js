@@ -1897,14 +1897,26 @@ function rememberPerPatch(parse) {
 
 export const getChangedFilesFromPatch = rememberPerPatch(function getChangedFilesFromPatch(patch) {
   if (!patch) return [];
-  const files = [];
+  const files = new Set();
   const lines = patch.split('\n');
   for (const line of lines) {
     if (line.startsWith('+++ b/')) {
-      files.push(line.slice(6).trim().replace(/\r$/, ''));
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('--- a/')) {
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      if (match) {
+        const fileA = match[1].trim().replace(/\r$/, '');
+        const fileB = match[2].trim().replace(/\r$/, '');
+        if (fileA && fileA !== '/dev/null') files.add(fileA);
+        if (fileB && fileB !== '/dev/null') files.add(fileB);
+      }
     }
   }
-  return Object.freeze(files);
+  return Object.freeze(Array.from(files));
 });
 
 export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates(patch) {
@@ -1914,19 +1926,22 @@ export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates
 
   const lines = patch.split('\n');
   let currentFile = null;
+  let oldFile = null;
 
   for (const line of lines) {
     if (line.startsWith('diff --git ')) {
       currentFile = null;
+      oldFile = null;
       const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
       if (match) {
+        oldFile = match[1].trim().replace(/\r$/, '');
         currentFile = match[2].trim().replace(/\r$/, '');
       }
-    } else if (currentFile) {
+    } else if (currentFile || oldFile) {
       if (line.startsWith('--- /dev/null')) {
-        addedFiles.add(currentFile);
+        addedFiles.add(currentFile || oldFile);
       } else if (line.startsWith('+++ /dev/null')) {
-        deletedFiles.add(currentFile);
+        deletedFiles.add(oldFile || currentFile);
       }
     }
   }
@@ -2418,6 +2433,28 @@ export function groupReleaseErrors(errors) {
   return { packages, others };
 }
 
+function extractMakefileVarFromDiff(diff, varName) {
+  if (!diff || !diff.added) return null;
+  const regex = new RegExp(`^\\s*${varName}\\s*(?::=|=)\\s*([^#\\r\\n]+)`);
+  for (let i = diff.added.length - 1; i >= 0; i--) {
+    const line = diff.added[i];
+    const match = line.match(regex);
+    if (match) {
+      return match[1].replace(/["']/g, '').trim();
+    }
+  }
+  return null;
+}
+
+function diffTouchesVar(diff, varNames) {
+  if (!diff) return false;
+  for (const line of [...(diff.added || []), ...(diff.deleted || [])]) {
+    const assign = line.match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+    if (assign && varNames.has(assign[1])) return true;
+  }
+  return false;
+}
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
@@ -2564,6 +2601,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let headSourceDate = null;
     let baseSourceDate = null;
     let headMakefileContent = null;
+    let baseMakefileContent = null;
     let isReleaseExempt = false;
 
     if (modifiedFiles.has(makefilePath)) {
@@ -2576,6 +2614,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         isNew ? Promise.resolve(null) : fetchFileContentAtBase(makefilePath)
       ]);
       headMakefileContent = headContent;
+      baseMakefileContent = baseContent;
       if (headContent === null) {
         // Package was deleted/dropped, skip checks
         return empty;
@@ -2760,6 +2799,49 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is reverted to ${restoredState}, matching its state before the reverted commit`] };
     }
 
+    let versionResetTo1InSeries = false;
+    if (commitDetails && commitDetails.length > 1 && versionChanged) {
+      let simRelease = baseRelease;
+      let simVersionReset = false;
+      let releaseBumpedAfterResetInSeries = false;
+
+      const versionVarNames = collectResolutionVarNames(headMakefileContent || '', 'PKG_VERSION');
+      collectResolutionVarNames(baseMakefileContent || '', 'PKG_VERSION', versionVarNames);
+      const trackingVarNames = new Set([...versionVarNames, 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']);
+
+      for (const item of commitDetails) {
+        if (!item || !item.commitPatch) continue;
+        const commitFileChanges = collectFileLineChanges(item.commitPatch);
+        const commitDiff = commitFileChanges ? commitFileChanges[makefilePath] : null;
+        if (!commitDiff) continue;
+
+        const touchesVersion = diffTouchesVar(commitDiff, trackingVarNames);
+        const addedRel = extractMakefileVarFromDiff(commitDiff, 'PKG_RELEASE');
+
+        if (touchesVersion) {
+          if (addedRel !== null) {
+            simRelease = addedRel;
+          }
+          if (simRelease === '1') {
+            simVersionReset = true;
+          } else {
+            simVersionReset = false;
+          }
+        } else if (addedRel !== null) {
+          const prevNum = parseInt(simRelease, 10);
+          const nextNum = parseInt(addedRel, 10);
+          if (simVersionReset && Number.isInteger(prevNum) && Number.isInteger(nextNum) && nextNum > prevNum) {
+            releaseBumpedAfterResetInSeries = true;
+          }
+          simRelease = addedRel;
+        }
+      }
+
+      if (simVersionReset && releaseBumpedAfterResetInSeries && simRelease === headRelease) {
+        versionResetTo1InSeries = true;
+      }
+    }
+
     if (versionChanged) {
       // Deliberately keyed on head alone, not base: dropping PKG_RELEASE
       // together with a version update is accepted OpenWrt practice for host
@@ -2773,9 +2855,30 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; packages on a shared helper without PKG_RELEASE don't require a reset to 1`] };
       }
       if (headRelease !== '1') {
+        if (versionResetTo1InSeries) {
+          return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' (reset to 1 and subsequently bumped to '${headRelease}' in commit series)`] };
+        }
         return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
       }
       return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`] };
+    }
+
+    const baseRelNum = parseInt(baseRelease, 10);
+    const headRelNum = parseInt(headRelease, 10);
+    const isNumericBase = Number.isInteger(baseRelNum) && !Number.isNaN(baseRelNum);
+    const isNumericHead = Number.isInteger(headRelNum) && !Number.isNaN(headRelNum);
+
+    if (isNumericBase && isNumericHead && headRelNum < baseRelNum) {
+      return {
+        errors: [`Package \`${pkgRoot}\` PKG_RELEASE was decreased from '${baseRelease}' to '${headRelease}' without a version update.`],
+        successes: []
+      };
+    }
+    if (isNumericBase && isNumericHead && headRelNum === baseRelNum) {
+      return {
+        errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],
+        successes: []
+      };
     }
 
     return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE bumped from '${baseRelease}' to '${headRelease}'`] };

@@ -88,17 +88,32 @@ export async function runValidations(
   }
   formalityOutputText += branchCheckOutputText;
 
-  const settled = (promise: Promise<any>) => { promise.catch(() => {}); return promise; };
+  const safeUci = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[] }> =>
+    promise.catch((err: any) => ({
+      successes: [],
+      errors: [],
+      warnings: [`Could not complete UCI config validation because of an error fetching file content: ${err?.message || err}`]
+    }));
+
+  const safePatches = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[]; skipped: string[]; incomplete?: boolean }> =>
+    promise.catch((err: any) => ({
+      successes: [],
+      errors: [],
+      warnings: [`Could not complete embedded patch validation because of an error fetching file content: ${err?.message || err}`],
+      skipped: [],
+      incomplete: true
+    }));
+
   const deepChecks = commitDetails.map((item: CommitDetail) => {
     if (usePrWidePatch || item.isVerbatim) return null;
     const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, item.sha);
     const fetchUpstream = (path: string) => item.upstreamSha ? fileBatchLoader.fetchFileContentCached(path, item.upstreamSha) : Promise.resolve(null);
     const hasUpstream = isBackportPr && item.upstreamPatch;
     return {
-      uci: settled(validateUciConfigs(item.commitPatch, config, fetchFileContent)),
-      upstreamUci: hasUpstream ? settled(validateUciConfigs(item.upstreamPatch, config, fetchUpstream)) : null,
-      patches: settled(validateEmbeddedPatches(item.commitPatch, config, fetchFileContent)),
-      upstreamPatches: hasUpstream ? settled(validateEmbeddedPatches(item.upstreamPatch, config, fetchUpstream)) : null
+      uci: safeUci(validateUciConfigs(item.commitPatch, config, fetchFileContent)),
+      upstreamUci: hasUpstream ? safeUci(validateUciConfigs(item.upstreamPatch, config, fetchUpstream)) : null,
+      patches: safePatches(validateEmbeddedPatches(item.commitPatch, config, fetchFileContent)),
+      upstreamPatches: hasUpstream ? safePatches(validateEmbeddedPatches(item.upstreamPatch, config, fetchUpstream)) : null
     };
   });
 
@@ -184,9 +199,13 @@ export async function runValidations(
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportMakefile.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
         reportUci.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
-        if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
-          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportMakefile.warnings.join("\n"));
-          reportMakefile.warnings.forEach((w: string) => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+        const allWarnings = [
+          ...(reportMakefile.warnings || []),
+          ...(reportUci.warnings || [])
+        ];
+        if (allWarnings.length > 0) {
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + allWarnings.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+          allWarnings.forEach((w: string) => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
         }
         if (reportMakefile.errors.length > 0 || reportUci.errors.length > 0) {
           const combinedErrors = [...reportMakefile.errors, ...reportUci.errors];
@@ -214,6 +233,10 @@ export async function runValidations(
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportPatches.successes.forEach((s: string) => { patchesOutputText += `  ${s}\n`; });
         for (const note of reportPatches.skipped) { unreadPatchNotes.add(note); patchesOutputText += `  ${note}\n`; }
+        if (reportPatches.warnings && reportPatches.warnings.length > 0) {
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.warnings.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+          reportPatches.warnings.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+        }
         if (reportPatches.errors.length > 0) {
           const isPatchWarning = config.check_patch_headers === 'warning';
           if (isPatchWarning) {
@@ -238,14 +261,18 @@ export async function runValidations(
 
     const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, ctx.headSha);
     const reportMakefile = validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname);
-    const reportUci = await validateUciConfigs(prPatch, config, fetchFileContent);
+    const reportUci = await safeUci(validateUciConfigs(prPatch, config, fetchFileContent));
 
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
     reportMakefile.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
     reportUci.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
-    if (reportMakefile.warnings && reportMakefile.warnings.length > 0) {
-      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportMakefile.warnings.join("\n"));
-      reportMakefile.warnings.forEach((w: string) => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    const allPrWideWarnings = [
+      ...(reportMakefile.warnings || []),
+      ...(reportUci.warnings || [])
+    ];
+    if (allPrWideWarnings.length > 0) {
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + allPrWideWarnings.join("\n"));
+      allPrWideWarnings.forEach((w: string) => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
     }
     if (reportMakefile.errors.length > 0 || reportUci.errors.length > 0) {
       const combinedErrors = [...reportMakefile.errors, ...reportUci.errors];
@@ -255,11 +282,15 @@ export async function runValidations(
     makefileOutputText += "\n";
 
     const isMissingAtHead = (path: string) => fileBatchLoader.isFileMissing(path, ctx.headSha);
-    const reportPatches = await validateEmbeddedPatches(prPatch, config, fetchFileContent, isMissingAtHead);
+    const reportPatches = await safePatches(validateEmbeddedPatches(prPatch, config, fetchFileContent, isMissingAtHead));
     if (reportPatches.incomplete) patchChecksIncomplete = true;
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach((s: string) => { patchesOutputText += `  ${s}\n`; });
     for (const note of reportPatches.skipped) { unreadPatchNotes.add(note); patchesOutputText += `  ${note}\n`; }
+    if (reportPatches.warnings && reportPatches.warnings.length > 0) {
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.warnings.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+      reportPatches.warnings.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    }
     if (reportPatches.errors.length > 0) {
       const isPatchWarning = config.check_patch_headers === 'warning';
       if (isPatchWarning) {
