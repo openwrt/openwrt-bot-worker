@@ -5,6 +5,7 @@ import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoLabels, graphqlF
 import { validateFormalities, validateMakefileContext, validateEmbeddedPatches, validatePkgReleaseBumps, validatePkgHashes, validateUciConfigs, groupReleaseErrors, collectPackageMakefiles, MISSING_BUMP_ERROR, MISSING_BUMP_SUMMARY, MISSING_BUMP_ACTION } from './validators.js';
 import { handleScheduled } from './stale.js';
 import { handleIssueLabeller, applyIssueLabelling, parseIssueLabellerYaml, isOwnAppComment, DEFAULT_ISSUE_LABELLER_CONFIG } from './issue-labeller.js';
+import { handleTesterPing, TESTERS_PATH } from './tester-ping.js';
 
 // --- GITHUB COMMENTS SCANNING AND SEARCH ---
 // Head branches that must not be used as the origin of a pull request. The
@@ -309,6 +310,28 @@ function getChangedFilesFromPatch(patch) {
 
 
 // --- WEBHOOK HANDLER ---
+// Merge .github/formalities.json from the default branch over the defaults.
+// Used by the issue labeller and tester ping.
+function defaultBranchConfig(configRes, repoFullname, purpose) {
+  if (configRes?.error) {
+    throw new Error(`Failed to fetch repository config for ${purpose}: ${configRes.error.message}`);
+  }
+  if (configRes?.content) {
+    try {
+      const repoConfig = JSON.parse(configRes.content);
+      if (repoConfig && typeof repoConfig === 'object') {
+        return { ...DEFAULT_CONFIG, ...repoConfig };
+      }
+    } catch (e) {
+      // Nothing gets posted about this so the log is the only place it
+      // shows up. Falling back to the defaults may also turn off the
+      // feature the repo wanted on.
+      console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be parsed, falling back to the defaults: ${e.message}`);
+    }
+  }
+  return DEFAULT_CONFIG;
+}
+
 async function handleWebhook(request, env) {
   const payloadText = await request.text();
   const signature = request.headers.get("x-hub-signature-256") || "";
@@ -361,8 +384,14 @@ async function handleWebhook(request, env) {
     // maintainer answers a failing check. GitHub reports both as an edit,
     // not as a synchronize.
     const action = data.action || '';
-    if (!['opened', 'synchronize', 'reopened', 'edited'].includes(action)) {
+    if (!['opened', 'synchronize', 'reopened', 'edited', 'labeled'].includes(action)) {
       return new Response("Ignored pull request action", { status: 200 });
+    }
+    // Labels only matter for the tester ping on open PRs. Every label a bot
+    // adds (this one included) also lands here as its own event, so drop
+    // those before minting a token.
+    if (action === 'labeled' && (isBotUser(data.sender) || data.pull_request?.state !== 'open')) {
+      return new Response("Ignored pull request label", { status: 200 });
     }
     // Edits that touch neither (a retitle is the common case) cannot change
     // any verdict. Skipping here saves every API call, token minting
@@ -406,24 +435,7 @@ async function handleWebhook(request, env) {
       { key: 'config', repoFullname, ref: defaultBranch, path: '.github/formalities.json' },
       { key: 'labeller', repoFullname, ref: defaultBranch, path: '.github/issue-labeller.yml' }
     ]);
-    const configRes = configFiles.get('config');
-    if (configRes?.error) {
-      throw new Error(`Failed to fetch repository config for issue labeller: ${configRes.error.message}`);
-    }
-    let issueConfig = DEFAULT_CONFIG;
-    if (configRes?.content) {
-      try {
-        const repoConfig = JSON.parse(configRes.content);
-        if (repoConfig && typeof repoConfig === 'object') {
-          issueConfig = { ...DEFAULT_CONFIG, ...repoConfig };
-        }
-      } catch (e) {
-        // Nothing is posted on an issue about this, so the log is the only
-        // place it can surface — and the fallback may well be what disables
-        // the labeller the repository meant to enable.
-        console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be parsed, falling back to the defaults: ${e.message}`);
-      }
-    }
+    const issueConfig = defaultBranchConfig(configFiles.get('config'), repoFullname, 'issue labeller');
     if (!issueConfig.enable_issue_labeller) {
       return new Response("Issue labeller disabled for this repository", { status: 200 });
     }
@@ -448,6 +460,36 @@ async function handleWebhook(request, env) {
       : new Set();
     await applyIssueLabelling(labelling, token, repoFullname, data.issue.number, existingLabels, currentIssueLabels, null, appId);
     return new Response(`Success: Processed issue labeller for issue #${data.issue.number}`, { status: 200 });
+  }
+
+  // --- PULL REQUEST LABELED: Tester Ping ---
+  if (event === "pull_request" && data.action === "labeled") {
+    // Read the testers file from the default branch like the config. One
+    // list for all branches, and a PR can't change who it pings.
+    const defaultBranch = data.repository.default_branch || "main";
+    const configFiles = await graphqlBatchFetchFiles(token, [
+      { key: 'config', repoFullname, ref: defaultBranch, path: '.github/formalities.json' },
+      { key: 'testers', repoFullname, ref: defaultBranch, path: TESTERS_PATH }
+    ]);
+    const pingConfig = defaultBranchConfig(configFiles.get('config'), repoFullname, 'tester ping');
+    if (!pingConfig.enable_tester_ping) {
+      return new Response("Tester ping disabled for this repository", { status: 200 });
+    }
+    if ((data.label?.name || '').toLowerCase() !== String(pingConfig.tester_ping_label).toLowerCase()) {
+      return new Response("Label is not the tester ping label", { status: 200 });
+    }
+    const testersRes = configFiles.get('testers');
+    if (testersRes?.error || testersRes?.failed) {
+      throw new Error(`Failed to fetch ${TESTERS_PATH}: ${testersRes.error?.message || 'partial GraphQL error'}`);
+    }
+    if (!testersRes?.content) {
+      return new Response(`Success: No ${TESTERS_PATH} on ${defaultBranch}`, { status: 200 });
+    }
+    // parseTesters needs the full repo label list or a word from a label
+    // could get read as a login, so fail the run if this fetch fails.
+    const repoLabels = await graphqlFetchRepoLabels(token, repoFullname);
+    const result = await handleTesterPing(data, token, repoFullname, testersRes.content, repoLabels, appId);
+    return new Response(`Success: ${result}`, { status: 200 });
   }
 
 
@@ -504,8 +546,8 @@ async function handleWebhook(request, env) {
     }
     // Nothing about a closed pull request can be fixed by re-validating it:
     // a merged one is already in the history, and a rejected one is not going
-    // anywhere. `pull_request` events for these never reach us (the action
-    // filter above only lets opened/synchronize/reopened through), but a
+    // anywhere. Closed PRs don't get many `pull_request` events (the action
+    // filter above drops label events on them), but a
     // comment on an old thread would otherwise re-run the whole audit and
     // repost check-runs against a commit nobody is working on.
     if (prRes.data?.state === 'closed') {

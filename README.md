@@ -72,6 +72,7 @@ Scans the contribution tree for nested downstream patch targets:
 *   **`add package` / `drop package`**: Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages. Both are removed again once the pull request no longer adds or drops a package.
 *   **Stable Branch Tracking**: Auto-generates matching grey release tags (e.g., `release/24.10`, `release/25.12`) whenever a PR targets an active release backport branch, and removes a release tag that no longer matches after the pull request is retargeted. Labels matched from `labeler.yml` are only ever added.
 *   **Issue Labeller**: Replaces the GitHub Actions `issue-labeller.yml` workflow. When a bug-report issue is opened with the trigger label, the bot validates form fields and applies labels based on a declarative `.github/issue-labeller.yml` configuration file (same spirit as `labeler.yml` for PRs — label name → list of conditions). Supports template variables (`{major}`, `{segment0}`, etc.), format validation (regex), existence checks (tag/path via GraphQL), substring matching, and presence checks. Falls back to sensible defaults if no config file exists. Disabled by default — enable per-repository with `"enable_issue_labeller": true`.
+*   **Tester Ping**: When someone with triage access or higher adds the `RFT` label to an open PR, the bot posts one comment mentioning the testers listed in `.github/testers` (default branch) for the labels on that PR. Testers only get pinged once per PR, so adding the label again only picks up labels added since then. The PR author is skipped. Disabled by default, enable it per-repository with `"enable_tester_ping": true`. See [Tester Ping Configuration](#6-tester-ping-configuration-githubtesters).
 *   **Stale PR Cleanup**: A daily scheduled cron task (05:30 UTC) scans all repositories where the App is installed. If explicitly enabled in a repository's configuration (\`"enable_stale_bot": true\`), it marks PRs containing the \`not following guidelines\` label as \`stale\` (with a warning comment) after 14 days of inactivity, and closes them after another 14 days of silence. Only contributor activity resets the countdown: pushed commits, force-pushes, reopens, and comments or reviews from people. Comments from GitHub Apps, `*[bot]` accounts and the machine accounts listed in `stale_ignored_users` are ignored, so an automated review can never keep a dead PR alive forever. Pushing new commits also removes the `stale` label immediately via the webhook, without waiting for the nightly scan. The scan asks GitHub for each repository's configuration and its labelled pull requests in two GraphQL queries, timelines included, so its request count no longer grows with the number of stale pull requests. A pull request whose timeline is longer than the fetched window (the most recent 100 entries) is left untouched rather than judged on incomplete history.
 
 > [!TIP]
@@ -111,7 +112,7 @@ The GitHub App requires the following permissions and event subscriptions:
     *   **Contents:** `Read-only` (to fetch repository-specific configurations like `.github/formalities.json`)
     *   **Metadata:** `Read-only` (mandatory for every App)
 *   **Event Subscriptions:**
-    *   Subscribe to **Pull request** events (triggers on opened, synchronized, and reopened).
+    *   Subscribe to **Pull request** events (triggers on opened, synchronized, reopened, edited, and labeled for the tester ping).
     *   Subscribe to **Issue comment** events (triggers on created — required for the override commands and comment-triggered re-checks).
     *   Subscribe to **Issues** events (triggers on opened — required for the issue labeller feature).
 
@@ -165,6 +166,8 @@ Some configuration keys offer advanced options:
 *   `stale_ignored_users`: List of account logins whose comments and reviews never reset the stale countdown (default: `["openwrt-ai"]`). GitHub Apps and `*[bot]` accounts are always ignored automatically; this list exists for automation that runs on a plain user account.
 *   `enable_labeler_yml`: Set to `true` to enable dynamic pull request labeling based on matching files in the `.github/labeler.yml` configuration file. Defaults to `false` (opt-in).
 *   `enable_issue_labeller`: Set to `true` to enable automated issue form validation and labelling (replaces the GitHub Actions `issue-labeller.yml` workflow). Defaults to `false` (opt-in).
+*   `enable_tester_ping`: Set to `true` to ping the testers in `.github/testers` when the trigger label is added to a PR. Defaults to `false` (opt-in).
+*   `tester_ping_label`: Label that triggers the tester ping, case-insensitive (default: `"RFT"`).
 
 Here is a comprehensive example containing all available toggle options:
 
@@ -212,7 +215,9 @@ Here is a comprehensive example containing all available toggle options:
   "enable_stale_bot": false,
   "stale_ignored_users": ["openwrt-ai"],
   "enable_labeler_yml": false,
-  "enable_issue_labeller": false
+  "enable_issue_labeller": false,
+  "enable_tester_ping": false,
+  "tester_ping_label": "RFT"
 }
 ```
 
@@ -298,3 +303,19 @@ _remove_labels: ["to-triage"]
 ```
 
 If the file is absent, the bot falls back to the default rules shown above.
+
+### 6. Tester Ping Configuration (`.github/testers`)
+
+If `enable_tester_ping` is set to `true`, the bot will read `.github/testers` from the default branch. The meaning is one list for all branches, and a PR can't change who it pings. Each line is a label followed by one or more GitHub logins. `#` starts a comment:
+
+```
+target/x86 foo bar  # x86/64: generic PC
+target/mediatek baz # filogic: mt6000
+```
+
+Labels with spaces work (`core packages carol`). Each line is matched against all repo labels, longest first, and only used if the PR has that label. Lines with a label the repo doesn't have are skipped. Labels are case-insensitive. Since `#` always starts a comment, labels with a `#` in them can't be used. Logins have to follow GitHub's rules (letters, numbers and single hyphens, max 39 characters), so team slugs like `org/team` are ignored. Ignored logins show up in the Worker log.
+
+Limitations:
+
+*   Only the labels on the PR at the time the trigger label is added are used. A PR opened with `RFT` already set won't have its `target/*` labels yet since `labeler.yml` adds them after, so nobody gets pinged until `RFT` is removed and added again.
+*   If the trigger label is removed and re-added within a few seconds, both runs can post the same ping.

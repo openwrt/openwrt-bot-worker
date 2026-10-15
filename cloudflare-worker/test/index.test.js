@@ -2583,6 +2583,137 @@ index 123456..789012 100644
     }
   });
 
+  // --- PULL REQUEST LABELED (tester ping) ---
+  async function sendLabeledWebhook(label, { sender = { login: 'maint', type: 'User' }, state = 'open', labels = ['target/x86', 'RFT'], repoLabels = ['target/x86', 'RFT'], formalities = '{"enable_tester_ping": true}', testers = 'target/x86 alice\n', fileStatus = 200 } = {}) {
+    const requests = [];
+    fetchMock = async (url, options) => {
+      requests.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      { const lr = graphqlLabelsHandler(url, options, repoLabels); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        if (fileStatus !== 200) {
+          return new Response('boom', { status: fileStatus });
+        }
+        const { groups } = parseGraphqlRequest(options);
+        return graphqlResponse(groups, (owner, name, ref, path) => {
+          if (ref !== 'main') return null;
+          if (path === '.github/formalities.json') return formalities;
+          if (path === '.github/testers') return testers;
+          return null;
+        });
+      }
+      if (url.includes('/comments') && (!options || options.method === 'GET')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes('/comments') && options?.method === 'POST') {
+        return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const payload = JSON.stringify({
+      action: 'labeled',
+      label: { name: label },
+      sender,
+      pull_request: {
+        number: 42, state, user: { login: 'author', type: 'User' },
+        labels: labels.map(name => ({ name })),
+        base: { ref: 'master', sha: 'b' }, head: { ref: 'feature', sha: 'h' }
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo', default_branch: 'main' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+    const request = new Request('http://localhost/webhook', {
+      method: 'POST',
+      body: payload,
+      headers: { 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }
+    });
+    const response = await worker.fetch(request, {
+      WEBHOOK_SECRET: secret,
+      APP_ID: '12345',
+      PRIVATE_KEY: 'YW55Y29udGVudA=='
+    }, {});
+    return { response, requests };
+  }
+
+  test('pull_request labeled: RFT pings testers from the default branch', async () => {
+    try {
+      const { response, requests } = await sendLabeledWebhook('RFT');
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(await response.text(), 'Success: Pinged testers on #42');
+      const post = requests.find(r => r.method === 'POST' && r.url.endsWith('/issues/42/comments'));
+      assert.match(post.body.body, /- `target\/x86`: @alice/);
+      // Should stop here, no check runs or labels.
+      assert.ok(!requests.some(r => r.url.includes('/check-runs')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request labeled: bot labels and closed pull requests cost no API call', async () => {
+    try {
+      for (const opts of [{ sender: { login: 'openwrt-bot[bot]', type: 'Bot' } }, { state: 'closed' }]) {
+        const { response, requests } = await sendLabeledWebhook('RFT', opts);
+        assert.strictEqual(await response.text(), 'Ignored pull request label');
+        assert.strictEqual(requests.length, 0);
+      }
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request labeled: other labels and disabled repositories post nothing', async () => {
+    try {
+      let res = await sendLabeledWebhook('target/x86');
+      assert.strictEqual(await res.response.text(), 'Label is not the tester ping label');
+      assert.ok(!res.requests.some(r => r.method === 'POST' && r.url.includes('/comments')));
+
+      res = await sendLabeledWebhook('RFT', { formalities: '{}' });
+      assert.strictEqual(await res.response.text(), 'Tester ping disabled for this repository');
+      assert.ok(!res.requests.some(r => r.method === 'POST' && r.url.includes('/comments')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request labeled: a missing testers file skips the label listing', async () => {
+    try {
+      const { response, requests } = await sendLabeledWebhook('RFT', { testers: null });
+      assert.strictEqual(await response.text(), 'Success: No .github/testers on main');
+      assert.ok(!requests.some(r => r.body?.query?.includes('labels(first:')));
+      assert.ok(!requests.some(r => r.method === 'POST' && r.url.includes('/comments')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request labeled: a failed file fetch posts nothing', async () => {
+    try {
+      const { response, requests } = await sendLabeledWebhook('RFT', { fileStatus: 400 });
+      assert.notStrictEqual(response.status, 200);
+      assert.ok(!requests.some(r => r.method === 'POST' && r.url.includes('/comments')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request labeled: honors a custom trigger label', async () => {
+    try {
+      const { response } = await sendLabeledWebhook('Needs Testing', {
+        labels: ['target/x86', 'needs testing'],
+        repoLabels: ['target/x86', 'needs testing'],
+        formalities: '{"enable_tester_ping": true, "tester_ping_label": "needs testing"}'
+      });
+      assert.strictEqual(await response.text(), 'Success: Pinged testers on #42');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
   // --- ISSUES EVENT (issue labeller) ---
   async function sendIssuesWebhook(action, issue, { changes = null, labellerYml = null, formalities = '{"enable_issue_labeller": true}' } = {}) {
     const requests = [];

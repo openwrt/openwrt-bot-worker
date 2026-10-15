@@ -59,6 +59,11 @@ export const DEFAULT_CONFIG = {
   enable_labeler_yml: false,
   enable_issue_labeller: false,
 
+  // Tester ping: adding tester_ping_label to a PR mentions the testers in
+  // .github/testers for its labels.
+  enable_tester_ping: false,
+  tester_ping_label: 'RFT',
+
   // Stale PR cleanup. Read by the scheduled scan (see stale.js), which checks
   // the repository config directly, but listed here so this object stays the
   // full set of keys a repository can set.
