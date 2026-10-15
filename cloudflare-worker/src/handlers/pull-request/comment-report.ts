@@ -122,9 +122,10 @@ export async function syncPrComment(
     }
   } else {
     if (existingCommentId) {
-      queue.enqueue('PR comment removal', () =>
-        client.trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'DELETE')
-      );
+      queue.enqueue('PR comment removal', async () => {
+        const res = await client.trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'DELETE');
+        return res.code === 404 ? { code: 200 } : res;
+      });
     }
   }
 }

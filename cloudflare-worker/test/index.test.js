@@ -2549,11 +2549,20 @@ index 123456..789012 100644
     return { response, requests };
   }
 
-  test('pull_request: title-only edit is dropped before any API call', async () => {
+  test('pull_request: title edit is re-evaluated, it can affect backport detection', async () => {
     try {
-      const { response, requests } = await sendPullRequestEdit({ title: { from: 'old title' } });
+      const { requests } = await sendPullRequestEdit({ title: { from: 'old title' } });
+      assert.ok(requests.length > 0, 'a title change must reach the GitHub API, not be dropped');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request: unrelated edit (e.g. milestone) is dropped before any API call', async () => {
+    try {
+      const { response, requests } = await sendPullRequestEdit({ milestone: { from: 'old milestone' } });
       assert.strictEqual(response.status, 200);
-      assert.strictEqual(await response.text(), 'Pull request edit changed neither the base branch nor the description');
+      assert.strictEqual(await response.text(), 'Pull request edit changed neither the title, base branch nor the description');
       assert.strictEqual(requests.length, 0);
     } finally {
       fetchMock = null;

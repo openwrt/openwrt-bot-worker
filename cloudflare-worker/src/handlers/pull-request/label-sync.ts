@@ -28,7 +28,8 @@ export async function syncLabels(
 
   let livePr = prData;
   if (client.hasHeadroom()) {
-    const liveRes = await client.optionalApiCall(prData.url);
+    const prUrl = prData.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
+    const liveRes = await client.optionalApiCall(prUrl);
     if (liveRes && liveRes.code === 200 && Array.isArray(liveRes.data?.labels)) {
       livePr = liveRes.data;
     }
