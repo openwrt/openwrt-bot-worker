@@ -279,6 +279,67 @@ describe('validateMakefileContext', () => {
     assertNoErrorIncludes(res, 'PKG_MAINTAINER');
   });
 
+  test('evaluates metadata per file when one commit adds two new packages', () => {
+    const state = existingPackage();
+    const twoPackagesPatch = `
+diff --git a/package/foo/Makefile b/package/foo/Makefile
+--- /dev/null
++++ b/package/foo/Makefile
+@@ -0,0 +1,10 @@
++PKG_NAME:=foo
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++PKG_MAINTAINER:=Foo Author <foo@example.com>
++PKG_LICENSE:=MIT
++PKG_LICENSE_FILES:=LICENSE
+diff --git a/package/bar/Makefile b/package/bar/Makefile
+--- /dev/null
++++ b/package/bar/Makefile
+@@ -0,0 +1,10 @@
++PKG_NAME:=bar
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++`;
+    const res = validate('packages: add foo and bar', twoPackagesPatch, {
+      config: { ...CONFIG, check_openwrt_meta: ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'] },
+      state
+    });
+    // package/bar/Makefile is missing metadata even though package/foo/Makefile has it!
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_MAINTAINER' (in package/bar/Makefile)")));
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_LICENSE' (in package/bar/Makefile)")));
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_LICENSE_FILES' (in package/bar/Makefile)")));
+  });
+
+  test('helper include in one new package does not exempt another package in the same commit', () => {
+    const state = existingPackage();
+    const patch = `
+diff --git a/package/luci-app-test/Makefile b/package/luci-app-test/Makefile
+--- /dev/null
++++ b/package/luci-app-test/Makefile
+@@ -0,0 +1,6 @@
++include $(TOPDIR)/rules.mk
++include $(TOPDIR)/feeds/luci/luci.mk
++PKG_NAME:=luci-app-test
++PKG_LICENSE:=Apache-2.0
++
+diff --git a/package/plain-pkg/Makefile b/package/plain-pkg/Makefile
+--- /dev/null
++++ b/package/plain-pkg/Makefile
+@@ -0,0 +1,6 @@
++include $(TOPDIR)/rules.mk
++PKG_NAME:=plain-pkg
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++`;
+    const res = validate('packages: add luci-app-test and plain-pkg', patch, {
+      config: { ...CONFIG, check_openwrt_meta: ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'] },
+      state
+    });
+    // plain-pkg does NOT include luci.mk, so it MUST require PKG_MAINTAINER and PKG_LICENSE_FILES
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_MAINTAINER' (in package/plain-pkg/Makefile)")));
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_LICENSE_FILES' (in package/plain-pkg/Makefile)")));
+  });
+
   test('still requires PKG_LICENSE/PKG_LICENSE_FILES when no known license include is present', () => {
     const state = existingPackage();
     const res = validate('newpkg: add package', `

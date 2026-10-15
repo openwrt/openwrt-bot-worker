@@ -901,10 +901,11 @@ function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
   return false;
 }
 
-export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname) {
+export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
   const errors = [];
   const successes = [];
   const warnings = [];
+  const pendingAsyncChecks = [];
   const subject = (fullCommit.commit.message || '').split("\n")[0].trim();
 
   if (!commitPatch) {
@@ -934,7 +935,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
       if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
-      cachedMakefileChunks.push({ filePath, lines: fileDiff.split('\n') });
+      cachedMakefileChunks.push({ filePath, lines: fileDiff.split('\n'), rawChunk: fileDiff });
     }
     return cachedMakefileChunks;
   };
@@ -987,31 +988,39 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       requiredMeta = CONFIG.check_openwrt_meta;
     }
     if (isNewPackageThisCommit) {
-      // Detect if the Makefile includes a known .mk file that defines PKG_LICENSE
-      // and PKG_LICENSE_FILES centrally (e.g. trusted-firmware-a.mk, u-boot.mk).
-      // In those cases, we should not require PKG_LICENSE / PKG_LICENSE_FILES directly.
-      const knownLicenseIncludeFiles = ['trusted-firmware-a.mk', 'u-boot.mk'];
-      const hasLicenseInclude = knownLicenseIncludeFiles.some(mkFile =>
-        new RegExp(`^\\+.*include.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(commitPatch)
+      const addedChunks = getMakefileChunks().filter(c =>
+        isPackageMakefilePath(c.filePath) && c.lines.some(l => /^---\s+\/dev\/null\r?$/.test(l))
       );
-      if (hasLicenseInclude) {
-        requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
-      }
-      // LuCI packages generate their package block in luci.mk: the emitted
-      // maintainer always comes from LUCI_MAINTAINER (defaulting to the LuCI
-      // community), and apps carry an SPDX header instead of a license file.
-      // PKG_LICENSE is still read by the build system and stays required.
-      if (/^\+\s*include\s+.*\bluci\.mk/m.test(commitPatch)) {
-        requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_MAINTAINER' && meta !== 'PKG_LICENSE_FILES');
-      }
-      requiredMeta.forEach(meta => {
-        const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
-        if (!metaRegex.test(commitPatch)) {
-          errors.push(`- New OpenWrt package is missing the mandatory parameter: '${meta}'`);
-        } else {
-          successes.push(`✅ Mandatory structural metadata present: '${meta}'`);
+
+      for (const chunk of addedChunks) {
+        let requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
+        if (Array.isArray(CONFIG.check_openwrt_meta)) {
+          requiredMeta = [...CONFIG.check_openwrt_meta];
         }
-      });
+
+        const knownLicenseIncludeFiles = ['trusted-firmware-a.mk', 'u-boot.mk'];
+        const hasLicenseInclude = knownLicenseIncludeFiles.some(mkFile =>
+          new RegExp(`^\\+.*include.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(chunk.rawChunk)
+        );
+        if (hasLicenseInclude) {
+          requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
+        }
+
+        if (/^\+\s*include\s+.*\bluci\.mk/m.test(chunk.rawChunk)) {
+          requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_MAINTAINER' && meta !== 'PKG_LICENSE_FILES');
+        }
+
+        requiredMeta.forEach(meta => {
+          const escapedMeta = meta.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const metaRegex = new RegExp(`^\\+\\s*${escapedMeta}\\s*(?::=|=)`, 'm');
+          if (!metaRegex.test(chunk.rawChunk)) {
+            const fileSuffix = addedChunks.length > 1 ? ` (in ${chunk.filePath})` : '';
+            errors.push(`- New OpenWrt package is missing the mandatory parameter: '${meta}'${fileSuffix}`);
+          } else {
+            successes.push(`✅ Mandatory structural metadata present: '${meta}'`);
+          }
+        });
+      }
     }
 
     const maintainerLines = commitPatch.split('\n').filter(line => line.startsWith('+') && line.includes('PKG_MAINTAINER'));
@@ -1120,7 +1129,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     let conffilesCheckRun = false;
     let conffilesCheckErrors = 0;
 
-    for (const { lines } of getMakefileChunks()) {
+    for (const { lines, filePath } of getMakefileChunks()) {
       // A diff of an existing Makefile is a window, not the file: the conffiles
       // block usually sits far from the install recipe and never shows up in
       // the hunks, so its absence here proves nothing. Only a newly added
@@ -1274,8 +1283,23 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         }
       }
 
-      if (MakefileInstallsConfig && !MakefileHasConffiles && isAddedMakefile) {
-        errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+      if (MakefileInstallsConfig && !MakefileHasConffiles) {
+        if (isAddedMakefile) {
+          errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+        } else if (typeof fetchFileContent === 'function') {
+          pendingAsyncChecks.push(async () => {
+            try {
+              const headText = await fetchFileContent(filePath);
+              if (headText && /define\s+Package\/[^\/]+\/conffiles\b/.test(headText)) {
+                successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
+              } else {
+                errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+              }
+            } catch (_) {
+              // Ignore fetch failure
+            }
+          });
+        }
       } else if (MakefileInstallsConfig && MakefileHasConffiles) {
         successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
       }
@@ -1763,6 +1787,17 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     } else if (changedFiles.size > 0) {
       successes.push("✅ All modified files contain a trailing newline");
     }
+  }
+
+  if (pendingAsyncChecks.length > 0) {
+    return (async () => {
+      for (const check of pendingAsyncChecks) {
+        try {
+          await check();
+        } catch (_) {}
+      }
+      return { errors, successes, warnings };
+    })();
   }
 
   return { errors, successes, warnings };
@@ -3035,7 +3070,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
 
     const versionChanged = ['PKG_VERSION', 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']
       .some(v => rawVar(baseContent, v) !== rawVar(headContent, v) && diffTouches(v));
-    const hashChanged = baseHash !== headHash || baseMirror !== headMirror;
+    const hashChanged = (baseHash !== headHash && diffTouches('PKG_HASH')) ||
+      (baseMirror !== headMirror && diffTouches('PKG_MIRROR_HASH'));
 
     if (versionChanged && !hashChanged && (baseHash !== null || baseMirror !== null)) {
       const varName = baseHash !== null ? 'PKG_HASH' : 'PKG_MIRROR_HASH';
@@ -3054,8 +3090,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
         return out;
       }
       let formatsOk = true;
-      if (headHash !== baseHash && headHash !== null) formatsOk = checkFormat('PKG_HASH', headHash) && formatsOk;
-      if (headMirror !== baseMirror && headMirror !== null) formatsOk = checkFormat('PKG_MIRROR_HASH', headMirror) && formatsOk;
+      if (headHash !== baseHash && headHash !== null && diffTouches('PKG_HASH')) formatsOk = checkFormat('PKG_HASH', headHash) && formatsOk;
+      if (headMirror !== baseMirror && headMirror !== null && diffTouches('PKG_MIRROR_HASH')) formatsOk = checkFormat('PKG_MIRROR_HASH', headMirror) && formatsOk;
       if (formatsOk && versionChanged) {
         out.successes.push(`✅ Package Makefile '${path}' updates the source checksum together with the version`);
       }

@@ -180,10 +180,12 @@ export async function runValidations(
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const reportMakefile = validateMakefileContext(fullCommit, commitPatch, config, packageState, repoFullname);
+        const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, sha);
+        const reportMakefile = await validateMakefileContext(fullCommit, commitPatch, config, packageState, repoFullname, fetchFileContent);
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
-          const reportUpstreamMakefile = validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname);
+          const fetchUpstream = (path: string) => item.upstreamSha ? fileBatchLoader.fetchFileContentCached(path, item.upstreamSha) : Promise.resolve(null);
+          const reportUpstreamMakefile = await validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname, fetchUpstream);
           reportMakefile.errors = reportMakefile.errors.filter((err: string) => !reportUpstreamMakefile.errors.includes(err));
           reportMakefile.warnings = reportMakefile.warnings.filter((warn: string) => !reportUpstreamMakefile.warnings.includes(warn));
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
@@ -260,7 +262,7 @@ export async function runValidations(
     };
 
     const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, ctx.headSha);
-    const reportMakefile = validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname);
+    const reportMakefile = await validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname, fetchFileContent);
     const reportUci = await safeUci(validateUciConfigs(prPatch, config, fetchFileContent));
 
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
