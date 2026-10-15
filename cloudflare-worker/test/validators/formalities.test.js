@@ -297,6 +297,11 @@ describe('validateFormalities', () => {
     assertNoWarningIncludes(res, 'imperative mood');
   });
 
+  test('warns about non-imperative mood after versioned package prefix', async () => {
+    const res = await validateFormalities(signedOff('lua5.4: added pkg-config file\n\nAdd the pkg-config file.\nhttps://example.com/', JANE), { ...CONFIG, warn_imperative_mood: true });
+    assertWarningIncludes(res, 'imperative mood');
+  });
+
   test('does not warn about mood when disabled', async () => {
     const res = await validateFormalities(signedOff('mypkg: added support for foo\n\nAdd the foo feature.\nhttps://example.com/', JANE), { ...CONFIG, warn_imperative_mood: false });
     assertNoWarningIncludes(res, 'imperative mood');
@@ -335,6 +340,67 @@ describe('validateFormalities', () => {
       title: 'rejects toolchain/musl with uppercase after prefix',
       commit: signedOff('toolchain/musl: Update to 1.2.5\n\nRelease notes: https://musl.libc.org/releases.html', JANE),
       error: 'lower-case word after the prefix'
+    },
+    {
+      title: 'accepts versioned package name with dot (e.g. lua5.4)',
+      commit: signedOff('lua5.4: install pkg-config file\n\nStage pkg-config file for lua5.4.\nhttps://www.lua.org/', JANE)
+    },
+    {
+      title: 'rejects versioned package name with uppercase after prefix',
+      commit: signedOff('lua5.4: Install pkg-config file\n\nStage pkg-config file.\nhttps://www.lua.org/', JANE),
+      error: 'lower-case word after the prefix'
+    },
+    {
+      title: 'accepts documentation file prefix (e.g. CONTRIBUTING.md)',
+      commit: signedOff('CONTRIBUTING.md: add AI policy\n\nAdd guidelines for AI contributions.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'rejects documentation file with uppercase after prefix',
+      commit: signedOff('CONTRIBUTING.md: Add AI policy\n\nAdd guidelines for AI contributions.\nhttps://openwrt.org/', JANE),
+      error: 'lower-case word after the prefix'
+    },
+    {
+      title: 'accepts README.md prefix',
+      commit: signedOff('README.md: update links\n\nFix broken documentation links.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'accepts root build system file prefix (e.g. rules.mk, Makefile, feeds.conf.default)',
+      commit: signedOff('rules.mk: add build helper\n\nAdd helper function for builds.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'accepts feeds.conf.default prefix',
+      commit: signedOff('feeds.conf.default: enable video feed\n\nEnable video feed by default.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'accepts dotfile prefix (e.g. .gitignore)',
+      commit: signedOff('.gitignore: add artifact ignore rules\n\nIgnore generated build files.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'accepts .github workflow path prefix',
+      commit: signedOff('.github/workflows/tests.yml: fix test job\n\nFix runner configuration.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'accepts package name with plus signs (e.g. libstdc++, c++)',
+      commit: signedOff('libstdc++: fix build on gcc 15\n\nBackport upstream fix.\nhttps://gcc.gnu.org/', JANE)
+    },
+    {
+      title: 'accepts chained prefixes (e.g. ci: labeler:)',
+      commit: signedOff('ci: labeler: update rules\n\nUpdate label mapping rules.\nhttps://openwrt.org/', JANE)
+    },
+    {
+      title: 'rejects chained prefixes with uppercase after prefix',
+      commit: signedOff('ci: labeler: Update rules\n\nUpdate label mapping rules.\nhttps://openwrt.org/', JANE),
+      error: 'lower-case word after the prefix'
+    },
+    {
+      title: 'rejects invalid prefix consisting only of dots',
+      commit: signedOff('..: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects invalid prefix with trailing dot on segment',
+      commit: signedOff('foo.: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
     }
   ];
 
@@ -366,6 +432,16 @@ describe('parseRevertSubject', () => {
   test('parses a prefixed revert (e.g. sing-box: Revert "...")', () => {
     const res = parseRevertSubject('sing-box: Revert "sing-box: update to 1.12.3"');
     assert.deepStrictEqual(res, { prefix: 'sing-box: ', original: 'sing-box: update to 1.12.3', depth: 1 });
+  });
+
+  test('parses a revert of a versioned package (e.g. lua5.4: Revert "...")', () => {
+    const res = parseRevertSubject('lua5.4: Revert "lua5.4: install pkg-config file"');
+    assert.deepStrictEqual(res, { prefix: 'lua5.4: ', original: 'lua5.4: install pkg-config file', depth: 1 });
+  });
+
+  test('parses a revert of a doc file (e.g. CONTRIBUTING.md: Revert "...")', () => {
+    const res = parseRevertSubject('CONTRIBUTING.md: Revert "CONTRIBUTING.md: add AI policy"');
+    assert.deepStrictEqual(res, { prefix: 'CONTRIBUTING.md: ', original: 'CONTRIBUTING.md: add AI policy', depth: 1 });
   });
 
   test('parses chained and tools/ style prefixes', () => {

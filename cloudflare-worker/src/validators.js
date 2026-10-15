@@ -1,12 +1,15 @@
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-licenses.js';
 
-// The grammar of a commit subject prefix: a package name (`bash`) or a source
-// tree path with subdirectories (`tools/cmake`, `toolchain/musl`), followed by
-// `: `. Defined once and reused by every place that has to recognize one, so
-// the subject check and the revert parser cannot drift apart again.
-export const SUBJECT_PREFIX_SOURCE = '[a-zA-Z0-9_-]+(?:\\/[a-zA-Z0-9_-]+)*: ';
+// The grammar of a commit subject prefix: a package name (`bash`, `lua5.4`),
+// a repository file (`CONTRIBUTING.md`, `README.md`, `feeds.conf.default`,
+// `rules.mk`, `.gitignore`), or a source tree path with subdirectories
+// (`tools/cmake`, `toolchain/musl`, `.github/workflows`), followed by `: `.
+// Defined once and reused by every place that has to recognize one, so the
+// subject check and the revert parser cannot drift apart again.
+const SUBJECT_PREFIX_SEGMENT = '\\.?[a-zA-Z0-9_]+[a-zA-Z0-9_+-]*(?:\\.[a-zA-Z0-9_]+[a-zA-Z0-9_+-]*)*';
+export const SUBJECT_PREFIX_SOURCE = `${SUBJECT_PREFIX_SEGMENT}(?:\\/${SUBJECT_PREFIX_SEGMENT})*: `;
 const SUBJECT_PREFIX_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}`);
-const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}\\s*`);
+const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^(?:${SUBJECT_PREFIX_SOURCE})+\\s*`);
 
 export function isValidName(name) {
   const nameRegex = /^[\p{L}'.-]+(?: [\p{L}'.-]+)+$/u;
@@ -381,7 +384,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
       disabled: 'disable', disabling: 'disable',
       replaced: 'replace', replacing: 'replace'
     };
-    const afterPrefix = subject.replace(/^(?:[a-zA-Z0-9_/-]+: )+/, '');
+    const afterPrefix = subject.replace(SUBJECT_PREFIX_STRIP_RE, '');
     const firstWord = (afterPrefix.match(/^[A-Za-z]+/) || [''])[0].toLowerCase();
     const imperative = NON_IMPERATIVE[firstWord];
     if (imperative) {
@@ -405,8 +408,8 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   if (fullCleanBody.length > 0) {
     if (CONFIG.warn_duplicate_body) {
-      const pkgPrefixMatch = lines[0].match(/^([a-zA-Z0-9_-]+):/);
-      const pkgName = pkgPrefixMatch ? pkgPrefixMatch[1] : '';
+      const prefixMatch = lines[0].match(SUBJECT_PREFIX_RE);
+      const pkgName = prefixMatch ? prefixMatch[0].replace(/:\s*$/, '').split('/').pop() : '';
 
       if (isVirtuallyIdentical(lines[0], fullCleanBody, pkgName)) {
         warnings.push("Commit subject and description body are identical or virtually identical. Avoid repeating the subject line in the body; provide context instead.");
