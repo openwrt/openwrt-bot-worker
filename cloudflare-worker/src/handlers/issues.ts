@@ -7,18 +7,37 @@ import {
   DEFAULT_ISSUE_LABELLER_CONFIG
 } from '../issue-labeller.js';
 import { isIssuesPayload, type IssuesEventPayload } from '../types/github.ts';
+import type { Env, SubrequestBudget } from '../types/env.ts';
 
 export async function handleIssuesEvent(
   data: unknown,
   token: string,
   repoFullname: string,
-  appId: number | null
+  appId: number | null,
+  env?: Env,
+  tokenMintAttempts = 0
 ): Promise<Response> {
   if (!isIssuesPayload(data)) {
     return new Response("Invalid payload: expected issues event payload with issue object", { status: 400 });
   }
+
+  const subrequestBudget: SubrequestBudget = {
+    limit: parseInt(env?.SUBREQUEST_BUDGET_LIMIT || '50', 10),
+    reserve: parseInt(env?.SUBREQUEST_RESERVE_HEADROOM || '15', 10),
+    used: tokenMintAttempts
+  };
+  const onCall = (_attempt = 1): boolean => {
+    if (subrequestBudget.limit - subrequestBudget.used <= 0) {
+      return false;
+    }
+    subrequestBudget.used++;
+    return true;
+  };
+
   const payload = data;
   const defaultBranch = payload.repository?.default_branch || "main";
+
+  onCall();
   const configFiles = await graphqlBatchFetchFiles(token, [
     { key: 'config', repoFullname, ref: defaultBranch, path: '.github/formalities.json' },
     { key: 'labeller', repoFullname, ref: defaultBranch, path: '.github/issue-labeller.yml' }
@@ -47,9 +66,17 @@ export async function handleIssuesEvent(
 
   const needsLabelCreation = labelling.labelsToAdd.some((l: string) => !currentIssueLabels.has(l.toLowerCase()));
   const existingLabels = needsLabelCreation
-    ? await graphqlFetchRepoLabels(token, repoFullname)
-        .catch(err => { console.warn(`Repository label listing failed, continuing without it: ${err.message}`); return null; })
+    ? await (async () => {
+        onCall();
+        return graphqlFetchRepoLabels(token, repoFullname)
+          .catch(err => { console.warn(`Repository label listing failed, continuing without it: ${err.message}`); return null; });
+      })()
     : new Set();
-  await applyIssueLabelling(labelling, token, repoFullname, payload.issue.number, existingLabels, currentIssueLabels, null, appId);
-  return new Response(`Success: Processed issue labeller for issue #${payload.issue.number}`, { status: 200 });
+  try {
+    await applyIssueLabelling(labelling, token, repoFullname, payload.issue.number, existingLabels, currentIssueLabels, onCall, appId);
+    return new Response(`Success: Processed issue labeller for issue #${payload.issue.number}`, { status: 200 });
+  } catch (err: any) {
+    console.error(`Error applying issue labelling for issue #${payload.issue.number}: ${err.message}`);
+    return new Response(`Error: Failed to apply issue labelling: ${err.message}`, { status: 502 });
+  }
 }

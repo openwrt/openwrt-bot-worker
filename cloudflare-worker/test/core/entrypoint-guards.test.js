@@ -113,6 +113,49 @@ describe('runtime type guards and entrypoint boundary validation', () => {
       assert.strictEqual(resNoIssueNumber.status, 400);
       assert.match(await resNoIssueNumber.text(), /expected issues event payload/);
     });
+
+    test('handleIssuesEvent returns HTTP 502 when issue labelling write operations fail', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        if (url.includes('/graphql')) {
+          return new Response(JSON.stringify({
+            data: {
+              repo0: {
+                f0: { oid: 'sha1', text: JSON.stringify({ enable_issue_labeller: true }), isBinary: false },
+                f1: { oid: 'sha2', text: 'rules:\n  - label: target/ramips\n    conditions:\n      - field: target\n        format: "^ramips$"\n', isBinary: false }
+              }
+            }
+          }), { status: 200 });
+        }
+        if (url.includes('/issues/123/labels') && options?.method === 'POST') {
+          return new Response('Write forbidden by branch/repo rules', { status: 403 });
+        }
+        if (url.includes('/issues/123/labels')) {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url.includes('/labels')) {
+          return new Response(JSON.stringify([{ name: 'target/ramips' }]), { status: 200 });
+        }
+        return new Response('{}', { status: 200 });
+      };
+
+      try {
+        const payload = {
+          action: 'opened',
+          issue: {
+            number: 123,
+            title: 'Kernel crash on mt7621',
+            body: '### OpenWrt target\n\nramips\n',
+            labels: [{ name: 'to-triage' }]
+          }
+        };
+        const res = await handleIssuesEvent(payload, 'token', 'openwrt/openwrt', null);
+        assert.strictEqual(res.status, 502);
+        assert.match(await res.text(), /Failed to apply issue labelling/);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 
   describe('webhook HTTP entrypoint boundary', () => {

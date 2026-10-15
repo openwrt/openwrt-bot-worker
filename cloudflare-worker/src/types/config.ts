@@ -153,9 +153,9 @@ export function parseAndValidateConfig(rawConfigText: string | null): {
       } else if (key === 'check_openwrt_meta') {
         const isValid =
           typeof val === 'boolean' ||
-          (Array.isArray(val) && val.every(item => typeof item === 'string' && item.trim().length > 0));
+          (Array.isArray(val) && val.length > 0 && val.every(item => typeof item === 'string' && /^[A-Za-z0-9_-]+$/.test(item.trim())));
         if (!isValid) {
-          fieldErrors.push(`field "check_openwrt_meta" must be a boolean or an array of non-empty strings (got ${JSON.stringify(val)})`);
+          fieldErrors.push(`field "check_openwrt_meta" must be a boolean or an array of valid Makefile variable names (got ${JSON.stringify(val)})`);
         }
       } else if (Object.hasOwn(ALLOWED_VALUES_BY_FIELD, key)) {
         const allowed = ALLOWED_VALUES_BY_FIELD[key];
@@ -169,6 +169,18 @@ export function parseAndValidateConfig(rawConfigText: string | null): {
         }
       }
       // Unknown fields are tolerated for forward/backward compatibility
+    }
+
+    if (fieldErrors.length === 0) {
+      const softLen = typeof parsed.max_subject_len_soft === 'number'
+        ? parsed.max_subject_len_soft
+        : (config.max_subject_len_soft ?? 50);
+      const hardLen = typeof parsed.max_subject_len_hard === 'number'
+        ? parsed.max_subject_len_hard
+        : (config.max_subject_len_hard ?? 72);
+      if (softLen > hardLen) {
+        fieldErrors.push(`max_subject_len_soft (${softLen}) must not be greater than max_subject_len_hard (${hardLen})`);
+      }
     }
 
     if (fieldErrors.length > 0) {

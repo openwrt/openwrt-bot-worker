@@ -82,7 +82,7 @@ async function handleWebhook(request, env) {
   }
 
   if (event === "issues") {
-    return await handleIssuesEvent(data, token, repoFullname, appId);
+    return await handleIssuesEvent(data, token, repoFullname, appId, env, tokenMintAttempts);
   }
 
   return await handlePullRequestEvent(data, event, env, token, repoFullname, appId, tokenMintAttempts);

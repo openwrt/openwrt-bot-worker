@@ -100,13 +100,20 @@ describe('parseAndValidateConfig', () => {
 
     // Invalid check_openwrt_meta
     const resInvalidMetaType = parseAndValidateConfig(JSON.stringify({ check_openwrt_meta: 'warning' }));
-    assert.match(resInvalidMetaType.error, /field "check_openwrt_meta" must be a boolean or an array of non-empty strings/);
+    assert.match(resInvalidMetaType.error, /field "check_openwrt_meta" must be a boolean or an array of valid Makefile variable names/);
 
     const resInvalidMetaItems = parseAndValidateConfig(JSON.stringify({ check_openwrt_meta: [123, 'PKG_LICENSE'] }));
-    assert.match(resInvalidMetaItems.error, /field "check_openwrt_meta" must be a boolean or an array of non-empty strings/);
+    assert.match(resInvalidMetaItems.error, /field "check_openwrt_meta" must be a boolean or an array of valid Makefile variable names/);
 
     const resEmptyMetaString = parseAndValidateConfig(JSON.stringify({ check_openwrt_meta: [''] }));
-    assert.match(resEmptyMetaString.error, /field "check_openwrt_meta" must be a boolean or an array of non-empty strings/);
+    assert.match(resEmptyMetaString.error, /field "check_openwrt_meta" must be a boolean or an array of valid Makefile variable names/);
+
+    const resBadMetaIdentifier = parseAndValidateConfig(JSON.stringify({ check_openwrt_meta: ['PKG_LICENSE[BAD]'] }));
+    assert.match(resBadMetaIdentifier.error, /field "check_openwrt_meta" must be a boolean or an array of valid Makefile variable names/);
+
+    // Soft/hard subject length limit check
+    const resSoftHard = parseAndValidateConfig(JSON.stringify({ max_subject_len_soft: 80, max_subject_len_hard: 60 }));
+    assert.match(resSoftHard.error, /max_subject_len_soft \(80\) must not be greater than max_subject_len_hard \(60\)/);
 
     // Invalid string array
     const resArray = parseAndValidateConfig(JSON.stringify({ stale_ignored_users: 'not-an-array' }));

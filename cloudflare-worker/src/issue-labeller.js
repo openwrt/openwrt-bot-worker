@@ -642,10 +642,10 @@ export async function applyIssueLabelling(result, token, repoFullname, issueNumb
     let marked = null;
     let legacy = null;
     for (let page = 1; page <= MAX_COMMENT_PAGES && !marked; page++) {
-      onCall?.();
+      if (onCall && onCall(page) === false) break;
       const listed = await githubApiCall(
         `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments?per_page=100&page=${page}`,
-        token
+        token, 'GET', null, 'application/vnd.github+json', { onAttempt: onCall }
       );
       if (listed.code !== 200) break;
       const batch = listed.data || [];
@@ -662,30 +662,36 @@ export async function applyIssueLabelling(result, token, repoFullname, issueNumb
 
     if (mine) {
       if (mine.body !== body) {
-        onCall?.();
-        await githubApiCall(
+        const res = await githubApiCall(
           `https://api.github.com/repos/${repoFullname}/issues/comments/${mine.id}`,
-          token, 'PATCH', { body }
+          token, 'PATCH', { body }, 'application/vnd.github+json', { onAttempt: onCall }
         );
+        if (res.code >= 400) {
+          throw new Error(`Failed to update issue comment on issue #${issueNumber} (HTTP ${res.code})`);
+        }
       }
     } else if (result.comments[0]) {
       // Nothing to acknowledge on an issue we never complained about.
-      onCall?.();
-      await githubApiCall(
+      const res = await githubApiCall(
         `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments`,
-        token, 'POST', { body }
+        token, 'POST', { body }, 'application/vnd.github+json', { onAttempt: onCall }
       );
+      if (res.code >= 400) {
+        throw new Error(`Failed to create issue comment on issue #${issueNumber} (HTTP ${res.code})`);
+      }
     }
   }
 
   // Remove labels (ignore 404 if label wasn't applied)
   for (const label of result.labelsToRemove) {
     if (currentLabels.has(label.toLowerCase())) {
-      onCall?.();
-      await githubApiCall(
+      const res = await githubApiCall(
         `${issueLabelUrl}/${encodeURIComponent(label)}`,
-        token, 'DELETE', null, 'application/vnd.github+json', { silent: true }
+        token, 'DELETE', null, 'application/vnd.github+json', { silent: true, onAttempt: onCall }
       );
+      if (res.code >= 400 && res.code !== 404) {
+        throw new Error(`Failed to remove label "${label}" from issue #${issueNumber} (HTTP ${res.code})`);
+      }
     }
   }
 
@@ -701,6 +707,8 @@ export async function applyIssueLabelling(result, token, repoFullname, issueNumb
   }));
 
   // Add labels to the issue in one API call
-  onCall?.();
-  await githubApiCall(issueLabelUrl, token, 'POST', { labels: toAdd });
+  const addRes = await githubApiCall(issueLabelUrl, token, 'POST', { labels: toAdd }, 'application/vnd.github+json', { onAttempt: onCall });
+  if (addRes.code >= 400) {
+    throw new Error(`Failed to add labels to issue #${issueNumber} (HTTP ${addRes.code})`);
+  }
 }

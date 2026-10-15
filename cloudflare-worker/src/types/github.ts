@@ -159,10 +159,10 @@ export function isPullRequestPayload(payload: unknown): payload is PullRequestEv
   const base = pr.base as Record<string, unknown>;
   const head = pr.head as Record<string, unknown>;
   return (
-    typeof base.ref === 'string' &&
-    typeof base.sha === 'string' &&
-    typeof head.ref === 'string' &&
-    typeof head.sha === 'string'
+    typeof base.ref === 'string' && base.ref.trim().length > 0 &&
+    typeof base.sha === 'string' && base.sha.trim().length > 0 &&
+    typeof head.ref === 'string' && head.ref.trim().length > 0 &&
+    typeof head.sha === 'string' && head.sha.trim().length > 0
   );
 }
 
