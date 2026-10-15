@@ -15,6 +15,7 @@
 // rate-limited write.
 const MAX_RETRY_AFTER_SECONDS = 5;
 
+/** @returns {Promise<{ code: number; data: any; raw: string; headers: any }>} */
 export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json', options = {}) {
   const headers = {
     'Authorization': `Bearer ${token}`,
@@ -340,6 +341,7 @@ const COMMIT_FIELDS = `oid
             ... on GpgSignature { keyId }
           }`;
 
+/** @param {string} token @param {string} repoFullname @param {string} ref @param {string} configPath @param {string} labelerPath @param {any} onCall @param {number|null} [prNumber] @param {number} [maxCommitPages] */
 export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath, labelerPath, onCall, prNumber = null, maxCommitPages = 3) {
   const slashIndex = repoFullname.indexOf('/');
   const owner = repoFullname.slice(0, slashIndex);
