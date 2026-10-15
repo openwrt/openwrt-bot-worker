@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities } from '../../src/validators.js';
+import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, extractSubjectEntity } from '../../src/validators.js';
 import {
   CONFIG, JOHN, makeCommit, commitBy,
   assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes
@@ -205,7 +205,11 @@ describe('validateFormalities', () => {
     ['warns when body only qualifies the kind of release (e.g. bird3: bump to v3.3.2)', true, 'bird3: bump to v3.3.2\n\nUpdate to latest upstream bugfix release.'],
     ['warns when body only claims bugs were fixed', true, 'mypkg: update to 2.4.0\n\nStable maintenance release, fixes bugs.'],
     ['does not warn when the body names what was fixed', false, 'bird3: bump to v3.3.2\n\nUpstream bugfix release, fixes a crash in the BGP reconfiguration path.'],
-    ['does not warn when body has meaningful context beyond subject', false, 'my-cli: update to 29.6.1\n\nBump my-cli CLI to 29.6.1.\nThis release fixes a CVE in the CLI implementation.']
+    ['does not warn when body has meaningful context beyond subject', false, 'my-cli: update to 29.6.1\n\nBump my-cli CLI to 29.6.1.\nThis release fixes a CVE in the CLI implementation.'],
+    ['warns when body restates doc file subject (e.g. CONTRIBUTING.md: add AI policy)', true, 'CONTRIBUTING.md: add AI policy\n\nAdd AI policy to CONTRIBUTING.md.'],
+    ['does not warn when doc file body provides actual context', false, 'CONTRIBUTING.md: add AI policy\n\nRequire human-written contributions and keep human in the loop for AI code.'],
+    ['warns when body restates path-prefixed package subject (e.g. tools/cmake)', true, 'tools/cmake: update to 4.0\n\nBump cmake to version 4.0.'],
+    ['does not warn when path-prefixed package body provides actual context', false, 'tools/cmake: update to 4.0\n\nBackport bootstrap fix for GCC 16.']
   ];
 
   for (const [title, duplicate, text] of duplicateBodies) {
@@ -401,6 +405,50 @@ describe('validateFormalities', () => {
       title: 'rejects invalid prefix with trailing dot on segment',
       commit: signedOff('foo.: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
       error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects invalid prefix with consecutive dots',
+      commit: signedOff('foo..bar: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects invalid prefix with dot followed by dash',
+      commit: signedOff('foo.-bar: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects path traversal in prefix',
+      commit: signedOff('foo/../bar: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects single dot segment in prefix path',
+      commit: signedOff('foo/./bar: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects trailing dash in prefix segment',
+      commit: signedOff('foo-: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects trailing underscore in prefix segment',
+      commit: signedOff('foo_: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects trailing dash in path segment',
+      commit: signedOff('foo/bar-: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'rejects double dot prefix start',
+      commit: signedOff('..foo: invalid prefix\n\nSome body text.\nhttps://example.com/', JANE),
+      error: 'Commit subject must start with `<package name or prefix>: `'
+    },
+    {
+      title: 'accepts valid dotfile with extension prefix (.foo.bar)',
+      commit: signedOff('.foo.bar: update configuration\n\nUpdate dotfile configuration.\nhttps://example.com/', JANE)
     }
   ];
 
@@ -606,5 +654,35 @@ describe('Signed-off-by parsing', () => {
     // slow or loaded machine cannot turn this into a false alarm.
     assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
     assertErrorIncludes(res, 'Signed-off-by');
+  });
+});
+
+describe('extractSubjectEntity', () => {
+  test('extracts package name from single package prefix', () => {
+    assert.deepStrictEqual(extractSubjectEntity('bash: update to 5.2'), ['bash']);
+    assert.deepStrictEqual(extractSubjectEntity('lua5.4: install pkg-config file'), ['lua5.4']);
+    assert.deepStrictEqual(extractSubjectEntity('libstdc++: fix build'), ['libstdc++']);
+  });
+
+  test('extracts target package from source tree path prefix', () => {
+    assert.deepStrictEqual(extractSubjectEntity('package/network/services/hostapd: fix build'), ['hostapd']);
+    assert.deepStrictEqual(extractSubjectEntity('tools/cmake: update to 4.0'), ['cmake']);
+    assert.deepStrictEqual(extractSubjectEntity('toolchain/musl: update to 1.2.5'), ['musl']);
+  });
+
+  test('extracts target entity from chained prefixes', () => {
+    assert.deepStrictEqual(extractSubjectEntity('ci: labeler: update rules'), ['labeler']);
+    assert.deepStrictEqual(extractSubjectEntity('toolchain: binutils: update to 2.45'), ['binutils']);
+  });
+
+  test('extracts file and base name from repository files with extensions', () => {
+    assert.deepStrictEqual(extractSubjectEntity('CONTRIBUTING.md: add AI policy'), ['CONTRIBUTING.md', 'CONTRIBUTING']);
+    assert.deepStrictEqual(extractSubjectEntity('rules.mk: add build helper'), ['rules.mk', 'rules']);
+    assert.deepStrictEqual(extractSubjectEntity('feeds.conf.default: enable feed'), ['feeds.conf.default', 'feeds.conf']);
+  });
+
+  test('returns empty array when subject has no prefix', () => {
+    assert.deepStrictEqual(extractSubjectEntity('commit without prefix'), []);
+    assert.deepStrictEqual(extractSubjectEntity(null), []);
   });
 });

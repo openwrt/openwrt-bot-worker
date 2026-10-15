@@ -6,7 +6,7 @@ import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-li
 // (`tools/cmake`, `toolchain/musl`, `.github/workflows`), followed by `: `.
 // Defined once and reused by every place that has to recognize one, so the
 // subject check and the revert parser cannot drift apart again.
-const SUBJECT_PREFIX_SEGMENT = '\\.?[a-zA-Z0-9_]+[a-zA-Z0-9_+-]*(?:\\.[a-zA-Z0-9_]+[a-zA-Z0-9_+-]*)*';
+const SUBJECT_PREFIX_SEGMENT = '\\.?[a-zA-Z0-9]+(?:[a-zA-Z0-9_+-]*[a-zA-Z0-9+])?(?:\\.[a-zA-Z0-9]+(?:[a-zA-Z0-9_+-]*[a-zA-Z0-9+])?)*';
 export const SUBJECT_PREFIX_SOURCE = `${SUBJECT_PREFIX_SEGMENT}(?:\\/${SUBJECT_PREFIX_SEGMENT})*: `;
 const SUBJECT_PREFIX_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}`);
 const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^(?:${SUBJECT_PREFIX_SOURCE})+\\s*`);
@@ -23,10 +23,41 @@ export function isNoreplyEmail(email) {
   return domain === 'noreply.github.com' || domain === 'users.noreply.github.com';
 }
 
-export function getNormalizedText(str, pkgName) {
+/**
+ * Extracts the target entity (package name, tool name, or file) from a commit subject prefix.
+ * For paths ('tools/cmake: ', 'package/libs/libnl-tiny: '), extracts the last path segment ('cmake', 'libnl-tiny').
+ * For chained prefixes ('ci: labeler: '), extracts the target prefix ('labeler').
+ * For files with an extension ('CONTRIBUTING.md: ', 'rules.mk: '), includes both the full filename and the base name.
+ * Returns an array of string tokens to be ignored when checking for duplicate bodies.
+ */
+export function extractSubjectEntity(subject) {
+  if (typeof subject !== 'string') return [];
+  const match = subject.match(SUBJECT_PREFIX_STRIP_RE);
+  if (!match) return [];
+
+  const rawPrefix = match[0].replace(/:\s*$/, '');
+  const prefixes = rawPrefix.split(/:\s+/).filter(Boolean);
+  const targetPrefix = prefixes[prefixes.length - 1];
+  const lastSegment = targetPrefix.split('/').pop();
+  if (!lastSegment) return [];
+
+  const entities = new Set([lastSegment]);
+  const extMatch = lastSegment.match(/^(.+)\.([a-zA-Z]+)$/);
+  if (extMatch) {
+    entities.add(extMatch[1]);
+  }
+  return Array.from(entities);
+}
+
+export function getNormalizedText(str, entities) {
   let cleaned = str.toLowerCase();
-  if (pkgName) {
-    cleaned = cleaned.replaceAll(pkgName.toLowerCase(), '');
+  if (entities) {
+    const list = Array.isArray(entities) ? entities : [entities];
+    for (const entity of list) {
+      if (entity) {
+        cleaned = cleaned.replaceAll(entity.toLowerCase(), '');
+      }
+    }
   }
   // Remove common list bullet markers and generic words
   cleaned = cleaned.replace(/^[\s\-*+•#]+/, '');
@@ -36,9 +67,9 @@ export function getNormalizedText(str, pkgName) {
   return cleaned.replace(/[^a-z0-9]/g, '');
 }
 
-export function isVirtuallyIdentical(subject, body, pkgName) {
-  const normSubject = getNormalizedText(subject, pkgName);
-  const normBody = getNormalizedText(body, pkgName);
+export function isVirtuallyIdentical(subject, body, entities) {
+  const normSubject = getNormalizedText(subject, entities);
+  const normBody = getNormalizedText(body, entities);
 
   // 1. Direct or substring matching
   if (normSubject === normBody || 
@@ -64,12 +95,15 @@ export function isVirtuallyIdentical(subject, body, pkgName) {
     'just', 'only', 'then', 'here', 'there', 'when', 'where', 'why', 'how', 'this'
   ]);
 
-  const pkgWords = new Set();
-  if (pkgName) {
-    pkgWords.add(pkgName.toLowerCase());
-    pkgName.toLowerCase().split(/[-_]/).forEach(w => {
-      if (w) pkgWords.add(w);
-    });
+  const entityWords = new Set();
+  const entityList = Array.isArray(entities) ? entities : (entities ? [entities] : []);
+  for (const entity of entityList) {
+    if (entity) {
+      entityWords.add(entity.toLowerCase());
+      entity.toLowerCase().split(/[-_.]/).forEach(w => {
+        if (w) entityWords.add(w);
+      });
+    }
   }
 
   // Split body into lowercase alphanumeric tokens
@@ -84,7 +118,7 @@ export function isVirtuallyIdentical(subject, body, pkgName) {
     // Strip trailing period or comma from token
     token = token.replace(/[.,]$/, '');
     
-    if (pkgWords.has(token)) continue;
+    if (entityWords.has(token)) continue;
     if (genericWords.has(token)) continue;
     // Check if version number (e.g. 29.6.1, v2.0, 2026.27, etc.)
     if (/^v?\d+(?:[.-]\d+)*$/.test(token)) continue;
@@ -408,10 +442,9 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   if (fullCleanBody.length > 0) {
     if (CONFIG.warn_duplicate_body) {
-      const prefixMatch = lines[0].match(SUBJECT_PREFIX_RE);
-      const pkgName = prefixMatch ? prefixMatch[0].replace(/:\s*$/, '').split('/').pop() : '';
+      const subjectEntities = extractSubjectEntity(lines[0]);
 
-      if (isVirtuallyIdentical(lines[0], fullCleanBody, pkgName)) {
+      if (isVirtuallyIdentical(lines[0], fullCleanBody, subjectEntities)) {
         warnings.push("Commit subject and description body are identical or virtually identical. Avoid repeating the subject line in the body; provide context instead.");
       }
     }
