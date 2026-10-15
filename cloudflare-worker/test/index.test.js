@@ -6067,5 +6067,478 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
       fetchMock = null;
     }
   });
+
+  test('Dependabot opened PR for npm_and_yarn creates dependencies and javascript labels and applies them to PR', async () => {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 99,
+        title: 'Bump lodash from 4.17.20 to 4.17.21',
+        body: 'Bumps [lodash](https://github.com/lodash/lodash).',
+        base: { ref: 'main' },
+        head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'abc123' },
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const labelCreates = [];
+    const labelApplies = [];
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelCreates.push(body);
+        return new Response(JSON.stringify({ name: body.name }), { status: 201 });
+      }
+      if (url.includes('/repos/test/repo/issues/99/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelApplies.push(body);
+        return new Response(JSON.stringify(body.labels.map(l => ({ name: l }))), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      const body = await response.text();
+      assert.ok(body.includes('Ignored PR from bot/system user'), `Expected ignored-bot response, got: ${body}`);
+
+      // Only dependencies and javascript should be created for npm_and_yarn
+      assert.strictEqual(labelCreates.length, 2, `Expected 2 label creates, got ${labelCreates.length}`);
+      const names = labelCreates.map(l => l.name).sort();
+      assert.deepStrictEqual(names, ['dependencies', 'javascript']);
+      assert.strictEqual(labelCreates.find(l => l.name === 'dependencies').color, '0366d6');
+      assert.strictEqual(labelCreates.find(l => l.name === 'javascript').color, 'f1e05a');
+
+      // Labels must be attached to the PR so the initial PR is not left unlabeled
+      assert.strictEqual(labelApplies.length, 1, `Expected 1 label application to PR, got ${labelApplies.length}`);
+      assert.deepStrictEqual(labelApplies[0].labels.sort(), ['dependencies', 'javascript']);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('Dependabot opened PR for github_actions creates dependencies, GitHub/CI, and github_actions and applies them', async () => {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 100,
+        title: 'Bump actions/checkout from 3 to 4',
+        body: 'Bumps [actions/checkout](https://github.com/actions/checkout).',
+        base: { ref: 'main' },
+        head: { ref: 'dependabot/github_actions/actions/checkout-4', sha: 'def456' },
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const labelCreates = [];
+    const labelApplies = [];
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelCreates.push(body);
+        return new Response(JSON.stringify({ name: body.name }), { status: 201 });
+      }
+      if (url.includes('/repos/test/repo/issues/100/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelApplies.push(body);
+        return new Response(JSON.stringify(body.labels.map(l => ({ name: l }))), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      // dependencies, GitHub/CI, and github_actions should be created
+      assert.strictEqual(labelCreates.length, 3, `Expected 3 label creates, got ${labelCreates.length}`);
+      const names = labelCreates.map(l => l.name).sort();
+      assert.deepStrictEqual(names, ['GitHub/CI', 'dependencies', 'github_actions']);
+      assert.strictEqual(labelCreates.find(l => l.name === 'GitHub/CI').color, 'e6a742');
+      assert.strictEqual(labelCreates.find(l => l.name === 'github_actions').color, '2088ff');
+
+      // Labels must be attached to PR 100
+      assert.strictEqual(labelApplies.length, 1, `Expected 1 label application to PR, got ${labelApplies.length}`);
+      assert.deepStrictEqual(labelApplies[0].labels.sort(), ['GitHub/CI', 'dependencies', 'github_actions']);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('Dependabot opened PR skips creation and application when labels are already attached', async () => {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 101,
+        title: 'Bump lodash from 4.17.20 to 4.17.21',
+        body: 'Bumps [lodash](https://github.com/lodash/lodash).',
+        base: { ref: 'main' },
+        head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'abc123' },
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        labels: [{ name: 'dependencies' }, { name: 'javascript' }]
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    let apiCallsCount = 0;
+    fetchMock = async (url) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      apiCallsCount++;
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      // No label creates or label attachments should have been made
+      assert.strictEqual(apiCallsCount, 0, `Expected 0 API calls when labels already exist, got ${apiCallsCount}`);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('Dependabot opened PR for github_actions with npm substring in action name does not get javascript label', async () => {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 102,
+        title: 'Bump actions/setup-npm-cache from 1 to 2',
+        body: 'Bumps actions/setup-npm-cache.',
+        base: { ref: 'main' },
+        head: { ref: 'dependabot/github_actions/actions/setup-npm-cache-2.0.0', sha: 'def789' },
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const labelCreates = [];
+    const labelApplies = [];
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelCreates.push(body);
+        return new Response(JSON.stringify({ name: body.name }), { status: 201 });
+      }
+      if (url.includes('/repos/test/repo/issues/102/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelApplies.push(body);
+        return new Response(JSON.stringify(body.labels.map(l => ({ name: l }))), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      // Must NOT include 'javascript', only github_actions and GitHub/CI
+      const names = labelCreates.map(l => l.name).sort();
+      assert.deepStrictEqual(names, ['GitHub/CI', 'dependencies', 'github_actions']);
+      assert.strictEqual(labelApplies.length, 1);
+      assert.deepStrictEqual(labelApplies[0].labels.sort(), ['GitHub/CI', 'dependencies', 'github_actions']);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('Dependabot opened PR with partial existing labels only creates and attaches missing ones', async () => {
+    const payload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        number: 103,
+        title: 'Bump actions/checkout from 3 to 4',
+        body: 'Bumps actions/checkout.',
+        base: { ref: 'main' },
+        head: { ref: 'dependabot/github_actions/actions/checkout-4', sha: 'def456' },
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        labels: [{ name: 'dependencies' }, { name: 'github_actions' }]
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const labelCreates = [];
+    const labelApplies = [];
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelCreates.push(body);
+        return new Response(JSON.stringify({ name: body.name }), { status: 201 });
+      }
+      if (url.includes('/repos/test/repo/issues/103/labels') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        labelApplies.push(body);
+        return new Response(JSON.stringify(body.labels.map(l => ({ name: l }))), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+
+      // Only GitHub/CI was missing, so only GitHub/CI is ensured and applied
+      assert.strictEqual(labelCreates.length, 1);
+      assert.strictEqual(labelCreates[0].name, 'GitHub/CI');
+      assert.strictEqual(labelApplies.length, 1);
+      assert.deepStrictEqual(labelApplies[0].labels, ['GitHub/CI']);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
+
+  test('Dependabot synchronize event does not attempt label creation', async () => {
+    const payload = JSON.stringify({
+      action: 'synchronize',
+      pull_request: {
+        number: 99,
+        title: 'Bump lodash from 4.17.20 to 4.17.21',
+        body: 'Bumps [lodash](https://github.com/lodash/lodash).',
+        base: { ref: 'main' },
+        head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'def456' },
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        labels: []
+      },
+      installation: { id: 456 },
+      repository: { full_name: 'test/repo' }
+    });
+    const secret = 'mysecret';
+    const signature = await calculateHmac(secret, payload);
+
+    const labelCreates = [];
+    fetchMock = async (url, options) => {
+      if (url.includes('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'mocktoken' }), { status: 200 });
+      }
+      if (url.includes('/repos/test/repo/labels') && options?.method === 'POST') {
+        labelCreates.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({}), { status: 201 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const originalImportKey = crypto.subtle.importKey;
+    crypto.subtle.importKey = async (format, keyData, algorithm, extractable, keyUsages) => {
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        return { type: 'private', extractable: false, algorithm, usages: keyUsages };
+      }
+      return originalImportKey.call(crypto.subtle, format, keyData, algorithm, extractable, keyUsages);
+    };
+    const originalSign = crypto.subtle.sign;
+    crypto.subtle.sign = async (algorithm, key, data) => {
+      if (algorithm === "RSASSA-PKCS1-v1_5") {
+        return new ArrayBuffer(256);
+      }
+      return originalSign.call(crypto.subtle, algorithm, key, data);
+    };
+
+    try {
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, {
+        WEBHOOK_SECRET: secret,
+        APP_ID: '12345',
+        PRIVATE_KEY: 'YW55Y29udGVudA=='
+      }, {});
+
+      assert.strictEqual(response.status, 200);
+      // No labels should have been created on synchronize
+      assert.strictEqual(labelCreates.length, 0, `Expected 0 label creates on synchronize, got ${labelCreates.length}`);
+    } finally {
+      crypto.subtle.importKey = originalImportKey;
+      crypto.subtle.sign = originalSign;
+      fetchMock = null;
+    }
+  });
 });
 

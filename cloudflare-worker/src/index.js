@@ -523,6 +523,45 @@ async function handleWebhook(request, env) {
   const senderType = data.pull_request?.user?.type || 'User';
 
   if (IGNORED_USERS.map(u => u.toLowerCase()).includes(prAuthor.toLowerCase()) || senderType === 'Bot') {
+    // Dependabot cannot create repository labels and silently skips missing ones
+    // when opening a PR, so we ensure and attach them here.
+    if (prAuthor.toLowerCase().startsWith('dependabot') && (data.action === 'opened')) {
+      const currentPrLabels = new Set(
+        (data.pull_request?.labels || []).map(l => (typeof l === 'string' ? l : l.name).toLowerCase())
+      );
+      const headRef = data.pull_request?.head?.ref || '';
+      const dependabotLabels = [
+        { name: 'dependencies', color: '0366d6', description: 'Pull requests that update a dependency file' }
+      ];
+
+      if (headRef.includes('/github_actions/') || headRef.includes('/github-actions/')) {
+        dependabotLabels.push(
+          { name: 'GitHub/CI',      color: 'e6a742', description: 'Pull requests/issues for GitHub, CI and related stuff' },
+          { name: 'github_actions', color: '2088ff', description: 'Pull requests that update GitHub Actions code' }
+        );
+      }
+      if (headRef.includes('/npm_and_yarn/')) {
+        dependabotLabels.push(
+          { name: 'javascript', color: 'f1e05a', description: 'Pull requests that update Javascript code' }
+        );
+      }
+
+      const labelsToEnsure = dependabotLabels.filter(lbl => !currentPrLabels.has(lbl.name.toLowerCase()));
+
+      if (labelsToEnsure.length > 0) {
+        await Promise.all(
+          labelsToEnsure.map(lbl =>
+            ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, null, () => { subrequestBudget.used++; })
+          )
+        );
+
+        const prNumber = data.pull_request?.number;
+        if (prNumber) {
+          const prLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/labels`;
+          await trackedApiCall(prLabelUrl, token, 'POST', { labels: labelsToEnsure.map(l => l.name) });
+        }
+      }
+    }
     return new Response(`Success: Ignored PR from bot/system user (@${prAuthor})`, { status: 200 });
   }
 
