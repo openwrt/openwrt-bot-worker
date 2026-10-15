@@ -58,11 +58,19 @@ describe('parseAndValidateConfig', () => {
 
     // String "50" instead of number 50
     const resStringNum = parseAndValidateConfig(JSON.stringify({ max_subject_len_soft: '50' }));
-    assert.match(resStringNum.error, /field "max_subject_len_soft" must be a non-negative number \(got string\)/);
+    assert.match(resStringNum.error, /field "max_subject_len_soft" must be a non-negative integer/);
 
     // Negative number
     const resNegative = parseAndValidateConfig(JSON.stringify({ max_subject_len_hard: -10 }));
-    assert.match(resNegative.error, /field "max_subject_len_hard" must be a non-negative number/);
+    assert.match(resNegative.error, /field "max_subject_len_hard" must be a non-negative integer/);
+
+    // Infinity (e.g. 1e999 in JSON text)
+    const resInfinity = parseAndValidateConfig('{"max_subject_len_soft": 1e999}');
+    assert.match(resInfinity.error, /field "max_subject_len_soft" must be a non-negative integer/);
+
+    // Float number (must be integer for length limits)
+    const resFloat = parseAndValidateConfig(JSON.stringify({ max_subject_len_soft: 50.5 }));
+    assert.match(resFloat.error, /field "max_subject_len_soft" must be a non-negative integer/);
 
     // Invalid discrete modes (e.g. typos or unsupported numbers)
     const resTypo = parseAndValidateConfig(JSON.stringify({ check_pkg_release: 'warnning' }));
@@ -73,6 +81,10 @@ describe('parseAndValidateConfig', () => {
 
     const resInvalidHash = parseAndValidateConfig(JSON.stringify({ check_pkg_hash: 'strict' }));
     assert.match(resInvalidHash.error, /field "check_pkg_hash" must be one of/);
+
+    // check_pkg_hash: true is ambiguous and rejected in favor of explicit warning / error / false / disabled
+    const resHashTrue = parseAndValidateConfig(JSON.stringify({ check_pkg_hash: true }));
+    assert.match(resHashTrue.error, /field "check_pkg_hash" must be one of/);
 
     const resInvalidBinary = parseAndValidateConfig(JSON.stringify({ check_binary_files: 'warnning' }));
     assert.match(resInvalidBinary.error, /field "check_binary_files" must be one of/);
@@ -106,6 +118,18 @@ describe('parseAndValidateConfig', () => {
     // Null field value
     const resNullField = parseAndValidateConfig(JSON.stringify({ check_signoff: null }));
     assert.match(resNullField.error, /field "check_signoff" must not be null/);
+  });
+
+  test('tolerates unknown fields and object prototype keys without error', () => {
+    const res = parseAndValidateConfig(JSON.stringify({
+      toString: 'custom-to-string',
+      valueOf: 'custom-value-of',
+      constructor: 'custom-constructor',
+      some_custom_future_flag: true
+    }));
+    assert.strictEqual(res.error, null);
+    assert.strictEqual(res.config.toString, 'custom-to-string');
+    assert.strictEqual(res.config.some_custom_future_flag, true);
   });
 
   test('accepts all documented valid configuration values and modes', () => {
@@ -158,6 +182,10 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_buildbot_default: val })).error, null);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_patch_headers: val })).error, null);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_release: val })).error, null);
+    }
+
+    // 8. check_pkg_hash modes (warning, error, false, disabled)
+    for (const val of [false, 'warning', 'error', 'disabled']) {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_hash: val })).error, null);
     }
   });

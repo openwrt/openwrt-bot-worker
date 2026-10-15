@@ -44,8 +44,8 @@ export interface PullRequestData {
   commits?: number;
   author_association?: string;
   user?: GitHubUser;
-  base?: { ref?: string; sha?: string };
-  head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
+  base: { ref: string; sha: string; [key: string]: unknown };
+  head: { ref: string; sha: string; repo?: { full_name?: string }; [key: string]: unknown };
   labels?: Array<string | { name: string }>;
   [key: string]: unknown;
 }
@@ -150,7 +150,20 @@ export function isPullRequestPayload(payload: unknown): payload is PullRequestEv
     return false;
   }
   const pr = p.pull_request as Record<string, unknown>;
-  return typeof pr.number === 'number';
+  if (typeof pr.number !== 'number') {
+    return false;
+  }
+  if (!pr.base || typeof pr.base !== 'object' || !pr.head || typeof pr.head !== 'object') {
+    return false;
+  }
+  const base = pr.base as Record<string, unknown>;
+  const head = pr.head as Record<string, unknown>;
+  return (
+    typeof base.ref === 'string' &&
+    typeof base.sha === 'string' &&
+    typeof head.ref === 'string' &&
+    typeof head.sha === 'string'
+  );
 }
 
 export function isIssueCommentPayload(payload: unknown): payload is IssueCommentEventPayload {

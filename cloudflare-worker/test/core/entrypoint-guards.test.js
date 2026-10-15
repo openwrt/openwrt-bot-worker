@@ -18,9 +18,26 @@ describe('runtime type guards and entrypoint boundary validation', () => {
       assert.strictEqual(isPullRequestPayload({}), false);
       assert.strictEqual(isPullRequestPayload({ pull_request: null }), false);
       assert.strictEqual(isPullRequestPayload({ pull_request: {} }), false);
-      assert.strictEqual(isPullRequestPayload({ pull_request: { number: 123 } }), true);
+      assert.strictEqual(isPullRequestPayload({ pull_request: { number: 123 } }), false);
+      assert.strictEqual(isPullRequestPayload({ pull_request: { number: 123, base: { ref: 'main', sha: 'bsha' } } }), false);
+      assert.strictEqual(isPullRequestPayload({ pull_request: { number: 123, head: { ref: 'feat', sha: 'hsha' } } }), false);
+      assert.strictEqual(isPullRequestPayload({ pull_request: { number: 123, base: { ref: 'main' }, head: { ref: 'feat' } } }), false);
+      assert.strictEqual(isPullRequestPayload({
+        pull_request: {
+          number: 123,
+          base: { ref: 'main', sha: 'bsha' },
+          head: { ref: 'feat', sha: 'hsha' }
+        }
+      }), true);
       // If it also contains comment, it's an issue_comment payload, not pull_request
-      assert.strictEqual(isPullRequestPayload({ pull_request: { number: 123 }, comment: { id: 1 } }), false);
+      assert.strictEqual(isPullRequestPayload({
+        pull_request: {
+          number: 123,
+          base: { ref: 'main', sha: 'bsha' },
+          head: { ref: 'feat', sha: 'hsha' }
+        },
+        comment: { id: 1 }
+      }), false);
     });
 
     test('isIssueCommentPayload validates both comment and issue objects with essential fields', () => {
@@ -56,6 +73,18 @@ describe('runtime type guards and entrypoint boundary validation', () => {
       const resNoNumber = await handlePullRequestEvent({ pull_request: {} }, 'pull_request', {}, 'token', 'openwrt/openwrt', null, 0);
       assert.strictEqual(resNoNumber.status, 400);
       assert.match(await resNoNumber.text(), /expected pull_request event payload/);
+
+      const resIncomplete = await handlePullRequestEvent(
+        { pull_request: { number: 123 } },
+        'pull_request',
+        {},
+        'token',
+        'openwrt/openwrt',
+        null,
+        0
+      );
+      assert.strictEqual(resIncomplete.status, 400);
+      assert.match(await resIncomplete.text(), /expected pull_request event payload/);
     });
 
     test('handlePullRequestEvent rejects malformed issue_comment payloads with HTTP 400', async () => {
@@ -91,6 +120,22 @@ describe('runtime type guards and entrypoint boundary validation', () => {
 
     test('rejects malformed pull_request payload at the webhook boundary with HTTP 400', async () => {
       const payload = JSON.stringify({ action: 'opened', pull_request: {} });
+      const signature = await calculateHmac(secret, payload);
+      const request = new Request('http://localhost/webhook', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'x-hub-signature-256': signature,
+          'x-github-event': 'pull_request'
+        }
+      });
+      const response = await worker.fetch(request, { WEBHOOK_SECRET: secret }, {});
+      assert.strictEqual(response.status, 400);
+      assert.match(await response.text(), /expected pull_request event payload/);
+    });
+
+    test('rejects incomplete pull_request payload (missing base/head) with HTTP 400', async () => {
+      const payload = JSON.stringify({ action: 'opened', pull_request: { number: 123 } });
       const signature = await calculateHmac(secret, payload);
       const request = new Request('http://localhost/webhook', {
         method: 'POST',

@@ -48,7 +48,7 @@ export interface FormalitiesConfig {
   check_pkg_release?: boolean | 'warning' | 'error' | 'disabled';
 
   // Package Hash Check features
-  check_pkg_hash?: boolean | 'warning' | 'error' | 'disabled';
+  check_pkg_hash?: false | 'warning' | 'error' | 'disabled';
 
   // Identity / Account linking Check features
   require_linked_github_account?: boolean | 'warning' | 'error' | 'disabled';
@@ -111,7 +111,7 @@ const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_buildbot_default: new Set([true, false, 'warning', 'error', 'disabled']),
   check_patch_headers: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_release: new Set([true, false, 'warning', 'error', 'disabled']),
-  check_pkg_hash: new Set([true, false, 'warning', 'error', 'disabled'])
+  check_pkg_hash: new Set([false, 'warning', 'error', 'disabled'])
 };
 
 const STRING_ARRAY_FIELDS = new Set([
@@ -147,8 +147,8 @@ export function parseAndValidateConfig(rawConfigText: string | null): {
           fieldErrors.push(`field "${key}" must be a boolean (got ${typeof val})`);
         }
       } else if (NUMBER_FIELDS.has(key)) {
-        if (typeof val !== 'number' || Number.isNaN(val) || val < 0) {
-          fieldErrors.push(`field "${key}" must be a non-negative number (got ${typeof val})`);
+        if (typeof val !== 'number' || !Number.isFinite(val) || !Number.isInteger(val) || val < 0) {
+          fieldErrors.push(`field "${key}" must be a non-negative integer (got ${val})`);
         }
       } else if (key === 'check_openwrt_meta') {
         const isValid =
@@ -157,7 +157,7 @@ export function parseAndValidateConfig(rawConfigText: string | null): {
         if (!isValid) {
           fieldErrors.push(`field "check_openwrt_meta" must be a boolean or an array of non-empty strings (got ${JSON.stringify(val)})`);
         }
-      } else if (key in ALLOWED_VALUES_BY_FIELD) {
+      } else if (Object.hasOwn(ALLOWED_VALUES_BY_FIELD, key)) {
         const allowed = ALLOWED_VALUES_BY_FIELD[key];
         if (!allowed.has(val)) {
           const allowedStr = Array.from(allowed).map(v => typeof v === 'string' ? `"${v}"` : String(v)).join(', ');

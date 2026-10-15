@@ -175,13 +175,13 @@ export async function loadPullRequestContext(
     return { kind: 'response', response: new Response(`Success: Ignored PR from bot/system user (@${prAuthor})`, { status: 200 }) };
   }
 
-  const baseBranch = prData.base?.ref || '';
-  const headBranch = prData.head?.ref || '';
+  const baseBranch = prData.base.ref;
+  const headBranch = prData.head.ref;
   const prNumber = prData.number;
   const prTitle = prData.title || '';
   const prBody = prData.body || '';
-  const headSha = prData.head?.sha || '';
-  const baseSha = prData.base?.sha || '';
+  const headSha = prData.head.sha;
+  const baseSha = prData.base.sha;
   const isBackportPr = /^(stable|openwrt-)/.test(baseBranch) || /^\[\d{2}\.\d{2}\]/.test(prTitle);
 
   const fileBatchLoader = createFileBatchLoader({
