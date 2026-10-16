@@ -655,7 +655,7 @@ describe('graphqlFetchRepoSetup with a pull request', { concurrency: 1 }, () => 
     );
   });
 
-  test('does not throw when GraphQL errors affect only comments, returning setup with comments: null (Issue 2)', async () => {
+  test('does not throw when GraphQL errors affect only comments, returning setup with comments: null', async () => {
     fetchMock = () => {
       return new Response(JSON.stringify({
         data: {

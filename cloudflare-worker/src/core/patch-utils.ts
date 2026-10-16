@@ -41,7 +41,7 @@ export function splitPrPatchByCommit(
   const expectedFiles = new Map(commits.map(c => [c.sha, Number.isInteger(c.changed_files) ? c.changed_files : null]));
   let pending = commits.map(c => c.sha);
   const starts: Array<{ sha: string; index: number }> = [];
-  const envelope = /^From ([0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$/gm;
+  const envelope = new RegExp(MBOX_ENVELOPE_PATTERN.source, MBOX_ENVELOPE_PATTERN.flags);
   let match: RegExpExecArray | null;
   while ((match = envelope.exec(prPatch)) !== null) {
     const position = pending.indexOf(match[1]);

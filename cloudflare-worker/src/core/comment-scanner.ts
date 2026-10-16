@@ -35,9 +35,9 @@ export async function scanCommentList(
   return scan;
 }
 
-// `hasHeadroom` is asked before every page after the first: a thread long
-// enough to page is also long enough to eat the headroom kept for the closing
-// writes, and losing those loses the whole report. Stopping counts as a failed
+// `hasHeadroom` is asked before every page: a thread long enough to page is
+// also long enough to eat the headroom kept for the closing writes, and
+// losing those loses the whole report. Stopping or skipping counts as a failed
 // scan, which the caller already handles by leaving the comment alone - better
 // a run without its comment than a run whose check-runs GitHub refuses.
 export async function scanPrComments(
@@ -53,6 +53,11 @@ export async function scanPrComments(
   const scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null };
 
   while (true) {
+    if (typeof hasHeadroom === 'function' && !hasHeadroom()) {
+      console.warn(`Comment scan for PR #${prNumber} ${page === 1 ? 'skipped before page 1' : `stopped after page ${page - 1}`}: no request budget left beyond the reserve.`);
+      return null;
+    }
+
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
     const res: GitHubApiResponse<any> = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { onAttempt: onCall });
     if (!res || res.code !== 200 || !Array.isArray(res.data)) {
@@ -67,10 +72,6 @@ export async function scanPrComments(
 
     if (res.data.length < 100) {
       break;
-    }
-    if (!hasHeadroom()) {
-      console.warn(`Comment scan for PR #${prNumber} stopped after page ${page}: no request budget left beyond the reserve.`);
-      return null;
     }
     page++;
   }

@@ -267,7 +267,7 @@ diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
 @@ -1,3 +1,3 @@
 -PKG_RELEASE:=1
 +PKG_RELEASE:=2
-`;
+ `;
 
     const patchesResult = {
       usePrWidePatch: true,
