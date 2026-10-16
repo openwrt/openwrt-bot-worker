@@ -946,47 +946,142 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     // used to have only its first bump validated, and one new package
     // anywhere in the PR used to switch the check off for every commit.
     const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
-    // A fixup's subject is dictated by the commit it amends, so it cannot
-    // name the version it introduces; the pair is squashed before merging.
     const isAutosquash = CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(subject);
     const isRevert = CONFIG.allow_revert !== false && parseRevertCommit(fullCommit.commit.message || '') !== null;
+
+    const commitsList = (fullCommit.isPrWidePatch && Array.isArray(fullCommit.commits))
+      ? fullCommit.commits
+      : [fullCommit];
+
+    const commitMatches = (newVer, targetFilePath) => {
+      const pkgDir = targetFilePath ? targetFilePath.replace(/\/Makefile$/, '') : '';
+      const pkgName = pkgDir ? pkgDir.split('/').pop().toLowerCase() : '';
+
+      for (const c of commitsList) {
+        const cMsg = c.commit?.message || '';
+        const rawSubject = cMsg.split('\n')[0].trim();
+        const unPrefixed = rawSubject.replace(/^(fixup!|squash!)\s+/, '');
+        const revertMatch = parseRevertCommit(cMsg);
+        const cleanSub = revertMatch ? (revertMatch.revertedSubject || unPrefixed) : unPrefixed;
+
+        let pertainsToPackage = false;
+        if (c.commitPatch && targetFilePath) {
+          if (c.commitPatch.includes(`b/${targetFilePath}`) || (pkgDir && c.commitPatch.includes(`b/${pkgDir}/`))) {
+            pertainsToPackage = true;
+          }
+        } else if (!c.commitPatch && pkgName) {
+          const entities = extractSubjectEntity(cleanSub).map(e => e.toLowerCase());
+          if (entities.includes(pkgName) ||
+              cleanSub.toLowerCase().startsWith(pkgName + ':') ||
+              (pkgDir && cleanSub.toLowerCase().startsWith(pkgDir.toLowerCase() + ':'))) {
+            pertainsToPackage = true;
+          }
+        }
+
+        if (!pertainsToPackage && commitsList.length === 1 && !c.commitPatch) {
+          pertainsToPackage = true;
+        }
+
+        if (!pertainsToPackage) {
+          continue;
+        }
+
+        if (CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(rawSubject)) return true;
+        if (CONFIG.allow_revert !== false && revertMatch !== null) return true;
+        if (matchVersionString(cleanSub, newVer)) return true;
+      }
+      return false;
+    };
+
+    const validateVersionAgainstCommit = (newVersion, filePath) => {
+      if (newVersion.includes('$')) {
+        successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
+      } else if (fullCommit.isPrWidePatch) {
+        if (!commitMatches(newVersion, filePath)) {
+          errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in pull request commit subjects. Please mention the new version in the relevant commit subject, e.g. '<package>: update to ${newVersion}'.`);
+        } else {
+          successes.push(`✅ PKG_VERSION bump matches context information inside commit subjects (${newVersion})`);
+        }
+      } else if (isRevert) {
+        successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
+      } else if (isAutosquash) {
+        successes.push(`✅ Autosquash commit, skipping subject validation for PKG_VERSION '${newVersion}'`);
+      } else if (!commitMatches(newVersion, filePath)) {
+        errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
+      } else {
+        successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
+      }
+    };
 
     for (const fileDiff of commitPatch.split(/^diff --git /m)) {
       const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
       if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
-      // A brand-new Makefile is a package addition, not a version bump: its
-      // subject says what is added and carries no old-to-new version context.
       if (/^---\s+\/dev\/null/m.test(fileDiff)) continue;
 
       const versionMatch = fileDiff.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
-      if (!versionMatch) continue;
-      const newVersion = versionMatch[1].replace(/["']/g, "").trim();
+      if (versionMatch) {
+        const newVersion = versionMatch[1].replace(/["']/g, "").trim();
+        validateVersionAgainstCommit(newVersion, filePath);
+        continue;
+      }
 
-      if (newVersion.includes('$')) {
-        successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
-      } else if (isRevert) {
-        // A revert restores the PKG_VERSION that preceded the reverted commit,
-        // while its subject quotes that commit (and therefore the version being
-        // undone). Requiring the restored version here would force the author
-        // away from the `git revert` subject format.
-        successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
-      } else if (isAutosquash) {
-        successes.push(`✅ Autosquash commit, skipping subject validation for PKG_VERSION '${newVersion}'`);
-      } else if (!matchVersionString(cleanSubject, newVersion)) {
-        errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
-      } else {
-        successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
+      // If PKG_VERSION wasn't directly changed in the diff, check if an indirect
+      // helper variable (e.g. GO_VERSION_PATCH) was modified.
+      if (typeof fetchFileContent === 'function') {
+        const touchedVars = new Set();
+        for (const line of fileDiff.split('\n')) {
+          if (!line.startsWith('+') || line.startsWith('+++')) continue;
+          const assign = line.slice(1).match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+          if (assign) {
+            const vName = assign[1];
+            if (vName !== 'PKG_RELEASE' && vName !== 'PKG_HASH' && vName !== 'PKG_MIRROR_HASH' &&
+                vName !== 'PKG_MAINTAINER' && vName !== 'PKG_LICENSE' && vName !== 'PKG_LICENSE_FILES') {
+              touchedVars.add(vName);
+            }
+          }
+        }
+
+        if (touchedVars.size > 0) {
+          const resolveIndirect = (content) => {
+            if (!content) return null;
+            const trackingVars = collectResolutionVarNames(content, 'PKG_VERSION');
+            const touchesAny = [...touchedVars].some(v => trackingVars.has(v));
+            if (touchesAny) {
+              return resolveMakefileVar(content, 'PKG_VERSION');
+            }
+            return null;
+          };
+
+          const resolvedFromDiff = resolveIndirect(fileDiff);
+          if (resolvedFromDiff && !resolvedFromDiff.includes('$')) {
+            newVersion = resolvedFromDiff.trim();
+          } else if (typeof fetchFileContent === 'function') {
+            pendingAsyncChecks.push(async () => {
+              try {
+                const headText = await fetchFileContent(filePath);
+                if (headText === null || headText === undefined) {
+                  warnings.push(`Could not fetch '${filePath}' to verify indirect PKG_VERSION.`);
+                  return { incomplete: true };
+                }
+                const resolvedFromHead = resolveIndirect(headText);
+                if (resolvedFromHead && !resolvedFromHead.includes('$')) {
+                  validateVersionAgainstCommit(resolvedFromHead.trim(), filePath);
+                }
+              } catch (err) {
+                warnings.push(`Could not complete PKG_VERSION check because of an error fetching '${filePath}': ${err?.message || err}`);
+                return { incomplete: true };
+              }
+            });
+            continue;
+          }
+        }
       }
     }
   }
 
   if (CONFIG.check_openwrt_meta) {
-    let requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
-    if (Array.isArray(CONFIG.check_openwrt_meta)) {
-      requiredMeta = CONFIG.check_openwrt_meta;
-    }
     if (isNewPackageThisCommit) {
       const addedChunks = getMakefileChunks().filter(c =>
         isPackageMakefilePath(c.filePath) && c.lines.some(l => /^---\s+\/dev\/null\r?$/.test(l))

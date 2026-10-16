@@ -9,7 +9,8 @@ import {
 } from '../../validators.js';
 import {
   getCommitMessageFromPatch,
-  getChangedFilesFromPatch
+  getChangedFilesFromPatch,
+  splitPrPatchByCommit
 } from '../../core/patch-utils.ts';
 import { CHERRY_PICK_MARKER } from '../../core/policy.ts';
 import type { PullRequestContext } from './context.ts';
@@ -255,7 +256,28 @@ export async function runValidations(
   }
 
   if (usePrWidePatch && prPatch) {
+    const splitMap = splitPrPatchByCommit(prPatch, ctx.commits);
+    const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?$/gm;
+    const matches = [...prPatch.matchAll(envelope)];
+
+    const commitsWithPatches = ctx.commits.map((c: any, i: number) => {
+      let patch = splitMap.get(c.sha) || null;
+      if (!patch && matches.length > 1 && matches.length === ctx.commits.length) {
+        const start = matches[i].index;
+        const end = i + 1 < matches.length ? matches[i + 1].index : prPatch.length;
+        patch = prPatch.slice(start, end);
+      } else if (!patch && ctx.commits.length === 1) {
+        patch = prPatch;
+      }
+      return {
+        ...c,
+        commitPatch: patch || (c.commitPatch ?? null)
+      };
+    });
+
     const virtualCommit = {
+      isPrWidePatch: true,
+      commits: commitsWithPatches,
       commit: {
         message: prTitle + "\n" + ctx.commits.map((c: any) => c.commit.message || '').join("\n")
       }
