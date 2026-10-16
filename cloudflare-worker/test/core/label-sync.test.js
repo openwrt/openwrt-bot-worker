@@ -9,12 +9,16 @@ describe('label-sync lifecycle phase and error handling', () => {
   const createMockContext = ({
     existingLabels = new Set(),
     trackedApiResult = { code: 200, data: null, raw: '', headers: { get: () => null } },
-    client = null
+    client = null,
+    headBranch = 'feature',
+    baseSha = 'base123'
   } = {}) => ({
     prNumber: 42,
     repoFullname: 'openwrt/openwrt',
+    headBranch,
     baseBranch: 'main',
     headSha: 'head123',
+    baseSha,
     token: 'fake-token',
     prData: {
       number: 42,
@@ -179,5 +183,242 @@ describe('label-sync lifecycle phase and error handling', () => {
 
     const removedLabels = queue.queue.filter(([what]) => what === 'remove label');
     assert.strictEqual(removedLabels.length, 0);
+  });
+
+  test('fails closed and does not touch labels when live PR fetch returns 500 error', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set([LABEL_GUIDELINES.toLowerCase()]);
+    const ctx = createMockContext({
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({ code: 500, data: null, raw: 'Internal Server Error' }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+
+    assert.strictEqual(queue.queue.length, 0);
+  });
+
+  test('does not remove stale label when live PR state verification returns HTTP 500 error', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set(['stale']);
+    const ctx = createMockContext({
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({ code: 500, data: null, raw: 'Internal Server Error' }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    ctx.action = 'synchronize';
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    assert.strictEqual(queue.queue.length, 0);
+  });
+
+  test('does not remove stale label when live PR head SHA moved (stale event)', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set(['stale']);
+    const ctx = createMockContext({
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({
+          code: 200,
+          data: {
+            labels: [{ name: 'stale' }],
+            head: { ref: 'feature', sha: 'newerSha456' },
+            base: { ref: 'main', sha: 'base123' },
+            body: 'PR Body'
+          }
+        }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    ctx.action = 'synchronize';
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    assert.strictEqual(queue.queue.length, 0);
+  });
+
+  test('removes stale label on synchronize when live PR is verified and head SHA matches', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set(['stale']);
+    const ctx = createMockContext({
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({
+          code: 200,
+          data: {
+            labels: [{ name: 'stale' }],
+            head: { ref: 'feature', sha: 'head123' },
+            base: { ref: 'main', sha: 'base123' },
+            body: 'PR Body'
+          }
+        }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    ctx.action = 'synchronize';
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    const staleRemoval = queue.queue.find(([desc]) => desc === 'label removal "stale"');
+    assert.ok(staleRemoval, 'stale label removal should be queued');
+  });
+
+  test('skips label sync when live PR is closed (state !== "open") even if head SHA and body match', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set(['stale']);
+    const ctx = createMockContext({
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({
+          code: 200,
+          data: {
+            state: 'closed',
+            labels: [{ name: 'stale' }],
+            head: { ref: 'feature', sha: 'head123' },
+            base: { ref: 'main', sha: 'base123' },
+            body: 'PR Body'
+          }
+        }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    ctx.action = 'synchronize';
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    assert.strictEqual(queue.queue.length, 0, 'no label operations should be queued when PR is closed');
+  });
+
+  test('skips label sync when live PR head branch ref changed', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set(['stale']);
+    const ctx = createMockContext({
+      headBranch: 'feature-original',
+      baseSha: 'base123',
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({
+          code: 200,
+          data: {
+            state: 'open',
+            labels: [{ name: 'stale' }],
+            head: { ref: 'feature-renamed', sha: 'head123' },
+            base: { ref: 'main', sha: 'base123' },
+            body: 'PR Body'
+          }
+        }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    ctx.action = 'synchronize';
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    assert.strictEqual(queue.queue.length, 0, 'no label operations should be queued when head.ref changed');
+  });
+
+  test('skips label sync when live PR base SHA changed', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set(['stale']);
+    const ctx = createMockContext({
+      headBranch: 'feature',
+      baseSha: 'base-original-123',
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({
+          code: 200,
+          data: {
+            state: 'open',
+            labels: [{ name: 'stale' }],
+            head: { ref: 'feature', sha: 'head123' },
+            base: { ref: 'main', sha: 'base-drifted-456' },
+            body: 'PR Body'
+          }
+        }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    ctx.action = 'synchronize';
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    assert.strictEqual(queue.queue.length, 0, 'no label operations should be queued when base.sha changed');
   });
 });

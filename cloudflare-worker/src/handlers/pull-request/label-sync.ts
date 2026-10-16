@@ -1,6 +1,6 @@
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from '../../config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from '../../labeler.js';
-import type { PullRequestContext } from './context.ts';
+import { fetchLivePrState, type PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult } from './patches.ts';
 import type { AggregatedReport } from './report.ts';
 import type { GitHubWriteQueue } from '../../core/github-write-queue.ts';
@@ -11,7 +11,7 @@ export async function syncLabels(
   report: AggregatedReport,
   queue: GitHubWriteQueue
 ): Promise<void> {
-  const { prNumber, repoFullname, baseBranch, headSha, prData, client, existingLabels, config, labelerText, action } = ctx;
+  const { prNumber, repoFullname, baseBranch, client, existingLabels, config, labelerText, action } = ctx;
   const { allPassed } = report;
   const { packageState, packageStateKnown, usePrWidePatch, prPatch, commitDetails } = patchesResult;
 
@@ -26,17 +26,7 @@ export async function syncLabels(
     labelsToAdd.push(name);
   };
 
-  let livePr = prData;
-  if (client.hasHeadroom()) {
-    const prUrl = prData.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
-    const liveRes = await client.optionalApiCall(prUrl);
-    if (liveRes && liveRes.code === 200 && Array.isArray(liveRes.data?.labels)) {
-      livePr = liveRes.data;
-    }
-  }
-
-  const branchMoved = livePr.head?.sha !== headSha || livePr.base?.ref !== baseBranch;
-  const verdictMoved = branchMoved || (livePr.body ?? '') !== (prData.body ?? '');
+  const { livePr, branchMoved, verdictMoved } = await fetchLivePrState(ctx);
 
   const currentPrLabels = new Set<string>((livePr.labels || []).map((l: any) => l.name.toLowerCase()));
   const currentPrLabelNames = new Map<string, string>((livePr.labels || []).map((l: any) => [l.name.toLowerCase(), l.name]));
@@ -49,7 +39,7 @@ export async function syncLabels(
     });
   };
 
-  if ((action === 'synchronize' || action === 'reopened') && currentPrLabels.has('stale')) {
+  if (!branchMoved && (action === 'synchronize' || action === 'reopened') && currentPrLabels.has('stale')) {
     enqueueRemove(spelledAsOnPr('stale'));
   }
 
@@ -92,7 +82,7 @@ export async function syncLabels(
     }
   }
 
-  if (config.enable_labeler_yml && labelerText) {
+  if (!branchMoved && config.enable_labeler_yml && labelerText) {
     let changedFiles: string[] = [];
     if (usePrWidePatch) {
       changedFiles = getAllChangedFiles(prPatch);

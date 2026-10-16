@@ -127,12 +127,18 @@ export async function runValidations(
 
   let makefileChecksIncomplete = false;
 
+  // Start all per-commit, PR-wide, release, and hash validations in the same
+  // synchronous tick so FileBatchLoader coalesces every file lookup into a
+  // single batched GraphQL query.
   const deepChecks = commitDetails.map((item: CommitDetail) => {
     if (usePrWidePatch || item.isVerbatim) return null;
     const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, item.sha);
     const fetchUpstream = (path: string) => item.upstreamSha ? fileBatchLoader.fetchFileContentCached(path, item.upstreamSha) : Promise.resolve(null);
     const hasUpstream = isBackportPr && item.upstreamPatch;
+    const upstreamCommit = hasUpstream ? { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } } : null;
     return {
+      makefile: safeMakefile(validateMakefileContext(item.fullCommit, item.commitPatch, config, packageState, repoFullname, fetchFileContent)),
+      upstreamMakefile: hasUpstream ? safeMakefile(validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname, fetchUpstream)) : null,
       uci: safeUci(validateUciConfigs(item.commitPatch, config, fetchFileContent)),
       upstreamUci: hasUpstream ? safeUci(validateUciConfigs(item.upstreamPatch, config, fetchUpstream)) : null,
       patches: safePatches(validateEmbeddedPatches(item.commitPatch, config, fetchFileContent)),
@@ -140,8 +146,107 @@ export async function runValidations(
     };
   });
 
+  const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?\nFrom: /gm;
+  const prWideEnvelopeMatches = (usePrWidePatch && prPatch) ? [...prPatch.matchAll(envelope)] : [];
+  const splitMap = (usePrWidePatch && prPatch)
+    ? (patchesResult.splitCommitPatches && patchesResult.splitCommitPatches.size > 0
+        ? patchesResult.splitCommitPatches
+        : (prWideEnvelopeMatches.length > 0 ? splitPrPatchByCommit(prPatch, ctx.commits) : new Map<string, string>()))
+    : new Map<string, string>();
+
+  const changedFiles = (usePrWidePatch && prPatch) ? getChangedFilesFromPatch(prPatch) : [];
+  const touchesMakefilesOrPackages = changedFiles.some(f =>
+    f === 'Makefile' || f.endsWith('/Makefile') || f.startsWith('package/') || f.startsWith('feeds/')
+  );
+
+  const nonMergeCommitsCount = ctx.commits.filter((c: any) => (c.parents || []).length <= 1).length;
+  const targetCommits = (ctx.commits || []).filter((c: any) => (c.parents || []).length <= 1 && c.changed_files !== 0);
+  const expectedCount = targetCommits.length > 0 ? targetCommits.length : nonMergeCommitsCount;
+
+  if (usePrWidePatch && prPatch && touchesMakefilesOrPackages && prWideEnvelopeMatches.length > 0 && expectedCount > 1) {
+    if (splitMap.size < expectedCount || prWideEnvelopeMatches.length < expectedCount || splitMap.size < Math.min(prWideEnvelopeMatches.length, nonMergeCommitsCount)) {
+      makefileChecksIncomplete = true;
+      const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series (${splitMap.size}/${expectedCount || prWideEnvelopeMatches.length} commits mapped)`;
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n- ⚠️ ${warnMsg}`);
+    }
+  }
+
+  const prWideChecks = (usePrWidePatch && prPatch) ? (() => {
+    const commitsWithPatches = ctx.commits.map((c: any) => {
+      let patch = splitMap.get(c.sha) || null;
+      if (!patch && ctx.commits.length === 1) {
+        patch = prPatch;
+      }
+      return {
+        ...c,
+        commitPatch: patch || (c.commitPatch ?? null)
+      };
+    });
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: commitsWithPatches,
+      commit: {
+        message: prTitle + "\n" + ctx.commits.map((c: any) => c.commit.message || '').join("\n")
+      }
+    };
+    const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, ctx.headSha);
+    const isMissingAtHead = (path: string) => fileBatchLoader.isFileMissing(path, ctx.headSha);
+    return {
+      makefile: safeMakefile(validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname, fetchFileContent)),
+      uci: safeUci(validateUciConfigs(prPatch, config, fetchFileContent)),
+      patches: safePatches(validateEmbeddedPatches(prPatch, config, fetchFileContent, isMissingAtHead))
+    };
+  })() : null;
+
+  let releaseDetails: any[] = [];
+  if (usePrWidePatch && prPatch) {
+    if (prWideEnvelopeMatches.length > 1) {
+      releaseDetails = ctx.commits.map((c: any) => ({
+        commitPatch: splitMap.get(c.sha) || null,
+        fullCommit: c
+      }));
+    } else {
+      releaseDetails = [{ commitPatch: prPatch }];
+    }
+  } else if (usePrWidePatch) {
+    releaseDetails = [{ commitPatch: prPatch }];
+  } else {
+    releaseDetails = commitDetails.filter(item => (item.fullCommit?.parents || []).length <= 1);
+  }
+
+  if (isBackportPr) {
+    releaseDetails = releaseDetails.filter((item: any) => !item.isVerbatim);
+  }
+
+  const fetchFileContentAtHead = (path: string) => fileBatchLoader.fetchFileContentCached(path, headSha);
+  const fetchFileContentAtBase = (path: string) => fileBatchLoader.fetchFileContentCached(path, baseSha);
+
+  const releasePromise = validatePkgReleaseBumps(releaseDetails, config, fetchFileContentAtHead, fetchFileContentAtBase)
+    .catch((e: any) => {
+      console.error(`Failed to audit package release bumps: ${e.message}`);
+      return {
+        successes: [] as string[],
+        errors: [] as string[],
+        warnings: [`Could not complete package release audit because of an error fetching file content: ${e.message}`],
+        notes: [] as string[],
+        incomplete: true
+      };
+    });
+
+  const hashesPromise = validatePkgHashes(releaseDetails, config, fetchFileContentAtHead, fetchFileContentAtBase)
+    .catch((e: any) => {
+      console.error(`Failed to audit package hashes: ${e.message}`);
+      return {
+        successes: [] as string[],
+        errors: [] as string[],
+        warnings: [`Could not complete package hash audit because of an error fetching file content: ${e.message}`],
+        findings: [] as string[],
+        incomplete: true
+      };
+    });
+
   for (const [commitIndex, item] of commitDetails.entries()) {
-    const { sha, html_url, fullCommit, commitPatch } = item;
+    const { sha, html_url, fullCommit } = item;
     const commitMsgLines = (fullCommit.commit.message || '').split("\n");
     const commitSubject = commitMsgLines[0].trim();
 
@@ -203,13 +308,10 @@ export async function runValidations(
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
-        const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, sha);
-        const reportMakefile = await safeMakefile(validateMakefileContext(fullCommit, commitPatch, config, packageState, repoFullname, fetchFileContent));
+        const reportMakefile = await deepChecks[commitIndex]!.makefile;
         if (reportMakefile.incomplete) makefileChecksIncomplete = true;
-        if (isBackportPr && item.upstreamPatch) {
-          const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
-          const fetchUpstream = (path: string) => item.upstreamSha ? fileBatchLoader.fetchFileContentCached(path, item.upstreamSha) : Promise.resolve(null);
-          const reportUpstreamMakefile = await safeMakefile(validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname, fetchUpstream));
+        if (deepChecks[commitIndex]!.upstreamMakefile) {
+          const reportUpstreamMakefile = await deepChecks[commitIndex]!.upstreamMakefile;
           if (reportUpstreamMakefile.incomplete) makefileChecksIncomplete = true;
           reportMakefile.errors = reportMakefile.errors.filter((err: string) => !reportUpstreamMakefile.errors.includes(err));
           reportMakefile.warnings = reportMakefile.warnings.filter((warn: string) => !reportUpstreamMakefile.warnings.includes(warn));
@@ -282,55 +384,10 @@ export async function runValidations(
     }
   }
 
-  let prWideSplitMap: Map<string, string> | null = null;
-  if (usePrWidePatch && prPatch) {
-    const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?$/gm;
-    const matches = [...prPatch.matchAll(envelope)];
-    prWideSplitMap = matches.length > 0 ? splitPrPatchByCommit(prPatch, ctx.commits) : new Map();
-    const changedFiles = getChangedFilesFromPatch(prPatch);
-    const touchesMakefilesOrPackages = changedFiles.some(f =>
-      f === 'Makefile' || f.endsWith('/Makefile') || f.startsWith('package/') || f.startsWith('feeds/')
-    );
-
-    const splitMap = prWideSplitMap;
-    const targetCommits = (ctx.commits || []).filter((c: any) => (c.parents || []).length <= 1 && c.changed_files !== 0);
-    const expectedCount = targetCommits.length > 0 ? targetCommits.length : (ctx.commits?.length || 0);
-
-    const isSplitIncomplete = touchesMakefilesOrPackages && matches.length > 0 && (
-      (expectedCount > 1 && (splitMap.size < expectedCount || matches.length < expectedCount)) ||
-      (matches.length > 1 && splitMap.size < matches.length)
-    );
-
-    if (isSplitIncomplete) {
-      makefileChecksIncomplete = true;
-      const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series (${splitMap.size}/${expectedCount || matches.length} commits mapped)`;
-      allPrWarnings.push(`**Pull Request Overall Diff**:\n- ⚠️ ${warnMsg}`);
-      makefileOutputText += `  ⚠️ Warning: ${warnMsg}\n\n`;
-    }
-
-    const commitsWithPatches = ctx.commits.map((c: any) => {
-      let patch = splitMap.get(c.sha) || null;
-      if (!patch && ctx.commits.length === 1) {
-        patch = prPatch;
-      }
-      return {
-        ...c,
-        commitPatch: patch || (c.commitPatch ?? null)
-      };
-    });
-
-    const virtualCommit = {
-      isPrWidePatch: true,
-      commits: commitsWithPatches,
-      commit: {
-        message: prTitle + "\n" + ctx.commits.map((c: any) => c.commit.message || '').join("\n")
-      }
-    };
-
-    const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, ctx.headSha);
-    const reportMakefile = await safeMakefile(validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname, fetchFileContent));
+  if (prWideChecks) {
+    const reportMakefile = await prWideChecks.makefile;
     if (reportMakefile.incomplete) makefileChecksIncomplete = true;
-    const reportUci = await safeUci(validateUciConfigs(prPatch, config, fetchFileContent));
+    const reportUci = await prWideChecks.uci;
     if (reportUci.incomplete) makefileChecksIncomplete = true;
 
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
@@ -351,8 +408,7 @@ export async function runValidations(
     }
     makefileOutputText += "\n";
 
-    const isMissingAtHead = (path: string) => fileBatchLoader.isFileMissing(path, ctx.headSha);
-    const reportPatches = await safePatches(validateEmbeddedPatches(prPatch, config, fetchFileContent, isMissingAtHead));
+    const reportPatches = await prWideChecks.patches;
     if (reportPatches.incomplete) patchChecksIncomplete = true;
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach((s: string) => { patchesOutputText += `  ${s}\n`; });
@@ -374,59 +430,8 @@ export async function runValidations(
     patchesOutputText += "\n";
   }
 
-  const fetchFileContentAtHead = (path: string) => fileBatchLoader.fetchFileContentCached(path, headSha);
-  const fetchFileContentAtBase = (path: string) => fileBatchLoader.fetchFileContentCached(path, baseSha);
-
-  let releaseDetails: any[] = [];
-  if (usePrWidePatch && prPatch) {
-    const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?$/gm;
-    const matches = [...prPatch.matchAll(envelope)];
-    const splitMap = prWideSplitMap || (matches.length > 0 ? splitPrPatchByCommit(prPatch, ctx.commits) : new Map());
-    const targetCommits = (ctx.commits || []).filter((c: any) => (c.parents || []).length <= 1 && c.changed_files !== 0);
-    const expectedCount = targetCommits.length > 0 ? targetCommits.length : (ctx.commits?.length || 0);
-
-    const changedFiles = getChangedFilesFromPatch(prPatch);
-    const touchesMakefilesOrPackages = changedFiles.some(f =>
-      f === 'Makefile' || f.endsWith('/Makefile') || f.startsWith('package/') || f.startsWith('feeds/')
-    );
-
-    if (matches.length > 0 && (expectedCount > 1 || matches.length > 1)) {
-      const isSplitIncomplete = touchesMakefilesOrPackages && (
-        splitMap.size < expectedCount || matches.length < expectedCount || splitMap.size < matches.length
-      );
-      if (isSplitIncomplete) {
-        makefileChecksIncomplete = true;
-        const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series for package release audit (${splitMap.size}/${expectedCount || matches.length} commits mapped)`;
-        if (!allPrWarnings.some(w => w.includes('PR-wide patch series'))) {
-          allPrWarnings.push(`**Package Release Audit**:\n- ⚠️ ${warnMsg}`);
-        }
-      }
-      releaseDetails = (ctx.commits || []).map((c: any) => ({
-        commitPatch: splitMap.get(c.sha) || null,
-        fullCommit: c
-      }));
-    } else {
-      releaseDetails = [{ commitPatch: prPatch }];
-    }
-  } else if (usePrWidePatch) {
-    releaseDetails = [{ commitPatch: prPatch }];
-  } else {
-    releaseDetails = commitDetails.filter(item => (item.fullCommit?.parents || []).length <= 1);
-  }
-
-  if (isBackportPr) {
-    releaseDetails = releaseDetails.filter((item: any) => !item.isVerbatim);
-  }
-
-  let reportRelease = { successes: [] as string[], errors: [] as string[], warnings: [] as string[], notes: [] as string[] };
-  try {
-    reportRelease = await validatePkgReleaseBumps(releaseDetails, config, fetchFileContentAtHead, fetchFileContentAtBase);
-    if ((reportRelease as any).incomplete) makefileChecksIncomplete = true;
-  } catch (e: any) {
-    console.error(`Failed to audit package release bumps: ${e.message}`);
-    reportRelease.warnings = [`Could not complete package release audit because of an error fetching file content: ${e.message}`];
-    makefileChecksIncomplete = true;
-  }
+  const reportRelease = await releasePromise;
+  if ((reportRelease as any).incomplete) makefileChecksIncomplete = true;
 
   if (isBackportPr && reportRelease.errors.length > 0) {
     reportRelease.errors = reportRelease.errors.filter(err => {
@@ -509,15 +514,8 @@ export async function runValidations(
     makefileOutputText += "\n";
   }
 
-  let reportHashes = { successes: [] as string[], errors: [] as string[], warnings: [] as string[], findings: [] as string[] };
-  try {
-    reportHashes = await validatePkgHashes(releaseDetails, config, fetchFileContentAtHead, fetchFileContentAtBase);
-    if ((reportHashes as any).incomplete) makefileChecksIncomplete = true;
-  } catch (e: any) {
-    console.error(`Failed to audit package hashes: ${e.message}`);
-    reportHashes.warnings = [`Could not complete package hash audit because of an error fetching file content: ${e.message}`];
-    makefileChecksIncomplete = true;
-  }
+  const reportHashes = await hashesPromise;
+  if ((reportHashes as any).incomplete) makefileChecksIncomplete = true;
   const hashErrors = [...reportHashes.errors, ...(config.check_pkg_hash === 'error' ? reportHashes.findings : [])];
   const hashWarnings = [
     ...reportHashes.warnings.map(w => `- ${w}`),

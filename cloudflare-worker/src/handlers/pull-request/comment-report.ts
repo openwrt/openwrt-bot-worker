@@ -1,5 +1,5 @@
 import { safeTruncate } from '../../core/utils.ts';
-import type { PullRequestContext } from './context.ts';
+import { fetchLivePrState, type PullRequestContext } from './context.ts';
 import type { AggregatedReport } from './report.ts';
 import type { GitHubWriteQueue } from '../../core/github-write-queue.ts';
 import type { Env } from '../../types/env.ts';
@@ -85,7 +85,7 @@ export async function syncPrComment(
   env: Env
 ): Promise<void> {
   const { config, repoFullname, prNumber, client, getCommentsScanWithRetry } = ctx;
-  const { allPassed, allFormalityErrors, allMakefileErrors, allPatchesErrors, allPrWarnings } = report;
+  const { allPassed, isValidationIncomplete, allFormalityErrors, allMakefileErrors, allPatchesErrors, allPrWarnings } = report;
 
   if (!config.enable_comments) {
     return;
@@ -93,6 +93,13 @@ export async function syncPrComment(
 
   const scanResult = await getCommentsScanWithRetry();
   if (scanResult === null) {
+    return;
+  }
+
+  // Prevent older runs from overwriting comments if PR moved or verification fails
+  const { verdictMoved } = await fetchLivePrState(ctx);
+  if (verdictMoved) {
+    console.warn(`Skipping PR comment sync for #${prNumber}: PR state moved or could not be verified`);
     return;
   }
 
@@ -120,7 +127,7 @@ export async function syncPrComment(
         client.trackedApiCall(commentsUrl, 'POST', { body: commentBody })
       );
     }
-  } else {
+  } else if (!isValidationIncomplete) {
     if (existingCommentId) {
       queue.enqueue('PR comment removal', async () => {
         const res = await client.trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'DELETE');
