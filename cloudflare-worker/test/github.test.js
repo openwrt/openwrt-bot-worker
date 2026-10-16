@@ -212,6 +212,19 @@ describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
     assert.deepStrictEqual(result.get('bin'), { content: null, exists: true, isBinary: true });
   });
 
+  test('marks probe as failed: true when GraphQL returns a Blob object but errors reading its text', async () => {
+    fetchMock = () => new Response(JSON.stringify({
+      data: { repo0: { f0: { oid: 'abc123', text: null, isBinary: false } } },
+      errors: [{ message: 'Read failed', path: ['repo0', 'f0', 'text'] }]
+    }), { status: 200 });
+
+    const result = await graphqlBatchFetchFiles('token', [
+      { key: 'f', repoFullname: 'openwrt/openwrt', ref: 'sha', path: 'Makefile' }
+    ]);
+
+    assert.deepStrictEqual(result.get('f'), { content: null, exists: true, isBinary: false, failed: true });
+  });
+
   test('probes ref existence with a bare-ref expression when path is null', async () => {
     let capturedVariables = null;
     fetchMock = (url, options) => {
@@ -640,6 +653,34 @@ describe('graphqlFetchRepoSetup with a pull request', { concurrency: 1 }, () => 
       () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988),
       /pullRequest.commits is null/
     );
+  });
+
+  test('does not throw when GraphQL errors affect only comments, returning setup with comments: null (Issue 2)', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: false, endCursor: null } },
+            cfg: { text: '{}' },
+            labeler: null,
+            pullRequest: {
+              commits: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+                commitNode('a'.repeat(40))
+              ] },
+              comments: null
+            }
+          }
+        },
+        errors: [
+          { message: 'Comments timeout', path: ['repository', 'pullRequest', 'comments'] }
+        ]
+      }), { status: 200 });
+    };
+
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+    assert.strictEqual(setup.commits.length, 1);
+    assert.strictEqual(setup.commits[0].sha, 'a'.repeat(40));
+    assert.strictEqual(setup.comments, null);
   });
 
   test('spells signature states the way REST did', () => {

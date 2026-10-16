@@ -241,17 +241,22 @@ export async function graphqlBatchFetchFiles(token, probes, onCall) {
   for (const meta of probeMeta) {
     const repoData = topLevelData[meta.repoAlias];
     const field = repoData ? repoData[meta.fieldAlias] : undefined;
+    const hasError = failedAt.has('*') || failedAt.has(meta.repoAlias) || failedAt.has(`${meta.repoAlias}.${meta.fieldAlias}`);
     if (field) {
-      results.set(meta.key, {
+      const result = {
         content: typeof field.text === 'string' ? field.text : null,
         exists: true,
         isBinary: field.isBinary === true
-      });
+      };
+      if (hasError && result.content === null) {
+        result.failed = true;
+      }
+      results.set(meta.key, result);
     } else {
       const result = { content: null, exists: false, isBinary: false };
       // A field lost to an error is empty too, so it is marked: only an
       // unmarked empty field says the file is not there.
-      if (failedAt.has('*') || failedAt.has(meta.repoAlias) || failedAt.has(`${meta.repoAlias}.${meta.fieldAlias}`)) {
+      if (hasError) {
         result.failed = true;
       }
       results.set(meta.key, result);
@@ -422,7 +427,12 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   }
 
   const commitsErrors = Array.isArray(res.data?.errors)
-    ? res.data.errors.filter(e => !e.path || e.path.includes('commits') || e.path.includes('pullRequest'))
+    ? res.data.errors.filter(e => {
+        if (!e.path || !Array.isArray(e.path) || e.path.length === 0) return true;
+        if (e.path.includes('commits')) return true;
+        if (!pr.commits && (e.path[e.path.length - 1] === 'pullRequest' || e.path[e.path.length - 1] === 'repository')) return true;
+        return false;
+      })
     : [];
   if (!pr.commits || commitsErrors.length > 0) {
     const errMsgs = commitsErrors.map(e => e.message).join('; ');
@@ -450,7 +460,7 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
       variables: { owner, name, pr: prNumber, after: commitsPage.endCursor }
     }, 'application/vnd.github+json', { onAttempt: onCall });
     const pageErrors = Array.isArray(pageRes.data?.errors)
-      ? pageRes.data.errors.filter(e => !e.path || e.path.includes('commits') || e.path.includes('pullRequest'))
+      ? pageRes.data.errors.filter(e => !e.path || !Array.isArray(e.path) || e.path.length === 0 || e.path.includes('commits'))
       : [];
     const page = pageRes.code === 200 && pageErrors.length === 0 ? pageRes.data?.data?.repository?.pullRequest?.commits : null;
     if (!page) {
@@ -464,7 +474,10 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   }
   setup.commits = commits;
 
-  if (pr.comments && !pr.comments.pageInfo?.hasNextPage) {
+  const commentsErrors = Array.isArray(res.data?.errors)
+    ? res.data.errors.filter(e => e.path && Array.isArray(e.path) && e.path.includes('comments'))
+    : [];
+  if (commentsErrors.length === 0 && pr.comments && !pr.comments.pageInfo?.hasNextPage) {
     setup.comments = (pr.comments.nodes || []).map(restCommentFromGraphql);
   }
   return setup;

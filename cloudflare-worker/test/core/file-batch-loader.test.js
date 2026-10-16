@@ -180,7 +180,7 @@ describe('FileBatchLoader', () => {
     assert.strictEqual(callCount, 2);
   });
 
-  test('rejects and increments fetchFailureCount when GraphQL returns field-level error (failed: true) (Finding 2)', async () => {
+  test('rejects and increments fetchFailureCount when GraphQL returns field-level error (failed: true)', async () => {
     globalThis.fetch = async () => {
       return new Response(JSON.stringify({
         data: {
@@ -207,6 +207,37 @@ describe('FileBatchLoader', () => {
       /GitHub GraphQL query returned an error/
     );
     assert.strictEqual(loader.isFileMissing('problematic.txt', 'main'), false, 'should not be recorded as missing file');
+    assert.strictEqual(loader.getFetchFailureCount(), 1);
+    assert.strictEqual(loader.getStats().fetchFailureCount, 1);
+  });
+
+  test('rejects and increments fetchFailureCount when Blob object exists but has GraphQL error in text', async () => {
+    globalThis.fetch = async () => {
+      return new Response(JSON.stringify({
+        data: {
+          repo0: {
+            f0: { oid: 'abc123', text: null, isBinary: false }
+          }
+        },
+        errors: [
+          { message: 'Read failed', path: ['repo0', 'f0', 'text'] }
+        ]
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const budget = { limit: 50, used: 0, reserve: 5 };
+    const loader = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => true
+    });
+
+    await assert.rejects(
+      () => loader.fetchFileContentCached('package/foo/Makefile', 'main'),
+      /GitHub GraphQL query returned an error/
+    );
+    assert.strictEqual(loader.isFileMissing('package/foo/Makefile', 'main'), false, 'should not be recorded as missing file');
     assert.strictEqual(loader.getFetchFailureCount(), 1);
     assert.strictEqual(loader.getStats().fetchFailureCount, 1);
   });

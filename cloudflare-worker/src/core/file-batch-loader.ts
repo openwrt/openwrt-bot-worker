@@ -154,9 +154,9 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
       if (refSource.has(ref)) continue;
       const baseRef = resultsByProbeKey.get(keys.baseKey);
       const forkRef = resultsByProbeKey.get(keys.forkKey);
-      if (baseRef && !baseRef.error && baseRef.exists) {
+      if (baseRef && !baseRef.error && !baseRef.failed && baseRef.exists) {
         refSource.set(ref, 'base');
-      } else if (baseRef && !baseRef.error && !baseRef.skipped && forkRef && !forkRef.error && forkRef.exists) {
+      } else if (baseRef && !baseRef.error && !baseRef.failed && !baseRef.skipped && forkRef && !forkRef.error && !forkRef.failed && forkRef.exists) {
         refSource.set(ref, 'fork');
         console.warn(`Ref ${ref} only resolves under head repo ${headRepoFullname}; subsequent file lookups at this ref will go straight to the fork.`);
       }
