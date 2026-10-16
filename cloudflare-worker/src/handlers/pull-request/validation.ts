@@ -26,6 +26,7 @@ export interface ValidationOutcome {
   patchesOutputText: string;
   patchesHeading: string;
   patchChecksIncomplete: boolean;
+  makefileChecksIncomplete: boolean;
   unreadPatchNotes: Set<string>;
 }
 
@@ -89,11 +90,30 @@ export async function runValidations(
   }
   formalityOutputText += branchCheckOutputText;
 
-  const safeUci = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[] }> =>
-    promise.catch((err: any) => ({
+  const safeUci = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[]; incomplete?: boolean }> =>
+    promise.then((res: any) => ({
+      successes: res?.successes || [],
+      errors: res?.errors || [],
+      warnings: res?.warnings || [],
+      incomplete: Boolean(res?.incomplete)
+    })).catch((err: any) => ({
       successes: [],
       errors: [],
-      warnings: [`Could not complete UCI config validation because of an error fetching file content: ${err?.message || err}`]
+      warnings: [`Could not complete UCI config validation because of an error fetching file content: ${err?.message || err}`],
+      incomplete: true
+    }));
+
+  const safeMakefile = (promiseOrVal: any): Promise<{ successes: string[]; errors: string[]; warnings: string[]; incomplete?: boolean }> =>
+    Promise.resolve(promiseOrVal).then((res: any) => ({
+      successes: res?.successes || [],
+      errors: res?.errors || [],
+      warnings: res?.warnings || [],
+      incomplete: Boolean(res?.incomplete)
+    })).catch((err: any) => ({
+      successes: [],
+      errors: [],
+      warnings: [`Could not complete Makefile validation because of an error fetching file content: ${err?.message || err}`],
+      incomplete: true
     }));
 
   const safePatches = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[]; skipped: string[]; incomplete?: boolean }> =>
@@ -104,6 +124,8 @@ export async function runValidations(
       skipped: [],
       incomplete: true
     }));
+
+  let makefileChecksIncomplete = false;
 
   const deepChecks = commitDetails.map((item: CommitDetail) => {
     if (usePrWidePatch || item.isVerbatim) return null;
@@ -182,23 +204,27 @@ export async function runValidations(
         makefileOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n\n";
       } else {
         const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, sha);
-        const reportMakefile = await validateMakefileContext(fullCommit, commitPatch, config, packageState, repoFullname, fetchFileContent);
+        const reportMakefile = await safeMakefile(validateMakefileContext(fullCommit, commitPatch, config, packageState, repoFullname, fetchFileContent));
+        if (reportMakefile.incomplete) makefileChecksIncomplete = true;
         if (isBackportPr && item.upstreamPatch) {
           const upstreamCommit = { commit: { message: getCommitMessageFromPatch(item.upstreamPatch) } };
           const fetchUpstream = (path: string) => item.upstreamSha ? fileBatchLoader.fetchFileContentCached(path, item.upstreamSha) : Promise.resolve(null);
-          const reportUpstreamMakefile = await validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname, fetchUpstream);
+          const reportUpstreamMakefile = await safeMakefile(validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname, fetchUpstream));
+          if (reportUpstreamMakefile.incomplete) makefileChecksIncomplete = true;
           reportMakefile.errors = reportMakefile.errors.filter((err: string) => !reportUpstreamMakefile.errors.includes(err));
           reportMakefile.warnings = reportMakefile.warnings.filter((warn: string) => !reportUpstreamMakefile.warnings.includes(warn));
           reportMakefile.successes.push("✅ Filtered out style/packaging issues already present in upstream commit");
         }
 
         const reportUci = await deepChecks[commitIndex]!.uci;
+        if (reportUci.incomplete) makefileChecksIncomplete = true;
         if (deepChecks[commitIndex]!.upstreamUci) {
           const reportUpstreamUci = await deepChecks[commitIndex]!.upstreamUci;
+          if (reportUpstreamUci.incomplete) makefileChecksIncomplete = true;
           reportUci.errors = reportUci.errors.filter((err: string) => !reportUpstreamUci.errors.includes(err));
           reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
         }
-
+ 
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportMakefile.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
         reportUci.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
@@ -229,6 +255,7 @@ export async function runValidations(
 
         if (deepChecks[commitIndex]!.upstreamPatches) {
           const reportUpstreamPatches = await deepChecks[commitIndex]!.upstreamPatches;
+          if (reportUpstreamPatches.incomplete) patchChecksIncomplete = true;
           reportPatches.errors = reportPatches.errors.filter((err: string) => !reportUpstreamPatches.errors.includes(err));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
@@ -284,8 +311,10 @@ export async function runValidations(
     };
 
     const fetchFileContent = (path: string) => fileBatchLoader.fetchFileContentCached(path, ctx.headSha);
-    const reportMakefile = await validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname, fetchFileContent);
+    const reportMakefile = await safeMakefile(validateMakefileContext(virtualCommit, prPatch, config, packageState, repoFullname, fetchFileContent));
+    if (reportMakefile.incomplete) makefileChecksIncomplete = true;
     const reportUci = await safeUci(validateUciConfigs(prPatch, config, fetchFileContent));
+    if (reportUci.incomplete) makefileChecksIncomplete = true;
 
     makefileOutputText += `#### Pull Request Overall Diff:\n`;
     reportMakefile.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
@@ -342,9 +371,11 @@ export async function runValidations(
   let reportRelease = { successes: [] as string[], errors: [] as string[], warnings: [] as string[], notes: [] as string[] };
   try {
     reportRelease = await validatePkgReleaseBumps(releaseDetails, config, fetchFileContentAtHead, fetchFileContentAtBase);
+    if ((reportRelease as any).incomplete) makefileChecksIncomplete = true;
   } catch (e: any) {
     console.error(`Failed to audit package release bumps: ${e.message}`);
     reportRelease.warnings = [`Could not complete package release audit because of an error fetching file content: ${e.message}`];
+    makefileChecksIncomplete = true;
   }
 
   if (isBackportPr && reportRelease.errors.length > 0) {
@@ -431,9 +462,11 @@ export async function runValidations(
   let reportHashes = { successes: [] as string[], errors: [] as string[], warnings: [] as string[], findings: [] as string[] };
   try {
     reportHashes = await validatePkgHashes(releaseDetails, config, fetchFileContentAtHead, fetchFileContentAtBase);
+    if ((reportHashes as any).incomplete) makefileChecksIncomplete = true;
   } catch (e: any) {
     console.error(`Failed to audit package hashes: ${e.message}`);
     reportHashes.warnings = [`Could not complete package hash audit because of an error fetching file content: ${e.message}`];
+    makefileChecksIncomplete = true;
   }
   const hashErrors = [...reportHashes.errors, ...(config.check_pkg_hash === 'error' ? reportHashes.findings : [])];
   const hashWarnings = [
@@ -464,6 +497,7 @@ export async function runValidations(
     patchesOutputText,
     patchesHeading,
     patchChecksIncomplete,
+    makefileChecksIncomplete,
     unreadPatchNotes
   };
 }

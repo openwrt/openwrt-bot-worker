@@ -74,4 +74,69 @@ diff --git a/package/network/services/dropbear/files/dropbear.config b/package/n
       'Warning should explain that UCI validation could not complete due to file fetch failure'
     );
   });
+
+  test('marks makefileChecksIncomplete when upstream Makefile check is incomplete', async () => {
+    const fakeFileBatchLoader = {
+      fetchFileContentCached: async () => null,
+      isFileMissing: () => false,
+      getRefSource: () => undefined,
+      hasRefSource: () => false,
+      setRefSource: () => {},
+      getBudgetSkipCount: () => 0,
+      getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+    };
+
+    const mockCtx = {
+      prNumber: 42,
+      prTitle: 'foo: backport fix',
+      baseBranch: 'main',
+      headSha: 'head123',
+      baseSha: 'base123',
+      isBackportPr: true,
+      repoFullname: 'openwrt/openwrt',
+      config: { ...DEFAULT_CONFIG, check_conffiles: true },
+      configError: null,
+      commitScanCapped: false,
+      commitsCount: 1,
+      commits: [],
+      fileBatchLoader: fakeFileBatchLoader,
+      getCommentsScanWithRetry: async () => null,
+      isMaintainerUser: async () => false,
+      isAuthorMaintainer: async () => false,
+      branchCheckError: null,
+      branchCheckOutputText: ''
+    };
+
+    const commitPatch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
++`;
+    const upstreamPatch = commitPatch;
+
+    const patchesResult = {
+      usePrWidePatch: false,
+      prPatch: null,
+      commitDetails: [{
+        sha: 'commit1234567890',
+        html_url: 'https://github.com/openwrt/openwrt/commit/commit1234567890',
+        fullCommit: {
+          commit: {
+            message: 'foo: backport fix\n\n(cherry picked from commit 0987654321098765432109876543210987654321)'
+          }
+        },
+        commitPatch,
+        isVerbatim: false,
+        upstreamPatch,
+        upstreamSha: '0987654321098765432109876543210987654321'
+      }],
+      packageState: { isNewPackage: false, isDroppedPackage: false }
+    };
+
+    const result = await runValidations(mockCtx, patchesResult);
+    assert.strictEqual(result.makefileChecksIncomplete, true);
+  });
 });

@@ -8,7 +8,8 @@ import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE } from '../../src/config.js';
 describe('label-sync lifecycle phase and error handling', () => {
   const createMockContext = ({
     existingLabels = new Set(),
-    trackedApiResult = { code: 200, data: null, raw: '', headers: { get: () => null } }
+    trackedApiResult = { code: 200, data: null, raw: '', headers: { get: () => null } },
+    client = null
   } = {}) => ({
     prNumber: 42,
     repoFullname: 'openwrt/openwrt',
@@ -23,7 +24,7 @@ describe('label-sync lifecycle phase and error handling', () => {
       head: { ref: 'feature', sha: 'head123' },
       base: { ref: 'main', sha: 'base123' }
     },
-    client: {
+    client: client || {
       budget: { limit: 50, used: 0, reserve: 5 },
       hasHeadroom: () => true,
       optionalApiCall: async () => ({
@@ -142,5 +143,41 @@ describe('label-sync lifecycle phase and error handling', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test('does not remove guidelines label when validation is incomplete even if allPassed is true', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const existingLabels = new Set([LABEL_GUIDELINES.toLowerCase()]);
+    const ctx = createMockContext({
+      existingLabels,
+      client: {
+        budget: { limit: 50, used: 0, reserve: 5 },
+        hasHeadroom: () => true,
+        optionalApiCall: async () => ({
+          code: 200,
+          data: {
+            labels: [{ name: LABEL_GUIDELINES }],
+            head: { ref: 'feature', sha: 'head123' },
+            base: { ref: 'main', sha: 'base123' },
+            body: 'PR Body'
+          }
+        }),
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: true,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+
+    const removedLabels = queue.queue.filter(([what]) => what === 'remove label');
+    assert.strictEqual(removedLabels.length, 0);
   });
 });

@@ -552,7 +552,7 @@ index 123456..789012 100644
       
       const makefileCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
       assert.ok(makefileCheck);
-      assert.strictEqual(makefileCheck.conclusion, 'success');
+      assert.strictEqual(makefileCheck.conclusion, 'neutral');
       assert.match(makefileCheck.output.text, /Package release bump audit skipped/);
       assert.match(makefileCheck.output.text, /PR modifies 16 packages/);
     } finally {
