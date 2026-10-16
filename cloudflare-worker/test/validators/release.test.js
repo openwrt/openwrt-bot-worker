@@ -789,6 +789,95 @@ deleted file mode 100644
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, makefile, makefile);
     assertErrorIncludes(res, 'content changed without a PKG_RELEASE or version bump');
   });
+
+  test('accepts f2fs-tools commit sequence in PR-wide mode when provided as a single mbox diff', async () => {
+    const mboxDiff = `From aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Wed, 14 Oct 2026 10:00:00 +0200
+Subject: [PATCH 1/2] f2fs-tools: update to 1.17.0
+
+---
+diff --git a/package/utils/f2fs-tools/Makefile b/package/utils/f2fs-tools/Makefile
+--- a/package/utils/f2fs-tools/Makefile
++++ b/package/utils/f2fs-tools/Makefile
+@@ -9,4 +9,4 @@
+-PKG_VERSION:=1.16.0
+-PKG_RELEASE:=2
++PKG_VERSION:=1.17.0
++PKG_RELEASE:=1
+
+From bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Wed, 14 Oct 2026 11:00:00 +0200
+Subject: [PATCH 2/2] f2fs-tools: add upstream bugfix patch
+
+---
+diff --git a/package/utils/f2fs-tools/Makefile b/package/utils/f2fs-tools/Makefile
+--- a/package/utils/f2fs-tools/Makefile
++++ b/package/utils/f2fs-tools/Makefile
+@@ -9,4 +9,4 @@
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+diff --git a/package/utils/f2fs-tools/patches/001-fix.patch b/package/utils/f2fs-tools/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/f2fs-tools/patches/001-fix.patch
+@@ -0,0 +1,5 @@
++new patch
+`;
+    const commitDetails = [{ commitPatch: mboxDiff }];
+    const headFetch = makefileAt('package/utils/f2fs-tools', 'PKG_NAME:=f2fs-tools\nPKG_VERSION:=1.17.0\nPKG_RELEASE:=2\n');
+    const baseFetch = makefileAt('package/utils/f2fs-tools', 'PKG_NAME:=f2fs-tools\nPKG_VERSION:=1.16.0\nPKG_RELEASE:=2\n');
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertNoErrors(res);
+    assertSuccessIncludes(res, "reset to 1 and subsequently bumped to '2' in commit series");
+  });
+
+  test('rejects non-integer PKG_RELEASE value like 2oops instead of parsing prefix', async () => {
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -10,2 +10,2 @@
+-PKG_RELEASE:=1
++PKG_RELEASE:=2oops
+`;
+    const headFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=2oops\n');
+    const baseFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=1\n');
+    const commitDetails = [{ fullCommit: makeCommit('mypkg: update release'), commitPatch: patch }];
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertErrorIncludes(res, "PKG_RELEASE value '2oops' is not a valid integer");
+  });
+
+  test('audits package that was deleted in one commit and re-added in a later commit', async () => {
+    const commit1Patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+deleted file mode 100644
+--- a/package/utils/mypkg/Makefile
++++ /dev/null
+`;
+    const commit2Patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/mypkg/Makefile
+@@ -0,0 +3,3 @@
++PKG_NAME:=mypkg
++PKG_VERSION:=1.0.0
++PKG_RELEASE:=2
+`;
+    const commitDetails = [
+      { fullCommit: makeCommit('mypkg: remove package'), commitPatch: commit1Patch },
+      { fullCommit: makeCommit('mypkg: re-add package'), commitPatch: commit2Patch }
+    ];
+    const headFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=2\n');
+    const baseFetch = async () => null;
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertErrorIncludes(res, "New package `package/utils/mypkg` must start with PKG_RELEASE set to 1 (currently: '2')");
+  });
 });
 
 describe('validatePkgReleaseBumps lookups', () => {

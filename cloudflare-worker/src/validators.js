@@ -901,6 +901,27 @@ function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
   return false;
 }
 
+export function splitMboxPatch(rawPatch) {
+  if (!rawPatch) return null;
+  const envelope = /^From ([0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$/gm;
+  const matches = [...rawPatch.matchAll(envelope)];
+  if (matches.length <= 1) {
+    return null;
+  }
+
+  const parts = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index;
+    const end = i + 1 < matches.length ? matches[i + 1].index : rawPatch.length;
+    const part = rawPatch.slice(start, end);
+    if (!part.includes('diff --git ')) {
+      return false;
+    }
+    parts.push({ sha: matches[i][1], commitPatch: part });
+  }
+  return parts;
+}
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
   const errors = [];
   const successes = [];
@@ -2594,6 +2615,8 @@ function diffTouchesVar(diff, varNames) {
   return false;
 }
 
+const isStrictInt = (v) => typeof v === 'string' && /^\d+$/.test(v.trim());
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
@@ -2620,14 +2643,37 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   // qualifies, keeping the audit strict when the origin of a change is unknown.
   const nonRevertedFiles = new Set();
 
-  for (const item of commitDetails) {
+  let effectiveCommitDetails = commitDetails;
+  if (Array.isArray(commitDetails) && commitDetails.length === 1 && commitDetails[0]?.commitPatch) {
+    const splitResult = splitMboxPatch(commitDetails[0].commitPatch);
+    if (splitResult === false) {
+      return {
+        errors: [],
+        successes: [],
+        warnings: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        notes: [],
+        incomplete: true
+      };
+    }
+    if (splitResult) {
+      effectiveCommitDetails = splitResult;
+    }
+  }
+
+  for (const item of effectiveCommitDetails) {
     const isRevertCommit = CONFIG.allow_revert !== false &&
       parseRevertCommit(item.fullCommit?.commit?.message || '') !== null;
 
     if (item.commitPatch) {
       const states = parseDiffFileStates(item.commitPatch);
-      states.addedFiles.forEach(f => addedFiles.add(f));
-      states.deletedFiles.forEach(f => deletedFiles.add(f));
+      states.addedFiles.forEach(f => {
+        addedFiles.add(f);
+        deletedFiles.delete(f);
+      });
+      states.deletedFiles.forEach(f => {
+        deletedFiles.add(f);
+        addedFiles.delete(f);
+      });
 
       // Changes per file in this commit patch
       for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
@@ -2939,7 +2985,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     }
 
     let versionResetTo1InSeries = false;
-    if (commitDetails && commitDetails.length > 1 && versionChanged) {
+    if (effectiveCommitDetails && effectiveCommitDetails.length > 1 && versionChanged) {
       let simRelease = baseRelease;
       let simVersionReset = false;
       let releaseBumpedAfterResetInSeries = false;
@@ -2948,7 +2994,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       collectResolutionVarNames(baseMakefileContent || '', 'PKG_VERSION', versionVarNames);
       const trackingVarNames = new Set([...versionVarNames, 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']);
 
-      for (const item of commitDetails) {
+      for (const item of effectiveCommitDetails) {
         if (!item || !item.commitPatch) continue;
         const commitFileChanges = collectFileLineChanges(item.commitPatch);
         const commitDiff = commitFileChanges ? commitFileChanges[makefilePath] : null;
@@ -2967,10 +3013,12 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
             simVersionReset = false;
           }
         } else if (addedRel !== null) {
-          const prevNum = parseInt(simRelease, 10);
-          const nextNum = parseInt(addedRel, 10);
-          if (simVersionReset && Number.isInteger(prevNum) && Number.isInteger(nextNum) && nextNum > prevNum) {
-            releaseBumpedAfterResetInSeries = true;
+          if (simVersionReset && isStrictInt(simRelease) && isStrictInt(addedRel)) {
+            const prevNum = parseInt(simRelease.trim(), 10);
+            const nextNum = parseInt(addedRel.trim(), 10);
+            if (nextNum > prevNum) {
+              releaseBumpedAfterResetInSeries = true;
+            }
           }
           simRelease = addedRel;
         }
@@ -2994,7 +3042,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; packages on a shared helper without PKG_RELEASE don't require a reset to 1`] };
       }
       if (headRelease !== '1') {
-        if (versionResetTo1InSeries) {
+        if (versionResetTo1InSeries && isStrictInt(headRelease)) {
           return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' (reset to 1 and subsequently bumped to '${headRelease}' in commit series)`] };
         }
         return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
@@ -3002,18 +3050,29 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`] };
     }
 
-    const baseRelNum = parseInt(baseRelease, 10);
-    const headRelNum = parseInt(headRelease, 10);
-    const isNumericBase = Number.isInteger(baseRelNum) && !Number.isNaN(baseRelNum);
-    const isNumericHead = Number.isInteger(headRelNum) && !Number.isNaN(headRelNum);
+    const isNumericBase = isStrictInt(baseRelease);
+    const isNumericHead = isStrictInt(headRelease);
 
-    if (isNumericBase && isNumericHead && headRelNum < baseRelNum) {
+    if (!isNumericHead) {
+      return {
+        errors: [`Package \`${pkgRoot}\` PKG_RELEASE value '${headRelease}' is not a valid integer.`],
+        successes: []
+      };
+    }
+    if (!isNumericBase) {
+      return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE updated to '${headRelease}'`] };
+    }
+
+    const baseRelNum = parseInt(baseRelease.trim(), 10);
+    const headRelNum = parseInt(headRelease.trim(), 10);
+
+    if (headRelNum < baseRelNum) {
       return {
         errors: [`Package \`${pkgRoot}\` PKG_RELEASE was decreased from '${baseRelease}' to '${headRelease}' without a version update.`],
         successes: []
       };
     }
-    if (isNumericBase && isNumericHead && headRelNum === baseRelNum) {
+    if (headRelNum === baseRelNum) {
       return {
         errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],
         successes: []
@@ -3071,11 +3130,34 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
   // difference alone, because pull_request.base.sha is frozen when the PR is
   // opened and drifts as the base branch moves.
   const makefileLineChanges = {}; // path -> { added: [], deleted: [] }
-  for (const item of commitDetails) {
+  let effectiveCommitDetails = commitDetails;
+  if (Array.isArray(commitDetails) && commitDetails.length === 1 && commitDetails[0]?.commitPatch) {
+    const splitResult = splitMboxPatch(commitDetails[0].commitPatch);
+    if (splitResult === false) {
+      return {
+        errors: [],
+        successes: [],
+        warnings: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        findings: [],
+        incomplete: true
+      };
+    }
+    if (splitResult) {
+      effectiveCommitDetails = splitResult;
+    }
+  }
+
+  for (const item of effectiveCommitDetails) {
     if (!item.commitPatch) continue;
     const states = parseDiffFileStates(item.commitPatch);
-    states.addedFiles.forEach(f => addedFiles.add(f));
-    states.deletedFiles.forEach(f => deletedFiles.add(f));
+    states.addedFiles.forEach(f => {
+      addedFiles.add(f);
+      deletedFiles.delete(f);
+    });
+    states.deletedFiles.forEach(f => {
+      deletedFiles.add(f);
+      addedFiles.delete(f);
+    });
     for (const file of getChangedFilesFromPatch(item.commitPatch)) {
       if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
       if (isHiddenOrSpecial(file)) continue;
@@ -3090,7 +3172,7 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
     }
   }
 
-  const paths = [...makefiles].filter(f => !deletedFiles.has(f));
+  const paths = [...makefiles].filter(f => !deletedFiles.has(f) || addedFiles.has(f));
   if (paths.length > 15) {
     warnings.push(`Package hash audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
     return { errors, warnings, findings, successes, incomplete: true };
