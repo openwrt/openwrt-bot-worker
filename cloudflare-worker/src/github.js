@@ -416,12 +416,22 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
 
   const pr = repo.pullRequest;
   if (!pr) {
-    throw new Error(`GraphQL repository setup fetch failed: pull request #${prNumber} not found in ${repoFullname}`);
+    const cleanRaw = (res.raw || '').trim().slice(0, 200);
+    const errMsgs = Array.isArray(res.data?.errors) ? res.data.errors.map(e => e.message).join('; ') : '';
+    throw new Error(`GraphQL repository setup fetch failed: pull request #${prNumber} not found in ${repoFullname}${errMsgs ? ` (${errMsgs})` : (cleanRaw ? `: ${cleanRaw}` : '')}`);
   }
 
-  const commits = (pr.commits?.nodes || []).map(node => restCommitFromGraphql(node.commit));
-  setup.commitsTotal = pr.commits?.totalCount ?? commits.length;
-  let commitsPage = pr.commits?.pageInfo;
+  const commitsErrors = Array.isArray(res.data?.errors)
+    ? res.data.errors.filter(e => !e.path || e.path.includes('commits') || e.path.includes('pullRequest'))
+    : [];
+  if (!pr.commits || commitsErrors.length > 0) {
+    const errMsgs = commitsErrors.map(e => e.message).join('; ');
+    throw new Error(`GraphQL repository setup fetch failed to retrieve commits for PR #${prNumber}: ${errMsgs || 'pullRequest.commits is null'}`);
+  }
+
+  const commits = (pr.commits.nodes || []).map(node => restCommitFromGraphql(node.commit));
+  setup.commitsTotal = pr.commits.totalCount ?? commits.length;
+  let commitsPage = pr.commits.pageInfo;
   let pagesFetched = 1;
   while (commitsPage?.hasNextPage && pagesFetched < maxCommitPages) {
     const pageRes = await githubApiCall(GRAPHQL_URL, token, 'POST', {
@@ -439,10 +449,14 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
 }`,
       variables: { owner, name, pr: prNumber, after: commitsPage.endCursor }
     }, 'application/vnd.github+json', { onAttempt: onCall });
-    const page = pageRes.code === 200 ? pageRes.data?.data?.repository?.pullRequest?.commits : null;
+    const pageErrors = Array.isArray(pageRes.data?.errors)
+      ? pageRes.data.errors.filter(e => !e.path || e.path.includes('commits') || e.path.includes('pullRequest'))
+      : [];
+    const page = pageRes.code === 200 && pageErrors.length === 0 ? pageRes.data?.data?.repository?.pullRequest?.commits : null;
     if (!page) {
       const cleanRaw = (pageRes.raw || '').trim().slice(0, 200);
-      throw new Error(`GraphQL commit listing failed past page ${pagesFetched} (HTTP ${pageRes.code}): ${cleanRaw}`);
+      const errMsgs = pageErrors.map(e => e.message).join('; ');
+      throw new Error(`GraphQL commit listing failed past page ${pagesFetched} (HTTP ${pageRes.code}): ${errMsgs || cleanRaw}`);
     }
     for (const node of page.nodes || []) commits.push(restCommitFromGraphql(node.commit));
     commitsPage = page.pageInfo;

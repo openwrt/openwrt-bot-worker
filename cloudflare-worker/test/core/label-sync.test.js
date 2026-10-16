@@ -346,6 +346,35 @@ describe('label-sync lifecycle phase and error handling', () => {
     assert.strictEqual(queue.queue.length, 0, 'no label operations should be queued when PR is closed');
   });
 
+  test('skips live PR check and skips label sync when client has no headroom', async () => {
+    const queue = new GitHubWriteQueue(42);
+    let optionalCallCount = 0;
+    const ctx = createMockContext({
+      client: {
+        budget: { limit: 50, used: 46, reserve: 5 },
+        hasHeadroom: () => false,
+        optionalApiCall: async () => {
+          optionalCallCount++;
+          return { code: 200, data: {} };
+        },
+        trackedApiCall: async () => ({ code: 200, data: null, raw: '', headers: { get: () => null } })
+      }
+    });
+    const patches = createMockPatches();
+    const report = {
+      allPassed: true,
+      isValidationIncomplete: false,
+      allFormalityErrors: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      allPrWarnings: []
+    };
+
+    await syncLabels(ctx, patches, report, queue);
+    assert.strictEqual(optionalCallCount, 0, 'optionalApiCall should not be invoked when hasHeadroom is false');
+    assert.strictEqual(queue.queue.length, 0, 'no label operations should be queued when headroom is exhausted');
+  });
+
   test('skips label sync when live PR head branch ref changed', async () => {
     const queue = new GitHubWriteQueue(42);
     const existingLabels = new Set(['stale']);

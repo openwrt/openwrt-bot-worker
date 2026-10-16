@@ -13,6 +13,7 @@ export interface FileBatchLoaderOptions {
 
 export interface FileBatchLoaderStats {
   budgetSkipCount: number;
+  fetchFailureCount?: number;
   missingFilesCount: number;
 }
 
@@ -23,6 +24,7 @@ export interface FileBatchLoader {
   setRefSource: (ref: string, source: 'base' | 'fork') => void;
   hasRefSource: (ref: string) => boolean;
   getBudgetSkipCount: () => number;
+  getFetchFailureCount?: () => number;
   getStats: () => FileBatchLoaderStats;
 }
 
@@ -64,6 +66,7 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
 
   let flushScheduled = false;
   let budgetSkipCount = 0;
+  let fetchFailureCount = 0;
   const missingFiles = new Set<string>();
 
   function scheduleFlush() {
@@ -77,6 +80,7 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
   async function flushQueue() {
     flushScheduled = false;
     if (pendingQueue.size === 0) return;
+
     const batch = [...pendingQueue.values()];
     pendingQueue.clear();
 
@@ -162,14 +166,16 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
       const keys = itemProbeKeys.get(item.key)!;
       const baseRes = keys.baseKey ? resultsByProbeKey.get(keys.baseKey) : null;
       const forkRes = keys.forkKey ? resultsByProbeKey.get(keys.forkKey) : null;
-      const baseOk = baseRes && !baseRes.error;
-      const forkOk = forkRes && !forkRes.error;
+      const baseOk = Boolean(baseRes && !baseRes.error && !baseRes.failed);
+      const forkOk = Boolean(forkRes && !forkRes.error && !forkRes.failed);
+
+      const source = hasForkRepo ? refSource.get(item.ref) : 'base';
+      const answer = source === 'base' ? baseRes : (source === 'fork' ? forkRes : null);
 
       if (baseOk && baseRes.content !== null) {
         if (!refSource.has(item.ref)) refSource.set(item.ref, 'base');
         item.resolve(baseRes.content);
-      } else if (baseOk && baseRes.exists) {
-        if (!refSource.has(item.ref)) refSource.set(item.ref, 'base');
+      } else if (baseOk && baseRes.exists && (!hasForkRepo || source === 'base')) {
         item.resolve(null);
       } else if (forkOk && forkRes.content !== null) {
         if (baseOk && !baseRes.skipped && !refSource.has(item.ref)) {
@@ -177,17 +183,18 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
           console.warn(`Ref ${item.ref} only resolves under head repo ${headRepoFullname}; subsequent file lookups at this ref will go straight to the fork.`);
         }
         item.resolve(forkRes.content);
-      } else if (baseOk || forkOk) {
-        if (baseRes?.skipped || forkRes?.skipped) budgetSkipCount++;
-        const source = hasForkRepo ? refSource.get(item.ref) : 'base';
-        const answer = source === 'base' ? baseRes : (source === 'fork' ? forkRes : null);
-        if (answer && !answer.error && !answer.skipped && !answer.failed && answer.exists === false) {
-          missingFiles.add(item.key);
-        }
+      } else if (forkOk && forkRes.exists && source === 'fork') {
+        item.resolve(null);
+      } else if (baseRes?.skipped || forkRes?.skipped) {
+        budgetSkipCount++;
+        item.resolve(null);
+      } else if (answer && !answer.error && !answer.skipped && !answer.failed && answer.exists === false) {
+        missingFiles.add(item.key);
         item.resolve(null);
       } else {
+        fetchFailureCount++;
         const err = (forkRes && forkRes.error) || (baseRes && baseRes.error) ||
-          new Error(`Failed to fetch file content for '${item.path}' at ref ${item.ref}: no data returned from GraphQL batch`);
+          new Error(`Failed to fetch file content for '${item.path}' at ref ${item.ref}: GitHub GraphQL query returned an error`);
         item.reject(err);
       }
     }
@@ -213,8 +220,10 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
     setRefSource: (ref: string, source: 'base' | 'fork') => { refSource.set(ref, source); },
     hasRefSource: (ref: string) => refSource.has(ref),
     getBudgetSkipCount: () => budgetSkipCount,
+    getFetchFailureCount: () => fetchFailureCount,
     getStats: () => ({
       budgetSkipCount,
+      fetchFailureCount,
       missingFilesCount: missingFiles.size
     })
   };

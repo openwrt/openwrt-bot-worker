@@ -179,5 +179,36 @@ describe('FileBatchLoader', () => {
     assert.strictEqual(resNeg, 'content\n');
     assert.strictEqual(callCount, 2);
   });
+
+  test('rejects and increments fetchFailureCount when GraphQL returns field-level error (failed: true) (Finding 2)', async () => {
+    globalThis.fetch = async () => {
+      return new Response(JSON.stringify({
+        data: {
+          repo0: {
+            f0: null
+          }
+        },
+        errors: [
+          { message: 'Git object lookup failed', path: ['repo0', 'f0'] }
+        ]
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const budget = { limit: 50, used: 0, reserve: 5 };
+    const loader = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => true
+    });
+
+    await assert.rejects(
+      () => loader.fetchFileContentCached('problematic.txt', 'main'),
+      /GitHub GraphQL query returned an error/
+    );
+    assert.strictEqual(loader.isFileMissing('problematic.txt', 'main'), false, 'should not be recorded as missing file');
+    assert.strictEqual(loader.getFetchFailureCount(), 1);
+    assert.strictEqual(loader.getStats().fetchFailureCount, 1);
+  });
 });
 

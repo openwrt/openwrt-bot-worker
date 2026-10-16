@@ -5,7 +5,8 @@ import { resolvePatchesAndCommits } from '../../src/handlers/pull-request/patche
 describe('resolvePatchesAndCommits lifecycle phase', () => {
   const createMockContext = ({
     commitsCount = 20,
-    availableBudget = 30,
+    availableBudget = 35,
+    reserve = 15,
     prPatchResponse = null,
     commitPatchResponse = { code: 200, raw: 'diff --git a/foo b/foo\n' }
   } = {}) => {
@@ -18,11 +19,14 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
       });
     }
 
+    const limit = 50;
+    const used = limit - availableBudget;
+
     return {
       commits,
       client: {
-        budget: { limit: 50, used: 50 - availableBudget, reserve: 0 },
-        hasHeadroom: () => true,
+        budget: { limit, used, reserve },
+        hasHeadroom: () => (limit - reserve - used) > 0,
         trackedApiCall: async (url) => {
           if (url.includes('/commits/')) {
             return commitPatchResponse;
@@ -65,7 +69,7 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
   test('falls back to commit-by-commit fetching when PR-wide patch is unavailable and budget allows', async () => {
     const ctx = createMockContext({
       commitsCount: 16,
-      availableBudget: 20, // 20 available >= 16 commits
+      availableBudget: 35, // 35 available - 15 reserve = 20 remaining >= 16 commits
       prPatchResponse: { code: 404, raw: 'Not Found', data: null, headers: { get: () => null } }
     });
 
@@ -79,7 +83,7 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
   test('marks patchUnavailable when PR-wide patch is unavailable and budget is insufficient for individual commits', async () => {
     const ctx = createMockContext({
       commitsCount: 25,
-      availableBudget: 10, // 10 available < 25 commits
+      availableBudget: 25, // 25 available - 15 reserve = 10 remaining < 25 commits
       prPatchResponse: { code: 404, raw: 'Not Found', data: null, headers: { get: () => null } }
     });
 
@@ -88,6 +92,36 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
     assert.strictEqual(result.usePrWidePatch, true);
     assert.strictEqual(result.patchUnavailable, true);
     assert.strictEqual(result.prPatch, null);
+  });
+
+  test('marks patchUnavailable when PR-wide patch is unavailable and budget is insufficient for small PR (<= 15 commits)', async () => {
+    const ctx = createMockContext({
+      commitsCount: 5,
+      availableBudget: 17, // 17 available - 15 reserve = 2 remaining < 5 commits
+      prPatchResponse: { code: 404, raw: 'Not Found', data: null, headers: { get: () => null } }
+    });
+
+    const result = await resolvePatchesAndCommits(ctx);
+
+    assert.strictEqual(result.usePrWidePatch, true);
+    assert.strictEqual(result.patchUnavailable, true);
+    assert.strictEqual(result.prPatch, null);
+  });
+
+  test('falls back to PR patch when individual commit patch fetch fails due to budget or network error', async () => {
+    const prPatchText = 'diff --git a/pkg/Makefile b/pkg/Makefile\n--- a/pkg/Makefile\n+++ b/pkg/Makefile\n';
+    const ctx = createMockContext({
+      commitsCount: 3,
+      availableBudget: 25,
+      prPatchResponse: { code: 200, raw: prPatchText, data: null, headers: { get: () => null } },
+      commitPatchResponse: { code: 500, raw: 'Server Error' }
+    });
+
+    const result = await resolvePatchesAndCommits(ctx);
+
+    assert.strictEqual(result.usePrWidePatch, true);
+    assert.strictEqual(result.patchUnavailable, false);
+    assert.strictEqual(result.prPatch, prPatchText);
   });
 
   test('increments upstreamComparisonSkips when fetching upstream backport commit fails', async () => {

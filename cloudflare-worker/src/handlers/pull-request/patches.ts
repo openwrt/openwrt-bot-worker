@@ -47,17 +47,6 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     }
   }
 
-  if (usePrWidePatch) {
-    if (prWidePatchText !== null) {
-      prPatch = prWidePatchText;
-    } else if (commits.length <= client.budget.limit - client.budget.reserve - client.budget.used) {
-      console.warn(`Fetching the ${commits.length} commit patches one by one instead.`);
-      usePrWidePatch = false;
-    } else {
-      patchUnavailable = true;
-    }
-  }
-
   let splitCommitPatches = new Map<string, string>();
   if (prWidePatchText !== null) {
     splitCommitPatches = splitPrPatchByCommit(prWidePatchText, commits);
@@ -66,6 +55,36 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
         fileBatchLoader.setRefSource(sha, 'base');
       }
     }
+  }
+
+  // Determine how many commits actually require an individual patch fetch
+  const commitsToFetch = commits.filter(
+    (c: any) => (c.parents || []).length <= 1 && !splitCommitPatches.has(c.sha)
+  );
+
+  const remainingCalls = client.budget.limit - client.budget.reserve - client.budget.used;
+  const canFetchCommits = client.hasHeadroom() && remainingCalls >= commitsToFetch.length;
+
+  if (usePrWidePatch) {
+    if (prWidePatchText !== null) {
+      prPatch = prWidePatchText;
+    } else if (canFetchCommits) {
+      console.warn(`Fetching the ${commitsToFetch.length} commit patches one by one instead.`);
+      usePrWidePatch = false;
+    } else {
+      patchUnavailable = true;
+    }
+  } else if (commits.length > 1 && commitsToFetch.length > 0 && !canFetchCommits) {
+    console.warn(`Insufficient headroom to fetch ${commitsToFetch.length} commit patches (${remainingCalls} calls remaining before reserve). Falling back to PR-wide patch.`);
+    usePrWidePatch = true;
+    if (prWidePatchText !== null) {
+      prPatch = prWidePatchText;
+    } else {
+      patchUnavailable = true;
+    }
+  } else if (commits.length <= 1 && client.budget.limit - client.budget.used <= 0) {
+    patchUnavailable = true;
+    usePrWidePatch = true;
   }
 
   const mapCommitData = async (commitData: any, fetchPatch: boolean): Promise<CommitDetail> => {
@@ -93,7 +112,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
       commitPatch = splitCommitPatches.get(sha)!;
     } else if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
-      let patchRes = await client.trackedApiCall(detailUrl, 'GET', null, 'application/vnd.github.patch');
+      let patchRes = await client.optionalApiCall(detailUrl, 'GET', null, 'application/vnd.github.patch');
       if (patchRes && patchRes.code === 200 && !fileBatchLoader.hasRefSource(sha)) {
         fileBatchLoader.setRefSource(sha, 'base');
       }
@@ -102,7 +121,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
       if (patchRes && (patchRes.code === 404 || patchRes.code === 422) && headRepoFullname && headRepoFullname !== repoFullname) {
         console.warn(`Commit ${sha} not found in base repo ${repoFullname} (HTTP ${patchRes.code}). Retrying fetch from head repo ${headRepoFullname}...`);
         const forkDetailUrl = `https://api.github.com/repos/${headRepoFullname}/commits/${sha}`;
-        patchRes = await client.trackedApiCall(forkDetailUrl, 'GET', null, 'application/vnd.github.patch', { silent: true });
+        patchRes = await client.optionalApiCall(forkDetailUrl, 'GET', null, 'application/vnd.github.patch', { silent: true });
         if (patchRes && patchRes.code === 200 && !fileBatchLoader.hasRefSource(sha)) {
           fileBatchLoader.setRefSource(sha, 'fork');
         }

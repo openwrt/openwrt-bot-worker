@@ -1,5 +1,6 @@
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-licenses.js';
-import { MBOX_ENVELOPE_PATTERN, getChangedFilesFromPatch as parseChangedFiles } from './core/patch-utils.ts';
+import { MBOX_ENVELOPE_PATTERN, getChangedFilesFromPatch as parseChangedFiles, splitMboxPatch } from './core/patch-utils.ts';
+export { splitMboxPatch };
 
 // The grammar of a commit subject prefix: a package name (`bash`, `lua5.4`),
 // a repository file (`CONTRIBUTING.md`, `README.md`, `feeds.conf.default`,
@@ -1042,27 +1043,6 @@ export function extractInstalledConfigPath(contentLine, makefileText) {
   }
 
   return { path: null, unresolvable: false };
-}
-
-export function splitMboxPatch(rawPatch) {
-  if (!rawPatch) return null;
-  const envelope = new RegExp(MBOX_ENVELOPE_PATTERN.source, MBOX_ENVELOPE_PATTERN.flags);
-  const matches = [...rawPatch.matchAll(envelope)];
-  if (matches.length <= 1) {
-    return null;
-  }
-
-  const parts = [];
-  for (let i = 0; i < matches.length; i++) {
-    const start = matches[i].index;
-    const end = i + 1 < matches.length ? matches[i + 1].index : rawPatch.length;
-    const part = rawPatch.slice(start, end);
-    if (!part.includes('diff --git ')) {
-      return false;
-    }
-    parts.push({ sha: matches[i][1], commitPatch: part });
-  }
-  return parts;
 }
 
 export function validateConffilesCoverage(conffilesMap, installedFiles, defaultPkg, errors, successes, definedPackages = new Set()) {

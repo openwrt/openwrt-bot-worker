@@ -593,6 +593,55 @@ describe('graphqlFetchRepoSetup with a pull request', { concurrency: 1 }, () => 
     assert.strictEqual(setup.comments, null);
   });
 
+  test('throws when GraphQL response contains errors on commits', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: {
+              commits: null,
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+            }
+          }
+        },
+        errors: [
+          { message: 'Could not resolve commits', path: ['repository', 'pullRequest', 'commits'] }
+        ]
+      }), { status: 200 });
+    };
+
+    await assert.rejects(
+      () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988),
+      /GraphQL repository setup fetch failed to retrieve commits for PR #24988: Could not resolve commits/
+    );
+  });
+
+  test('throws when pullRequest.commits is null even without explicit error', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: {
+              commits: null,
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+            }
+          }
+        }
+      }), { status: 200 });
+    };
+
+    await assert.rejects(
+      () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988),
+      /pullRequest.commits is null/
+    );
+  });
+
   test('spells signature states the way REST did', () => {
     const reason = (state) => restCommitFromGraphql({ oid: 'x', parents: { totalCount: 1 }, signature: { isValid: false, state, signature: 's' } }).commit.verification.reason;
     assert.strictEqual(reason('MALFORMED_SIG'), 'malformed_signature');
