@@ -68,6 +68,7 @@ Scans the contribution tree for nested downstream patch targets:
 
 ### Automated Triage & Stale PR Management
 
+*   **`bot:skip`**: Apply this fixed label to a pull request to skip all PR webhook processing, including comment-triggered rechecks, and daily stale cleanup. Matching is case-insensitive and requires no repository configuration. Existing check results, comments, and labels are left untouched. After removing the label, processing resumes on the next supported webhook event or scheduled scan; removing the label alone does not trigger a recheck. Regular issues are unaffected.
 *   **`not following guidelines`**: A high-visibility tag automatically attached to the PR if any critical validation check drops a failure blueprint. Clears itself upon a successful push.
 *   **`add package` / `drop package`**: Dynamically analyzes unified diff targets to label tracking trees introducing or purging software packages. Both are removed again once the pull request no longer adds or drops a package.
 *   **Stable Branch Tracking**: Auto-generates matching grey release tags (e.g., `release/24.10`, `release/25.12`) whenever a PR targets an active release backport branch, and removes a release tag that no longer matches after the pull request is retargeted. Labels matched from `labeler.yml` are only ever added.
