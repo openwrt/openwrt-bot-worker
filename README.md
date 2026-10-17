@@ -73,6 +73,7 @@ Scans the contribution tree for nested downstream patch targets:
 *   **Stable Branch Tracking**: Auto-generates matching grey release tags (e.g., `release/24.10`, `release/25.12`) whenever a PR targets an active release backport branch, and removes a release tag that no longer matches after the pull request is retargeted. Labels matched from `labeler.yml` are only ever added.
 *   **Issue Labeller**: Replaces the GitHub Actions `issue-labeller.yml` workflow. When a bug-report issue is opened with the trigger label, the bot validates form fields and applies labels based on a declarative `.github/issue-labeller.yml` configuration file (same spirit as `labeler.yml` for PRs — label name → list of conditions). Supports template variables (`{major}`, `{segment0}`, etc.), format validation (regex), existence checks (tag/path via GraphQL), substring matching, and presence checks. Falls back to sensible defaults if no config file exists. Disabled by default — enable per-repository with `"enable_issue_labeller": true`.
 *   **Stale PR Cleanup**: A daily scheduled cron task (05:30 UTC) scans all repositories where the App is installed. If explicitly enabled in a repository's configuration (\`"enable_stale_bot": true\`), it marks PRs containing the \`not following guidelines\` label as \`stale\` (with a warning comment) after 14 days of inactivity, and closes them after another 14 days of silence. Only contributor activity resets the countdown: pushed commits, force-pushes, reopens, and comments or reviews from people. Comments from GitHub Apps, `*[bot]` accounts and the machine accounts listed in `stale_ignored_users` are ignored, so an automated review can never keep a dead PR alive forever. Pushing new commits also removes the `stale` label immediately via the webhook, without waiting for the nightly scan. The scan asks GitHub for each repository's configuration and its labelled pull requests in two GraphQL queries, timelines included, so its request count no longer grows with the number of stale pull requests. A pull request whose timeline is longer than the fetched window (the most recent 100 entries) is left untouched rather than judged on incomplete history.
+*   **Stale Issue Cleanup**: The same daily scan handles issues when a repository sets `"enable_issue_stale_bot": true` and lists labels in `issue_stale_labels`, such as the labels of releases that no longer get updates, an old tracker import or `invalid`. An open issue with one of those labels and no activity for 14 days is marked `stale` with a comment asking whether the problem still happens on a supported release, and is closed as not planned after another 14 days without a reply. The same activity rules as for pull requests apply. Each issue is asked only once: after a person replies, the `stale` label goes and the issue is not marked again, since the label that made it a candidate usually stays. At most `issue_stale_max_per_run` issues are marked per scan, so enabling it on a large backlog does not post on every issue at once.
 
 > [!TIP]
 > Stale PR cleanup is completely disabled by default. If a repository wants to enable this automated cleanup flow, it must commit a `.github/formalities.json` file in its default branch containing `"enable_stale_bot": true`. 
@@ -163,6 +164,9 @@ Some configuration keys offer advanced options:
 *   `allow_revert`: Set to `true` (default) to accept the subject format produced by `git revert` (`Revert "<original subject>"`, nested reverts, and the prefixed `<package>: Revert "..."` variant) and the `PKG_VERSION`/`PKG_RELEASE` values a revert restores, for commits whose body references the reverted commit (`This reverts commit <sha>.` or `Reverts <owner>/<repo>#<number>`). Set to `false` to hold revert commits to the regular subject and release bump rules.
 *   `enable_stale_bot`: Set to `true` to enable the stale PR bot cleanup for this repository. Defaults to `false` (opt-in).
 *   `stale_ignored_users`: List of account logins whose comments and reviews never reset the stale countdown (default: `["openwrt-ai"]`). GitHub Apps and `*[bot]` accounts are always ignored automatically; this list exists for automation that runs on a plain user account.
+*   `enable_issue_stale_bot`: Set to `true` to enable stale issue cleanup for this repository. Defaults to `false` (opt-in).
+*   `issue_stale_labels`: Labels that make an open issue a candidate for stale issue cleanup (default: `[]`, which marks nothing).
+*   `issue_stale_max_per_run`: Maximum number of issues marked stale per daily scan (default: `10`).
 *   `enable_labeler_yml`: Set to `true` to enable dynamic pull request labeling based on matching files in the `.github/labeler.yml` configuration file. Defaults to `false` (opt-in).
 *   `enable_issue_labeller`: Set to `true` to enable automated issue form validation and labelling (replaces the GitHub Actions `issue-labeller.yml` workflow). Defaults to `false` (opt-in).
 
@@ -211,6 +215,9 @@ Here is a comprehensive example containing all available toggle options:
   "check_openwrt_spelling": true,
   "enable_stale_bot": false,
   "stale_ignored_users": ["openwrt-ai"],
+  "enable_issue_stale_bot": false,
+  "issue_stale_labels": [],
+  "issue_stale_max_per_run": 10,
   "enable_labeler_yml": false,
   "enable_issue_labeller": false
 }

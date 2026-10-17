@@ -32,7 +32,7 @@ function staleTimelineNodes(entries) {
   });
 }
 
-function staleGraphqlHandler(url, options, { config = null, staleLabelExists = true, prs = [], errors = null } = {}) {
+function staleGraphqlHandler(url, options, { config = null, staleLabelExists = true, prs = [], issues = [], errors = null } = {}) {
   if (!url.includes('/graphql') || !options?.body) return null;
   const body = JSON.parse(options.body);
   if (body.query.includes('staleLabel: label(')) {
@@ -41,6 +41,26 @@ function staleGraphqlHandler(url, options, { config = null, staleLabelExists = t
         repository: {
           cfg: config === null ? null : { text: JSON.stringify(config) },
           staleLabel: staleLabelExists ? { name: 'stale' } : null
+        }
+      }
+    }), { status: 200 });
+  }
+  if (body.query.includes('issues(states: OPEN')) {
+    return new Response(JSON.stringify({
+      data: {
+        repository: {
+          issues: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: issues.map(issue => ({
+              number: issue.number,
+              updatedAt: issue.updatedAt,
+              labels: { nodes: (issue.labels || []).map(name => ({ name })) },
+              timelineItems: {
+                totalCount: (issue.timeline || []).length,
+                nodes: staleTimelineNodes(issue.timeline)
+              }
+            }))
+          }
         }
       }
     }), { status: 200 });
@@ -817,6 +837,117 @@ index 123456..789012 100644
     } finally {
       fetchMock = null;
     }
+  });
+
+  describe('stale issues', () => {
+    const day = 24 * 60 * 60 * 1000;
+    const ago = (ms) => new Date(Date.now() - ms).toISOString();
+
+    async function runIssueScan(config, issues) {
+      const apiCalls = [];
+      const queries = [];
+      fetchMock = async (url, options) => {
+        apiCalls.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+        if (url.includes('/graphql') && options?.body) queries.push(JSON.parse(options.body).query);
+        if (url.includes('/access_tokens')) {
+          return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+        }
+        if (url.includes('/app/installations')) {
+          return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+        }
+        if (url.includes('/installation/repositories')) {
+          return new Response(JSON.stringify({ repositories: [{ full_name: 'testorg/repo1' }] }), { status: 200 });
+        }
+        const sr = staleGraphqlHandler(url, options, { config, issues });
+        if (sr) return sr;
+        return new Response(JSON.stringify({}), { status: 200 });
+      };
+      try {
+        await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM });
+      } finally {
+        fetchMock = null;
+      }
+      return { apiCalls, queries };
+    }
+
+    const enabled = { enable_issue_stale_bot: true, issue_stale_labels: ['release/19.07', 'invalid'] };
+    const writes = (apiCalls, n) => apiCalls.filter(c => c.method !== 'GET' && c.url.includes(`/issues/${n}`));
+
+    test('marks idle issues with a listed label, at most issue_stale_max_per_run of them', async () => {
+      const { apiCalls } = await runIssueScan({ ...enabled, issue_stale_max_per_run: 2 }, [
+        { number: 1, updatedAt: ago(400 * day), labels: ['release/19.07'] },
+        { number: 2, updatedAt: ago(300 * day), labels: ['invalid'] },
+        { number: 3, updatedAt: ago(200 * day), labels: ['release/19.07'] },
+        { number: 4, updatedAt: ago(3 * day), labels: ['release/19.07'] },
+        { number: 5, updatedAt: ago(400 * day), labels: ['bug'] }
+      ]);
+      for (const n of [1, 2]) {
+        const label = writes(apiCalls, n).find(c => c.url.endsWith(`/issues/${n}/labels`));
+        assert.deepStrictEqual(label?.body, { labels: ['stale'] });
+        const comment = writes(apiCalls, n).find(c => c.url.endsWith(`/issues/${n}/comments`));
+        assert.ok(comment.body.body.includes('still happens'));
+      }
+      for (const n of [3, 4, 5]) assert.strictEqual(writes(apiCalls, n).length, 0, `issue ${n}`);
+    });
+
+    test('asks an issue only once', async () => {
+      const { apiCalls } = await runIssueScan(enabled, [{
+        number: 7, updatedAt: ago(100 * day), labels: ['release/19.07'],
+        timeline: [
+          { kind: 'labeled', label: 'stale', at: ago(200 * day) },
+          { kind: 'commented', login: 'reporter', at: ago(190 * day) }
+        ]
+      }]);
+      assert.strictEqual(writes(apiCalls, 7).length, 0);
+    });
+
+    test('closes an issue as not planned when only bots replied by the deadline', async () => {
+      const { apiCalls } = await runIssueScan(enabled, [{
+        number: 8, updatedAt: ago(15 * day), labels: ['release/19.07', 'stale'],
+        timeline: [
+          { kind: 'labeled', label: 'stale', at: ago(15 * day) },
+          { kind: 'commented', login: 'openwrt-ai', at: ago(10 * day) }
+        ]
+      }]);
+      const close = writes(apiCalls, 8).find(c => c.method === 'PATCH');
+      assert.deepStrictEqual(close?.body, { state: 'closed', state_reason: 'not_planned' });
+      assert.ok(writes(apiCalls, 8).some(c => c.url.endsWith('/issues/8/comments')));
+    });
+
+    test('removes stale after a reply or once the listed label is gone', async () => {
+      const { apiCalls } = await runIssueScan(enabled, [
+        {
+          number: 9, updatedAt: ago(1 * day), labels: ['release/19.07', 'stale'],
+          timeline: [
+            { kind: 'labeled', label: 'stale', at: ago(20 * day) },
+            { kind: 'commented', login: 'reporter', at: ago(1 * day) }
+          ]
+        },
+        {
+          number: 10, updatedAt: ago(20 * day), labels: ['stale'],
+          timeline: [{ kind: 'labeled', label: 'stale', at: ago(20 * day) }]
+        }
+      ]);
+      for (const n of [9, 10]) {
+        const w = writes(apiCalls, n);
+        assert.strictEqual(w.length, 1, `issue ${n}`);
+        assert.ok(w[0].method === 'DELETE' && w[0].url.endsWith(`/issues/${n}/labels/stale`));
+      }
+    });
+
+    test('leaves a stale label it did not set alone', async () => {
+      const { apiCalls } = await runIssueScan(enabled, [
+        { number: 11, updatedAt: ago(400 * day), labels: ['release/19.07', 'stale'] }
+      ]);
+      assert.strictEqual(writes(apiCalls, 11).length, 0);
+    });
+
+    test('does not query issues unless enable_issue_stale_bot is true', async () => {
+      const { queries } = await runIssueScan({ enable_stale_bot: true, issue_stale_labels: ['release/19.07'] }, [
+        { number: 12, updatedAt: ago(400 * day), labels: ['release/19.07'] }
+      ]);
+      assert.ok(!queries.some(q => q.includes('issues(states: OPEN')));
+    });
   });
 
   test('removes stale label from active PRs (activity detected post-stale)', async () => {
