@@ -214,3 +214,49 @@ config timeserver 'ntp'
     assertNoErrors(res);
   });
 });
+
+// Extensionless payloads may share their basename with a UCI config in a
+// different source directory (openwrt/packages#30800, mwan3's rpcd plugin).
+describe('UCI install source identity', () => {
+  const cases = [
+    { name: 'rpcd plugin with the same basename as its UCI sibling',
+      source: 'files/usr/share/rpcd/ucode/mwan3',
+      recipe: '\t$(INSTALL_BIN) ./files/usr/share/rpcd/ucode/mwan3 \\\n\t\t$(1)/usr/share/rpcd/ucode/' },
+    { name: 'bare relative source path', source: 'files/usr/sbin/mwan3',
+      recipe: '\t$(INSTALL_BIN) files/usr/sbin/mwan3 $(1)/usr/sbin/' },
+    { name: 'double-quoted source path', source: 'files/usr/sbin/mwan3',
+      recipe: '\t$(INSTALL_BIN) "./files/usr/sbin/mwan3" "$(1)/usr/sbin/"' },
+    { name: 'single-quoted source path', source: 'files/usr/sbin/mwan3',
+      recipe: "\t$(CP) './files/usr/sbin/mwan3' '$(1)/usr/sbin/'" },
+    { name: 'regexp characters in the source path', source: 'files/usr/sbin/mwan3+rpc',
+      recipe: '\t$(INSTALL_BIN) ./files/usr/sbin/mwan3+rpc $(1)/usr/sbin/' },
+    { name: 'exact source explicitly installed to etc/config', source: 'files/payload/mwan3',
+      recipe: '\t$(INSTALL_CONF) ./files/payload/mwan3 \\\n\t\t$(1)/etc/config/mwan3', reject: true },
+    { name: 'one source installed both outside and inside etc/config', source: 'files/payload/mwan3',
+      recipe: '\t$(CP) ./files/payload/mwan3 $(1)/usr/share/\n\t$(CP) ./files/payload/mwan3 $(1)/etc/config/', reject: true },
+    { name: 'unresolved destination keeps the conffiles fallback', source: 'files/payload/mwan3',
+      recipe: '\t$(INSTALL_CONF) ./files/payload/mwan3 $(CONFIG_DIR)/mwan3', reject: true },
+    { name: 'brace-form package root destination', source: 'files/usr/sbin/mwan3',
+      recipe: '\t$(INSTALL_BIN) ./files/usr/sbin/mwan3 ${1}/usr/sbin/' },
+    { name: 'longer sibling source path is not an exact match', source: 'files/payload/mwan3',
+      recipe: '\t$(INSTALL_BIN) ./files/payload/mwan3-helper $(1)/usr/sbin/', reject: true }
+  ];
+  for (const { name, source, recipe, reject } of cases) {
+    test(name, async () => {
+      const makefile = [
+        'PKG_NAME:=mwan3',
+        'define Package/mwan3/conffiles', '/etc/config/mwan3', 'endef',
+        'define Package/mwan3/install',
+        '\t$(INSTALL_CONF) ./files/etc/config/mwan3 \\\n\t\t$(1)/etc/config/mwan3',
+        recipe, 'endef'
+      ].join('\n');
+      const path = `net/mwan3/${source}`;
+      const res = await validateUciConfigs(fileDiff(path, []), CONFIG, repo({
+        'net/mwan3/Makefile': makefile,
+        [path]: "'use strict';\n"
+      }));
+      if (reject) assertErrorIncludes(res, NOT_UCI);
+      else assertNoErrors(res);
+    });
+  }
+});

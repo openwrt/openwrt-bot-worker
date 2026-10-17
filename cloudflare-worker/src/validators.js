@@ -3026,6 +3026,21 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
     if (file.includes('/etc/config/')) {
       isDestinedForEtcConfig = true;
     } else if (makefileContent) {
+      // Distinguish extensionless siblings such as files/etc/config/mwan3
+      // and files/usr/share/rpcd/ucode/mwan3. Join continued recipe lines
+      // before checking the destination of this exact source token.
+      const sourcePath = file.substring(pkgRoot.length + 1);
+      const escapedSource = sourcePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const sourceToken = new RegExp(`(?:^|[\\s"'])(?:\\./)?${escapedSource}(?=$|[\\s"'])`);
+      const sourceLines = makefileContent.replace(/\\\r?\n/g, ' ').split('\n')
+        .filter(l => /^\s*(?:\$\((?:INSTALL_(?:BIN|DATA|CONF)|CP)\)|cp|install)\s/.test(l) && sourceToken.test(l));
+      const rootDestination = /(?:^|[\s"'])(?:\$\(1\)|\$\{1\})\/([^\s"']*)["']?\s*$/;
+      const destinations = sourceLines.map(l => l.match(rootDestination)?.[1]);
+      if (destinations.length > 0 && destinations.every(d => d !== undefined) &&
+          !destinations.some(d => d === 'etc/config' || d.startsWith('etc/config/'))) {
+        return empty;
+      }
+
       // A Makefile line naming this exact file is authoritative about where
       // it goes: `$(INSTALL_DATA) ./files/uhttpd.acl $(1)/usr/share/acl.d/...`
       // settles uhttpd.acl, however many siblings share its base name
