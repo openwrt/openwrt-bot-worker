@@ -57,7 +57,7 @@ export async function syncLabels(
     if (!verdictMoved && !currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       requestLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines');
     }
-  } else {
+  } else if (!report.isValidationIncomplete) {
     if (!verdictMoved && currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       enqueueRemove(spelledAsOnPr(LABEL_GUIDELINES));
     }

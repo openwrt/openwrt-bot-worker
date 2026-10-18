@@ -4,6 +4,7 @@ import type { ValidationOutcome } from './validation.ts';
 
 export interface AggregatedReport {
   allPassed: boolean;
+  isValidationIncomplete: boolean;
   formalityPassed: boolean;
   makefilePassed: boolean;
   patchesPassed: boolean;
@@ -38,6 +39,7 @@ export function aggregateReport(
     patchesOutputText,
     patchesHeading,
     patchChecksIncomplete,
+    makefileChecksIncomplete,
     unreadPatchNotes
   } = validationOutcome;
 
@@ -73,17 +75,20 @@ export function aggregateReport(
 
   const formalityIncomplete = upstreamComparisonSkips > 0 || commitScanCapped;
   const deepScanIncomplete = budgetSkipCount > 0 || patchUnavailable;
+  const makefileIncomplete = deepScanIncomplete || makefileChecksIncomplete;
   const patchesIncomplete = deepScanIncomplete || patchChecksIncomplete;
+  const isValidationIncomplete = formalityIncomplete || makefileIncomplete || patchesIncomplete;
 
   const conclusionFor = (passed: boolean, incomplete: boolean): 'success' | 'failure' | 'neutral' =>
     (!passed ? 'failure' : (incomplete ? 'neutral' : 'success'));
 
   const formalityConclusion = conclusionFor(formalityPassed, formalityIncomplete);
-  const makefileConclusion = conclusionFor(makefilePassed, deepScanIncomplete);
+  const makefileConclusion = conclusionFor(makefilePassed, makefileIncomplete);
   const patchesConclusion = conclusionFor(patchesPassed, patchesIncomplete);
 
   return {
     allPassed,
+    isValidationIncomplete,
     formalityPassed,
     makefilePassed,
     patchesPassed,

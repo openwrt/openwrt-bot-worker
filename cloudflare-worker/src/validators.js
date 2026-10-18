@@ -1385,13 +1385,18 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           pendingAsyncChecks.push(async () => {
             try {
               const headText = await fetchFileContent(filePath);
+              if (headText === null || headText === undefined) {
+                warnings.push(`Could not fetch '${filePath}' to verify conffiles section.`);
+                return { incomplete: true };
+              }
               if (headText && /define\s+Package\/[^\/]+\/conffiles\b/.test(headText)) {
                 successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
               } else {
                 errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
               }
-            } catch (_) {
-              // Ignore fetch failure
+            } catch (err) {
+              warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
+              return { incomplete: true };
             }
           });
         }
@@ -1886,16 +1891,20 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
   if (pendingAsyncChecks.length > 0) {
     return (async () => {
+      let incomplete = false;
       for (const check of pendingAsyncChecks) {
         try {
-          await check();
-        } catch (_) {}
+          const res = await check();
+          if (res?.incomplete) incomplete = true;
+        } catch (_) {
+          incomplete = true;
+        }
       }
-      return { errors, successes, warnings };
+      return { errors, successes, warnings, incomplete };
     })();
   }
 
-  return { errors, successes, warnings };
+  return { errors, successes, warnings, incomplete: false };
 }
 
 export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent, isMissing) {
@@ -2660,7 +2669,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
   if (pkgRoots.size > 15) {
     warnings.push(`Package release bump audit skipped: PR modifies ${pkgRoots.size} packages. Batch updates of >15 packages are not automatically audited to prevent hitting API rate/subrequest limits.`);
-    return { errors, warnings, successes, notes: [] };
+    return { errors, warnings, successes, notes: [], incomplete: true };
   }
 
   // 2. Process each package root — each root's Makefile-diff analysis runs
@@ -3084,7 +3093,7 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
   const paths = [...makefiles].filter(f => !deletedFiles.has(f));
   if (paths.length > 15) {
     warnings.push(`Package hash audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
-    return { errors, warnings, findings, successes };
+    return { errors, warnings, findings, successes, incomplete: true };
   }
 
   // The raw right-hand side, unresolved: a '$(...)' reference marks the value

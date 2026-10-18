@@ -122,9 +122,11 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     if (isBackportPr) {
       const commitMsg = commitData.commit?.message || '';
       const match = commitMsg.match(CHERRY_PICK_MARKER);
-      if (match && !client.hasHeadroom()) {
+      if (match && (!fetchPatch || !commitPatch)) {
         upstreamComparisonSkips++;
-      } else if (match) {
+      } else if (match && client.hasHeadroom && !client.hasHeadroom()) {
+        upstreamComparisonSkips++;
+      } else if (match && commitPatch) {
         const targetSha = match[1];
         upstreamSha = targetSha;
         const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${targetSha}`;
@@ -134,10 +136,9 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
             fileBatchLoader.setRefSource(targetSha, 'base');
           }
           upstreamPatch = upstreamRes.raw;
-          if (commitPatch) {
-            isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
-          }
+          isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
         } else {
+          upstreamComparisonSkips++;
           upstreamFetchError = `Could not fetch upstream commit ${targetSha.slice(0, 7)} from GitHub API (HTTP ${upstreamRes?.code})`;
         }
       }

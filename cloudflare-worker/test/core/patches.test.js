@@ -22,6 +22,7 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
       commits,
       client: {
         budget: { limit: 50, used: 50 - availableBudget, reserve: 0 },
+        hasHeadroom: () => true,
         trackedApiCall: async (url) => {
           if (url.includes('/commits/')) {
             return commitPatchResponse;
@@ -87,5 +88,25 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
     assert.strictEqual(result.usePrWidePatch, true);
     assert.strictEqual(result.patchUnavailable, true);
     assert.strictEqual(result.prPatch, null);
+  });
+
+  test('increments upstreamComparisonSkips when fetching upstream backport commit fails', async () => {
+    const ctx = createMockContext({ commitsCount: 1 });
+    ctx.isBackportPr = true;
+    ctx.commits = [{
+      sha: '1234567890123456789012345678901234567890',
+      html_url: 'https://github.com/test/repo/commit/1234567890123456789012345678901234567890',
+      commit: { message: 'foo: backport fix\n\n(cherry picked from commit 0987654321098765432109876543210987654321)' }
+    }];
+    ctx.client.optionalApiCall = async (url) => {
+      if (url.includes('/commits/0987654321098765432109876543210987654321')) {
+        return { code: 500, raw: 'Internal Server Error' };
+      }
+      return { code: 200, raw: 'diff --git a/foo b/foo\n' };
+    };
+
+    const result = await resolvePatchesAndCommits(ctx);
+    assert.strictEqual(result.upstreamComparisonSkips, 1);
+    assert.ok(result.commitDetails[0].upstreamFetchError.includes('Could not fetch upstream commit'));
   });
 });
