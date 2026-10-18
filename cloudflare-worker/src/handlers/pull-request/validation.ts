@@ -224,7 +224,7 @@ export async function runValidations(
           reportUci.errors = reportUci.errors.filter((err: string) => !reportUpstreamUci.errors.includes(err));
           reportUci.successes.push("✅ Filtered out configuration format issues already present in upstream commit");
         }
- 
+
         makefileOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportMakefile.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
         reportUci.successes.forEach((s: string) => { makefileOutputText += `  ${s}\n`; });
@@ -282,18 +282,35 @@ export async function runValidations(
     }
   }
 
+  let prWideSplitMap: Map<string, string> | null = null;
   if (usePrWidePatch && prPatch) {
-    const splitMap = splitPrPatchByCommit(prPatch, ctx.commits);
     const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?$/gm;
     const matches = [...prPatch.matchAll(envelope)];
+    prWideSplitMap = matches.length > 0 ? splitPrPatchByCommit(prPatch, ctx.commits) : new Map();
+    const changedFiles = getChangedFilesFromPatch(prPatch);
+    const touchesMakefilesOrPackages = changedFiles.some(f =>
+      f === 'Makefile' || f.endsWith('/Makefile') || f.startsWith('package/') || f.startsWith('feeds/')
+    );
 
-    const commitsWithPatches = ctx.commits.map((c: any, i: number) => {
+    const splitMap = prWideSplitMap;
+    const targetCommits = (ctx.commits || []).filter((c: any) => (c.parents || []).length <= 1 && c.changed_files !== 0);
+    const expectedCount = targetCommits.length > 0 ? targetCommits.length : (ctx.commits?.length || 0);
+
+    const isSplitIncomplete = touchesMakefilesOrPackages && matches.length > 0 && (
+      (expectedCount > 1 && (splitMap.size < expectedCount || matches.length < expectedCount)) ||
+      (matches.length > 1 && splitMap.size < matches.length)
+    );
+
+    if (isSplitIncomplete) {
+      makefileChecksIncomplete = true;
+      const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series (${splitMap.size}/${expectedCount || matches.length} commits mapped)`;
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n- ⚠️ ${warnMsg}`);
+      makefileOutputText += `  ⚠️ Warning: ${warnMsg}\n\n`;
+    }
+
+    const commitsWithPatches = ctx.commits.map((c: any) => {
       let patch = splitMap.get(c.sha) || null;
-      if (!patch && matches.length > 1 && matches.length === ctx.commits.length) {
-        const start = matches[i].index;
-        const end = i + 1 < matches.length ? matches[i + 1].index : prPatch.length;
-        patch = prPatch.slice(start, end);
-      } else if (!patch && ctx.commits.length === 1) {
+      if (!patch && ctx.commits.length === 1) {
         patch = prPatch;
       }
       return {
@@ -360,9 +377,42 @@ export async function runValidations(
   const fetchFileContentAtHead = (path: string) => fileBatchLoader.fetchFileContentCached(path, headSha);
   const fetchFileContentAtBase = (path: string) => fileBatchLoader.fetchFileContentCached(path, baseSha);
 
-  let releaseDetails = usePrWidePatch 
-    ? [{ commitPatch: prPatch }] 
-    : commitDetails.filter(item => (item.fullCommit?.parents || []).length <= 1);
+  let releaseDetails: any[] = [];
+  if (usePrWidePatch && prPatch) {
+    const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?$/gm;
+    const matches = [...prPatch.matchAll(envelope)];
+    const splitMap = prWideSplitMap || (matches.length > 0 ? splitPrPatchByCommit(prPatch, ctx.commits) : new Map());
+    const targetCommits = (ctx.commits || []).filter((c: any) => (c.parents || []).length <= 1 && c.changed_files !== 0);
+    const expectedCount = targetCommits.length > 0 ? targetCommits.length : (ctx.commits?.length || 0);
+
+    const changedFiles = getChangedFilesFromPatch(prPatch);
+    const touchesMakefilesOrPackages = changedFiles.some(f =>
+      f === 'Makefile' || f.endsWith('/Makefile') || f.startsWith('package/') || f.startsWith('feeds/')
+    );
+
+    if (matches.length > 0 && (expectedCount > 1 || matches.length > 1)) {
+      const isSplitIncomplete = touchesMakefilesOrPackages && (
+        splitMap.size < expectedCount || matches.length < expectedCount || splitMap.size < matches.length
+      );
+      if (isSplitIncomplete) {
+        makefileChecksIncomplete = true;
+        const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series for package release audit (${splitMap.size}/${expectedCount || matches.length} commits mapped)`;
+        if (!allPrWarnings.some(w => w.includes('PR-wide patch series'))) {
+          allPrWarnings.push(`**Package Release Audit**:\n- ⚠️ ${warnMsg}`);
+        }
+      }
+      releaseDetails = (ctx.commits || []).map((c: any) => ({
+        commitPatch: splitMap.get(c.sha) || null,
+        fullCommit: c
+      }));
+    } else {
+      releaseDetails = [{ commitPatch: prPatch }];
+    }
+  } else if (usePrWidePatch) {
+    releaseDetails = [{ commitPatch: prPatch }];
+  } else {
+    releaseDetails = commitDetails.filter(item => (item.fullCommit?.parents || []).length <= 1);
+  }
 
   if (isBackportPr) {
     releaseDetails = releaseDetails.filter((item: any) => !item.isVerbatim);

@@ -1,4 +1,5 @@
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-licenses.js';
+import { MBOX_ENVELOPE_PATTERN, getChangedFilesFromPatch as parseChangedFiles } from './core/patch-utils.ts';
 
 // The grammar of a commit subject prefix: a package name (`bash`, `lua5.4`),
 // a repository file (`CONTRIBUTING.md`, `README.md`, `feeds.conf.default`,
@@ -901,11 +902,240 @@ function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
   return false;
 }
 
+const NON_VERSION_MAKEFILE_VARS = new Set([
+  'PKG_NAME', 'PKG_RELEASE', 'PKG_HASH', 'PKG_MIRROR_HASH',
+  'PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES',
+  'PKG_BUILD_DEPENDS', 'PKG_CONFIG_DEPENDS', 'PKG_BUILD_DIR',
+  'PKG_BUILD_PARALLEL', 'PKG_INSTALL', 'PKG_FIXUP', 'PKG_FORTIFY_SOURCE',
+  'PKG_SSP', 'PKG_ASLR_PIE', 'PKG_RELRO', 'PKG_SOURCE', 'PKG_SOURCE_URL',
+  'PKG_SOURCE_PROTO', 'PKG_SOURCE_SUBDIR', 'PKG_CPE_ID', 'PKG_ABI_VERSION',
+  'CMAKE_OPTIONS', 'CMAKE_INSTALL', 'MESON_ARGS', 'CONFIGURE_ARGS',
+  'CONFIGURE_VARS', 'MAKE_FLAGS', 'MAKE_VARS', 'TARGET_CFLAGS',
+  'TARGET_LDFLAGS', 'TARGET_CPPFLAGS', 'HOST_CFLAGS', 'HOST_LDFLAGS'
+]);
+
+export function extractConffilesMap(makefileText) {
+  const map = new Map();
+  if (!makefileText) return map;
+
+  // Extract all define blocks for potential macro calls like $(call Package/foo/Default/conffiles)
+  const defineBlocks = new Map();
+  const rawLines = makefileText.split('\n');
+  let currentMacro = null;
+  let currentLines = [];
+
+  for (const rawLine of rawLines) {
+    if (currentMacro === null) {
+      const match = rawLine.match(/^[ \t+]*define\s+([^\s\(\)]+)\b/);
+      if (match) {
+        currentMacro = match[1];
+        currentLines = [];
+      }
+    } else {
+      if (/^[ \t+]*endef\b/.test(rawLine)) {
+        defineBlocks.set(currentMacro, currentLines);
+        currentMacro = null;
+        currentLines = [];
+      } else {
+        if (!rawLine.startsWith('-')) {
+          const cleaned = rawLine.replace(/^[ \t+]/, '').trim();
+          if (cleaned && !cleaned.startsWith('#')) {
+            currentLines.push(cleaned);
+          }
+        }
+      }
+    }
+  }
+
+  function expandLines(lines, seenMacros = new Set()) {
+    const result = [];
+    for (const line of lines) {
+      const callMatch = line.match(/^\$\(call\s+([^\)\s]+)\)/);
+      if (callMatch) {
+        const macroName = callMatch[1];
+        if (defineBlocks.has(macroName) && !seenMacros.has(macroName)) {
+          const nextSeen = new Set(seenMacros);
+          nextSeen.add(macroName);
+          result.push(...expandLines(defineBlocks.get(macroName), nextSeen));
+        }
+      } else {
+        // Expand known variables
+        const expandedLine = line.replace(/\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g, (match, p1, p2) => {
+          const varName = (p1 || p2).trim();
+          if (varName === 'CONF_DIR') {
+            return resolveMakefileVar(makefileText, 'CONF_DIR') || '/etc';
+          }
+          if (varName === 'config_directory') {
+            return resolveMakefileVar(makefileText, 'config_directory') || '/etc/config';
+          }
+          const resolved = resolveMakefileVar(makefileText, varName);
+          return resolved !== null ? resolved : match;
+        });
+        result.push(expandedLine);
+      }
+    }
+    return result;
+  }
+
+  for (const [name, lines] of defineBlocks.entries()) {
+    const conffilesMatch = name.match(/^Package\/([^\/\s]+)\/conffiles$/);
+    if (conffilesMatch) {
+      const pkg = conffilesMatch[1];
+      if (!map.has(pkg)) map.set(pkg, new Set());
+      const expanded = expandLines(lines);
+      for (const l of expanded) {
+        map.get(pkg).add(l);
+      }
+    }
+  }
+
+  return map;
+}
+
+export function extractDefinedPackages(makefileText) {
+  const pkgs = new Set();
+  if (!makefileText) return pkgs;
+  const regex = /(?:^|\n)[ \t+]*define\s+Package\/([^\s\/\(\)]+)(?:\/Default)?\b/g;
+  let m;
+  while ((m = regex.exec(makefileText)) !== null) {
+    pkgs.add(m[1]);
+  }
+  return pkgs;
+}
+
+export function extractInstalledConfigPath(contentLine, makefileText) {
+  const match = contentLine.match(/(?:([^\s;&|]+)\s+)?\$(?:\(1\)|\{1\})([^\s;&|]+)/);
+  if (!match) return { path: null, unresolvable: true };
+  const rawSource = match[1] ? match[1].replace(/['"]/g, '') : null;
+  let target = match[2];
+
+  const expandVars = (str) => {
+    let out = str
+      .replace(/\$(?:\(CONF_DIR\)|\{CONF_DIR\})/g, '/etc')
+      .replace(/\$(?:\(config_directory\)|\{config_directory\})/g, '/etc/config');
+    if (makefileText) {
+      out = out.replace(/\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g, (m, p1, p2) => {
+        const varName = (p1 || p2).trim();
+        const resolved = resolveMakefileVar(makefileText, varName);
+        return resolved !== null ? resolved : m;
+      });
+    }
+    return out;
+  };
+
+  target = expandVars(target).replace(/['"]/g, '').replace(/\/+/g, '/');
+
+  if ((target === '/etc' || target === '/etc/config' || target.endsWith('/')) && rawSource && !rawSource.startsWith('-')) {
+    const expandedSource = expandVars(rawSource).replace(/['"]/g, '');
+    const basename = expandedSource.split('/').pop();
+    if (basename && !/[*?$({]/.test(basename)) {
+      target = (target.endsWith('/') ? target : target + '/') + basename;
+    }
+  }
+
+  if (/\$[({]/.test(target)) {
+    return { path: null, unresolvable: true };
+  }
+
+  if (target === '/etc' || target.startsWith('/etc/')) {
+    return { path: target, unresolvable: false };
+  }
+
+  return { path: null, unresolvable: false };
+}
+
+export function splitMboxPatch(rawPatch) {
+  if (!rawPatch) return null;
+  const envelope = new RegExp(MBOX_ENVELOPE_PATTERN.source, MBOX_ENVELOPE_PATTERN.flags);
+  const matches = [...rawPatch.matchAll(envelope)];
+  if (matches.length <= 1) {
+    return null;
+  }
+
+  const parts = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index;
+    const end = i + 1 < matches.length ? matches[i + 1].index : rawPatch.length;
+    const part = rawPatch.slice(start, end);
+    if (!part.includes('diff --git ')) {
+      return false;
+    }
+    parts.push({ sha: matches[i][1], commitPatch: part });
+  }
+  return parts;
+}
+
+export function validateConffilesCoverage(conffilesMap, installedFiles, defaultPkg, errors, successes, definedPackages = new Set()) {
+  if (conffilesMap.size === 0) {
+    errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+    return { incomplete: false };
+  }
+
+  if (!installedFiles || installedFiles.length === 0) {
+    return { incomplete: false };
+  }
+
+  let missingCount = 0;
+  for (const item of installedFiles) {
+    let pkgEntries = null;
+    let targetPkg = item.pkg || defaultPkg;
+
+    if (item.pkg) {
+      pkgEntries = conffilesMap.get(item.pkg);
+    } else {
+      if (defaultPkg && conffilesMap.has(defaultPkg)) {
+        pkgEntries = conffilesMap.get(defaultPkg);
+        targetPkg = defaultPkg;
+      } else if (conffilesMap.size === 1 && definedPackages.size === 1) {
+        const singlePkg = conffilesMap.keys().next().value;
+        if (definedPackages.has(singlePkg)) {
+          pkgEntries = conffilesMap.get(singlePkg);
+          targetPkg = singlePkg;
+        }
+      }
+    }
+
+    if (!pkgEntries) {
+      missingCount++;
+      const pkgDesc = item.pkg || (defaultPkg ? `'${defaultPkg}'` : 'the target package');
+      errors.push(`- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section for package ${pkgDesc.startsWith("'") ? pkgDesc : `'${pkgDesc}'`}. Please add a 'define Package/${item.pkg || defaultPkg || '<pkgname>'}/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.`);
+      continue;
+    }
+
+    const hasPath = [...pkgEntries].some(entry => {
+      if (entry === item.path) return true;
+      if (entry.endsWith('/') && item.path.startsWith(entry)) return true;
+      if (item.path.startsWith(entry + '/')) return true;
+      if (entry.includes('$')) {
+        const regexPattern = '^' + entry
+          .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          .replace(/\\\$\\\([^\\)]+\\\)/g, '[^/]+')
+          .replace(/\\\$\\\{[^\\}]+\\\}/g, '[^/]+') + '$';
+        try {
+          if (new RegExp(regexPattern).test(item.path)) return true;
+        } catch (_) {}
+      }
+      return false;
+    });
+
+    if (!hasPath) {
+      missingCount++;
+      errors.push(`- Makefile installs '${item.path}', but 'define Package/${targetPkg}/conffiles' does not list it. Please add it to the conffiles section, terminated with 'endef'.`);
+    }
+  }
+
+  if (missingCount === 0) {
+    successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
+  }
+  return { incomplete: false };
+}
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
   const errors = [];
   const successes = [];
   const warnings = [];
   const pendingAsyncChecks = [];
+  let isValidationIncomplete = false;
   const subject = (fullCommit.commit.message || '').split("\n")[0].trim();
 
   if (!commitPatch) {
@@ -1006,7 +1236,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
       } else if (isAutosquash) {
         successes.push(`✅ Autosquash commit, skipping subject validation for PKG_VERSION '${newVersion}'`);
-      } else if (!commitMatches(newVersion, filePath)) {
+      } else if (!matchVersionString(cleanSubject, newVersion)) {
         errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
       } else {
         successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
@@ -1018,27 +1248,30 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
       if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
+      // A brand-new Makefile is a package addition, not a version bump: its
+      // subject says what is added and carries no old-to-new version context.
       if (/^---\s+\/dev\/null/m.test(fileDiff)) continue;
 
+      let newVersion = null;
       const versionMatch = fileDiff.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
       if (versionMatch) {
-        const newVersion = versionMatch[1].replace(/["']/g, "").trim();
-        validateVersionAgainstCommit(newVersion, filePath);
-        continue;
-      }
+        newVersion = versionMatch[1].replace(/["']/g, "").trim();
+      } else {
+        // Check if an indirect version helper variable was modified in this diff (e.g. GO_VERSION_PATCH)
+        const staticVerInContext = fileDiff.match(/^ \s*PKG_VERSION\s*(?::=|=)\s*([^\r\n#]+)/m);
+        const hasStaticUnchangedPkgVersion = Boolean(staticVerInContext && !staticVerInContext[1].includes('$'));
 
-      // If PKG_VERSION wasn't directly changed in the diff, check if an indirect
-      // helper variable (e.g. GO_VERSION_PATCH) was modified.
-      if (typeof fetchFileContent === 'function') {
         const touchedVars = new Set();
-        for (const line of fileDiff.split('\n')) {
-          if (!line.startsWith('+') || line.startsWith('+++')) continue;
-          const assign = line.slice(1).match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
-          if (assign) {
-            const vName = assign[1];
-            if (vName !== 'PKG_RELEASE' && vName !== 'PKG_HASH' && vName !== 'PKG_MIRROR_HASH' &&
-                vName !== 'PKG_MAINTAINER' && vName !== 'PKG_LICENSE' && vName !== 'PKG_LICENSE_FILES') {
-              touchedVars.add(vName);
+        if (!hasStaticUnchangedPkgVersion) {
+          const fileLines = fileDiff.split('\n');
+          for (const line of fileLines) {
+            if (!line.startsWith('+') || line.startsWith('+++')) continue;
+            const assign = line.slice(1).match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+            if (assign) {
+              const vName = assign[1];
+              if (!NON_VERSION_MAKEFILE_VARS.has(vName)) {
+                touchedVars.add(vName);
+              }
             }
           }
         }
@@ -1077,6 +1310,10 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             continue;
           }
         }
+      }
+
+      if (newVersion) {
+        validateVersionAgainstCommit(newVersion, filePath);
       }
     }
   }
@@ -1224,7 +1461,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     let conffilesCheckRun = false;
     let conffilesCheckErrors = 0;
 
-    for (const { lines, filePath } of getMakefileChunks()) {
+    for (const { lines, filePath, rawChunk } of getMakefileChunks()) {
       // A diff of an existing Makefile is a window, not the file: the conffiles
       // block usually sits far from the install recipe and never shows up in
       // the hunks, so its absence here proves nothing. Only a newly added
@@ -1236,6 +1473,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       let MakefileHasConffiles = false;
       let inConffiles = false;
       let currentPackage = '';
+      let currentInstallPackage = '';
+      const rawInstalledConfigLines = [];
 
       for (const line of lines) {
         // Also check diff hunk headers (lines starting with @@) for endef/define
@@ -1249,23 +1488,31 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           const hunkContext = hunkContextMatch ? hunkContextMatch[1].trim() : '';
 
           if (hunkContext) {
-            // Only a conffiles define keeps us inside the block; any other
-            // context ('endef', another define, 'CONFIGURE_VARS += \') means
-            // this hunk starts outside it. git also takes an entry that begins
-            // with a make expansion ('$(CONF_DIR)/my.cnf') as context, and that
-            // one does sit inside the block - but the diff alone cannot tell it
-            // from a `$(call ...)` line opening an install or build recipe, so
-            // such a hunk is treated as outside and its added entries go
-            // unchecked rather than judged against the wrong rules.
             const hunkDefineMatch = hunkContext.match(/^define\s+(Package\/\S+)/);
-            if (hunkDefineMatch && /conffiles$/.test(hunkDefineMatch[1])) {
-              inConffiles = true;
-              currentPackage = hunkDefineMatch[1];
-              MakefileHasConffiles = true;
+            if (hunkDefineMatch) {
+              const installMatch = hunkDefineMatch[1].match(/^Package\/([^\/\s]+)\/install$/);
+              if (installMatch) {
+                currentInstallPackage = installMatch[1];
+              } else {
+                currentInstallPackage = '';
+              }
+              if (/^Package\/[^\s]*conffiles$/.test(hunkDefineMatch[1])) {
+                inConffiles = true;
+                currentPackage = hunkDefineMatch[1];
+                MakefileHasConffiles = true;
+              } else {
+                inConffiles = false;
+                currentPackage = '';
+              }
             } else {
               inConffiles = false;
               currentPackage = '';
+              currentInstallPackage = '';
             }
+          } else {
+            inConffiles = false;
+            currentPackage = '';
+            currentInstallPackage = '';
           }
           continue;
         }
@@ -1277,6 +1524,12 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           // 'endef' does — its body must not be validated as conffiles paths.
           const defineMatch = contentLine.match(/^define\s+(\S+)/);
           if (defineMatch) {
+            const installMatch = defineMatch[1].match(/^Package\/([^\/\s]+)\/install$/);
+            if (installMatch) {
+              currentInstallPackage = installMatch[1];
+            } else {
+              currentInstallPackage = '';
+            }
             if (/^Package\/[^\s]*conffiles$/.test(defineMatch[1])) {
               inConffiles = true;
               currentPackage = defineMatch[1];
@@ -1290,6 +1543,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           if (contentLine.match(/^endef/)) {
             inConffiles = false;
             currentPackage = '';
+            currentInstallPackage = '';
             continue;
           }
 
@@ -1300,9 +1554,13 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             // demanded conffiles for capability files, profile.d snippets and
             // other /etc payload that is not user configuration at all.
             const isInstallLine = contentLine.includes('INSTALL_CONF') ||
-              contentLine.includes('$(1)/etc/config');
+              (contentLine.includes('$(1)/etc/config') && !contentLine.includes('INSTALL_DIR'));
             if (isInstallLine) {
               MakefileInstallsConfig = true;
+              rawInstalledConfigLines.push({
+                pkg: currentInstallPackage,
+                contentLine
+              });
             }
 
             if (inConffiles) {
@@ -1378,9 +1636,56 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         }
       }
 
-      if (MakefileInstallsConfig && !MakefileHasConffiles) {
-        if (isAddedMakefile) {
-          errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+      const defaultPkgName = filePath ? filePath.replace(/\/Makefile$/, '').split('/').pop() : '';
+      const definedPackages = extractDefinedPackages(rawChunk);
+
+      const resolveConfigEntries = (sourceText) => {
+        const files = [];
+        let undetermined = false;
+        for (const item of rawInstalledConfigLines) {
+          const { path: resolvedPath, unresolvable } = extractInstalledConfigPath(item.contentLine, sourceText);
+          if (resolvedPath) {
+            files.push({ pkg: item.pkg, path: resolvedPath });
+          } else if (unresolvable || item.contentLine.includes('INSTALL_CONF')) {
+            undetermined = true;
+          }
+        }
+        return { files, undetermined };
+      };
+
+      if (MakefileInstallsConfig) {
+        const { files: installedConfigFiles, undetermined: hasUndeterminedConfigPath } = resolveConfigEntries(rawChunk);
+        if (hasUndeterminedConfigPath || installedConfigFiles.length === 0) {
+          if (isAddedMakefile || typeof fetchFileContent !== 'function') {
+            warnings.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
+            isValidationIncomplete = true;
+          } else {
+            pendingAsyncChecks.push(async () => {
+              try {
+                const headText = await fetchFileContent(filePath);
+                if (headText === null || headText === undefined) {
+                  warnings.push(`Could not fetch '${filePath}' to verify conffiles section.`);
+                  return { incomplete: true };
+                }
+                const resolvedFromHead = resolveConfigEntries(headText);
+                if (resolvedFromHead.undetermined || resolvedFromHead.files.length === 0) {
+                  warnings.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
+                  return { incomplete: true };
+                }
+                const headMap = extractConffilesMap(headText);
+                const headDefinedPkgs = extractDefinedPackages(headText);
+                const res = validateConffilesCoverage(headMap, resolvedFromHead.files, defaultPkgName, errors, successes, headDefinedPkgs);
+                if (res?.incomplete) return { incomplete: true };
+              } catch (err) {
+                warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
+                return { incomplete: true };
+              }
+            });
+          }
+        } else if (isAddedMakefile) {
+          const diffMap = extractConffilesMap(rawChunk);
+          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages);
+          if (res?.incomplete) isValidationIncomplete = true;
         } else if (typeof fetchFileContent === 'function') {
           pendingAsyncChecks.push(async () => {
             try {
@@ -1389,19 +1694,20 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
                 warnings.push(`Could not fetch '${filePath}' to verify conffiles section.`);
                 return { incomplete: true };
               }
-              if (headText && /define\s+Package\/[^\/]+\/conffiles\b/.test(headText)) {
-                successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
-              } else {
-                errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
-              }
+              const headMap = extractConffilesMap(headText);
+              const headDefinedPkgs = extractDefinedPackages(headText);
+              const res = validateConffilesCoverage(headMap, installedConfigFiles, defaultPkgName, errors, successes, headDefinedPkgs);
+              if (res?.incomplete) return { incomplete: true };
             } catch (err) {
               warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
               return { incomplete: true };
             }
           });
+        } else if (MakefileHasConffiles) {
+          const diffMap = extractConffilesMap(rawChunk);
+          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages);
+          if (res?.incomplete) isValidationIncomplete = true;
         }
-      } else if (MakefileInstallsConfig && MakefileHasConffiles) {
-        successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
       }
     }
 
@@ -1889,22 +2195,26 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     }
   }
 
-  if (pendingAsyncChecks.length > 0) {
-    return (async () => {
-      let incomplete = false;
-      for (const check of pendingAsyncChecks) {
-        try {
-          const res = await check();
-          if (res?.incomplete) incomplete = true;
-        } catch (_) {
-          incomplete = true;
-        }
+  const promise = (async () => {
+    let incomplete = isValidationIncomplete;
+    for (const check of pendingAsyncChecks) {
+      try {
+        const res = await check();
+        if (res?.incomplete) incomplete = true;
+      } catch (err) {
+        warnings.push(`Could not complete async Makefile validation: ${err?.message || err}`);
+        incomplete = true;
       }
-      return { errors, successes, warnings, incomplete };
-    })();
-  }
+    }
+    return { errors, successes, warnings, incomplete };
+  })();
 
-  return { errors, successes, warnings, incomplete: false };
+  return Object.assign(promise, {
+    errors,
+    successes,
+    warnings,
+    incomplete: isValidationIncomplete
+  });
 }
 
 export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent, isMissing) {
@@ -2034,29 +2344,7 @@ function rememberPerPatch(parse) {
   };
 }
 
-export const getChangedFilesFromPatch = rememberPerPatch(function getChangedFilesFromPatch(patch) {
-  if (!patch) return [];
-  const files = new Set();
-  const lines = patch.split('\n');
-  for (const line of lines) {
-    if (line.startsWith('+++ b/')) {
-      const p = line.slice(6).trim().replace(/\r$/, '');
-      if (p && p !== '/dev/null') files.add(p);
-    } else if (line.startsWith('--- a/')) {
-      const p = line.slice(6).trim().replace(/\r$/, '');
-      if (p && p !== '/dev/null') files.add(p);
-    } else if (line.startsWith('diff --git ')) {
-      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
-      if (match) {
-        const fileA = match[1].trim().replace(/\r$/, '');
-        const fileB = match[2].trim().replace(/\r$/, '');
-        if (fileA && fileA !== '/dev/null') files.add(fileA);
-        if (fileB && fileB !== '/dev/null') files.add(fileB);
-      }
-    }
-  }
-  return Object.freeze(Array.from(files));
-});
+export const getChangedFilesFromPatch = rememberPerPatch((patch) => Object.freeze(parseChangedFiles(patch)));
 
 export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates(patch) {
   const addedFiles = new Set();
@@ -2212,48 +2500,19 @@ export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
 }
 
-export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
-  // 'root', 'htdocs', 'luasrc', 'ucode' and 'po' are the payload directories
-  // of LuCI packages (root/ plays the role files/ has elsewhere).
+export function getFastPkgRoot(filePath) {
   const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git',
     'root', 'htdocs', 'luasrc', 'ucode', 'po']);
-  // OpenWrt uses versioned kernel patch dirs such as `target/linux/<subtarget>/patches-6.18/`
-  // for kernel-version-specific patches. They must be skipped just like the plain `patches` dir
-  // so we don't fall into the expensive candidate fallback and blow past Cloudflare's per-Worker
-  // subrequest limit when a PR touches many such files.
   const isSkippableDir = (name) =>
     skipDirs.has(name) ||
     name.startsWith('.') ||
     name.startsWith('patches-') ||
     name.startsWith('files-');
-  // 'frameworks' and 'games' come from the video feed.
   const CATEGORIES = new Set([
     'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
     'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
   ]);
-  // Language groups whose packages sit one level deeper: lang/python/Flask.
-  // golang keeps its compiler builds the same way (lang/golang/golang1.26).
   const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua', 'golang']);
-
-  const hasPkgName = async (dir) => {
-    if (!fetchFileContent) return false;
-    if (dir in cache) return cache[dir];
-
-    const makefilePath = `${dir}/Makefile`;
-    const content = await fetchFileContent(makefilePath);
-    // Some packages leave PKG_NAME to a shared helper: luci.mk supplies
-    // `PKG_NAME?=$(LUCI_NAME)`, and u-boot.mk, trusted-firmware-a.mk and
-    // optee-os.mk each carry a `PKG_NAME ?=` of their own. For those the
-    // include line is what marks the directory as a package root. uboot-tools
-    // names its source with PKG_DISTNAME instead and defines its packages
-    // itself, so that variable marks a package root too.
-    const ok = !!(content && (
-      /^PKG_(?:NAME|DISTNAME)\s*(?::=|=)/m.test(content) ||
-      /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m.test(content)
-    ));
-    cache[dir] = ok;
-    return ok;
-  };
 
   const isCategoryLevel = (parts) => {
     if (parts.length === 0) return true;
@@ -2263,22 +2522,14 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return false;
   };
 
-  // A payload directory sits inside a package; a directory sitting directly
-  // under a category IS the package. `package/utils/ucode` is the ucode
-  // interpreter, not the ucode payload of a LuCI application, and treating it
-  // as payload walked up to the category and returned no package root at all,
-  // so every pull request touching it went unaudited without saying so.
   const isPayloadDir = (dirParts) =>
     isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
 
   let parts = filePath.split('/');
   if (parts.length > 0) {
-    // Remove filename
     parts.pop();
   }
 
-  // Traverse up skipping standard directories (including versioned
-  // `patches-X.Y` / `files-X.Y` dirs used by `target/linux/<subtarget>/`).
   while (parts.length > 0) {
     if (isPayloadDir(parts)) {
       parts.pop();
@@ -2291,7 +2542,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
     return null;
   }
 
-      // Fast path for common OpenWrt layouts: no network calls needed.
+  // Fast path for common OpenWrt layouts: no network calls needed.
   if (parts[0] === 'package') {
     if (parts.length >= 3 && CATEGORIES.has(parts[1])) {
       if (parts[1] === 'lang' && NESTED_LANGS.has(parts[2])) {
@@ -2300,8 +2551,6 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
         }
         return `package/lang/${parts[2]}`;
       }
-      // Only use fast path for exact 3-level depth (package/<category>/<pkgname>)
-      // Deeper paths (e.g. package/network/utils/mosdns) need fallback resolution
       if (parts.length === 3) {
         return `package/${parts[1]}/${parts[2]}`;
       }
@@ -2318,12 +2567,6 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
       }
       return `lang/${parts[1]}`;
     }
-    // Only the exact <category>/<pkgname> depth is safe without a probe, the
-    // same way the package/ branch above stops at three levels. A deeper path
-    // is either payload of that package or a <category>/<group>/<pkgname>
-    // layout - libs/protobuf/protobuf-compat, utils/bigclown/bigclown-gateway -
-    // and answering <category>/<group> for the latter named a directory with
-    // no Makefile in it, which the audits then fetched and silently skipped.
     if (parts.length === 2) {
       return `${parts[0]}/${parts[1]}`;
     }
@@ -2336,12 +2579,63 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
       }
       return `${parts[0]}/lang/${parts[2]}`;
     }
-    // Only use fast path for exact 3-level depth (feed/<category>/<pkgname>)
-    // Deeper paths (e.g. package/network/utils/mosdns) need fallback resolution
     if (parts.length === 3) {
       return `${parts[0]}/${parts[1]}/${parts[2]}`;
     }
   }
+
+  return undefined;
+}
+
+export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
+  const fast = getFastPkgRoot(filePath);
+  if (fast !== undefined) return fast;
+
+  let parts = filePath.split('/');
+  if (parts.length > 0) {
+    parts.pop();
+  }
+  const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git',
+    'root', 'htdocs', 'luasrc', 'ucode', 'po']);
+  const isSkippableDir = (name) =>
+    skipDirs.has(name) ||
+    name.startsWith('.') ||
+    name.startsWith('patches-') ||
+    name.startsWith('files-');
+  const CATEGORIES = new Set([
+    'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
+    'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
+  ]);
+  const isCategoryLevel = (parts) => {
+    if (parts.length === 0) return true;
+    if (parts.length === 1 && CATEGORIES.has(parts[0])) return true;
+    if (parts[0] === 'package' && parts.length === 2 && CATEGORIES.has(parts[1])) return true;
+    if (parts.length === 2 && CATEGORIES.has(parts[1])) return true;
+    return false;
+  };
+  const isPayloadDir = (dirParts) =>
+    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
+  while (parts.length > 0) {
+    if (isPayloadDir(parts)) {
+      parts.pop();
+    } else {
+      break;
+    }
+  }
+
+  const hasPkgName = async (dir) => {
+    if (!fetchFileContent) return false;
+    if (dir in cache) return cache[dir];
+
+    const makefilePath = `${dir}/Makefile`;
+    const content = await fetchFileContent(makefilePath);
+    const ok = !!(content && (
+      /^PKG_(?:NAME|DISTNAME)\s*(?::=|=)/m.test(content) ||
+      /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m.test(content)
+    ));
+    cache[dir] = ok;
+    return ok;
+  };
 
   const candidates = [];
   const seen = new Set();
@@ -2594,6 +2888,8 @@ function diffTouchesVar(diff, varNames) {
   return false;
 }
 
+const isStrictInt = (v) => typeof v === 'string' && /^\d+$/.test(v.trim());
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
@@ -2620,14 +2916,37 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   // qualifies, keeping the audit strict when the origin of a change is unknown.
   const nonRevertedFiles = new Set();
 
-  for (const item of commitDetails) {
+  let effectiveCommitDetails = commitDetails;
+  if (Array.isArray(commitDetails) && commitDetails.length === 1 && commitDetails[0]?.commitPatch) {
+    const splitResult = splitMboxPatch(commitDetails[0].commitPatch);
+    if (splitResult === false) {
+      return {
+        errors: [],
+        successes: [],
+        warnings: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        notes: [],
+        incomplete: true
+      };
+    }
+    if (splitResult) {
+      effectiveCommitDetails = splitResult;
+    }
+  }
+
+  for (const item of effectiveCommitDetails) {
     const isRevertCommit = CONFIG.allow_revert !== false &&
       parseRevertCommit(item.fullCommit?.commit?.message || '') !== null;
 
     if (item.commitPatch) {
       const states = parseDiffFileStates(item.commitPatch);
-      states.addedFiles.forEach(f => addedFiles.add(f));
-      states.deletedFiles.forEach(f => deletedFiles.add(f));
+      states.addedFiles.forEach(f => {
+        addedFiles.add(f);
+        deletedFiles.delete(f);
+      });
+      states.deletedFiles.forEach(f => {
+        deletedFiles.add(f);
+        addedFiles.delete(f);
+      });
 
       // Changes per file in this commit patch
       for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
@@ -2661,7 +2980,15 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   // Makefile probes into far fewer GraphQL requests. The >15-package cap
   // below is checked against the full, precomputed set rather than bailing
   // out mid-scan, so the reported count is now always the true total.
-  const resolvedRoots = await Promise.all(candidateFiles.map(file => findPkgRoot(file, fetchFileContentAtHead, pkgRootCache)));
+  const fastRoots = candidateFiles.map(file => pkgRootCache[file] !== undefined ? pkgRootCache[file] : getFastPkgRoot(file));
+  let resolvedRoots;
+  if (fastRoots.every(r => r !== undefined)) {
+    resolvedRoots = fastRoots;
+  } else {
+    resolvedRoots = await Promise.all(candidateFiles.map((file, i) =>
+      fastRoots[i] !== undefined ? fastRoots[i] : findPkgRoot(file, fetchFileContentAtHead, pkgRootCache)
+    ));
+  }
   const pkgRoots = new Set();
   for (const pkgRoot of resolvedRoots) {
     if (pkgRoot) pkgRoots.add(pkgRoot);
@@ -2939,7 +3266,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     }
 
     let versionResetTo1InSeries = false;
-    if (commitDetails && commitDetails.length > 1 && versionChanged) {
+    if (effectiveCommitDetails && effectiveCommitDetails.length > 1 && versionChanged) {
       let simRelease = baseRelease;
       let simVersionReset = false;
       let releaseBumpedAfterResetInSeries = false;
@@ -2948,7 +3275,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       collectResolutionVarNames(baseMakefileContent || '', 'PKG_VERSION', versionVarNames);
       const trackingVarNames = new Set([...versionVarNames, 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']);
 
-      for (const item of commitDetails) {
+      for (const item of effectiveCommitDetails) {
         if (!item || !item.commitPatch) continue;
         const commitFileChanges = collectFileLineChanges(item.commitPatch);
         const commitDiff = commitFileChanges ? commitFileChanges[makefilePath] : null;
@@ -2967,10 +3294,12 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
             simVersionReset = false;
           }
         } else if (addedRel !== null) {
-          const prevNum = parseInt(simRelease, 10);
-          const nextNum = parseInt(addedRel, 10);
-          if (simVersionReset && Number.isInteger(prevNum) && Number.isInteger(nextNum) && nextNum > prevNum) {
-            releaseBumpedAfterResetInSeries = true;
+          if (simVersionReset && isStrictInt(simRelease) && isStrictInt(addedRel)) {
+            const prevNum = parseInt(simRelease.trim(), 10);
+            const nextNum = parseInt(addedRel.trim(), 10);
+            if (nextNum > prevNum) {
+              releaseBumpedAfterResetInSeries = true;
+            }
           }
           simRelease = addedRel;
         }
@@ -2994,7 +3323,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; packages on a shared helper without PKG_RELEASE don't require a reset to 1`] };
       }
       if (headRelease !== '1') {
-        if (versionResetTo1InSeries) {
+        if (versionResetTo1InSeries && isStrictInt(headRelease)) {
           return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' (reset to 1 and subsequently bumped to '${headRelease}' in commit series)`] };
         }
         return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
@@ -3002,18 +3331,29 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`] };
     }
 
-    const baseRelNum = parseInt(baseRelease, 10);
-    const headRelNum = parseInt(headRelease, 10);
-    const isNumericBase = Number.isInteger(baseRelNum) && !Number.isNaN(baseRelNum);
-    const isNumericHead = Number.isInteger(headRelNum) && !Number.isNaN(headRelNum);
+    const isNumericBase = isStrictInt(baseRelease);
+    const isNumericHead = isStrictInt(headRelease);
 
-    if (isNumericBase && isNumericHead && headRelNum < baseRelNum) {
+    if (!isNumericHead) {
+      return {
+        errors: [`Package \`${pkgRoot}\` PKG_RELEASE value '${headRelease}' is not a valid integer.`],
+        successes: []
+      };
+    }
+    if (!isNumericBase) {
+      return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE updated to '${headRelease}'`] };
+    }
+
+    const baseRelNum = parseInt(baseRelease.trim(), 10);
+    const headRelNum = parseInt(headRelease.trim(), 10);
+
+    if (headRelNum < baseRelNum) {
       return {
         errors: [`Package \`${pkgRoot}\` PKG_RELEASE was decreased from '${baseRelease}' to '${headRelease}' without a version update.`],
         successes: []
       };
     }
-    if (isNumericBase && isNumericHead && headRelNum === baseRelNum) {
+    if (headRelNum === baseRelNum) {
       return {
         errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],
         successes: []
@@ -3071,11 +3411,35 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
   // difference alone, because pull_request.base.sha is frozen when the PR is
   // opened and drifts as the base branch moves.
   const makefileLineChanges = {}; // path -> { added: [], deleted: [] }
-  for (const item of commitDetails) {
+
+  let effectiveCommitDetails = commitDetails;
+  if (Array.isArray(commitDetails) && commitDetails.length === 1 && commitDetails[0]?.commitPatch) {
+    const splitResult = splitMboxPatch(commitDetails[0].commitPatch);
+    if (splitResult === false) {
+      return {
+        errors: [],
+        successes: [],
+        warnings: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        findings: [],
+        incomplete: true
+      };
+    }
+    if (splitResult) {
+      effectiveCommitDetails = splitResult;
+    }
+  }
+
+  for (const item of effectiveCommitDetails) {
     if (!item.commitPatch) continue;
     const states = parseDiffFileStates(item.commitPatch);
-    states.addedFiles.forEach(f => addedFiles.add(f));
-    states.deletedFiles.forEach(f => deletedFiles.add(f));
+    states.addedFiles.forEach(f => {
+      addedFiles.add(f);
+      deletedFiles.delete(f);
+    });
+    states.deletedFiles.forEach(f => {
+      deletedFiles.add(f);
+      addedFiles.delete(f);
+    });
     for (const file of getChangedFilesFromPatch(item.commitPatch)) {
       if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
       if (isHiddenOrSpecial(file)) continue;
@@ -3090,7 +3454,7 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
     }
   }
 
-  const paths = [...makefiles].filter(f => !deletedFiles.has(f));
+  const paths = [...makefiles].filter(f => !deletedFiles.has(f) || addedFiles.has(f));
   if (paths.length > 15) {
     warnings.push(`Package hash audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
     return { errors, warnings, findings, successes, incomplete: true };
@@ -3222,11 +3586,11 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
   const successes = [];
 
   if (CONFIG.check_uci_config === false || CONFIG.check_uci_config === 'disabled') {
-    return { errors, successes };
+    return { errors, successes, warnings: [], incomplete: false };
   }
 
   if (!commitPatch) {
-    return { errors, successes };
+    return { errors, successes, warnings: [], incomplete: false };
   }
 
   const { deletedFiles } = parseDiffFileStates(commitPatch);
@@ -3278,6 +3642,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
       // through the shared stem and was rejected as invalid UCI.
       const namingLines = makefileContent.split('\n')
         .filter(l => !l.trim().startsWith('#') && l.includes(filename));
+
       if (namingLines.length > 0 && !namingLines.some(l => l.includes('etc/config'))) {
         return empty;
       }
@@ -3344,42 +3709,62 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
     }
 
     if (isDestinedForEtcConfig) {
-      const content = await fetchFileContent(file);
-      if (content !== null) {
-        const uciLines = content.split('\n');
-        let isValidUci = true;
-        let invalidLine = '';
-        let invalidLineNum = 0;
-
-        for (let i = 0; i < uciLines.length; i++) {
-          const trimmedLine = uciLines[i].trim();
-          if (trimmedLine === '' || trimmedLine.startsWith('#')) {
-            continue;
-          }
-          if (!/^(?:package|config|option|list)[ \t]/.test(trimmedLine)) {
-            isValidUci = false;
-            invalidLine = uciLines[i];
-            invalidLineNum = i + 1;
-            break;
-          }
-        }
-
-        if (!isValidUci) {
-          return { errors: [`- File '${file}' is destined for '/etc/config/' but is not a valid UCI configuration file. In OpenWrt, '/etc/config/' is reserved for UCI-formatted configuration files. Raw files (such as TOML, JSON, or YAML) are not allowed at this path. Invalid line ${invalidLineNum}: '${invalidLine}'`], successes: [] };
-        }
-        return { errors: [], successes: [`✅ Configuration file '${file}' destined for '/etc/config/' is a valid UCI configuration file`] };
+      let content = null;
+      try {
+        content = await fetchFileContent(file);
+      } catch (err) {
+        return {
+          errors: [],
+          successes: [],
+          warnings: [`Could not complete UCI config validation for '${file}': ${err?.message || err}`],
+          incomplete: true
+        };
       }
+      if (content === null || content === undefined) {
+        return {
+          errors: [],
+          successes: [],
+          warnings: [`Could not fetch content for configuration file '${file}' to validate UCI syntax`],
+          incomplete: true
+        };
+      }
+      const uciLines = content.split('\n');
+      let isValidUci = true;
+      let invalidLine = '';
+      let invalidLineNum = 0;
+
+      for (let i = 0; i < uciLines.length; i++) {
+        const trimmedLine = uciLines[i].trim();
+        if (trimmedLine === '' || trimmedLine.startsWith('#')) {
+          continue;
+        }
+        if (!/^(?:package|config|option|list)[ \t]/.test(trimmedLine)) {
+          isValidUci = false;
+          invalidLine = uciLines[i];
+          invalidLineNum = i + 1;
+          break;
+        }
+      }
+
+      if (!isValidUci) {
+        return { errors: [`- File '${file}' is destined for '/etc/config/' but is not a valid UCI configuration file. In OpenWrt, '/etc/config/' is reserved for UCI-formatted configuration files. Raw files (such as TOML, JSON, or YAML) are not allowed at this path. Invalid line ${invalidLineNum}: '${invalidLine}'`], successes: [] };
+      }
+      return { errors: [], successes: [`✅ Configuration file '${file}' destined for '/etc/config/' is a valid UCI configuration file`] };
     }
 
     return empty;
   }
 
+  const warnings = [];
+  let incomplete = false;
   const results = await Promise.all(changedFiles.map(processFile));
   for (const result of results) {
-    errors.push(...result.errors);
-    successes.push(...result.successes);
+    if (result.errors) errors.push(...result.errors);
+    if (result.successes) successes.push(...result.successes);
+    if (result.warnings) warnings.push(...result.warnings);
+    if (result.incomplete) incomplete = true;
   }
 
-  return { errors, successes };
+  return { errors, successes, warnings, incomplete };
 }
 

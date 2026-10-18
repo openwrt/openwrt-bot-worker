@@ -121,7 +121,7 @@ describe('validateMakefileContext', () => {
     assertNoErrorIncludes(res, "'1.0'");
   });
 
-  test('validates commit subject against version in PR-wide patch mode across multiple commits (Issue 9)', () => {
+  test('validates commit subject against version in PR-wide patch mode across multiple commits', () => {
     const virtualCommit = {
       isPrWidePatch: true,
       commits: [
@@ -146,7 +146,7 @@ diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
     assert.ok(res.successes.some(s => s.includes('PKG_VERSION bump matches context information inside commit subjects (2.4.0)')));
   });
 
-  test('flags missing version in commit subjects even if PR title mentions version in PR-wide patch mode (Issue 9)', () => {
+  test('flags missing version in commit subjects even if PR title mentions version in PR-wide patch mode', () => {
     const virtualCommit = {
       isPrWidePatch: true,
       commits: [

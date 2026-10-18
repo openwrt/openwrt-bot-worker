@@ -93,6 +93,26 @@ endef
     const resWith = await validateMakefileContext(makeCommit('foo: install conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headWithConffiles);
     assertNoErrorIncludes(resWith, MISSING_SECTION);
     assertSomeIncludes(resWith.successes, 'conffiles macro properly registers INSTALL_CONF');
+
+    // 3. When head Makefile has conffiles section, but it does NOT list the newly installed config file:
+    const headWithMismatchedConffiles = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/oldfile.conf
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
+endef
+`;
+    const resMismatched = await validateMakefileContext(makeCommit('foo: install conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headWithMismatchedConffiles);
+    assert.ok(resMismatched.errors.some(e => e.includes("Makefile installs '/etc/foo.conf', but 'define Package/foo/conffiles' does not list it")));
   });
 
   test('rejects package that installs config files but is missing conffiles section', () => {
@@ -376,5 +396,313 @@ endef
       assertSomeIncludes(conffilesErrorsFor([entry]), TRAILING_SLASH, `errors for ${JSON.stringify(entry)}`);
     }
     assert.deepStrictEqual(conffilesErrorsFor(['/etc/nftables.d/', '/etc/luci-uploads/']), []);
+  });
+
+  test('rejects config file installed by subpackage when conffiles block belongs only to another subpackage', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo-utils/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/foo-utils.conf $(1)/etc/foo-utils.conf
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/foo.conf
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
+endef
+
+define Package/foo-utils
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo utilities
+endef
+
+define Package/foo-utils/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo-utils.conf $(1)/etc/foo-utils.conf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: update utils'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.ok(res.errors.some(e => e.includes("missing the required 'conffiles' section for package 'foo-utils'")));
+  });
+
+  test('correctly identifies subpackage from hunk header context in diff of existing Makefile', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -35,3 +35,4 @@ define Package/foo-utils/install
+ \t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/foo-utils.conf $(1)/etc/foo-utils.conf
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/foo.conf
+endef
+
+define Package/foo-utils
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo utilities
+endef
+
+define Package/foo-utils/conffiles
+/etc/other.conf
+endef
+
+define Package/foo-utils/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo-utils.conf $(1)/etc/foo-utils.conf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: add config to utils'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.ok(res.errors.some(e => e.includes("Makefile installs '/etc/foo-utils.conf', but 'define Package/foo-utils/conffiles' does not list it")));
+  });
+
+  test('accepts conffiles coverage through variable expansion like $(CONF_DIR)/my.cnf', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/my.cnf $(1)/etc/my.cnf
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+$(CONF_DIR)/my.cnf
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/my.cnf $(1)/etc/my.cnf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install my.cnf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.deepStrictEqual(res.errors, []);
+    assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF');
+  });
+
+  test('accepts conffiles coverage through embedded macro calls like $(call ...)', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/shared.conf $(1)/etc/shared.conf
+`;
+    const headMakefile = `
+define Package/foo/Default/conffiles
+/etc/shared.conf
+endef
+
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+$(call Package/foo/Default/conffiles)
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/shared.conf $(1)/etc/shared.conf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install shared.conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.deepStrictEqual(res.errors, []);
+    assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF');
+  });
+
+  test('accepts conffiles coverage when install target uses variables like $(CONF_DIR) or $(config_directory)', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/my.cnf $(1)$(CONF_DIR)/my.cnf
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/my.cnf
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/my.cnf $(1)$(CONF_DIR)/my.cnf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install my.cnf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.deepStrictEqual(res.errors, []);
+    assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF');
+  });
+
+  test('marks conffiles validation as incomplete when install target path cannot be safely determined', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/my.cnf $(1)/$(DYNAMIC_DEST)/my.cnf
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/my.cnf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install dynamic dest'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.strictEqual(res.incomplete, true);
+    assert.ok(!res.successes.some(s => s.includes('conffiles macro properly registers INSTALL_CONF')));
+    assert.ok(res.warnings.some(w => w.includes('Could not safely determine installed configuration path(s)')));
+  });
+
+  test('does not fall back to single conffiles block belonging to another subpackage when install package context is missing in multi-package Makefile', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -40,3 +40,3 @@
+-\t$(INSTALL_DATA) ./files/utils.conf $(1)/etc/utils.conf
++\t$(INSTALL_CONF) ./files/utils.conf $(1)/etc/utils.conf
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo-utils
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo Utils
+endef
+
+define Package/foo-utils/conffiles
+/etc/utils.conf
+endef
+
+define Package/foo-utils/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/utils.conf $(1)/etc/utils.conf
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install utils conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.ok(res.errors.some(e => e.includes("missing the required 'conffiles' section for package 'foo'")));
+    assert.ok(!res.successes.some(s => s.includes('conffiles macro properly registers INSTALL_CONF')));
+  });
+
+  test('infers installed filename when INSTALL_CONF target is a directory like $(1)/etc/ or $(1)/etc/config/', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/
++`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/foo.conf
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install foo.conf into /etc/'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.deepStrictEqual(res.errors, []);
+    assert.strictEqual(res.incomplete, false);
+    assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF');
+  });
+
+  test('resolves $(PKG_NAME) in INSTALL_CONF target against headMakefile when not present in diff hunk', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -40,2 +40,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc/config
++\t$(INSTALL_CONF) ./files/foo.config $(1)/etc/config/$(PKG_NAME)
++`;
+    const headMakefile = `
+PKG_NAME:=foo
+
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/config/foo
+endef
+`;
+    const res = await validateMakefileContext(makeCommit('foo: install config'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
+    assert.deepStrictEqual(res.errors, []);
+    assert.strictEqual(res.incomplete, false);
+    assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF');
+  });
+
+  test('ignores deleted conffiles entries in diff when validating conffiles coverage', () => {
+    const res = validate('foo: replace config path', newFooMakefile(
+      ' define Package/foo/conffiles',
+      '-/etc/foo.conf',
+      '+/etc/other.conf',
+      ' endef',
+      '+define Package/foo/install',
+      '+\t$(INSTALL_DIR) $(1)/etc',
+      '+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf',
+      '+endef'
+    ));
+    assert.ok(res.errors.some(e => e.includes("Makefile installs '/etc/foo.conf', but 'define Package/foo/conffiles' does not list it")));
   });
 });

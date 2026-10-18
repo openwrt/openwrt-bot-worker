@@ -6,6 +6,8 @@ export function getDiffFromPatch(patchText: string | null | undefined): string {
   return idx === -1 ? '' : patchText.slice(idx);
 }
 
+export const MBOX_ENVELOPE_PATTERN = /^From ([0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?\nFrom: /gm;
+
 // A pull request's .patch is the mbox-style concatenation of its commits'
 // patches in commit order, each opening with git's
 // "From <sha> Mon Sep 17 00:00:00 2001" envelope line. Split it back into one
