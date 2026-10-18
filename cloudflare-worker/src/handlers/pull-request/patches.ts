@@ -26,6 +26,7 @@ export interface ResolvedPatchesResult {
   upstreamComparisonSkips: number;
   packageState: { isNewPackage: boolean; isDroppedPackage: boolean };
   packageStateKnown: boolean;
+  splitCommitPatches?: Map<string, string>;
 }
 
 export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise<ResolvedPatchesResult> {
@@ -58,7 +59,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
   }
 
   let splitCommitPatches = new Map<string, string>();
-  if (!usePrWidePatch && prWidePatchText !== null) {
+  if (prWidePatchText !== null) {
     splitCommitPatches = splitPrPatchByCommit(prWidePatchText, commits);
     for (const sha of splitCommitPatches.keys()) {
       if (!fileBatchLoader.hasRefSource(sha)) {
@@ -88,7 +89,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     const isMergeCommit = (commitData.parents || []).length > 1;
     if (fetchPatch && isMergeCommit) {
       commitPatch = null;
-    } else if (fetchPatch && splitCommitPatches.has(sha)) {
+    } else if (!isMergeCommit && splitCommitPatches.has(sha)) {
       commitPatch = splitCommitPatches.get(sha)!;
     } else if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
@@ -205,6 +206,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     commitDetails,
     upstreamComparisonSkips,
     packageState,
-    packageStateKnown
+    packageStateKnown,
+    splitCommitPatches
   };
 }

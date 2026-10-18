@@ -62,6 +62,58 @@ export interface PullRequestContext {
   branchCheckOutputText: string;
 }
 
+export interface LivePrState {
+  verified: boolean;
+  livePr: any;
+  branchMoved: boolean;
+  verdictMoved: boolean;
+}
+
+const livePrStateCache = new WeakMap<object, Promise<LivePrState>>();
+
+export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> {
+  let cached = livePrStateCache.get(ctx);
+  if (!cached) {
+    cached = (async () => {
+      const { prData, prNumber, repoFullname, headSha, headBranch, baseBranch, baseSha, client } = ctx;
+      let verified = false;
+      let livePr: any = prData || {};
+
+      if (typeof client?.optionalApiCall === 'function') {
+        const prUrl = prData?.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
+        const liveRes = await client.optionalApiCall(prUrl);
+        if (liveRes && liveRes.code >= 200 && liveRes.code < 300 && liveRes.data) {
+          if (Array.isArray(liveRes.data.labels) || liveRes.data.head || liveRes.data.base) {
+            livePr = { ...prData, ...liveRes.data };
+          }
+          verified = true;
+        } else {
+          console.warn(`Failed to verify current PR state for #${prNumber}; treating PR as moved to avoid stale operations`);
+        }
+      } else {
+        verified = true;
+      }
+
+      const prClosed = Boolean(livePr?.state && livePr.state !== 'open');
+      if (prClosed) {
+        console.warn(`Skipping PR operations: PR #${prNumber} is no longer open (state: ${livePr.state})`);
+      }
+
+      const branchMoved = !verified || prClosed ||
+        Boolean(livePr.head?.sha && headSha && livePr.head.sha !== headSha) ||
+        Boolean(livePr.head?.ref && headBranch && livePr.head.ref !== headBranch) ||
+        Boolean(livePr.base?.ref && baseBranch && livePr.base.ref !== baseBranch) ||
+        Boolean(livePr.base?.sha && baseSha && livePr.base.sha !== baseSha);
+      const verdictMoved = branchMoved ||
+        Boolean(livePr.body !== undefined && prData?.body !== undefined && livePr.body !== prData.body);
+
+      return { verified, livePr, branchMoved, verdictMoved };
+    })();
+    livePrStateCache.set(ctx, cached);
+  }
+  return cached;
+}
+
 export type ContextResult =
   | { kind: 'response'; response: Response }
   | { kind: 'context'; context: PullRequestContext };

@@ -182,6 +182,7 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
 
     // prPatch only has 2 envelopes out of 3 commits (truncated patch series)
     const prPatch = `From ${sha1} Mon Sep 17 00:00:00 2001
+From: Author <author@example.com>
 Subject: [PATCH 1/3] pkgA: first commit
 
 diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
@@ -192,6 +193,7 @@ diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
 +PKG_RELEASE:=2
 
 From ${sha2} Mon Sep 17 00:00:00 2001
+From: Author <author@example.com>
 Subject: [PATCH 2/3] pkgB: second commit
 
 diff --git a/package/utils/pkgB/Makefile b/package/utils/pkgB/Makefile
@@ -256,6 +258,7 @@ diff --git a/package/utils/pkgB/Makefile b/package/utils/pkgB/Makefile
 
     // prPatch has only 1 envelope out of 2 commits
     const prPatch = `From ${sha1} Mon Sep 17 00:00:00 2001
+From: Author <author@example.com>
 Subject: [PATCH 1/2] pkgA: first commit
 
 diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
