@@ -7,6 +7,7 @@ import {
 } from '../../src/types/github.ts';
 import { handlePullRequestEvent } from '../../src/handlers/pull-request/index.ts';
 import { handleIssuesEvent } from '../../src/handlers/issues.ts';
+import { applyIssueLabelling } from '../../src/issue-labeller.js';
 import worker from '../../src/index.js';
 import { calculateHmac, graphqlLabelsHandler } from '../github-mocks.js';
 
@@ -344,5 +345,196 @@ describe('runtime type guards and entrypoint boundary validation', () => {
       assert.strictEqual(response.status, 400);
       assert.match(await response.text(), /expected issue_comment event payload/);
     });
+  });
+});
+
+// The issue labeller spends the same per-invocation subrequest budget as the
+// pull request path: one unit per outgoing request, and the reserve kept off
+// the optional lookups so the labelling writes at the end always have room.
+// These tests drive the handler with budgets tight enough that a miscounted
+// request shows up as a skipped write or a second comment.
+describe('issue labeller subrequest budget', () => {
+  const INVALID_FORMAT_YML = 'target/ramips:\n  - field: target\n    format: "^ramips$"\n';
+  const EXISTS_YML = 'has-target:\n  - field: target\n    exists: "path:target/linux/mediatek"\n';
+
+  // An issue whose form field fails validation: the verdict carries the
+  // invalid label (a write), the trigger label removal (a write) and a
+  // comment, so every part of the budget is exercised.
+  const flaggedIssue = {
+    number: 7,
+    title: 'Kernel crash',
+    body: '### OpenWrt target\n\nmediatek\n',
+    labels: [{ name: 'to-triage' }],
+    author_association: 'NONE'
+  };
+
+  const json = (payload, status = 200) => new Response(JSON.stringify(payload), { status });
+
+  // Answers everything an issues event asks GitHub and records what really
+  // went out. `configFailures` makes the first answers to the config query a
+  // 500, so githubApiCall retries it; `commentPages` is the thread.
+  function stubIssuesApi({ labellerYml = INVALID_FORMAT_YML, commentPages = [[]], repoLabels = ['invalid'], configFailures = 0 } = {}) {
+    const requests = [];
+    let configCalls = 0;
+    globalThis.fetch = async (url, options = {}) => {
+      const method = options.method || 'GET';
+      requests.push({ url, method, body: options.body ? JSON.parse(options.body) : null });
+
+      if (url.includes('/graphql')) {
+        const body = JSON.parse(options.body);
+        if (body.query.includes('labels(first:')) {
+          return json({ data: { repository: { labels: { nodes: repoLabels.map(name => ({ name })), pageInfo: { hasNextPage: false, endCursor: null } } } } });
+        }
+        if (body.variables.o0 !== undefined) {
+          configCalls++;
+          if (configCalls <= configFailures) return new Response('upstream hiccup', { status: 500 });
+          return json({
+            data: {
+              repo0: {
+                f0: { oid: 'cfg', text: '{"enable_issue_labeller": true}', isBinary: false },
+                f1: { oid: 'yml', text: labellerYml, isBinary: false }
+              }
+            }
+          });
+        }
+        // Existence probes: nothing the config asks about resolves.
+        const aliases = Object.keys(body.variables).filter(k => k.startsWith('expr'));
+        return json({ data: { repository: Object.fromEntries(aliases.map((_, i) => [`p${i}`, null])) } });
+      }
+
+      if (method === 'GET' && url.includes('/comments?')) {
+        const page = Number(new URL(url).searchParams.get('page') || 1);
+        return json(commentPages[page - 1] || []);
+      }
+      return json({});
+    };
+    return requests;
+  }
+
+  const runIssuesEvent = (env, tokenMintAttempts = 0, issue = flaggedIssue) => handleIssuesEvent(
+    { action: 'opened', issue, repository: { full_name: 'openwrt/openwrt', default_branch: 'main' } },
+    'token',
+    'openwrt/openwrt',
+    null,
+    env,
+    tokenMintAttempts
+  );
+
+  const commentListings = (requests) => requests.filter(r => r.method === 'GET' && r.url.includes('/comments?'));
+  const commentPosts = (requests) => requests.filter(r => r.method === 'POST' && r.url.endsWith('/issues/7/comments'));
+  const labelPost = (requests) => requests.find(r => r.method === 'POST' && r.url.endsWith('/issues/7/labels'));
+
+  test('a budget equal to the requests the run really makes carries it to the end', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubIssuesApi();
+
+    // Config query, label listing, one comment page, the comment, the label
+    // removal and the label addition: six requests, so a six-unit budget has
+    // to cover them. Charging any of them twice starves the writes at the
+    // end, and a declined write is the 502 that makes GitHub re-deliver.
+    const res = await runIssuesEvent({ SUBREQUEST_BUDGET_LIMIT: '6', SUBREQUEST_RESERVE_HEADROOM: '0' });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(requests.length, 6);
+    assert.strictEqual(commentListings(requests).length, 1);
+    assert.strictEqual(commentPosts(requests).length, 1);
+    assert.deepStrictEqual(labelPost(requests).body.labels, ['invalid']);
+  });
+
+  for (const [what, env] of [
+    ['unset', {}],
+    ['unparseable', { SUBREQUEST_BUDGET_LIMIT: 'forty-five', SUBREQUEST_RESERVE_HEADROOM: 'fifteen' }]
+  ]) {
+    test(`an ${what} budget limit falls back to 45 with 15 reserved for the writes`, async (t) => {
+      const realFetch = globalThis.fetch;
+      t.after(() => { globalThis.fetch = realFetch; });
+      const requests = stubIssuesApi();
+
+      // 30 units are already spent when the handler starts, so the config
+      // query and the label listing leave nothing beyond the reserve: the
+      // comment scan is skipped, the labelling writes still go out. A
+      // ceiling of 50 would page the thread, and an unparseable value must
+      // not turn the ceiling into NaN, which never declines anything.
+      const res = await runIssuesEvent(env, 30);
+
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(commentListings(requests).length, 0);
+      assert.strictEqual(commentPosts(requests).length, 0);
+      assert.deepStrictEqual(labelPost(requests).body.labels, ['invalid']);
+    });
+  }
+
+  test('a retried config query is charged for every attempt it made', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubIssuesApi({ configFailures: 1 });
+
+    // The config query costs two requests (a 500, then the retry) and the
+    // label listing one: with four units and one reserved there is nothing
+    // left for the thread. Counting the retried query as one request would
+    // leave room for a page that the budget cannot actually pay for.
+    const res = await runIssuesEvent({ SUBREQUEST_BUDGET_LIMIT: '4', SUBREQUEST_RESERVE_HEADROOM: '1' });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(requests.filter(r => r.url.includes('/graphql')).length, 3);
+    assert.strictEqual(commentListings(requests).length, 0);
+    assert.deepStrictEqual(labelPost(requests).body.labels, ['invalid']);
+  });
+
+  test('the existence query the rules ask for is charged too', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubIssuesApi({ labellerYml: EXISTS_YML });
+
+    // Config query, existence query, label listing: three requests, and with
+    // four units and one reserved the thread is out of reach. An existence
+    // query nobody charges for hides a request that was really made.
+    const res = await runIssuesEvent({ SUBREQUEST_BUDGET_LIMIT: '4', SUBREQUEST_RESERVE_HEADROOM: '1' });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(requests.filter(r => r.url.includes('/graphql')).length, 3);
+    assert.strictEqual(commentListings(requests).length, 0);
+    assert.deepStrictEqual(labelPost(requests).body.labels, ['invalid']);
+  });
+
+  test('every comment page is charged once, not twice', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    // A full page keeps the pager going, and no page carries the marker.
+    const filler = (n) => Array.from({ length: n }, (_, i) => ({ id: 1000 + i, body: `chatter ${i}` }));
+    const requests = stubIssuesApi({ commentPages: [filler(100), filler(20)] });
+
+    const charges = [];
+    const onCall = () => { charges.push(1); return true; };
+    await applyIssueLabelling(
+      { labelsToAdd: [], labelsToRemove: [], comments: ['Fields are wrong'], resolvedComment: null, legacyHeader: null, labelMeta: {} },
+      'token', 'openwrt/openwrt', 7, new Set(), new Set(), onCall
+    );
+
+    // Two listings and the comment itself: what the budget is told must be
+    // what went out, or the budget declines a write it could have afforded.
+    assert.strictEqual(requests.length, 3);
+    assert.strictEqual(charges.length, requests.length);
+  });
+
+  test('a thread the budget stopped reading is not answered with a second comment', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const filler = (n) => Array.from({ length: n }, (_, i) => ({ id: 1000 + i, body: `chatter ${i}` }));
+    const requests = stubIssuesApi({ commentPages: [filler(100), filler(20)] });
+
+    // Headroom for the first page only: the comment this run would edit may
+    // be on the page it never read, so it posts nothing rather than a
+    // duplicate.
+    let pagesAffordable = 1;
+    await applyIssueLabelling(
+      { labelsToAdd: [], labelsToRemove: [], comments: ['Fields are wrong'], resolvedComment: null, legacyHeader: null, labelMeta: {} },
+      'token', 'openwrt/openwrt', 7, new Set(), new Set(), () => true, null,
+      { hasHeadroom: () => pagesAffordable-- > 0 }
+    );
+
+    assert.strictEqual(commentListings(requests).length, 1);
+    assert.strictEqual(commentPosts(requests).length, 0);
   });
 });

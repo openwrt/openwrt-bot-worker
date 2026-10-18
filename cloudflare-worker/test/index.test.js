@@ -2630,7 +2630,7 @@ index 123456..789012 100644
   });
 
   // --- ISSUES EVENT (issue labeller) ---
-  async function sendIssuesWebhook(action, issue, { changes = null, labellerYml = null, formalities = '{"enable_issue_labeller": true}' } = {}) {
+  async function sendIssuesWebhook(action, issue, { changes = null, labellerYml = null, formalities = '{"enable_issue_labeller": true}', env = {}, commentListing = null } = {}) {
     const requests = [];
     fetchMock = async (url, options) => {
       requests.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
@@ -2647,6 +2647,7 @@ index 123456..789012 100644
         });
       }
       if (url.includes('/comments') && (!options || options.method === 'GET')) {
+        if (commentListing) return commentListing();
         return new Response(JSON.stringify([]), { status: 200 });
       }
       return new Response(JSON.stringify({}), { status: 200 });
@@ -2669,7 +2670,8 @@ index 123456..789012 100644
     const response = await worker.fetch(request, {
       WEBHOOK_SECRET: secret,
       APP_ID: '12345',
-      PRIVATE_KEY: 'YW55Y29udGVudA=='
+      PRIVATE_KEY: 'YW55Y29udGVudA==',
+      ...env
     }, {});
     return { response, requests };
   }
@@ -2721,6 +2723,99 @@ index 123456..789012 100644
       const labelListings = requests.filter(r => r.url.includes('/graphql') && r.body?.query?.includes('labels(first:'));
       assert.strictEqual(labelListings.length, 0);
       assert.ok(!requests.some(r => r.method === 'POST' && r.url.endsWith('/issues/9/labels')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('issues: a budget down to its reserve still labels the issue instead of failing the delivery', async () => {
+    try {
+      // The config query and the label listing leave only the reserve, which
+      // belongs to the writes: the comment scan is skipped and the labelling
+      // writes go out. Charging a scan page twice spends that reserve, and a
+      // declined write answers the delivery with a 502 GitHub re-sends.
+      const { response, requests } = await sendIssuesWebhook('opened',
+        {
+          number: 9,
+          body: '### OpenWrt target\n\nmediatek',
+          labels: [{ name: 'to-triage' }],
+          author_association: 'NONE'
+        },
+        {
+          labellerYml: 'target/ramips:\n  - field: target\n    format: "^ramips$"\n',
+          env: { SUBREQUEST_BUDGET_LIMIT: '3', SUBREQUEST_RESERVE_HEADROOM: '1' }
+        }
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.ok(!requests.some(r => r.url.includes('/comments')));
+      const labelPost = requests.find(r => r.method === 'POST' && r.url.endsWith('/issues/9/labels'));
+      assert.deepStrictEqual(labelPost.body.labels, ['invalid']);
+      assert.ok(requests.some(r => r.method === 'DELETE' && r.url.endsWith('/issues/9/labels/to-triage')));
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('issues: a comment page the run could not read must not earn a second bot comment', async () => {
+    try {
+      // A thread this run never finished reading may already hold the bot's
+      // comment on a page it never saw, and a second one never goes away.
+      const flagged = {
+        number: 9,
+        body: '### OpenWrt target\n\nmediatek',
+        labels: [{ name: 'to-triage' }],
+        author_association: 'NONE'
+      };
+      const opts = { labellerYml: 'target/ramips:\n  - field: target\n    format: "^ramips$"\n' };
+
+      // The budget comes out of the run itself rather than a guessed number:
+      // every request before the scan is charged once, so the index of the
+      // first listing is what the scan starts from.
+      const probe = await sendIssuesWebhook('opened', flagged, opts);
+      const beforeScan = probe.requests.findIndex(r => r.method === 'GET' && r.url.includes('/comments?'));
+      assert.ok(beforeScan > 0, 'the scan has to run for this test to mean anything');
+      assert.ok(probe.requests.some(r => r.method === 'POST' && r.url.endsWith('/issues/9/comments')),
+        'the verdict has a comment to post once the thread reads clean');
+
+      const reserve = 1;
+      // One 500, then a clean empty listing: whether the retry goes out at all
+      // is the budget's decision, and `spare` is the room left for it.
+      const run = async (spare) => {
+        let listings = 0;
+        const { response, requests } = await sendIssuesWebhook('opened', flagged, {
+          ...opts,
+          commentListing: () => (++listings === 1
+            ? new Response('upstream failure', { status: 500 })
+            : new Response(JSON.stringify([]), { status: 200 })),
+          env: {
+            SUBREQUEST_BUDGET_LIMIT: String(reserve + beforeScan + spare),
+            SUBREQUEST_RESERVE_HEADROOM: String(reserve)
+          }
+        });
+        return { response, requests, listings };
+      };
+
+      const declined = await run(1);
+      assert.strictEqual(declined.listings, 1, 'room for page 1 only: the retry must not be made');
+      assert.strictEqual(declined.response.status, 200);
+      assert.ok(!declined.requests.some(r => r.method === 'POST' && r.url.endsWith('/issues/9/comments')),
+        'a thread the run never read must not get a comment beside the one it may already carry');
+      // The reserve exists for these, so an unread thread still costs no labels.
+      assert.ok(declined.requests.some(r => r.method === 'DELETE' && r.url.endsWith('/issues/9/labels/to-triage')));
+      assert.deepStrictEqual(
+        declined.requests.find(r => r.method === 'POST' && r.url.endsWith('/issues/9/labels')).body.labels,
+        ['invalid']
+      );
+
+      // One request more and the retry fits, reads the thread and the comment
+      // goes out. The pair also pins the accounting: page 1 charged twice
+      // would decline this retry too, charged not at all would have let the
+      // declined one through.
+      const allowed = await run(2);
+      assert.strictEqual(allowed.listings, 2, 'the retry fits above the reserve');
+      assert.ok(allowed.requests.some(r => r.method === 'POST' && r.url.endsWith('/issues/9/comments')),
+        'a scan that did finish reading the thread still posts the first comment');
     } finally {
       fetchMock = null;
     }

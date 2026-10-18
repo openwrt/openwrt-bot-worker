@@ -311,13 +311,15 @@ async function fetchLabelPages(token, owner, name, labels, cursor, onCall) {
 // Fetches all repository label names in a single paginated GraphQL query,
 // replacing multiple REST calls (one per 100-label page). Returns a Set of
 // lowercased label names for O(1) existence checks.
-export async function graphqlFetchRepoLabels(token, repoFullname) {
+export async function graphqlFetchRepoLabels(token, repoFullname, onCall) {
   const slashIndex = repoFullname.indexOf('/');
   const owner = repoFullname.slice(0, slashIndex);
   const name = repoFullname.slice(slashIndex + 1);
 
+  // A repository past 100 labels pages inside fetchLabelPages, and every page
+  // and retry is a subrequest, so the counter has to reach them.
   const labels = new Set();
-  await fetchLabelPages(token, owner, name, labels, null);
+  await fetchLabelPages(token, owner, name, labels, null, onCall);
   return labels;
 }
 
@@ -623,7 +625,7 @@ export async function ensureLabelExists(token, repoFullname, name, color, descri
 //   type 'tag': checks if refs/tags/<value> exists
 //   type 'path': checks if <ref>:<value> object exists (file or tree)
 // Returns Map<key, boolean>
-export async function graphqlCheckExistence(token, repoFullname, ref, probes) {
+export async function graphqlCheckExistence(token, repoFullname, ref, probes, onCall) {
   const results = new Map();
   if (!probes || probes.length === 0) return results;
 
@@ -650,9 +652,17 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes) {
 
   const query = `query(${varDefs.join(', ')}) {\n  repository(owner: $owner, name: $name) {\n    ${fieldParts.join('\n    ')}\n  }\n}`;
 
-  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables });
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables }, 'application/vnd.github+json', { onAttempt: onCall });
 
   if (res.code !== 200 || !res.data?.data?.repository) {
+    // An attempt the caller declined asked GitHub nothing, so it must not read
+    // as "the tag and the path do not exist": the labeller would annotate the
+    // issue as if the repository were empty. It is raised instead, which leaves
+    // the failure in the delivery log. A real 404 or error is still an answer
+    // and keeps marking the probes non-existent.
+    if (res.code === 599 && res.raw === DECLINED_ATTEMPT_RAW) {
+      throw new Error(`GraphQL existence probe for ${repoFullname} was not sent (no request budget left), so existence is unknown`);
+    }
     // On failure, mark all as non-existent rather than throwing
     for (const probe of probes) results.set(probe.key, false);
     return results;

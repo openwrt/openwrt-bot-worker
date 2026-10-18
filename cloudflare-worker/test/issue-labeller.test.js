@@ -1,6 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { parseIssueForm, normalizeFields, parseIssueLabellerYaml, extractTemplateVars, DEFAULT_ISSUE_LABELLER_CONFIG, handleIssueLabeller, applyIssueLabelling, ISSUE_LABELLER_MARKER } from '../src/issue-labeller.js';
+import { optionalAttemptCounter } from '../src/core/utils.ts';
 
 describe('parseIssueForm', () => {
   test('parses structured issue form body', () => {
@@ -498,20 +499,44 @@ describe('applyIssueLabelling comment handling', () => {
   // Records every request and answers comment listings from `existing`.
   // `existing` is either a flat list of comments (one page) or an array of
   // pages, which lets a test put the marker beyond the first 100.
-  const stubApi = (existing) => {
+  // `listingStatuses` answers successive listing attempts with those HTTP
+  // codes instead, in order, so a test can put a transient GitHub failure in
+  // front of a thread that does hold the marker; once they run out the
+  // listing answers normally again.
+  const stubApi = (existing, listingStatuses = []) => {
     const pages = Array.isArray(existing[0]) ? existing : [existing];
     const requests = [];
+    let attempts = 0;
     globalThis.fetch = async (url, opts = {}) => {
       const method = opts.method || 'GET';
       requests.push({ url, method, body: opts.body ? JSON.parse(opts.body) : null });
       let payload = [];
       if (method === 'GET' && url.includes('/comments?')) {
+        const status = listingStatuses[attempts++];
+        if (status !== undefined && status !== 200) {
+          return { status, headers: { get: () => null }, text: async () => 'upstream failure' };
+        }
         const page = Number(new URL(url).searchParams.get('page') || 1);
         payload = pages[page - 1] || [];
       }
       return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify(payload) };
     };
     return requests;
+  };
+
+  // The budget shape the issues handler builds, wired the way it wires it:
+  // the scan gets the real optional counter and the headroom gate, the writes
+  // a counter that never declines.
+  const stubBudget = (limit, reserve) => {
+    const budget = { limit, reserve, used: 0 };
+    return {
+      budget,
+      countAttempt: () => { budget.used++; return true; },
+      hooks: {
+        onOptionalAttempt: optionalAttemptCounter(budget),
+        hasHeadroom: () => budget.limit - budget.reserve - budget.used > 0
+      }
+    };
   };
 
   // A full page, so the pager keeps going.
@@ -587,6 +612,71 @@ describe('applyIssueLabelling comment handling', () => {
     await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
     assert.strictEqual(requests.filter(r => r.method === 'GET').length, 3);
     assert.strictEqual(requests.filter(r => r.method === 'POST').length, 1);
+  });
+
+  test('does not post beside the comment it could not read when the listing keeps failing', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    // The marker comment is right there on page 1; three 500s mean this run
+    // never gets to see it, and a second comment beside it would be permanent.
+    const requests = stubApi([bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)], [500, 500, 500]);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 3, 'a 500 is retried to exhaustion');
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0, 'an unread thread may already carry the comment');
+    assert.strictEqual(requests.filter(r => r.method === 'PATCH').length, 0);
+  });
+
+  test('treats a 404 on the first page as a thread it could not read', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)], [404]);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 1, '404 is final, not retried');
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+  });
+
+  test('treats a single 403 on the first page as a thread it could not read', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    // Without a Retry-After header a 403 is a refusal, so it is one attempt.
+    const requests = stubApi([bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)], [403]);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 1);
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+  });
+
+  test('does not post when the budget declines the retry of a failed page', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    const requests = stubApi([bot(42, `Old text\n\n${ISSUE_LABELLER_MARKER}`)], [500]);
+    // One request fits above the reserve, so page 1 goes out; its 500 leaves
+    // nothing, the counter declines the retry and githubApiCall hands back the
+    // 500 it already had. The page is unread either way.
+    const { budget, hooks } = stubBudget(2, 1);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null, null, hooks);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 1, 'the declined retry is not made');
+    assert.strictEqual(budget.used, 1, 'the page that went out is charged once, the declined attempt not at all');
+    assert.strictEqual(requests.filter(r => r.method === 'POST').length, 0);
+  });
+
+  test('still posts the first comment when a healthy listing shows an empty thread', async (t) => {
+    const realFetch = globalThis.fetch;
+    t.after(() => { globalThis.fetch = realFetch; });
+    // A scan that read an empty thread is a finished scan, not a blind one:
+    // an issue with no comments has to get its first one.
+    const requests = stubApi([]);
+    const { budget, countAttempt, hooks } = stubBudget(45, 15);
+
+    await applyIssueLabelling({ ...empty, comments: ['Fields are wrong'] }, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), countAttempt, null, hooks);
+    assert.strictEqual(requests.filter(r => r.method === 'GET').length, 1);
+    const posted = requests.filter(r => r.method === 'POST');
+    assert.strictEqual(posted.length, 1);
+    assert.ok(posted[0].body.body.includes(ISSUE_LABELLER_MARKER));
+    assert.strictEqual(budget.used, requests.length, 'every request that went out is charged exactly once');
   });
 
   test('adopts a pre-marker comment instead of posting beside it', async (t) => {

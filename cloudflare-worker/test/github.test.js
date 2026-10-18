@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, GRAPHQL_URL } from '../src/github.js';
+import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, graphqlFetchRepoLabels, graphqlCheckExistence, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -1057,5 +1057,95 @@ describe('githubApiCall declined attempts', { concurrency: 1 }, () => {
 
     assert.strictEqual(served, 1);
     assert.strictEqual(res.code, 503, 'the 503 that would have been retried is what the caller sees');
+  });
+});
+
+// A page and a retry are each one subrequest, so the counter has to be handed
+// to the function that makes them, not charged once at the call site.
+describe('subrequest accounting in paged and probe queries', { concurrency: 1 }, () => {
+  let originalFetch;
+
+  before(() => { originalFetch = globalThis.fetch; });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  test('charges every label page', async () => {
+    const pages = [
+      { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: true, endCursor: 'c1' } },
+      { nodes: [{ name: 'stale' }], pageInfo: { hasNextPage: false, endCursor: null } }
+    ];
+    let served = 0;
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: { repository: { labels: pages[served++] } } }), { status: 200 });
+
+    let charged = 0;
+    const labels = await graphqlFetchRepoLabels('token', 'openwrt/openwrt', () => { charged++; return true; });
+
+    assert.deepStrictEqual([...labels].sort(), ['bug', 'stale']);
+    assert.strictEqual(served, 2);
+    assert.strictEqual(charged, served);
+  });
+
+  test('charges every attempt of an existence probe, retries included', async () => {
+    let served = 0;
+    globalThis.fetch = async () => {
+      served++;
+      return served === 1
+        ? new Response('upstream hiccup', { status: 500 })
+        : new Response(JSON.stringify({ data: { repository: { p0: { oid: 'abc123' } } } }), { status: 200 });
+    };
+
+    let charged = 0;
+    const res = await graphqlCheckExistence('token', 'openwrt/openwrt', 'HEAD', [{ key: 'k', type: 'path', value: 'README.md' }], () => { charged++; return true; });
+
+    assert.strictEqual(res.get('k'), true);
+    assert.strictEqual(served, 2);
+    assert.strictEqual(charged, served);
+  });
+});
+
+// A probe the caller declined asked GitHub nothing. Reading it as "nothing
+// exists" would label an issue from an answer that never came.
+describe('graphqlCheckExistence when the attempt is not made', { concurrency: 1 }, () => {
+  let originalFetch;
+
+  before(() => { originalFetch = globalThis.fetch; });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  test('raises instead of reporting every probe false when the attempt is declined', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return new Response(JSON.stringify({ data: { repository: { p0: { name: 'v24.10.0' } } } }), { status: 200 }); };
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await assert.rejects(
+        () => graphqlCheckExistence('token', 'openwrt/openwrt', 'HEAD', [{ key: 'tag', type: 'tag', value: 'v24.10.0' }], () => false),
+        /existence probe for openwrt\/openwrt was not sent/
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(served, 0, 'nothing was asked, so nothing may be answered');
+  });
+
+  test('still reports every probe false when GitHub itself fails', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return new Response('upstream hiccup', { status: 500 }); };
+
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    console.warn = () => {};
+    console.error = () => {};
+    let results;
+    try {
+      results = await graphqlCheckExistence('token', 'openwrt/openwrt', 'HEAD', [
+        { key: 'tag', type: 'tag', value: 'v24.10.0' },
+        { key: 'path', type: 'path', value: 'package/utils/foo' }
+      ], () => true);
+    } finally {
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+    assert.strictEqual(served, 3, 'a real failure is retried to exhaustion');
+    assert.deepStrictEqual([...results.entries()], [['tag', false], ['path', false]]);
   });
 });

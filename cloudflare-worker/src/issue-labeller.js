@@ -368,7 +368,8 @@ export const DEFAULT_ISSUE_LABELLER_CONFIG = {
 // --- MAIN HANDLER ---
 // Processes an opened, edited or reopened issue event using the declarative
 // config. Returns { labelsToAdd, labelsToRemove, comments, resolvedComment }.
-export async function handleIssueLabeller(data, token, config, repoFullname) {
+/** @param {any} data @param {string} token @param {any} config @param {string} repoFullname @param {((attempt?: number) => boolean)|null} [onCall] */
+export async function handleIssueLabeller(data, token, config, repoFullname, onCall = null) {
   const result = { labelsToAdd: [], labelsToRemove: [], comments: [], resolvedComment: null, legacyHeader: null, labelMeta: {} };
 
   const issue = data.issue;
@@ -484,7 +485,9 @@ export async function handleIssueLabeller(data, token, config, repoFullname) {
   // Execute all existence checks in one GraphQL call
   let existenceResults = new Map();
   if (probes.length > 0) {
-    existenceResults = await graphqlCheckExistence(token, repoFullname, 'HEAD', probes);
+    // Charged inside the call, so a retried query costs the budget what it
+    // really cost rather than one unit per call site.
+    existenceResults = await graphqlCheckExistence(token, repoFullname, 'HEAD', probes, onCall);
   }
 
   // Resolve rule matches and aggregate validation per form field: a field is
@@ -619,10 +622,15 @@ const MAX_COMMENT_PAGES = 10;
 // Applies the labelling result via GitHub REST API (mutations are still REST).
 // `appId` (the numeric GitHub App id) pins comment adoption to this app's own
 // comments; without it the match falls back to bot-authored comments only.
-/** @param {any} result @param {string} token @param {string} repoFullname @param {number} issueNumber @param {any} existingLabels @param {any} currentIssueLabels @param {any} onCall @param {number|null} [appId] */
-export async function applyIssueLabelling(result, token, repoFullname, issueNumber, existingLabels, currentIssueLabels, onCall, appId = null) {
+/** @param {any} result @param {string} token @param {string} repoFullname @param {number} issueNumber @param {any} existingLabels @param {any} currentIssueLabels @param {any} onCall @param {number|null} [appId] @param {{ onOptionalAttempt?: any, hasHeadroom?: () => boolean }} [budgetHooks] */
+export async function applyIssueLabelling(result, token, repoFullname, issueNumber, existingLabels, currentIssueLabels, onCall, appId = null, budgetHooks = {}) {
   const issueLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/labels`;
   const currentLabels = currentIssueLabels || new Set();
+  // Paging the thread is the only lookup here the run can do without, so it
+  // is the only one the budget may stop: `hasHeadroom` counts nothing and
+  // keeps the pages off the reserve the writes below need, while every
+  // request - pages included - is charged once, where it is made.
+  const { onOptionalAttempt = onCall, hasHeadroom = () => true } = budgetHooks;
 
   // One marker-tagged comment per issue, edited in place on every re-run, so a
   // reporter who fixes the form in three edits gets one comment, not four.
@@ -641,13 +649,29 @@ export async function applyIssueLabelling(result, token, repoFullname, issueNumb
     // the marker into it, and every run after this finds it the normal way.
     let marked = null;
     let legacy = null;
+    // Set by every exit that leaves a page unread, so the thread is only
+    // partly known: no headroom, a page GitHub would not serve, a retry the
+    // budget declined. The page cap is deliberately not one of those - 1000
+    // comments deep, one more bot comment is not the thread's problem.
+    let scanStopped = false;
     for (let page = 1; page <= MAX_COMMENT_PAGES && !marked; page++) {
-      if (onCall && onCall(page) === false) break;
+      if (!hasHeadroom()) {
+        console.warn(`Issue #${issueNumber} comment scan ${page === 1 ? 'skipped before page 1' : `stopped after page ${page - 1}`}: no request budget left beyond the reserve.`);
+        scanStopped = true;
+        break;
+      }
       const listed = await githubApiCall(
         `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments?per_page=100&page=${page}`,
-        token, 'GET', null, 'application/vnd.github+json', { onAttempt: onCall }
+        token, 'GET', null, 'application/vnd.github+json', { onAttempt: onOptionalAttempt }
       );
-      if (listed.code !== 200) break;
+      if (listed.code !== 200) {
+        // The comment to edit may be the one on this page. A retry the budget
+        // declined arrives here too: githubApiCall hands back the failed
+        // answer it already had, so the page is unread either way.
+        console.warn(`Issue #${issueNumber} comment scan stopped at page ${page}: the comment listing answered HTTP ${listed.code}.`);
+        scanStopped = true;
+        break;
+      }
       const batch = listed.data || [];
       // Only a comment this app wrote itself qualifies: a user quoting the
       // raw markdown of our comment copies the marker along, and another bot
@@ -670,8 +694,11 @@ export async function applyIssueLabelling(result, token, repoFullname, issueNumb
           throw new Error(`Failed to update issue comment on issue #${issueNumber} (HTTP ${res.code})`);
         }
       }
-    } else if (result.comments[0]) {
-      // Nothing to acknowledge on an issue we never complained about.
+    } else if (result.comments[0] && !scanStopped) {
+      // Nothing to acknowledge on an issue we never complained about - and
+      // nothing to post on a thread this run did not read to the end, where
+      // the comment to edit may be on a page it never saw. A run without its
+      // comment beats a second copy of one.
       const res = await githubApiCall(
         `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/comments`,
         token, 'POST', { body }, 'application/vnd.github+json', { onAttempt: onCall }
