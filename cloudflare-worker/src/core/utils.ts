@@ -21,13 +21,15 @@ export function safeTruncate(text: string, limit: number = 65000): string {
 }
 
 // Parses an env var as an integer, falling back to `fallback` only when the
-// value is unset/unparseable — unlike `parseInt(x, 10) || fallback`, this
+// value is unset/unparseable/out of bounds — unlike `parseInt(x, 10) || fallback`, this
 // correctly honors an explicitly configured 0 instead of treating it the
-// same as "not set".
-export function parseEnvInt(value: unknown, fallback: number): number {
+// same as "not set", unless a minimum value `min` is specified.
+export function parseEnvInt(value: unknown, fallback: number, min?: number): number {
   if (value === undefined || value === null || value === '') return fallback;
   const parsed = parseInt(String(value), 10);
-  return Number.isNaN(parsed) ? fallback : parsed;
+  if (Number.isNaN(parsed) || !Number.isFinite(parsed)) return fallback;
+  if (min !== undefined && parsed < min) return fallback;
+  return parsed;
 }
 
 // Bots never act as maintainers here, whatever access they hold on the

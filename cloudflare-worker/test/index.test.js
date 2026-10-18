@@ -318,7 +318,9 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       commit: {
         author: { name: 'John Doe', email: 'john@doe.com' },
         committer: { name: 'John Doe', email: 'john@doe.com' },
-        message: `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+        message: i === 0
+          ? 'crun: update to 1.15\n\nSigned-off-by: John Doe <john@doe.com>'
+          : `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
       }
     }));
 
@@ -364,6 +366,17 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
         }), { status: 200 });
       }
       { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        return graphqlResponse(groups, (owner, name, ref, path) => {
+          if (path === 'utils/crun/Makefile') {
+            return ref === 'headsha'
+              ? 'PKG_NAME:=crun\nPKG_VERSION:=1.15\nPKG_RELEASE:=1\nPKG_LICENSE:=GPL-2.0-or-later\n'
+              : 'PKG_NAME:=crun\nPKG_VERSION:=1.14\nPKG_RELEASE:=1\nPKG_LICENSE:=GPL-2.0-or-later\n';
+          }
+          return null;
+        });
+      }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commitsList), { status: 200 });
       }
@@ -4568,6 +4581,10 @@ diff --git a/${file} b/${file}
       }
       if (url.includes('/graphql') && options?.body && JSON.parse(options.body).query.includes('labels(first:')) order.push('setup');
       { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+      if (url.includes('/graphql')) {
+        const { groups } = parseGraphqlRequest(options);
+        return graphqlResponse(groups, () => null);
+      }
       if (url.includes('/pulls/123/commits')) {
         return new Response(JSON.stringify(commits), { status: 200 });
       }

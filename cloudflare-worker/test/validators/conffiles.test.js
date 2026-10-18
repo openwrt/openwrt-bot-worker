@@ -39,7 +39,7 @@ describe('validateMakefileContext', () => {
     }
   });
 
-  test('does not demand conffiles when an existing Makefile only changes its install line', () => {
+  test('does not demand conffiles when an existing Makefile only changes its install line and no fetcher is provided', () => {
     const res = validate('foo: install the configuration with INSTALL_CONF', diff(
       gitModified(FOO),
       '@@ -120,7 +120,7 @@ define Package/foo/install',
@@ -47,6 +47,52 @@ describe('validateMakefileContext', () => {
       '+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf'
     ));
     assertNoErrorIncludes(res, MISSING_SECTION);
+  });
+
+  test('verifies conffiles in head Makefile when existing Makefile introduces INSTALL_CONF', async () => {
+    const patch = diff(
+      gitModified(FOO),
+      '@@ -120,7 +120,7 @@ define Package/foo/install',
+      '-\t$(INSTALL_DATA) ./files/foo.conf $(1)/etc/foo.conf',
+      '+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf'
+    );
+
+    // 1. When head Makefile does NOT have conffiles section:
+    const headWithoutConffiles = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
+endef
+`;
+    const resWithout = await validateMakefileContext(makeCommit('foo: install conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headWithoutConffiles);
+    assertErrorIncludes(resWithout, MISSING_SECTION);
+
+    // 2. When head Makefile DOES have conffiles section:
+    const headWithConffiles = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/foo.conf
+endef
+
+define Package/foo/install
+\t$(INSTALL_DIR) $(1)/etc
+\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf
+endef
+`;
+    const resWith = await validateMakefileContext(makeCommit('foo: install conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headWithConffiles);
+    assertNoErrorIncludes(resWith, MISSING_SECTION);
+    assertSomeIncludes(resWith.successes, 'conffiles macro properly registers INSTALL_CONF');
   });
 
   test('rejects package that installs config files but is missing conffiles section', () => {

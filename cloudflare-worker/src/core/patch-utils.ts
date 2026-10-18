@@ -99,12 +99,24 @@ export function getCommitMessageFromPatch(patch: string | null | undefined): str
 
 export function getChangedFilesFromPatch(patch: string | null | undefined): string[] {
   if (!patch) return [];
-  const files: string[] = [];
+  const files = new Set<string>();
   const lines = patch.split('\n');
   for (const line of lines) {
     if (line.startsWith('+++ b/')) {
-      files.push(line.slice(6).trim().replace(/\r$/, ''));
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('--- a/')) {
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      if (match) {
+        const fileA = match[1].trim().replace(/\r$/, '');
+        const fileB = match[2].trim().replace(/\r$/, '');
+        if (fileA && fileA !== '/dev/null') files.add(fileA);
+        if (fileB && fileB !== '/dev/null') files.add(fileB);
+      }
     }
   }
-  return files;
+  return Array.from(files);
 }

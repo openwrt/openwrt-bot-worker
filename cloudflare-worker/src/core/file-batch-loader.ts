@@ -37,6 +37,10 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
     initialBaseSha
   } = options;
 
+  const safeChunkSize = (typeof graphqlChunkSize === 'number' && Number.isFinite(graphqlChunkSize) && graphqlChunkSize >= 1)
+    ? Math.floor(graphqlChunkSize)
+    : 50;
+
   const fileCache = new Map<string, Promise<string | null>>();
   // Tracks where each ref is resolvable: 'base' means the base repo serves the
   // ref, so a null (not-found) result for a path there is authoritative — the
@@ -127,8 +131,8 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
 
     const resultsByProbeKey = new Map<string, any>();
     const fires: Array<Promise<void>> = [];
-    for (let i = 0; i < probes.length; i += graphqlChunkSize) {
-      const chunk = probes.slice(i, i + graphqlChunkSize);
+    for (let i = 0; i < probes.length; i += safeChunkSize) {
+      const chunk = probes.slice(i, i + safeChunkSize);
       const available = subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used;
       if (available <= 0) {
         for (const p of chunk) resultsByProbeKey.set(p.key, { content: null, skipped: true });

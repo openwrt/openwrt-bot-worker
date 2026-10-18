@@ -691,6 +691,104 @@ diff --git a/package/utils/mypkg/files/mypkg.init b/package/utils/mypkg/files/my
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, makefile, makefile);
     assertErrorIncludes(res, 'content changed without a PKG_RELEASE or version bump');
   });
+
+  test('accepts version bump with release reset to 1 followed by subsequent release bump in multi-commit PR (f2fs-tools)', async () => {
+    const commit1Patch = `
+diff --git a/package/utils/f2fs-tools/Makefile b/package/utils/f2fs-tools/Makefile
+--- a/package/utils/f2fs-tools/Makefile
++++ b/package/utils/f2fs-tools/Makefile
+@@ -9,4 +9,4 @@
+-PKG_VERSION:=1.16.0
+-PKG_RELEASE:=2
++PKG_VERSION:=1.17.0
++PKG_RELEASE:=1
+`;
+    const commit2Patch = `
+diff --git a/package/utils/f2fs-tools/Makefile b/package/utils/f2fs-tools/Makefile
+--- a/package/utils/f2fs-tools/Makefile
++++ b/package/utils/f2fs-tools/Makefile
+@@ -9,4 +9,4 @@
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+diff --git a/package/utils/f2fs-tools/patches/001-fix.patch b/package/utils/f2fs-tools/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/f2fs-tools/patches/001-fix.patch
+@@ -0,0 +1,5 @@
++new patch
+`;
+    const commitDetails = [
+      { fullCommit: makeCommit('f2fs-tools: update to 1.17.0'), commitPatch: commit1Patch },
+      { fullCommit: makeCommit('f2fs-tools: add upstream bugfix patch'), commitPatch: commit2Patch }
+    ];
+    const headFetch = makefileAt('package/utils/f2fs-tools', 'PKG_NAME:=f2fs-tools\nPKG_VERSION:=1.17.0\nPKG_RELEASE:=2\n');
+    const baseFetch = makefileAt('package/utils/f2fs-tools', 'PKG_NAME:=f2fs-tools\nPKG_VERSION:=1.16.0\nPKG_RELEASE:=2\n');
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertNoErrors(res);
+    assertSuccessIncludes(res, "reset to 1 and subsequently bumped to '2' in commit series");
+  });
+
+  test('fails version bump when release was not reset to 1 across multi-commit PR', async () => {
+    const commit1Patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -9,2 +9,2 @@
+-PKG_VERSION:=1.0.0
++PKG_VERSION:=2.0.0
+`;
+    const commit2Patch = `
+diff --git a/package/utils/mypkg/patches/001-fix.patch b/package/utils/mypkg/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/mypkg/patches/001-fix.patch
+@@ -0,0 +1,5 @@
++new patch
+`;
+    const commitDetails = [
+      { fullCommit: makeCommit('mypkg: update to 2.0.0'), commitPatch: commit1Patch },
+      { fullCommit: makeCommit('mypkg: add patch'), commitPatch: commit2Patch }
+    ];
+    const headFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=2.0.0\nPKG_RELEASE:=2\n');
+    const baseFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=2\n');
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertErrorIncludes(res, "PKG_RELEASE was not reset to 1 (currently: '2')");
+  });
+
+  test('fails when PKG_RELEASE is decreased without a version update', async () => {
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -10,2 +10,2 @@
+-PKG_RELEASE:=4
++PKG_RELEASE:=2
+`;
+    const commitDetails = [{ fullCommit: makeCommit('mypkg: lower release'), commitPatch: patch }];
+    const headFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=2\n');
+    const baseFetch = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=4\n');
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertErrorIncludes(res, "PKG_RELEASE was decreased from '4' to '2' without a version update");
+  });
+
+  test('flags missing release bump when package file is deleted without modifying Makefile', async () => {
+    const patch = `
+diff --git a/package/utils/mypkg/files/obsolete.conf b/package/utils/mypkg/files/obsolete.conf
+deleted file mode 100644
+--- a/package/utils/mypkg/files/obsolete.conf
++++ /dev/null
+@@ -1,2 +0,0 @@
+-foo=bar
+`;
+    const commitDetails = [{ fullCommit: makeCommit('mypkg: remove obsolete config'), commitPatch: patch }];
+    const makefile = makefileAt('package/utils/mypkg', 'PKG_NAME:=mypkg\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=1\n');
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, makefile, makefile);
+    assertErrorIncludes(res, 'content changed without a PKG_RELEASE or version bump');
+  });
 });
 
 describe('validatePkgReleaseBumps lookups', () => {

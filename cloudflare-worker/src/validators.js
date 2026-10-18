@@ -901,10 +901,11 @@ function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
   return false;
 }
 
-export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname) {
+export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
   const errors = [];
   const successes = [];
   const warnings = [];
+  const pendingAsyncChecks = [];
   const subject = (fullCommit.commit.message || '').split("\n")[0].trim();
 
   if (!commitPatch) {
@@ -934,7 +935,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
       if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
-      cachedMakefileChunks.push({ filePath, lines: fileDiff.split('\n') });
+      cachedMakefileChunks.push({ filePath, lines: fileDiff.split('\n'), rawChunk: fileDiff });
     }
     return cachedMakefileChunks;
   };
@@ -945,73 +946,176 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     // used to have only its first bump validated, and one new package
     // anywhere in the PR used to switch the check off for every commit.
     const cleanSubject = subject.replace(/^(fixup!|squash!)\s+/, '');
-    // A fixup's subject is dictated by the commit it amends, so it cannot
-    // name the version it introduces; the pair is squashed before merging.
     const isAutosquash = CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(subject);
     const isRevert = CONFIG.allow_revert !== false && parseRevertCommit(fullCommit.commit.message || '') !== null;
+
+    const commitsList = (fullCommit.isPrWidePatch && Array.isArray(fullCommit.commits))
+      ? fullCommit.commits
+      : [fullCommit];
+
+    const commitMatches = (newVer, targetFilePath) => {
+      const pkgDir = targetFilePath ? targetFilePath.replace(/\/Makefile$/, '') : '';
+      const pkgName = pkgDir ? pkgDir.split('/').pop().toLowerCase() : '';
+
+      for (const c of commitsList) {
+        const cMsg = c.commit?.message || '';
+        const rawSubject = cMsg.split('\n')[0].trim();
+        const unPrefixed = rawSubject.replace(/^(fixup!|squash!)\s+/, '');
+        const revertMatch = parseRevertCommit(cMsg);
+        const cleanSub = revertMatch ? (revertMatch.revertedSubject || unPrefixed) : unPrefixed;
+
+        let pertainsToPackage = false;
+        if (c.commitPatch && targetFilePath) {
+          if (c.commitPatch.includes(`b/${targetFilePath}`) || (pkgDir && c.commitPatch.includes(`b/${pkgDir}/`))) {
+            pertainsToPackage = true;
+          }
+        } else if (!c.commitPatch && pkgName) {
+          const entities = extractSubjectEntity(cleanSub).map(e => e.toLowerCase());
+          if (entities.includes(pkgName) ||
+              cleanSub.toLowerCase().startsWith(pkgName + ':') ||
+              (pkgDir && cleanSub.toLowerCase().startsWith(pkgDir.toLowerCase() + ':'))) {
+            pertainsToPackage = true;
+          }
+        }
+
+        if (!pertainsToPackage && commitsList.length === 1 && !c.commitPatch) {
+          pertainsToPackage = true;
+        }
+
+        if (!pertainsToPackage) {
+          continue;
+        }
+
+        if (CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(rawSubject)) return true;
+        if (CONFIG.allow_revert !== false && revertMatch !== null) return true;
+        if (matchVersionString(cleanSub, newVer)) return true;
+      }
+      return false;
+    };
+
+    const validateVersionAgainstCommit = (newVersion, filePath) => {
+      if (newVersion.includes('$')) {
+        successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
+      } else if (fullCommit.isPrWidePatch) {
+        if (!commitMatches(newVersion, filePath)) {
+          errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in pull request commit subjects. Please mention the new version in the relevant commit subject, e.g. '<package>: update to ${newVersion}'.`);
+        } else {
+          successes.push(`✅ PKG_VERSION bump matches context information inside commit subjects (${newVersion})`);
+        }
+      } else if (isRevert) {
+        successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
+      } else if (isAutosquash) {
+        successes.push(`✅ Autosquash commit, skipping subject validation for PKG_VERSION '${newVersion}'`);
+      } else if (!commitMatches(newVersion, filePath)) {
+        errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
+      } else {
+        successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
+      }
+    };
 
     for (const fileDiff of commitPatch.split(/^diff --git /m)) {
       const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
       if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
-      // A brand-new Makefile is a package addition, not a version bump: its
-      // subject says what is added and carries no old-to-new version context.
       if (/^---\s+\/dev\/null/m.test(fileDiff)) continue;
 
       const versionMatch = fileDiff.match(/^\+\s*PKG_VERSION\s*(?::=|=)\s*(.+)$/m);
-      if (!versionMatch) continue;
-      const newVersion = versionMatch[1].replace(/["']/g, "").trim();
+      if (versionMatch) {
+        const newVersion = versionMatch[1].replace(/["']/g, "").trim();
+        validateVersionAgainstCommit(newVersion, filePath);
+        continue;
+      }
 
-      if (newVersion.includes('$')) {
-        successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
-      } else if (isRevert) {
-        // A revert restores the PKG_VERSION that preceded the reverted commit,
-        // while its subject quotes that commit (and therefore the version being
-        // undone). Requiring the restored version here would force the author
-        // away from the `git revert` subject format.
-        successes.push(`✅ Commit reverts a previous change, skipping subject validation for restored PKG_VERSION '${newVersion}'`);
-      } else if (isAutosquash) {
-        successes.push(`✅ Autosquash commit, skipping subject validation for PKG_VERSION '${newVersion}'`);
-      } else if (!matchVersionString(cleanSubject, newVersion)) {
-        errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in the commit subject line. Please mention the new version in the subject, e.g. '<package>: update to ${newVersion}'.`);
-      } else {
-        successes.push(`✅ PKG_VERSION bump matches context information inside subject line (${newVersion})`);
+      // If PKG_VERSION wasn't directly changed in the diff, check if an indirect
+      // helper variable (e.g. GO_VERSION_PATCH) was modified.
+      if (typeof fetchFileContent === 'function') {
+        const touchedVars = new Set();
+        for (const line of fileDiff.split('\n')) {
+          if (!line.startsWith('+') || line.startsWith('+++')) continue;
+          const assign = line.slice(1).match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+          if (assign) {
+            const vName = assign[1];
+            if (vName !== 'PKG_RELEASE' && vName !== 'PKG_HASH' && vName !== 'PKG_MIRROR_HASH' &&
+                vName !== 'PKG_MAINTAINER' && vName !== 'PKG_LICENSE' && vName !== 'PKG_LICENSE_FILES') {
+              touchedVars.add(vName);
+            }
+          }
+        }
+
+        if (touchedVars.size > 0) {
+          const resolveIndirect = (content) => {
+            if (!content) return null;
+            const trackingVars = collectResolutionVarNames(content, 'PKG_VERSION');
+            const touchesAny = [...touchedVars].some(v => trackingVars.has(v));
+            if (touchesAny) {
+              return resolveMakefileVar(content, 'PKG_VERSION');
+            }
+            return null;
+          };
+
+          const resolvedFromDiff = resolveIndirect(fileDiff);
+          if (resolvedFromDiff && !resolvedFromDiff.includes('$')) {
+            newVersion = resolvedFromDiff.trim();
+          } else if (typeof fetchFileContent === 'function') {
+            pendingAsyncChecks.push(async () => {
+              try {
+                const headText = await fetchFileContent(filePath);
+                if (headText === null || headText === undefined) {
+                  warnings.push(`Could not fetch '${filePath}' to verify indirect PKG_VERSION.`);
+                  return { incomplete: true };
+                }
+                const resolvedFromHead = resolveIndirect(headText);
+                if (resolvedFromHead && !resolvedFromHead.includes('$')) {
+                  validateVersionAgainstCommit(resolvedFromHead.trim(), filePath);
+                }
+              } catch (err) {
+                warnings.push(`Could not complete PKG_VERSION check because of an error fetching '${filePath}': ${err?.message || err}`);
+                return { incomplete: true };
+              }
+            });
+            continue;
+          }
+        }
       }
     }
   }
 
   if (CONFIG.check_openwrt_meta) {
-    let requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
-    if (Array.isArray(CONFIG.check_openwrt_meta)) {
-      requiredMeta = CONFIG.check_openwrt_meta;
-    }
     if (isNewPackageThisCommit) {
-      // Detect if the Makefile includes a known .mk file that defines PKG_LICENSE
-      // and PKG_LICENSE_FILES centrally (e.g. trusted-firmware-a.mk, u-boot.mk).
-      // In those cases, we should not require PKG_LICENSE / PKG_LICENSE_FILES directly.
-      const knownLicenseIncludeFiles = ['trusted-firmware-a.mk', 'u-boot.mk'];
-      const hasLicenseInclude = knownLicenseIncludeFiles.some(mkFile =>
-        new RegExp(`^\\+.*include.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(commitPatch)
+      const addedChunks = getMakefileChunks().filter(c =>
+        isPackageMakefilePath(c.filePath) && c.lines.some(l => /^---\s+\/dev\/null\r?$/.test(l))
       );
-      if (hasLicenseInclude) {
-        requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
-      }
-      // LuCI packages generate their package block in luci.mk: the emitted
-      // maintainer always comes from LUCI_MAINTAINER (defaulting to the LuCI
-      // community), and apps carry an SPDX header instead of a license file.
-      // PKG_LICENSE is still read by the build system and stays required.
-      if (/^\+\s*include\s+.*\bluci\.mk/m.test(commitPatch)) {
-        requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_MAINTAINER' && meta !== 'PKG_LICENSE_FILES');
-      }
-      requiredMeta.forEach(meta => {
-        const metaRegex = new RegExp(`^\\+\\s*${meta}\\s*(?::=|=)`, 'm');
-        if (!metaRegex.test(commitPatch)) {
-          errors.push(`- New OpenWrt package is missing the mandatory parameter: '${meta}'`);
-        } else {
-          successes.push(`✅ Mandatory structural metadata present: '${meta}'`);
+
+      for (const chunk of addedChunks) {
+        let requiredMeta = ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'];
+        if (Array.isArray(CONFIG.check_openwrt_meta)) {
+          requiredMeta = [...CONFIG.check_openwrt_meta];
         }
-      });
+
+        const knownLicenseIncludeFiles = ['trusted-firmware-a.mk', 'u-boot.mk'];
+        const hasLicenseInclude = knownLicenseIncludeFiles.some(mkFile =>
+          new RegExp(`^\\+.*include.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(chunk.rawChunk)
+        );
+        if (hasLicenseInclude) {
+          requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
+        }
+
+        if (/^\+\s*include\s+.*\bluci\.mk/m.test(chunk.rawChunk)) {
+          requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_MAINTAINER' && meta !== 'PKG_LICENSE_FILES');
+        }
+
+        requiredMeta.forEach(meta => {
+          const escapedMeta = meta.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const metaRegex = new RegExp(`^\\+\\s*${escapedMeta}\\s*(?::=|=)`, 'm');
+          if (!metaRegex.test(chunk.rawChunk)) {
+            const fileSuffix = addedChunks.length > 1 ? ` (in ${chunk.filePath})` : '';
+            errors.push(`- New OpenWrt package is missing the mandatory parameter: '${meta}'${fileSuffix}`);
+          } else {
+            successes.push(`✅ Mandatory structural metadata present: '${meta}'`);
+          }
+        });
+      }
     }
 
     const maintainerLines = commitPatch.split('\n').filter(line => line.startsWith('+') && line.includes('PKG_MAINTAINER'));
@@ -1120,7 +1224,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     let conffilesCheckRun = false;
     let conffilesCheckErrors = 0;
 
-    for (const { lines } of getMakefileChunks()) {
+    for (const { lines, filePath } of getMakefileChunks()) {
       // A diff of an existing Makefile is a window, not the file: the conffiles
       // block usually sits far from the install recipe and never shows up in
       // the hunks, so its absence here proves nothing. Only a newly added
@@ -1274,8 +1378,23 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         }
       }
 
-      if (MakefileInstallsConfig && !MakefileHasConffiles && isAddedMakefile) {
-        errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+      if (MakefileInstallsConfig && !MakefileHasConffiles) {
+        if (isAddedMakefile) {
+          errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+        } else if (typeof fetchFileContent === 'function') {
+          pendingAsyncChecks.push(async () => {
+            try {
+              const headText = await fetchFileContent(filePath);
+              if (headText && /define\s+Package\/[^\/]+\/conffiles\b/.test(headText)) {
+                successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
+              } else {
+                errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
+              }
+            } catch (_) {
+              // Ignore fetch failure
+            }
+          });
+        }
       } else if (MakefileInstallsConfig && MakefileHasConffiles) {
         successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
       }
@@ -1765,6 +1884,17 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     }
   }
 
+  if (pendingAsyncChecks.length > 0) {
+    return (async () => {
+      for (const check of pendingAsyncChecks) {
+        try {
+          await check();
+        } catch (_) {}
+      }
+      return { errors, successes, warnings };
+    })();
+  }
+
   return { errors, successes, warnings };
 }
 
@@ -1897,14 +2027,26 @@ function rememberPerPatch(parse) {
 
 export const getChangedFilesFromPatch = rememberPerPatch(function getChangedFilesFromPatch(patch) {
   if (!patch) return [];
-  const files = [];
+  const files = new Set();
   const lines = patch.split('\n');
   for (const line of lines) {
     if (line.startsWith('+++ b/')) {
-      files.push(line.slice(6).trim().replace(/\r$/, ''));
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('--- a/')) {
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      if (match) {
+        const fileA = match[1].trim().replace(/\r$/, '');
+        const fileB = match[2].trim().replace(/\r$/, '');
+        if (fileA && fileA !== '/dev/null') files.add(fileA);
+        if (fileB && fileB !== '/dev/null') files.add(fileB);
+      }
     }
   }
-  return Object.freeze(files);
+  return Object.freeze(Array.from(files));
 });
 
 export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates(patch) {
@@ -1914,19 +2056,22 @@ export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates
 
   const lines = patch.split('\n');
   let currentFile = null;
+  let oldFile = null;
 
   for (const line of lines) {
     if (line.startsWith('diff --git ')) {
       currentFile = null;
+      oldFile = null;
       const match = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
       if (match) {
+        oldFile = match[1].trim().replace(/\r$/, '');
         currentFile = match[2].trim().replace(/\r$/, '');
       }
-    } else if (currentFile) {
+    } else if (currentFile || oldFile) {
       if (line.startsWith('--- /dev/null')) {
-        addedFiles.add(currentFile);
+        addedFiles.add(currentFile || oldFile);
       } else if (line.startsWith('+++ /dev/null')) {
-        deletedFiles.add(currentFile);
+        deletedFiles.add(oldFile || currentFile);
       }
     }
   }
@@ -2418,6 +2563,28 @@ export function groupReleaseErrors(errors) {
   return { packages, others };
 }
 
+function extractMakefileVarFromDiff(diff, varName) {
+  if (!diff || !diff.added) return null;
+  const regex = new RegExp(`^\\s*${varName}\\s*(?::=|=)\\s*([^#\\r\\n]+)`);
+  for (let i = diff.added.length - 1; i >= 0; i--) {
+    const line = diff.added[i];
+    const match = line.match(regex);
+    if (match) {
+      return match[1].replace(/["']/g, '').trim();
+    }
+  }
+  return null;
+}
+
+function diffTouchesVar(diff, varNames) {
+  if (!diff) return false;
+  for (const line of [...(diff.added || []), ...(diff.deleted || [])]) {
+    const assign = line.match(/^\s*([A-Za-z0-9_-]+)\s*(?::=|\+=|\?=|=)/);
+    if (assign && varNames.has(assign[1])) return true;
+  }
+  return false;
+}
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   const warnings = [];
@@ -2564,6 +2731,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let headSourceDate = null;
     let baseSourceDate = null;
     let headMakefileContent = null;
+    let baseMakefileContent = null;
     let isReleaseExempt = false;
 
     if (modifiedFiles.has(makefilePath)) {
@@ -2576,6 +2744,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         isNew ? Promise.resolve(null) : fetchFileContentAtBase(makefilePath)
       ]);
       headMakefileContent = headContent;
+      baseMakefileContent = baseContent;
       if (headContent === null) {
         // Package was deleted/dropped, skip checks
         return empty;
@@ -2760,6 +2929,49 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is reverted to ${restoredState}, matching its state before the reverted commit`] };
     }
 
+    let versionResetTo1InSeries = false;
+    if (commitDetails && commitDetails.length > 1 && versionChanged) {
+      let simRelease = baseRelease;
+      let simVersionReset = false;
+      let releaseBumpedAfterResetInSeries = false;
+
+      const versionVarNames = collectResolutionVarNames(headMakefileContent || '', 'PKG_VERSION');
+      collectResolutionVarNames(baseMakefileContent || '', 'PKG_VERSION', versionVarNames);
+      const trackingVarNames = new Set([...versionVarNames, 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']);
+
+      for (const item of commitDetails) {
+        if (!item || !item.commitPatch) continue;
+        const commitFileChanges = collectFileLineChanges(item.commitPatch);
+        const commitDiff = commitFileChanges ? commitFileChanges[makefilePath] : null;
+        if (!commitDiff) continue;
+
+        const touchesVersion = diffTouchesVar(commitDiff, trackingVarNames);
+        const addedRel = extractMakefileVarFromDiff(commitDiff, 'PKG_RELEASE');
+
+        if (touchesVersion) {
+          if (addedRel !== null) {
+            simRelease = addedRel;
+          }
+          if (simRelease === '1') {
+            simVersionReset = true;
+          } else {
+            simVersionReset = false;
+          }
+        } else if (addedRel !== null) {
+          const prevNum = parseInt(simRelease, 10);
+          const nextNum = parseInt(addedRel, 10);
+          if (simVersionReset && Number.isInteger(prevNum) && Number.isInteger(nextNum) && nextNum > prevNum) {
+            releaseBumpedAfterResetInSeries = true;
+          }
+          simRelease = addedRel;
+        }
+      }
+
+      if (simVersionReset && releaseBumpedAfterResetInSeries && simRelease === headRelease) {
+        versionResetTo1InSeries = true;
+      }
+    }
+
     if (versionChanged) {
       // Deliberately keyed on head alone, not base: dropping PKG_RELEASE
       // together with a version update is accepted OpenWrt practice for host
@@ -2773,9 +2985,30 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; packages on a shared helper without PKG_RELEASE don't require a reset to 1`] };
       }
       if (headRelease !== '1') {
+        if (versionResetTo1InSeries) {
+          return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' (reset to 1 and subsequently bumped to '${headRelease}' in commit series)`] };
+        }
         return { errors: [`Package \`${pkgRoot}\` version updated from '${baseVersion || baseSourceVer || baseSourceDate}' to '${headVersion || headSourceVer || headSourceDate}', but PKG_RELEASE was not reset to 1 (currently: '${headRelease || 'not defined'}')`], successes: [] };
       }
       return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and PKG_RELEASE correctly reset to 1`] };
+    }
+
+    const baseRelNum = parseInt(baseRelease, 10);
+    const headRelNum = parseInt(headRelease, 10);
+    const isNumericBase = Number.isInteger(baseRelNum) && !Number.isNaN(baseRelNum);
+    const isNumericHead = Number.isInteger(headRelNum) && !Number.isNaN(headRelNum);
+
+    if (isNumericBase && isNumericHead && headRelNum < baseRelNum) {
+      return {
+        errors: [`Package \`${pkgRoot}\` PKG_RELEASE was decreased from '${baseRelease}' to '${headRelease}' without a version update.`],
+        successes: []
+      };
+    }
+    if (isNumericBase && isNumericHead && headRelNum === baseRelNum) {
+      return {
+        errors: [`Package \`${pkgRoot}\` content changed without a PKG_RELEASE or version bump.`],
+        successes: []
+      };
     }
 
     return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version unchanged, but PKG_RELEASE bumped from '${baseRelease}' to '${headRelease}'`] };
@@ -2932,7 +3165,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
 
     const versionChanged = ['PKG_VERSION', 'PKG_SOURCE_VERSION', 'PKG_SOURCE_DATE']
       .some(v => rawVar(baseContent, v) !== rawVar(headContent, v) && diffTouches(v));
-    const hashChanged = baseHash !== headHash || baseMirror !== headMirror;
+    const hashChanged = (baseHash !== headHash && diffTouches('PKG_HASH')) ||
+      (baseMirror !== headMirror && diffTouches('PKG_MIRROR_HASH'));
 
     if (versionChanged && !hashChanged && (baseHash !== null || baseMirror !== null)) {
       const varName = baseHash !== null ? 'PKG_HASH' : 'PKG_MIRROR_HASH';
@@ -2951,8 +3185,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
         return out;
       }
       let formatsOk = true;
-      if (headHash !== baseHash && headHash !== null) formatsOk = checkFormat('PKG_HASH', headHash) && formatsOk;
-      if (headMirror !== baseMirror && headMirror !== null) formatsOk = checkFormat('PKG_MIRROR_HASH', headMirror) && formatsOk;
+      if (headHash !== baseHash && headHash !== null && diffTouches('PKG_HASH')) formatsOk = checkFormat('PKG_HASH', headHash) && formatsOk;
+      if (headMirror !== baseMirror && headMirror !== null && diffTouches('PKG_MIRROR_HASH')) formatsOk = checkFormat('PKG_MIRROR_HASH', headMirror) && formatsOk;
       if (formatsOk && versionChanged) {
         out.successes.push(`✅ Package Makefile '${path}' updates the source checksum together with the version`);
       }

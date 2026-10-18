@@ -121,6 +121,242 @@ describe('validateMakefileContext', () => {
     assertNoErrorIncludes(res, "'1.0'");
   });
 
+  test('validates commit subject against version in PR-wide patch mode across multiple commits (Issue 9)', () => {
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        makeCommit('mypkg: first preparatory commit'),
+        makeCommit('mypkg: update to 2.4.0'),
+        makeCommit('mypkg: clean up makefile')
+      ],
+      commit: {
+        message: 'PR Title Does Not Mention Version\n\nFull PR body text'
+      }
+    };
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.strictEqual(res.errors.length, 0);
+    assert.ok(res.successes.some(s => s.includes('PKG_VERSION bump matches context information inside commit subjects (2.4.0)')));
+  });
+
+  test('flags missing version in commit subjects even if PR title mentions version in PR-wide patch mode (Issue 9)', () => {
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        makeCommit('mypkg: first preparatory commit'),
+        makeCommit('mypkg: some unrelated message'),
+        makeCommit('mypkg: clean up makefile')
+      ],
+      commit: {
+        message: 'mypkg: update to 2.4.0\n\nFull PR body text'
+      }
+    };
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.ok(res.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+  });
+
+  test('rejects version match in PR-wide mode when matching version belongs to unrelated package', () => {
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        makeCommit('otherpkg: update to 2.4.0'),
+        makeCommit('mypkg: update makefile')
+      ],
+      commit: { message: 'various package updates' }
+    };
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.ok(res.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+  });
+
+  test('rejects version bump when PR contains unrelated fixup or revert commit', () => {
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        makeCommit('fixup! otherpkg: fix compilation warning'),
+        makeCommit('Revert "otherpkg: update to 1.0.0"\\n\\nThis reverts commit 1234567890123456789012345678901234567890.'),
+        makeCommit('mypkg: some commit message without version')
+      ],
+      commit: { message: 'update mypkg and fix otherpkg' }
+    };
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.ok(res.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+  });
+
+  test('rejects version match in PR-wide mode when commit diff does not touch affected package even if subject matches', () => {
+    const commit1Patch = `
+diff --git a/package/utils/otherpkg/Makefile b/package/utils/otherpkg/Makefile
+--- a/package/utils/otherpkg/Makefile
++++ b/package/utils/otherpkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const commit2Patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        { ...makeCommit('mypkg: update to 2.4.0'), commitPatch: commit1Patch },
+        { ...makeCommit('mypkg: minor makefile cleanups'), commitPatch: commit2Patch }
+      ],
+      commit: { message: 'update mypkg' }
+    };
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.ok(res.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+  });
+
+  test('accepts version match in PR-wide mode when commit diff touches affected package and subject matches', () => {
+    const commit1Patch = `
+diff --git a/package/utils/otherpkg/Makefile b/package/utils/otherpkg/Makefile
+--- a/package/utils/otherpkg/Makefile
++++ b/package/utils/otherpkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=1.0.0
++PKG_VERSION:=1.1.0
+`;
+    const commit2Patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        { ...makeCommit('otherpkg: update to 1.1.0'), commitPatch: commit1Patch },
+        { ...makeCommit('mypkg: update to 2.4.0'), commitPatch: commit2Patch }
+      ],
+      commit: { message: 'update packages' }
+    };
+    const patch = `
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
+`;
+    const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.ok(res.successes.some(s => s.includes('PKG_VERSION bump matches context information inside commit subjects (2.4.0)')));
+  });
+
+  test('scopes revert in PR-wide mode to the reverted package and rejects unrelated package bump without version in subject', () => {
+    const commit1Patch = `
+diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
+--- a/package/utils/pkgA/Makefile
++++ b/package/utils/pkgA/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=1.2.3
++PKG_VERSION:=1.2.2
++`;
+    const commit2Patch = `
+diff --git a/package/utils/pkgB/Makefile b/package/utils/pkgB/Makefile
+--- a/package/utils/pkgB/Makefile
++++ b/package/utils/pkgB/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=2.3.0
++PKG_VERSION:=2.4.0
++`;
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        {
+          ...makeCommit('pkgA: Revert "pkgA: update to 1.2.3"\n\nThis reverts commit 1234567890123456789012345678901234567890.'),
+          commitPatch: commit1Patch
+        },
+        {
+          ...makeCommit('pkgB: update package\n\nSigned-off-by: Dev <dev@example.com>'),
+          commitPatch: commit2Patch
+        }
+      ],
+      commit: {
+        message: 'Revert "pkgA: update to 1.2.3"\n\nThis reverts commit 1234567890123456789012345678901234567890.\n\npkgB: update package'
+      }
+    };
+
+    const resA = validateMakefileContext(virtualCommit, commit1Patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.deepStrictEqual(resA.errors, []);
+    assert.ok(resA.successes.some(s => s.includes('PKG_VERSION bump matches context information inside commit subjects (1.2.2)')));
+
+    const resB = validateMakefileContext(virtualCommit, commit2Patch, CONFIG, existingPackage(), 'openwrt/packages');
+    assert.ok(resB.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+  });
+
+  test('validates commit subject when version changes via indirect helper variable', async () => {
+    const patch = `
+diff --git a/package/lang/golang/golang/Makefile b/package/lang/golang/golang/Makefile
+--- a/package/lang/golang/golang/Makefile
++++ b/package/lang/golang/golang/Makefile
+@@ -1,4 +1,4 @@
+-GO_VERSION_PATCH:=1
++GO_VERSION_PATCH:=2
+`;
+    const headMakefileContent = `
+GO_VERSION_MAJOR:=1
+GO_VERSION_MINOR:=22
+GO_VERSION_PATCH:=2
+PKG_VERSION:=$(GO_VERSION_MAJOR).$(GO_VERSION_MINOR).$(GO_VERSION_PATCH)
+PKG_NAME:=golang
+`;
+    const fetchFileContent = async (path) => headMakefileContent;
+    // Commit subject does not mention 1.22.2:
+    const badCommit = makeCommit('golang: bump patch level');
+    const resBad = await validateMakefileContext(badCommit, patch, CONFIG, existingPackage(), 'openwrt/packages', fetchFileContent);
+    assert.ok(resBad.errors.some(err => err.includes("Makefile introduces PKG_VERSION '1.22.2', but this version string is missing in the commit subject line")));
+
+    // Commit subject mentions 1.22.2:
+    const goodCommit = makeCommit('golang: update to 1.22.2');
+    const resGood = await validateMakefileContext(goodCommit, patch, CONFIG, existingPackage(), 'openwrt/packages', fetchFileContent);
+    assert.ok(resGood.successes.some(s => s.includes('PKG_VERSION bump matches context information inside subject line (1.22.2)')));
+  });
+
   test('requires metadata fields for new packages', () => {
     const state = existingPackage();
     const res = validate('newpkg: add package', diff(
@@ -277,6 +513,67 @@ describe('validateMakefileContext', () => {
     assertNoErrorIncludes(res, 'PKG_LICENSE_FILES');
     // PKG_MAINTAINER is still required, and this Makefile sets it
     assertNoErrorIncludes(res, 'PKG_MAINTAINER');
+  });
+
+  test('evaluates metadata per file when one commit adds two new packages', () => {
+    const state = existingPackage();
+    const twoPackagesPatch = `
+diff --git a/package/foo/Makefile b/package/foo/Makefile
+--- /dev/null
++++ b/package/foo/Makefile
+@@ -0,0 +1,10 @@
++PKG_NAME:=foo
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++PKG_MAINTAINER:=Foo Author <foo@example.com>
++PKG_LICENSE:=MIT
++PKG_LICENSE_FILES:=LICENSE
+diff --git a/package/bar/Makefile b/package/bar/Makefile
+--- /dev/null
++++ b/package/bar/Makefile
+@@ -0,0 +1,10 @@
++PKG_NAME:=bar
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++`;
+    const res = validate('packages: add foo and bar', twoPackagesPatch, {
+      config: { ...CONFIG, check_openwrt_meta: ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'] },
+      state
+    });
+    // package/bar/Makefile is missing metadata even though package/foo/Makefile has it!
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_MAINTAINER' (in package/bar/Makefile)")));
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_LICENSE' (in package/bar/Makefile)")));
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_LICENSE_FILES' (in package/bar/Makefile)")));
+  });
+
+  test('helper include in one new package does not exempt another package in the same commit', () => {
+    const state = existingPackage();
+    const patch = `
+diff --git a/package/luci-app-test/Makefile b/package/luci-app-test/Makefile
+--- /dev/null
++++ b/package/luci-app-test/Makefile
+@@ -0,0 +1,6 @@
++include $(TOPDIR)/rules.mk
++include $(TOPDIR)/feeds/luci/luci.mk
++PKG_NAME:=luci-app-test
++PKG_LICENSE:=Apache-2.0
++
+diff --git a/package/plain-pkg/Makefile b/package/plain-pkg/Makefile
+--- /dev/null
++++ b/package/plain-pkg/Makefile
+@@ -0,0 +1,6 @@
++include $(TOPDIR)/rules.mk
++PKG_NAME:=plain-pkg
++PKG_VERSION:=1.0
++PKG_RELEASE:=1
++`;
+    const res = validate('packages: add luci-app-test and plain-pkg', patch, {
+      config: { ...CONFIG, check_openwrt_meta: ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'] },
+      state
+    });
+    // plain-pkg does NOT include luci.mk, so it MUST require PKG_MAINTAINER and PKG_LICENSE_FILES
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_MAINTAINER' (in package/plain-pkg/Makefile)")));
+    assert.ok(res.errors.some(err => err.includes("missing the mandatory parameter: 'PKG_LICENSE_FILES' (in package/plain-pkg/Makefile)")));
   });
 
   test('still requires PKG_LICENSE/PKG_LICENSE_FILES when no known license include is present', () => {

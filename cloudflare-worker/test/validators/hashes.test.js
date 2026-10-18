@@ -37,11 +37,26 @@ diff --git a/package/utils/newpkg/Makefile b/package/utils/newpkg/Makefile
   // A bash Makefile at a version, followed by the given lines.
   const bash = (version, ...rest) => ['PKG_NAME:=bash', `PKG_VERSION:=${version}`, ...rest];
 
+  const generateDiff = (head, base) => {
+    const headLines = head || [];
+    const baseLines = base || [];
+    let diff = 'diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile\n--- a/package/utils/bash/Makefile\n+++ b/package/utils/bash/Makefile\n';
+    for (const b of baseLines) {
+      if (!headLines.includes(b)) diff += `-${b}\n`;
+    }
+    for (const h of headLines) {
+      if (!baseLines.includes(h)) diff += `+${h}\n`;
+    }
+    return diff;
+  };
+
   // Audits one commit, serving the same head and base Makefile for every
   // path; a null base is a file the base branch does not have.
-  const audit = (patch, head, base, config = HASH_CONFIG) =>
-    validatePkgHashes([{ commitPatch: patch }], config,
+  const audit = (patch, head, base, config = HASH_CONFIG) => {
+    const actualPatch = (patch === bumpPatch && head && base) ? generateDiff(head, base) : patch;
+    return validatePkgHashes([{ commitPatch: actualPatch }], config,
       async () => makefile(head), async () => (base === null ? null : makefile(base)));
+  };
 
   const bumpCases = [
     {
@@ -137,6 +152,22 @@ diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
       ['PKG_NAME:=fw', 'PKG_SOURCE_VERSION:=deadbeef', 'PKG_RELEASE:=2', `PKG_MIRROR_HASH:=${sha256a}`],
       ['PKG_NAME:=fw', 'PKG_SOURCE_VERSION:=cafebabe', 'PKG_RELEASE:=1', `PKG_MIRROR_HASH:=${sha256a}`]);
     assertReported(res, { findings: [], errors: [] });
+  });
+
+  test('ignores a hash difference caused only by a stale base.sha when PR diff does not touch hash', async () => {
+    const versionOnlyPatch = `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+--- a/package/utils/bash/Makefile
++++ b/package/utils/bash/Makefile
+-PKG_VERSION:=5.2
++PKG_VERSION:=5.3
+`;
+    // Base and head hashes differ due to base branch drift, but PR diff only touched PKG_VERSION.
+    // Because author did NOT touch PKG_HASH in PR, bot should NOT consider hash updated.
+    const res = await validatePkgHashes([{ commitPatch: versionOnlyPatch }], HASH_CONFIG,
+      async () => makefile(bash('5.3', `PKG_HASH:=${sha256b}`)),
+      async () => makefile(bash('5.2', `PKG_HASH:=${sha256a}`)));
+    assertReported(res, { findings: 'keeps the old PKG_HASH' });
   });
 
   const newPackageCases = [
