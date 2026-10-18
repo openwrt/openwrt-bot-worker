@@ -13,6 +13,7 @@ export interface FileBatchLoaderOptions {
 
 export interface FileBatchLoaderStats {
   budgetSkipCount: number;
+  fetchFailureCount?: number;
   missingFilesCount: number;
 }
 
@@ -23,6 +24,7 @@ export interface FileBatchLoader {
   setRefSource: (ref: string, source: 'base' | 'fork') => void;
   hasRefSource: (ref: string) => boolean;
   getBudgetSkipCount: () => number;
+  getFetchFailureCount?: () => number;
   getStats: () => FileBatchLoaderStats;
 }
 
@@ -64,6 +66,7 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
 
   let flushScheduled = false;
   let budgetSkipCount = 0;
+  let fetchFailureCount = 0;
   const missingFiles = new Set<string>();
 
   function scheduleFlush() {
@@ -77,6 +80,7 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
   async function flushQueue() {
     flushScheduled = false;
     if (pendingQueue.size === 0) return;
+
     const batch = [...pendingQueue.values()];
     pendingQueue.clear();
 
@@ -150,9 +154,9 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
       if (refSource.has(ref)) continue;
       const baseRef = resultsByProbeKey.get(keys.baseKey);
       const forkRef = resultsByProbeKey.get(keys.forkKey);
-      if (baseRef && !baseRef.error && baseRef.exists) {
+      if (baseRef && !baseRef.error && !baseRef.failed && baseRef.exists) {
         refSource.set(ref, 'base');
-      } else if (baseRef && !baseRef.error && !baseRef.skipped && forkRef && !forkRef.error && forkRef.exists) {
+      } else if (baseRef && !baseRef.error && !baseRef.failed && !baseRef.skipped && forkRef && !forkRef.error && !forkRef.failed && forkRef.exists) {
         refSource.set(ref, 'fork');
         console.warn(`Ref ${ref} only resolves under head repo ${headRepoFullname}; subsequent file lookups at this ref will go straight to the fork.`);
       }
@@ -162,23 +166,38 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
       const keys = itemProbeKeys.get(item.key)!;
       const baseRes = keys.baseKey ? resultsByProbeKey.get(keys.baseKey) : null;
       const forkRes = keys.forkKey ? resultsByProbeKey.get(keys.forkKey) : null;
-      const baseOk = baseRes && !baseRes.error;
-      const forkOk = forkRes && !forkRes.error;
+      const baseOk = Boolean(baseRes && !baseRes.error && !baseRes.failed);
+      const forkOk = Boolean(forkRes && !forkRes.error && !forkRes.failed);
 
       if (baseOk && baseRes.content !== null) {
         if (!refSource.has(item.ref)) refSource.set(item.ref, 'base');
         item.resolve(baseRes.content);
       } else if (baseOk && baseRes.exists) {
+        // The path exists in the base repo but has no readable text (binary
+        // or oversized blob). That is an authoritative answer — the fork
+        // holds the identical tree for this ref — and it also proves the
+        // base repo resolves the ref.
         if (!refSource.has(item.ref)) refSource.set(item.ref, 'base');
         item.resolve(null);
       } else if (forkOk && forkRes.content !== null) {
+        // Base resolved cleanly but had nothing at this path/ref, while the
+        // fork does — the base repo simply cannot resolve this ref. A
+        // budget-skipped base probe is not a clean miss, so it must not feed
+        // this inference.
         if (baseOk && !baseRes.skipped && !refSource.has(item.ref)) {
           refSource.set(item.ref, 'fork');
           console.warn(`Ref ${item.ref} only resolves under head repo ${headRepoFullname}; subsequent file lookups at this ref will go straight to the fork.`);
         }
         item.resolve(forkRes.content);
       } else if (baseOk || forkOk) {
+        // Every source we probed answered cleanly, and none had the file — a
+        // genuine "not found", not a transport error. Rejecting here would
+        // fail a whole audit over one speculative findPkgRoot probe.
         if (baseRes?.skipped || forkRes?.skipped) budgetSkipCount++;
+        // Only a repository that serves the ref can say the file is not
+        // there: asking one that cannot resolve the ref comes back empty too.
+        // Without a fork, the base repository holds every commit of the pull
+        // request. A field lost to a partial error is never such an answer.
         const source = hasForkRepo ? refSource.get(item.ref) : 'base';
         const answer = source === 'base' ? baseRes : (source === 'fork' ? forkRes : null);
         if (answer && !answer.error && !answer.skipped && !answer.failed && answer.exists === false) {
@@ -186,8 +205,9 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
         }
         item.resolve(null);
       } else {
+        fetchFailureCount++;
         const err = (forkRes && forkRes.error) || (baseRes && baseRes.error) ||
-          new Error(`Failed to fetch file content for '${item.path}' at ref ${item.ref}: no data returned from GraphQL batch`);
+          new Error(`Failed to fetch file content for '${item.path}' at ref ${item.ref}: GitHub GraphQL query returned an error`);
         item.reject(err);
       }
     }
@@ -213,8 +233,10 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
     setRefSource: (ref: string, source: 'base' | 'fork') => { refSource.set(ref, source); },
     hasRefSource: (ref: string) => refSource.has(ref),
     getBudgetSkipCount: () => budgetSkipCount,
+    getFetchFailureCount: () => fetchFailureCount,
     getStats: () => ({
       budgetSkipCount,
+      fetchFailureCount,
       missingFilesCount: missingFiles.size
     })
   };

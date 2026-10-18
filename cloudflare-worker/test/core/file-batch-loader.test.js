@@ -179,5 +179,132 @@ describe('FileBatchLoader', () => {
     assert.strictEqual(resNeg, 'content\n');
     assert.strictEqual(callCount, 2);
   });
+
+  test('resolves null when every probed repo answered cleanly and none knows the ref', async () => {
+    let callCount = 0;
+    globalThis.fetch = async () => {
+      callCount++;
+      // repo0 is the base, repo1 the fork; f0 is the file probe and f1 the
+      // bare-ref probe. Neither repo resolves the ref, so all four are null.
+      return new Response(JSON.stringify({
+        data: {
+          repo0: { f0: null, f1: null },
+          repo1: { f0: null, f1: null }
+        }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const budget = { limit: 50, used: 0, reserve: 5 };
+    const loader = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      headRepoFullname: 'janedoe/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => { budget.used++; return true; }
+    });
+
+    const content = await loader.fetchFileContentCached('package/foo/Makefile', 'deadbeef');
+    assert.strictEqual(content, null);
+    assert.strictEqual(callCount, 1);
+    assert.strictEqual(loader.getFetchFailureCount(), 0, 'a clean miss is not a fetch failure');
+    assert.strictEqual(loader.getStats().fetchFailureCount, 0);
+    // No repository claimed the ref, so nothing proves the file is gone.
+    assert.strictEqual(loader.isFileMissing('package/foo/Makefile', 'deadbeef'), false);
+    assert.strictEqual(loader.hasRefSource('deadbeef'), false);
+  });
+
+  test('resolves null when the budget skips the ref probes but the file probes answered', async () => {
+    let callCount = 0;
+    globalThis.fetch = async () => {
+      callCount++;
+      return new Response(JSON.stringify({
+        data: {
+          repo0: { f0: null },
+          repo1: { f0: null }
+        }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    // Two probes per chunk puts the file probes in the first chunk and the
+    // ref-existence probes in the second, which the budget guard skips.
+    const budget = { limit: 10, used: 4, reserve: 5 };
+    const loader = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      headRepoFullname: 'janedoe/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => { budget.used++; return true; },
+      graphqlChunkSize: 2
+    });
+
+    const content = await loader.fetchFileContentCached('package/foo/Makefile', 'deadbeef');
+    assert.strictEqual(content, null);
+    assert.strictEqual(callCount, 1, 'only the file probes were affordable');
+    assert.strictEqual(loader.getFetchFailureCount(), 0, 'a skipped ref probe is not a fetch failure');
+    assert.strictEqual(loader.getBudgetSkipCount(), 0, 'the file lookup itself was not skipped');
+    assert.strictEqual(loader.isFileMissing('package/foo/Makefile', 'deadbeef'), false);
+  });
+
+  test('rejects and increments fetchFailureCount when GraphQL returns field-level error (failed: true)', async () => {
+    globalThis.fetch = async () => {
+      return new Response(JSON.stringify({
+        data: {
+          repo0: {
+            f0: null
+          }
+        },
+        errors: [
+          { message: 'Git object lookup failed', path: ['repo0', 'f0'] }
+        ]
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const budget = { limit: 50, used: 0, reserve: 5 };
+    const loader = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => true
+    });
+
+    await assert.rejects(
+      () => loader.fetchFileContentCached('problematic.txt', 'main'),
+      /GitHub GraphQL query returned an error/
+    );
+    assert.strictEqual(loader.isFileMissing('problematic.txt', 'main'), false, 'should not be recorded as missing file');
+    assert.strictEqual(loader.getFetchFailureCount(), 1);
+    assert.strictEqual(loader.getStats().fetchFailureCount, 1);
+  });
+
+  test('rejects and increments fetchFailureCount when Blob object exists but has GraphQL error in text', async () => {
+    globalThis.fetch = async () => {
+      return new Response(JSON.stringify({
+        data: {
+          repo0: {
+            f0: { oid: 'abc123', text: null, isBinary: false }
+          }
+        },
+        errors: [
+          { message: 'Read failed', path: ['repo0', 'f0', 'text'] }
+        ]
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const budget = { limit: 50, used: 0, reserve: 5 };
+    const loader = createFileBatchLoader({
+      token: 'fake-token',
+      repoFullname: 'openwrt/openwrt',
+      subrequestBudget: budget,
+      countOptionalAttempt: () => true
+    });
+
+    await assert.rejects(
+      () => loader.fetchFileContentCached('package/foo/Makefile', 'main'),
+      /GitHub GraphQL query returned an error/
+    );
+    assert.strictEqual(loader.isFileMissing('package/foo/Makefile', 'main'), false, 'should not be recorded as missing file');
+    assert.strictEqual(loader.getFetchFailureCount(), 1);
+    assert.strictEqual(loader.getStats().fetchFailureCount, 1);
+  });
 });
 

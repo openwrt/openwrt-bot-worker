@@ -10,7 +10,8 @@ import {
 import {
   getCommitMessageFromPatch,
   getChangedFilesFromPatch,
-  splitPrPatchByCommit
+  splitPrPatchByCommit,
+  MBOX_ENVELOPE_PATTERN
 } from '../../core/patch-utils.ts';
 import { CHERRY_PICK_MARKER } from '../../core/policy.ts';
 import type { PullRequestContext } from './context.ts';
@@ -146,7 +147,7 @@ export async function runValidations(
     };
   });
 
-  const envelope = /^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001\r?\nFrom: /gm;
+  const envelope = new RegExp(MBOX_ENVELOPE_PATTERN.source, MBOX_ENVELOPE_PATTERN.flags);
   const prWideEnvelopeMatches = (usePrWidePatch && prPatch) ? [...prPatch.matchAll(envelope)] : [];
   const splitMap = (usePrWidePatch && prPatch)
     ? (patchesResult.splitCommitPatches && patchesResult.splitCommitPatches.size > 0
@@ -163,10 +164,10 @@ export async function runValidations(
   const targetCommits = (ctx.commits || []).filter((c: any) => (c.parents || []).length <= 1 && c.changed_files !== 0);
   const expectedCount = targetCommits.length > 0 ? targetCommits.length : nonMergeCommitsCount;
 
-  if (usePrWidePatch && prPatch && touchesMakefilesOrPackages && prWideEnvelopeMatches.length > 0 && expectedCount > 1) {
+  if (usePrWidePatch && prPatch && touchesMakefilesOrPackages && expectedCount > 1) {
     if (splitMap.size < expectedCount || prWideEnvelopeMatches.length < expectedCount || splitMap.size < Math.min(prWideEnvelopeMatches.length, nonMergeCommitsCount)) {
       makefileChecksIncomplete = true;
-      const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series (${splitMap.size}/${expectedCount || prWideEnvelopeMatches.length} commits mapped)`;
+      const warnMsg = `Could not safely verify commit boundaries or coverage in PR-wide patch series (${splitMap.size}/${expectedCount} commits mapped)`;
       allPrWarnings.push(`**Pull Request Overall Diff**:\n- ⚠️ ${warnMsg}`);
     }
   }

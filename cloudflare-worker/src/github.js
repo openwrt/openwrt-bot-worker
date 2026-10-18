@@ -15,6 +15,11 @@
 // rate-limited write.
 const MAX_RETRY_AFTER_SECONDS = 5;
 
+// The body a declined attempt answers with, in one place: a caller that has
+// to tell "not asked" apart from "answered no" matches on it, because the 599
+// code alone is also what a network failure reports.
+const DECLINED_ATTEMPT_RAW = 'Request not made: the caller declined the attempt';
+
 /** @returns {Promise<{ code: number; data: any; raw: string; headers: any }>} */
 export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json', options = {}) {
   const headers = {
@@ -43,7 +48,7 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
   let lastResult = {
     code: 599,
     data: null,
-    raw: 'Request not made: the caller declined the attempt',
+    raw: DECLINED_ATTEMPT_RAW,
     headers: { get: () => null }
   };
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -241,17 +246,22 @@ export async function graphqlBatchFetchFiles(token, probes, onCall) {
   for (const meta of probeMeta) {
     const repoData = topLevelData[meta.repoAlias];
     const field = repoData ? repoData[meta.fieldAlias] : undefined;
+    const hasError = failedAt.has('*') || failedAt.has(meta.repoAlias) || failedAt.has(`${meta.repoAlias}.${meta.fieldAlias}`);
     if (field) {
-      results.set(meta.key, {
+      const result = {
         content: typeof field.text === 'string' ? field.text : null,
         exists: true,
         isBinary: field.isBinary === true
-      });
+      };
+      if (hasError && result.content === null) {
+        result.failed = true;
+      }
+      results.set(meta.key, result);
     } else {
       const result = { content: null, exists: false, isBinary: false };
       // A field lost to an error is empty too, so it is marked: only an
       // unmarked empty field says the file is not there.
-      if (failedAt.has('*') || failedAt.has(meta.repoAlias) || failedAt.has(`${meta.repoAlias}.${meta.fieldAlias}`)) {
+      if (hasError) {
         result.failed = true;
       }
       results.set(meta.key, result);
@@ -341,6 +351,53 @@ const COMMIT_FIELDS = `oid
             ... on GpgSignature { keyId }
           }`;
 
+// A GraphQL error only explains a missing commits connection when it stands
+// at repository.pullRequest.commits or at one of its parents. Anything longer
+// points inside a commit the connection did deliver.
+const COMMITS_FIELD_PATH = ['repository', 'pullRequest', 'commits'];
+function atOrAboveCommits(path) {
+  return Array.isArray(path) && path.length > 0 && path.length <= COMMITS_FIELD_PATH.length
+    && path.every((segment, index) => segment === COMMITS_FIELD_PATH[index]);
+}
+
+// What to quote when commits really are missing: the errors that point at the
+// connection, or every message when none does, so GitHub's pathless soft
+// error still names the cause.
+function commitsErrorMessages(errors) {
+  if (!Array.isArray(errors) || errors.length === 0) return '';
+  const atCommits = errors.filter(e => atOrAboveCommits(e.path));
+  return (atCommits.length > 0 ? atCommits : errors).map(e => e.message).join('; ');
+}
+
+// Partial errors the response survived: logged once, never fatal.
+function warnPartialErrors(errors, where) {
+  if (!Array.isArray(errors) || errors.length === 0) return;
+  console.warn(`GraphQL ${where} returned partial errors, continuing with what resolved: ${errors.map(e => e.message).join('; ').slice(0, 500)}`);
+}
+
+// Maps the commit nodes of one page into `commits`, and returns how many nodes
+// the page carried. PullRequestCommit.commit and the fields selected under it
+// are non-null, so a partial error inside one commit nulls that whole list
+// element while the nodes list itself survives: reading `.commit` off it threw,
+// which left the run with no check-runs at all. Such an element is skipped
+// instead - and still counted, so the caller sees a listing shorter than
+// commitsTotal and reports a capped scan rather than a silent pass.
+function pushGraphqlCommits(nodes, commits, where) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  let dropped = 0;
+  for (const node of list) {
+    if (!node?.commit) {
+      dropped++;
+      continue;
+    }
+    commits.push(restCommitFromGraphql(node.commit));
+  }
+  if (dropped > 0) {
+    console.warn(`GraphQL ${where} returned ${dropped} commit node(s) without a commit, continuing with the ${list.length - dropped} that resolved`);
+  }
+  return list.length;
+}
+
 /** @param {string} token @param {string} repoFullname @param {string} ref @param {string} configPath @param {string} labelerPath @param {any} onCall @param {number|null} [prNumber] @param {number} [maxCommitPages] */
 export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath, labelerPath, onCall, prNumber = null, maxCommitPages = 3) {
   const slashIndex = repoFullname.indexOf('/');
@@ -416,12 +473,22 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
 
   const pr = repo.pullRequest;
   if (!pr) {
-    throw new Error(`GraphQL repository setup fetch failed: pull request #${prNumber} not found in ${repoFullname}`);
+    const cleanRaw = (res.raw || '').trim().slice(0, 200);
+    const errMsgs = Array.isArray(res.data?.errors) ? res.data.errors.map(e => e.message).join('; ') : '';
+    throw new Error(`GraphQL repository setup fetch failed: pull request #${prNumber} not found in ${repoFullname}${errMsgs ? ` (${errMsgs})` : (cleanRaw ? `: ${cleanRaw}` : '')}`);
   }
 
-  const commits = (pr.commits?.nodes || []).map(node => restCommitFromGraphql(node.commit));
-  setup.commitsTotal = pr.commits?.totalCount ?? commits.length;
-  let commitsPage = pr.commits?.pageInfo;
+  // Partial errors beside a populated commits connection are not fatal: the
+  // commits that resolved are what the checks read, so the run carries on
+  // with them rather than answering the webhook with a failure.
+  if (!pr.commits) {
+    throw new Error(`GraphQL repository setup fetch failed to retrieve commits for PR #${prNumber}: ${commitsErrorMessages(res.data?.errors) || 'pullRequest.commits is null'}`);
+  }
+  warnPartialErrors(res.data?.errors, `repository setup for PR #${prNumber}`);
+
+  const commits = [];
+  let nodesSeen = pushGraphqlCommits(pr.commits.nodes, commits, `repository setup for PR #${prNumber}`);
+  let commitsPage = pr.commits.pageInfo;
   let pagesFetched = 1;
   while (commitsPage?.hasNextPage && pagesFetched < maxCommitPages) {
     const pageRes = await githubApiCall(GRAPHQL_URL, token, 'POST', {
@@ -442,15 +509,23 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
     const page = pageRes.code === 200 ? pageRes.data?.data?.repository?.pullRequest?.commits : null;
     if (!page) {
       const cleanRaw = (pageRes.raw || '').trim().slice(0, 200);
-      throw new Error(`GraphQL commit listing failed past page ${pagesFetched} (HTTP ${pageRes.code}): ${cleanRaw}`);
+      throw new Error(`GraphQL commit listing failed past page ${pagesFetched} (HTTP ${pageRes.code}): ${commitsErrorMessages(pageRes.data?.errors) || cleanRaw}`);
     }
-    for (const node of page.nodes || []) commits.push(restCommitFromGraphql(node.commit));
+    warnPartialErrors(pageRes.data?.errors, `commit listing past page ${pagesFetched}`);
+    nodesSeen += pushGraphqlCommits(page.nodes, commits, `commit listing past page ${pagesFetched}`);
     commitsPage = page.pageInfo;
     pagesFetched++;
   }
+  // Counted from the nodes the pages carried, not from the commits that
+  // survived them: a dropped node must not shrink the total too, or the short
+  // listing it leaves behind would be invisible to the caller.
+  setup.commitsTotal = Math.max(pr.commits.totalCount ?? 0, nodesSeen);
   setup.commits = commits;
 
-  if (pr.comments && !pr.comments.pageInfo?.hasNextPage) {
+  const commentsErrors = Array.isArray(res.data?.errors)
+    ? res.data.errors.filter(e => e.path && Array.isArray(e.path) && e.path.includes('comments'))
+    : [];
+  if (commentsErrors.length === 0 && pr.comments && !pr.comments.pageInfo?.hasNextPage) {
     setup.comments = (pr.comments.nodes || []).map(restCommentFromGraphql);
   }
   return setup;

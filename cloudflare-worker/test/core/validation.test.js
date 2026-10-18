@@ -267,7 +267,7 @@ diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
 @@ -1,3 +1,3 @@
 -PKG_RELEASE:=1
 +PKG_RELEASE:=2
-`;
+ `;
 
     const patchesResult = {
       usePrWidePatch: true,
@@ -279,6 +279,67 @@ diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
     assert.strictEqual(result.makefileChecksIncomplete, true);
     assert.ok(
       result.allPrWarnings.some(w => w.includes('PR-wide patch series')),
+      'Should report warning about inability to verify commit boundaries in PR-wide patch series'
+    );
+  });
+
+  test('marks makefileChecksIncomplete and adds warning when multi-commit PR patch has 0 envelopes', async () => {
+    const fakeFileBatchLoader = {
+      fetchFileContentCached: async () => null,
+      isFileMissing: () => false,
+      getRefSource: () => undefined,
+      hasRefSource: () => false,
+      setRefSource: () => {},
+      getBudgetSkipCount: () => 0,
+      getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+    };
+
+    const sha1 = '1111111111111111111111111111111111111111';
+    const sha2 = '2222222222222222222222222222222222222222';
+
+    const mockCtx = {
+      prNumber: 42,
+      prTitle: 'multi: two commits PR',
+      baseBranch: 'main',
+      headSha: sha2,
+      baseSha: 'base123',
+      isBackportPr: false,
+      repoFullname: 'openwrt/openwrt',
+      config: { ...DEFAULT_CONFIG },
+      configError: null,
+      commitScanCapped: false,
+      commitsCount: 2,
+      commits: [
+        { sha: sha1, commit: { message: 'pkgA: first commit' } },
+        { sha: sha2, commit: { message: 'pkgB: second commit' } }
+      ],
+      fileBatchLoader: fakeFileBatchLoader,
+      getCommentsScanWithRetry: async () => null,
+      isMaintainerUser: async () => false,
+      isAuthorMaintainer: async () => false,
+      branchCheckError: null,
+      branchCheckOutputText: ''
+    };
+
+    // prPatch has 0 envelopes (raw diff without From <sha> headers)
+    const prPatch = `diff --git a/package/utils/pkgA/Makefile b/package/utils/pkgA/Makefile
+--- a/package/utils/pkgA/Makefile
++++ b/package/utils/pkgA/Makefile
+@@ -1,3 +1,3 @@
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+`;
+
+    const patchesResult = {
+      usePrWidePatch: true,
+      prPatch,
+      commitDetails: []
+    };
+
+    const result = await runValidations(mockCtx, patchesResult);
+    assert.strictEqual(result.makefileChecksIncomplete, true);
+    assert.ok(
+      result.allPrWarnings.some(w => w.includes('PR-wide patch series') && w.includes('0/2 commits mapped')),
       'Should report warning about inability to verify commit boundaries in PR-wide patch series'
     );
   });

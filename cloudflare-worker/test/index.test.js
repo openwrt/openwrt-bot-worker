@@ -311,18 +311,21 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
   });
 
   test('handles large PRs with > 15 commits by fetching overall PR patch and checking PR-wide', async () => {
-    // Generate 17 commits
-    const commitsList = Array.from({ length: 17 }, (_, i) => ({
-      sha: `sha123456789${i}`,
-      html_url: `https://github.com/commit/sha123456789${i}`,
-      commit: {
-        author: { name: 'John Doe', email: 'john@doe.com' },
-        committer: { name: 'John Doe', email: 'john@doe.com' },
-        message: i === 0
-          ? 'crun: update to 1.15\n\nSigned-off-by: John Doe <john@doe.com>'
-          : `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
-      }
-    }));
+    // Generate 17 commits with valid 40-character SHAs
+    const commitsList = Array.from({ length: 17 }, (_, i) => {
+      const sha = (i + 1).toString(16).padStart(40, '0');
+      return {
+        sha,
+        html_url: `https://github.com/commit/${sha}`,
+        commit: {
+          author: { name: 'John Doe', email: 'john@doe.com' },
+          committer: { name: 'John Doe', email: 'john@doe.com' },
+          message: i === 0
+            ? 'crun: update to 1.15\n\nSigned-off-by: John Doe <john@doe.com>'
+            : `mypkg: commit ${i}\n\nSigned-off-by: John Doe <john@doe.com>`
+        }
+      };
+    });
 
     const payload = JSON.stringify({
       action: 'opened',
@@ -385,8 +388,13 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       }
       if (url.endsWith('/pulls/123') && options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
         overallPrPatchFetched = true;
-        // Return a mock patch that introduces PKG_VERSION bump for crun to 1.15
-        const mockPatch = `diff --git a/utils/crun/Makefile b/utils/crun/Makefile
+        // Return a mock mbox patch covering all 17 commits
+        let mockPatch = `From ${commitsList[0].sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Fri, 16 Oct 2026 12:00:00 +0000
+Subject: [PATCH 1/17] crun: update to 1.15
+
+diff --git a/utils/crun/Makefile b/utils/crun/Makefile
 index 123456..789012 100644
 --- a/utils/crun/Makefile
 +++ b/utils/crun/Makefile
@@ -398,6 +406,20 @@ index 123456..789012 100644
  PKG_MAINTAINER:=John Doe <john@doe.com>
  PKG_LICENSE:=GPL-2.0-or-later
 `;
+        for (let i = 1; i <= 16; i++) {
+          mockPatch += `From ${commitsList[i].sha} Mon Sep 17 00:00:00 2001
+From: John Doe <john@doe.com>
+Date: Fri, 16 Oct 2026 12:00:00 +0000
+Subject: [PATCH ${i + 1}/17] mypkg: commit ${i}
+
+diff --git a/utils/crun/file${i}.txt b/utils/crun/file${i}.txt
+new file mode 100644
+--- /dev/null
++++ b/utils/crun/file${i}.txt
+@@ -0,0 +1 @@
++test
+`;
+        }
         return new Response(mockPatch, { status: 200 });
       }
       if (url.includes('/check-runs')) {
@@ -4125,6 +4147,8 @@ index 123456..789012 100644
       const patchesCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Code Patches');
       assert.strictEqual(patchesCheck.conclusion, 'neutral');
 
+      // The 15 reserved subrequests ensure the live PR state is verified,
+      // comments are synchronized, and the budget warning is visible to contributors.
       assert.ok(commentBody);
       assert.ok(commentBody.includes('Deep file-content validation skipped'));
       assert.ok(commentBody.includes('file lookup(s)'));

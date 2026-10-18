@@ -212,6 +212,19 @@ describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
     assert.deepStrictEqual(result.get('bin'), { content: null, exists: true, isBinary: true });
   });
 
+  test('marks probe as failed: true when GraphQL returns a Blob object but errors reading its text', async () => {
+    fetchMock = () => new Response(JSON.stringify({
+      data: { repo0: { f0: { oid: 'abc123', text: null, isBinary: false } } },
+      errors: [{ message: 'Read failed', path: ['repo0', 'f0', 'text'] }]
+    }), { status: 200 });
+
+    const result = await graphqlBatchFetchFiles('token', [
+      { key: 'f', repoFullname: 'openwrt/openwrt', ref: 'sha', path: 'Makefile' }
+    ]);
+
+    assert.deepStrictEqual(result.get('f'), { content: null, exists: true, isBinary: false, failed: true });
+  });
+
   test('probes ref existence with a bare-ref expression when path is null', async () => {
     let capturedVariables = null;
     fetchMock = (url, options) => {
@@ -591,6 +604,344 @@ describe('graphqlFetchRepoSetup with a pull request', { concurrency: 1 }, () => 
     assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['1', '2']);
     assert.strictEqual(setup.commitsTotal, 150);
     assert.strictEqual(setup.comments, null);
+  });
+
+  test('throws when GraphQL response contains errors on commits', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: {
+              commits: null,
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+            }
+          }
+        },
+        errors: [
+          { message: 'Could not resolve commits', path: ['repository', 'pullRequest', 'commits'] }
+        ]
+      }), { status: 200 });
+    };
+
+    await assert.rejects(
+      () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988),
+      /GraphQL repository setup fetch failed to retrieve commits for PR #24988: Could not resolve commits/
+    );
+  });
+
+  test('throws when pullRequest.commits is null even without explicit error', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: {
+              commits: null,
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+            }
+          }
+        }
+      }), { status: 200 });
+    };
+
+    await assert.rejects(
+      () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988),
+      /pullRequest.commits is null/
+    );
+  });
+
+  test('carries on when a partial error has no path at all and the commits resolved', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: {
+              commits: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [commitNode('a'.repeat(40))] },
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+            }
+          }
+        },
+        errors: [
+          { message: 'Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug.' }
+        ]
+      }), { status: 200 });
+    };
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.strictEqual(setup.commits.length, 1);
+      assert.strictEqual(setup.commits[0].sha, 'a'.repeat(40));
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('carries on when a partial error points inside one commit, not at the commits field', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: {
+              commits: { totalCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+                commitNode('a'.repeat(40)),
+                commitNode('b'.repeat(40))
+              ] },
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+            }
+          }
+        },
+        errors: [
+          { message: 'Resource not accessible by integration', path: ['repository', 'pullRequest', 'commits', 'nodes', 0, 'commit', 'signature'] }
+        ]
+      }), { status: 200 });
+    };
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['a', 'b']);
+      assert.strictEqual(setup.commitsTotal, 2);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('throws when commits are missing and an error lands above them', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [], pageInfo: { hasNextPage: false } },
+            cfg: null,
+            labeler: null,
+            pullRequest: { commits: null, comments: null }
+          }
+        },
+        errors: [
+          { message: 'Something went wrong while executing your query', path: ['repository', 'pullRequest'] }
+        ]
+      }), { status: 200 });
+    };
+
+    await assert.rejects(
+      () => graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988),
+      /failed to retrieve commits for PR #24988: Something went wrong while executing your query/
+    );
+  });
+
+  test('carries on when a commit page carries a partial error inside one commit', async () => {
+    const calls = [];
+    fetchMock = (url, options) => {
+      const body = JSON.parse(options.body);
+      calls.push(body.variables.after || 'first');
+      if (!body.variables.after) {
+        return new Response(JSON.stringify({ data: { repository: {
+          labels: { nodes: [], pageInfo: { hasNextPage: false } }, cfg: null, labeler: null,
+          pullRequest: {
+            commits: { totalCount: 150, pageInfo: { hasNextPage: true, endCursor: 'C1' }, nodes: [commitNode('1'.repeat(40))] },
+            comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+          }
+        } } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: { repository: { pullRequest: {
+          commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [commitNode('2'.repeat(40))] }
+        } } },
+        errors: [
+          { message: 'Resource not accessible by integration', path: ['repository', 'pullRequest', 'commits', 'nodes', 0, 'commit', 'signature'] }
+        ]
+      }), { status: 200 });
+    };
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.deepStrictEqual(calls, ['first', 'C1']);
+      assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['1', '2']);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('does not throw when GraphQL errors affect only comments, returning setup with comments: null', async () => {
+    fetchMock = () => {
+      return new Response(JSON.stringify({
+        data: {
+          repository: {
+            labels: { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: false, endCursor: null } },
+            cfg: { text: '{}' },
+            labeler: null,
+            pullRequest: {
+              commits: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+                commitNode('a'.repeat(40))
+              ] },
+              comments: null
+            }
+          }
+        },
+        errors: [
+          { message: 'Comments timeout', path: ['repository', 'pullRequest', 'comments'] }
+        ]
+      }), { status: 200 });
+    };
+
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+    assert.strictEqual(setup.commits.length, 1);
+    assert.strictEqual(setup.commits[0].sha, 'a'.repeat(40));
+    assert.strictEqual(setup.comments, null);
+  });
+
+  // PullRequestCommit.commit and the fields selected under it are non-null, so
+  // a partial error inside one commit comes back as a nulled list element. The
+  // run has to survive it with the commits that did resolve: a throw here is a
+  // pull request that gets no check-runs and no comment at all.
+  test('skips a nulled commit node and still reports the listing as short', async () => {
+    fetchMock = () => new Response(JSON.stringify({
+      data: { repository: {
+        labels: { nodes: [], pageInfo: { hasNextPage: false } }, cfg: null, labeler: null,
+        pullRequest: {
+          commits: { totalCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [null, commitNode('b'.repeat(40))] },
+          comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+        }
+      } },
+      errors: [
+        { message: 'Resource not accessible by integration', path: ['repository', 'pullRequest', 'commits', 'nodes', 0, 'commit', 'signature'] }
+      ]
+    }), { status: 200 });
+
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (msg) => warnings.push(String(msg));
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['b']);
+      assert.strictEqual(setup.commitsTotal, 2, 'the dropped node still counts, so the caller caps the commit scan');
+      assert.ok(warnings.some(w => w.includes('1 commit node(s) without a commit')), 'a skipped node must not be invisible');
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('skips a node whose commit is null without dying one frame deeper', async () => {
+    fetchMock = () => new Response(JSON.stringify({
+      data: { repository: {
+        labels: { nodes: [], pageInfo: { hasNextPage: false } }, cfg: null, labeler: null,
+        pullRequest: {
+          commits: { totalCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [commitNode('a'.repeat(40)), { commit: null }] },
+          comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+        }
+      } },
+      errors: [
+        { message: 'Something went wrong while executing your query', path: ['repository', 'pullRequest', 'commits', 'nodes', 1, 'commit'] }
+      ]
+    }), { status: 200 });
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['a']);
+      assert.ok(setup.commitsTotal > setup.commits.length, 'the listing stays visibly short');
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('skips a nulled commit node on a later page too', async () => {
+    const calls = [];
+    fetchMock = (url, options) => {
+      const body = JSON.parse(options.body);
+      calls.push(body.variables.after || 'first');
+      if (!body.variables.after) {
+        return new Response(JSON.stringify({ data: { repository: {
+          labels: { nodes: [], pageInfo: { hasNextPage: false } }, cfg: null, labeler: null,
+          pullRequest: {
+            commits: { totalCount: 3, pageInfo: { hasNextPage: true, endCursor: 'C1' }, nodes: [commitNode('1'.repeat(40))] },
+            comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+          }
+        } } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: { repository: { pullRequest: {
+          commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [null, commitNode('2'.repeat(40))] }
+        } } },
+        errors: [
+          { message: 'Resource not accessible by integration', path: ['repository', 'pullRequest', 'commits', 'nodes', 0, 'commit', 'signature'] }
+        ]
+      }), { status: 200 });
+    };
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.deepStrictEqual(calls, ['first', 'C1']);
+      assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['1', '2']);
+      assert.strictEqual(setup.commitsTotal, 3, 'the node page 2 dropped keeps the scan capped');
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test('skips a nulled commit node that comes with no error at all', async () => {
+    fetchMock = () => new Response(JSON.stringify({
+      data: { repository: {
+        labels: { nodes: [], pageInfo: { hasNextPage: false } }, cfg: null, labeler: null,
+        pullRequest: {
+          commits: { totalCount: 2, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [null, commitNode('b'.repeat(40))] },
+          comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+        }
+      } }
+    }), { status: 200 });
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.deepStrictEqual(setup.commits.map(c => c.sha[0]), ['b']);
+      assert.strictEqual(setup.commitsTotal, 2);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  // Without a totalCount the dropped node is the only trace left, so the total
+  // counts the nodes the page carried rather than the commits that survived.
+  test('counts a dropped node into the total when totalCount is missing', async () => {
+    fetchMock = () => new Response(JSON.stringify({
+      data: { repository: {
+        labels: { nodes: [], pageInfo: { hasNextPage: false } }, cfg: null, labeler: null,
+        pullRequest: {
+          commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [null, commitNode('b'.repeat(40))] },
+          comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] }
+        }
+      } }
+    }), { status: 200 });
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml', null, 24988);
+      assert.strictEqual(setup.commits.length, 1);
+      assert.strictEqual(setup.commitsTotal, 2, 'two nodes came back, one of them unusable');
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   test('spells signature states the way REST did', () => {

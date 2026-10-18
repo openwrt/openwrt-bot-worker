@@ -48,6 +48,7 @@ export function aggregateReport(
   let finalFormalityOutput = formalityOutputText;
 
   const budgetSkipCount = fileBatchLoader.getBudgetSkipCount();
+  const fetchFailureCount = fileBatchLoader.getFetchFailureCount ? fileBatchLoader.getFetchFailureCount() : 0;
   if (patchUnavailable) {
     const patchWarning = `GitHub did not serve this pull request's patch (it is past GitHub's diff limits), and fetching each of its ${commits.length} commits would not fit the API request budget, so the Makefile, configuration and patch-header checks could not run.`;
     allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${patchWarning}`);

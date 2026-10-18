@@ -80,15 +80,30 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
       let livePr: any = prData || {};
 
       if (typeof client?.optionalApiCall === 'function') {
-        const prUrl = prData?.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
-        const liveRes = await client.optionalApiCall(prUrl);
-        if (liveRes && liveRes.code >= 200 && liveRes.code < 300 && liveRes.data) {
-          if (Array.isArray(liveRes.data.labels) || liveRes.data.head || liveRes.data.base) {
-            livePr = { ...prData, ...liveRes.data };
-          }
-          verified = true;
+        const hasReserveForClosingWrites = client?.budget
+          ? (client.budget.limit - client.budget.used >= 6)
+          : false;
+        const canCheckLiveState = (typeof client?.hasHeadroom === 'function')
+          ? (client.hasHeadroom() || hasReserveForClosingWrites)
+          : true;
+
+        if (!canCheckLiveState) {
+          console.warn(`Skipping live PR state check for #${prNumber}: no API budget headroom left. Treating PR as unverified/moved to preserve check-run writes.`);
         } else {
-          console.warn(`Failed to verify current PR state for #${prNumber}; treating PR as moved to avoid stale operations`);
+          const prUrl = prData?.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
+          const isBudgetExhausted = typeof client?.hasHeadroom === 'function' && !client.hasHeadroom();
+          const apiCall = (isBudgetExhausted && typeof client?.trackedApiCall === 'function')
+            ? client.trackedApiCall
+            : client.optionalApiCall;
+          const liveRes = await apiCall(prUrl);
+          if (liveRes && liveRes.code >= 200 && liveRes.code < 300 && liveRes.data) {
+            if (Array.isArray(liveRes.data.labels) || liveRes.data.head || liveRes.data.base) {
+              livePr = { ...prData, ...liveRes.data };
+            }
+            verified = true;
+          } else {
+            console.warn(`Failed to verify current PR state for #${prNumber}; treating PR as moved to avoid stale operations`);
+          }
         }
       } else {
         verified = true;
@@ -275,6 +290,9 @@ export async function loadPullRequestContext(
 
   const commits = setup.commits || [];
   const commitsCount = setup.commitsTotal || commits.length;
+  if (!Array.isArray(commits) || commits.length === 0) {
+    throw new Error(`GraphQL setup fetch returned no commits for PR #${prNumber} in ${repoFullname}. Aborting validation to prevent premature pass.`);
+  }
   const commitScanCapped = commitsCount > commits.length;
 
   let fetchCommentsPromise: Promise<CommentScanResult | null> | null = null;
