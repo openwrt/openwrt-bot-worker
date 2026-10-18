@@ -9,12 +9,16 @@ import {
 import type { IssuesEventPayload } from '../types/github.ts';
 
 export async function handleIssuesEvent(
-  data: IssuesEventPayload,
+  data: unknown,
   token: string,
   repoFullname: string,
   appId: number | null
 ): Promise<Response> {
-  const defaultBranch = data.repository?.default_branch || "main";
+  if (!data || typeof data !== 'object') {
+    return new Response("Invalid payload: expected JSON object", { status: 400 });
+  }
+  const payload = data as IssuesEventPayload;
+  const defaultBranch = payload.repository?.default_branch || "main";
   const configFiles = await graphqlBatchFetchFiles(token, [
     { key: 'config', repoFullname, ref: defaultBranch, path: '.github/formalities.json' },
     { key: 'labeller', repoFullname, ref: defaultBranch, path: '.github/issue-labeller.yml' }
@@ -38,14 +42,14 @@ export async function handleIssuesEvent(
     ? (parseIssueLabellerYaml(labellerFile.content) || DEFAULT_ISSUE_LABELLER_CONFIG)
     : DEFAULT_ISSUE_LABELLER_CONFIG;
 
-  const labelling = await handleIssueLabeller(data, token, labellerConfig, repoFullname);
-  const currentIssueLabels = new Set(((data.issue?.labels || []) as Array<any>).map(l => (typeof l === "string" ? l : l.name).toLowerCase()));
+  const labelling = await handleIssueLabeller(payload, token, labellerConfig, repoFullname);
+  const currentIssueLabels = new Set(((payload.issue?.labels || []) as Array<any>).map(l => (typeof l === "string" ? l : l.name).toLowerCase()));
 
   const needsLabelCreation = labelling.labelsToAdd.some((l: string) => !currentIssueLabels.has(l.toLowerCase()));
   const existingLabels = needsLabelCreation
     ? await graphqlFetchRepoLabels(token, repoFullname)
         .catch(err => { console.warn(`Repository label listing failed, continuing without it: ${err.message}`); return null; })
     : new Set();
-  await applyIssueLabelling(labelling, token, repoFullname, data.issue!.number, existingLabels, currentIssueLabels, null, appId);
-  return new Response(`Success: Processed issue labeller for issue #${data.issue!.number}`, { status: 200 });
+  await applyIssueLabelling(labelling, token, repoFullname, payload.issue!.number, existingLabels, currentIssueLabels, null, appId);
+  return new Response(`Success: Processed issue labeller for issue #${payload.issue!.number}`, { status: 200 });
 }

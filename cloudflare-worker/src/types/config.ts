@@ -64,6 +64,61 @@ export interface FormalitiesConfig {
   [key: string]: unknown;
 }
 
+const BOOLEAN_FIELDS = new Set([
+  'check_branch',
+  'check_merge_commits',
+  'check_noreply_email',
+  'check_signoff',
+  'check_signature',
+  'allow_autosquash',
+  'allow_revert',
+  'enable_comments',
+  'show_force_push_tip',
+  'warn_duplicate_body',
+  'warn_generic_subjects',
+  'warn_imperative_mood',
+  'require_release_notes',
+  'require_body',
+  'check_openwrt_spelling',
+  'check_pkg_version',
+  'check_binary_files',
+  'check_crlf',
+  'check_trailing_newline',
+  'add_package_label',
+  'drop_package_label',
+  'branch_labeling',
+  'check_openwrt_meta',
+  'check_spdx_license',
+  'check_init_scripts',
+  'check_conffiles',
+  'check_uci_config',
+  'check_space_after_assignment',
+  'check_missing_colon',
+  'check_makefile_indentation',
+  'check_pkg_name_reuse',
+  'require_linked_github_account',
+  'enable_labeler_yml',
+  'enable_issue_labeller',
+  'enable_stale_bot'
+]);
+
+const NUMBER_FIELDS = new Set([
+  'max_subject_len_soft',
+  'max_subject_len_hard',
+  'max_body_line_len'
+]);
+
+const TRISTATE_FIELDS = new Set([
+  'check_buildbot_default',
+  'check_patch_headers',
+  'check_pkg_release',
+  'check_pkg_hash'
+]);
+
+const STRING_ARRAY_FIELDS = new Set([
+  'stale_ignored_users'
+]);
+
 export function parseAndValidateConfig(rawConfigText: string | null): {
   config: FormalitiesConfig;
   error: string | null;
@@ -77,11 +132,43 @@ export function parseAndValidateConfig(rawConfigText: string | null): {
 
   try {
     const parsed = JSON.parse(rawConfigText);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      config = { ...DEFAULT_CONFIG, ...parsed };
-    } else {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       error = `it does not contain a JSON object (got ${parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed})`;
+      return { config, error };
     }
+
+    const fieldErrors: string[] = [];
+    for (const [key, val] of Object.entries(parsed)) {
+      if (val === null || val === undefined) {
+        fieldErrors.push(`field "${key}" must not be null`);
+        continue;
+      }
+      if (BOOLEAN_FIELDS.has(key)) {
+        if (typeof val !== 'boolean') {
+          fieldErrors.push(`field "${key}" must be a boolean (got ${typeof val})`);
+        }
+      } else if (NUMBER_FIELDS.has(key)) {
+        if (typeof val !== 'number' || Number.isNaN(val) || val < 0) {
+          fieldErrors.push(`field "${key}" must be a non-negative number (got ${typeof val})`);
+        }
+      } else if (TRISTATE_FIELDS.has(key)) {
+        if (typeof val !== 'boolean' && typeof val !== 'string') {
+          fieldErrors.push(`field "${key}" must be a boolean or string (got ${typeof val})`);
+        }
+      } else if (STRING_ARRAY_FIELDS.has(key)) {
+        if (!Array.isArray(val) || !val.every(item => typeof item === 'string')) {
+          fieldErrors.push(`field "${key}" must be an array of strings`);
+        }
+      }
+      // Unknown fields are tolerated for forward/backward compatibility
+    }
+
+    if (fieldErrors.length > 0) {
+      error = fieldErrors.join('; ');
+      return { config, error };
+    }
+
+    config = { ...DEFAULT_CONFIG, ...parsed };
   } catch (e: any) {
     error = e.message;
   }

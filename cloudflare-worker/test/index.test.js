@@ -4078,11 +4078,11 @@ index 123456..789012 100644
         WEBHOOK_SECRET: secret,
         APP_ID: '12345',
         PRIVATE_KEY: 'YW55Y29udGVudA==',
-        // Force the file-content budget to be exhausted before any lookup,
+        // Force the file-content budget headroom to be exhausted before any lookup,
         // so every optional deep-validation fetch must be skipped rather
-        // than attempted.
-        SUBREQUEST_BUDGET_LIMIT: '0',
-        SUBREQUEST_RESERVE_HEADROOM: '0'
+        // than attempted while preserving the reserve for closing status writes.
+        SUBREQUEST_BUDGET_LIMIT: '15',
+        SUBREQUEST_RESERVE_HEADROOM: '15'
       }, {});
 
       assert.strictEqual(response.status, 200);

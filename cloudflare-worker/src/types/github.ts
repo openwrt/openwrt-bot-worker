@@ -83,21 +83,89 @@ export interface BaseWebhookPayload {
   [key: string]: unknown;
 }
 
+export type PullRequestAction =
+  | 'opened'
+  | 'synchronize'
+  | 'reopened'
+  | 'edited'
+  | 'closed'
+  | 'labeled'
+  | 'unlabeled'
+  | 'assigned'
+  | 'unassigned'
+  | 'review_requested'
+  | 'review_request_removed'
+  | 'ready_for_review'
+  | 'converted_to_draft';
+
+export type IssueCommentAction =
+  | 'created'
+  | 'edited'
+  | 'deleted';
+
+export type IssuesAction =
+  | 'opened'
+  | 'edited'
+  | 'deleted'
+  | 'pinned'
+  | 'unpinned'
+  | 'closed'
+  | 'reopened'
+  | 'assigned'
+  | 'unassigned'
+  | 'labeled'
+  | 'unlabeled'
+  | 'locked'
+  | 'unlocked'
+  | 'transferred';
+
 export interface PullRequestEventPayload extends BaseWebhookPayload {
-  action: 'opened' | 'synchronize' | 'reopened' | 'edited' | string;
+  event?: 'pull_request';
+  action: PullRequestAction;
   pull_request: PullRequestData;
 }
 
 export interface IssueCommentEventPayload extends BaseWebhookPayload {
-  action: 'created' | string;
+  event?: 'issue_comment';
+  action: IssueCommentAction;
   issue: IssueData;
   comment: IssueCommentData;
   pull_request?: PullRequestData;
 }
 
 export interface IssuesEventPayload extends BaseWebhookPayload {
-  action: 'opened' | 'edited' | 'reopened' | string;
+  event?: 'issues';
+  action: IssuesAction;
   issue: IssueData;
 }
 
-export type WebhookPayload = PullRequestEventPayload | IssueCommentEventPayload | IssuesEventPayload | BaseWebhookPayload;
+export type WebhookPayload = PullRequestEventPayload | IssueCommentEventPayload | IssuesEventPayload;
+
+export function isPullRequestPayload(payload: unknown): payload is PullRequestEventPayload {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    'pull_request' in payload &&
+    typeof (payload as any).pull_request === 'object' &&
+    (payload as any).pull_request !== null &&
+    !('comment' in payload)
+  );
+}
+
+export function isIssueCommentPayload(payload: unknown): payload is IssueCommentEventPayload {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    'comment' in payload &&
+    'issue' in payload
+  );
+}
+
+export function isIssuesPayload(payload: unknown): payload is IssuesEventPayload {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    'issue' in payload &&
+    !('comment' in payload)
+  );
+}
