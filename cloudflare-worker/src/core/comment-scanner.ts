@@ -7,6 +7,16 @@ export interface CommentScanResult {
   hasCherryPickBypassComment: boolean;
   hasBranchBypassComment: boolean;
   existingCommentId: string | number | null;
+  // Whether the whole thread was read. What an unfinished scan did find still
+  // holds - an override seen on page 1 is an override - but the absence of one
+  // says nothing, so "no override found" and "could not look" are not the same
+  // answer: reading the second as the first fails a pull request a maintainer
+  // already waved through.
+  incomplete: boolean;
+}
+
+export function incompleteCommentScan(): CommentScanResult {
+  return { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null, incomplete: true };
 }
 
 // Reads one list of issue comments for the three facts a run needs: the id
@@ -17,7 +27,7 @@ export async function scanCommentList(
   comments: Array<any>,
   isMaintainerUser: (user: GitHubUser | null | undefined, association: string | null | undefined) => Promise<boolean>,
   appId: number | null,
-  scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null }
+  scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null, incomplete: false }
 ): Promise<CommentScanResult> {
   for (const c of comments) {
     if ((c.viewer_did_author === true || isOwnAppComment(c, appId)) && c.body?.startsWith('## Formality Check:')) {
@@ -35,11 +45,13 @@ export async function scanCommentList(
   return scan;
 }
 
-// `hasHeadroom` is asked before every page: a thread long enough to page is
-// also long enough to eat the headroom kept for the closing writes, and
-// losing those loses the whole report. Stopping or skipping counts as a failed
-// scan, which the caller already handles by leaving the comment alone - better
-// a run without its comment than a run whose check-runs GitHub refuses.
+// `hasHeadroom` is asked before every page after the first: a thread long
+// enough to page is also long enough to eat the headroom kept for the closing
+// writes, and losing those loses the whole report. Page 1 is always read,
+// because it is the one page nearly every thread fits in and the overrides
+// this scan looks for are on it. A scan that stops short, or a page GitHub
+// does not serve, comes back marked `incomplete` rather than as a thread
+// without overrides.
 export async function scanPrComments(
   repoFullname: string,
   prNumber: number,
@@ -48,20 +60,16 @@ export async function scanPrComments(
   isMaintainerUser: (user: GitHubUser | null | undefined, association: string | null | undefined) => Promise<boolean>,
   appId: number | null,
   hasHeadroom: () => boolean = () => true
-): Promise<CommentScanResult | null> {
+): Promise<CommentScanResult> {
   let page = 1;
-  const scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null };
+  const scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null, incomplete: false };
 
   while (true) {
-    if (typeof hasHeadroom === 'function' && !hasHeadroom()) {
-      console.warn(`Comment scan for PR #${prNumber} ${page === 1 ? 'skipped before page 1' : `stopped after page ${page - 1}`}: no request budget left beyond the reserve.`);
-      return null;
-    }
-
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
     const res: GitHubApiResponse<any> = await githubApiCall(url, token, 'GET', null, 'application/vnd.github+json', { onAttempt: onCall });
     if (!res || res.code !== 200 || !Array.isArray(res.data)) {
-      return null;
+      scan.incomplete = true;
+      return scan;
     }
 
     await scanCommentList(res.data, isMaintainerUser, appId, scan);
@@ -72,6 +80,11 @@ export async function scanPrComments(
 
     if (res.data.length < 100) {
       break;
+    }
+    if (typeof hasHeadroom === 'function' && !hasHeadroom()) {
+      console.warn(`Comment scan for PR #${prNumber} stopped after page ${page}: no request budget left beyond the reserve.`);
+      scan.incomplete = true;
+      return scan;
     }
     page++;
   }

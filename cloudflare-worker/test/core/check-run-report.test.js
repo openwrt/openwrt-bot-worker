@@ -1,6 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { buildCheckRunPayloads, enqueueCheckRuns } from '../../src/handlers/pull-request/check-run-report.ts';
+import { aggregateReport } from '../../src/handlers/pull-request/report.ts';
 import { GitHubWriteQueue } from '../../src/core/github-write-queue.ts';
 
 describe('check-run-report lifecycle phase', () => {
@@ -85,5 +86,114 @@ describe('check-run-report lifecycle phase', () => {
     const responseBody = await errorResponse.text();
     assert.match(responseBody, /Failed to report status for PR #888/);
     assert.match(responseBody, /check-run "OpenWrt Makefiles" \(HTTP 500\)/);
+  });
+  // A long series fills the details past GitHub's limit and safeTruncate cuts
+  // the tail, so a coverage note appended there is the first thing dropped -
+  // including the sentence a neutral summary sends the reader to look for.
+  test('keeps the coverage note and the first finding inside truncated details', () => {
+    let formalityOutputText = '### Checking PR #123: big backport series (Formalities Audit)\n\n';
+    formalityOutputText += '#### Commit [0000001](https://github.com/commit/1) - mypkg: first:\n';
+    formalityOutputText += '  ❌ Commit to stable branch must be marked as cherry-picked\n\n';
+    for (let i = 2; i <= 200; i++) {
+      formalityOutputText += `#### Commit [000000${i}](https://github.com/commit/${i}) - mypkg: commit ${i}:\n`;
+      formalityOutputText += `  ✅ ${'subject, body and sign-off all check out '.repeat(16)}\n\n`;
+    }
+
+    const ctx = {
+      client: { budget: { limit: 50, used: 10, reserve: 15 } },
+      fileBatchLoader: { getBudgetSkipCount: () => 0 },
+      commitScanCapped: false,
+      commits: new Array(200).fill({ sha: 'dummy' })
+    };
+    const patchesResult = {
+      patchUnavailable: false,
+      upstreamComparisonSkips: 3,
+      upstreamFetchFailures: 0,
+      commitDetailsIncomplete: false
+    };
+    const outcome = {
+      allFormalityErrors: ['**Commit [0000001](https://github.com/commit/1)**:\n- not marked as cherry-picked'],
+      allPrWarnings: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      formalityOutputText,
+      makefileOutputText: 'Makefile OK\n',
+      patchesOutputText: 'Patches OK\n',
+      patchesHeading: '## Patches\n',
+      patchChecksIncomplete: false,
+      makefileChecksIncomplete: false,
+      formalityChecksIncomplete: false,
+      makefileReportedFinding: false,
+      patchesReportedFinding: false,
+      unreadPatchNotes: new Set()
+    };
+
+    const report = aggregateReport(ctx, patchesResult, outcome);
+    const [gitRun] = buildCheckRunPayloads(report, 'sha-abc-123');
+    const text = gitRun.payload.output.text;
+
+    assert.match(text, /Output truncated due to GitHub character limit/,
+      'the body has to be long enough that the cut happens');
+    assert.match(text, /Upstream comparison skipped for 3 cherry-picked commit\(s\)/,
+      'the note explaining the gap has to survive the cut');
+    assert.match(text, /must be marked as cherry-picked/,
+      'the finding the contributor has to act on has to survive the cut');
+  });
+
+  // The same cut, over the one reason that was left as a per-commit line: the
+  // unfetchable upstream turns the check neutral, and on a long series the
+  // commit carrying it is below the cut, so the summary would send the reader
+  // to a detail page that no longer says why.
+  test('keeps the reason for a neutral upstream comparison inside truncated details', () => {
+    let formalityOutputText = '### Checking PR #123: big backport series (Formalities Audit)\n\n';
+    for (let i = 1; i <= 200; i++) {
+      formalityOutputText += `#### Commit [000000${i}](https://github.com/commit/${i}) - mypkg: commit ${i}:\n`;
+      formalityOutputText += `  ✅ ${'subject, body and sign-off all check out '.repeat(16)}\n`;
+      formalityOutputText += i === 150
+        ? '  ⚠️ Could not fetch upstream commit def5678 from GitHub API (HTTP 404)\n\n'
+        : '\n';
+    }
+
+    const ctx = {
+      client: { budget: { limit: 50, used: 10, reserve: 15 } },
+      fileBatchLoader: { getBudgetSkipCount: () => 0 },
+      commitScanCapped: false,
+      commits: new Array(200).fill({ sha: 'dummy' })
+    };
+    const patchesResult = {
+      patchUnavailable: false,
+      upstreamComparisonSkips: 0,
+      upstreamFetchFailures: 1,
+      commitDetailsIncomplete: false
+    };
+    const outcome = {
+      allFormalityErrors: [],
+      allPrWarnings: [],
+      allMakefileErrors: [],
+      allPatchesErrors: [],
+      formalityOutputText,
+      makefileOutputText: 'Makefile OK\n',
+      patchesOutputText: 'Patches OK\n',
+      patchesHeading: '## Patches\n',
+      patchChecksIncomplete: false,
+      makefileChecksIncomplete: false,
+      formalityChecksIncomplete: false,
+      makefileReportedFinding: false,
+      patchesReportedFinding: false,
+      unreadPatchNotes: new Set()
+    };
+
+    const report = aggregateReport(ctx, patchesResult, outcome);
+    assert.strictEqual(report.formalityConclusion, 'neutral');
+
+    const [gitRun] = buildCheckRunPayloads(report, 'sha-abc-123');
+    const text = gitRun.payload.output.text;
+
+    assert.match(text, /Output truncated due to GitHub character limit/,
+      'the body has to be long enough that the cut happens');
+    assert.doesNotMatch(text, /HTTP 404/,
+      'the per-commit line this stands in for is below the cut, which is the point');
+    assert.match(text, /1 upstream commit\(s\) could not be fetched from GitHub, so those backports were not compared with the commits they were taken from/,
+      'the reason the summary points at has to survive the cut');
   });
 });

@@ -1359,7 +1359,7 @@ function conffilesLiteralCovers(literals, path, pathSegments) {
   return false;
 }
 
-export function validateConffilesCoverage(conffilesMap, installedFiles, defaultPkg, errors, successes, definedPackages = new Set(), isAddedMakefile = true, warnings = null) {
+export function validateConffilesCoverage(conffilesMap, installedFiles, defaultPkg, errors, successes, definedPackages = new Set(), isAddedMakefile = true, notices = null) {
   if (conffilesMap.size === 0) {
     // A Makefile with no conffiles block at all is only asked for one when the
     // pull request wrote the Makefile. Asking an established package for a
@@ -1455,7 +1455,7 @@ export function validateConffilesCoverage(conffilesMap, installedFiles, defaultP
     if (!hasPath) {
       if (tooVague) {
         unverifiableCount++;
-        warnings?.push(`Could not verify that 'define Package/${targetPkg}/conffiles' lists '${item.path}': its entries name the path only through unresolved make expansions.`);
+        notices?.push(`Could not verify that 'define Package/${targetPkg}/conffiles' lists '${item.path}': its entries name the path only through unresolved make expansions.`);
         continue;
       }
       missingCount++;
@@ -1474,13 +1474,18 @@ export function validateConffilesCoverage(conffilesMap, installedFiles, defaultP
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
   const errors = [];
   const successes = [];
+  // `warnings` carries the findings a repository asked to have reported as
+  // warnings; `notices` carries the gaps that stopped a check. Both print as
+  // the same indented line, but only a finding can have been inherited from an
+  // upstream commit, which is what the report's backport caveat is about.
   const warnings = [];
+  const notices = [];
   const pendingAsyncChecks = [];
   let isValidationIncomplete = false;
   const subject = (fullCommit.commit.message || '').split("\n")[0].trim();
 
   if (!commitPatch) {
-    return { errors: [], successes: ["✅ No codebase text files changed to analyze"], warnings: [] };
+    return { errors: [], successes: ["✅ No codebase text files changed to analyze"], warnings: [], notices: [] };
   }
 
   let isNewPackageThisCommit = false;
@@ -1668,7 +1673,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
               try {
                 const headText = await fetchFileContent(filePath);
                 if (headText === null || headText === undefined) {
-                  warnings.push(`Could not fetch '${filePath}' to verify indirect PKG_VERSION.`);
+                  notices.push(`Could not fetch '${filePath}' to verify indirect PKG_VERSION.`);
                   return { incomplete: true };
                 }
                 const resolvedFromHead = resolveIndirect(headText);
@@ -1676,7 +1681,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
                   validateVersionAgainstCommit(resolvedFromHead.trim(), filePath);
                 }
               } catch (err) {
-                warnings.push(`Could not complete PKG_VERSION check because of an error fetching '${filePath}': ${err?.message || err}`);
+                notices.push(`Could not complete PKG_VERSION check because of an error fetching '${filePath}': ${err?.message || err}`);
                 return { incomplete: true };
               }
             });
@@ -2074,41 +2079,41 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         const { files: installedConfigFiles, undetermined: hasUndeterminedConfigPath } = resolveConfigEntries(rawChunk);
         if (hasUndeterminedConfigPath || installedConfigFiles.length === 0) {
           if (isAddedMakefile || typeof fetchFileContent !== 'function') {
-            warnings.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
+            notices.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
             isValidationIncomplete = true;
           } else {
             pendingAsyncChecks.push(async () => {
               try {
                 const headText = await fetchFileContent(filePath);
                 if (headText === null || headText === undefined) {
-                  warnings.push(`Could not fetch '${filePath}' to verify conffiles section.`);
+                  notices.push(`Could not fetch '${filePath}' to verify conffiles section.`);
                   return { incomplete: true };
                 }
                 const resolvedFromHead = resolveConfigEntries(headText);
                 if (resolvedFromHead.undetermined || resolvedFromHead.files.length === 0) {
-                  warnings.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
+                  notices.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
                   return { incomplete: true };
                 }
                 const headMap = extractConffilesMap(headText);
                 const headDefinedPkgs = extractDefinedPackages(headText);
-                const res = validateConffilesCoverage(headMap, resolvedFromHead.files, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, warnings);
+                const res = validateConffilesCoverage(headMap, resolvedFromHead.files, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, notices);
                 if (res?.incomplete) return { incomplete: true };
               } catch (err) {
-                warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
+                notices.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
                 return { incomplete: true };
               }
             });
           }
         } else if (isAddedMakefile) {
           const diffMap = extractConffilesMap(rawChunk);
-          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, warnings);
+          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, notices);
           if (res?.incomplete) isValidationIncomplete = true;
         } else if (typeof fetchFileContent === 'function') {
           pendingAsyncChecks.push(async () => {
             try {
               const headText = await fetchFileContent(filePath);
               if (headText === null || headText === undefined) {
-                warnings.push(`Could not fetch '${filePath}' to verify conffiles section.`);
+                notices.push(`Could not fetch '${filePath}' to verify conffiles section.`);
                 return { incomplete: true };
               }
               const headMap = extractConffilesMap(headText);
@@ -2126,16 +2131,16 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
                 // the assignment behind a '$(PKG_NAME)' recipe name, so name
                 // them against the text the blocks are read from.
                 : installedConfigFiles.map(file => ({ ...file, pkg: resolveHeadPkgName(file.pkg) }));
-              const res = validateConffilesCoverage(headMap, entries, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, warnings);
+              const res = validateConffilesCoverage(headMap, entries, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, notices);
               if (res?.incomplete) return { incomplete: true };
             } catch (err) {
-              warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
+              notices.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
               return { incomplete: true };
             }
           });
         } else if (MakefileHasConffiles) {
           const diffMap = extractConffilesMap(rawChunk);
-          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, warnings);
+          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, notices);
           if (res?.incomplete) isValidationIncomplete = true;
         }
       }
@@ -2632,17 +2637,18 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         const res = await check();
         if (res?.incomplete) incomplete = true;
       } catch (err) {
-        warnings.push(`Could not complete async Makefile validation: ${err?.message || err}`);
+        notices.push(`Could not complete async Makefile validation: ${err?.message || err}`);
         incomplete = true;
       }
     }
-    return { errors, successes, warnings, incomplete };
+    return { errors, successes, warnings, notices, incomplete };
   })();
 
   return Object.assign(promise, {
     errors,
     successes,
     warnings,
+    notices,
     incomplete: isValidationIncomplete
   });
 }
@@ -3386,11 +3392,15 @@ const isStrictInt = (v) => typeof v === 'string' && /^\d+$/.test(v.trim());
 
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
-  const warnings = [];
+  // The gaps that stopped the audit, apart from whatever it found; see
+  // validateMakefileContext. Findings are errors here, which the report
+  // downgrades to warnings where a repository asked it to. `notes` below is
+  // advice about the rule, not about this run.
+  const notices = [];
   const successes = [];
 
   if (CONFIG.check_pkg_release === false || CONFIG.check_pkg_release === 'disabled') {
-    return { errors, warnings, successes, notes: [] };
+    return { errors, notices, successes, notes: [] };
   }
 
   // 1. Collect all modified package roots and file changes.
@@ -3429,7 +3439,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       return {
         errors: [],
         successes: [],
-        warnings: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        notices: ["Could not safely verify commit boundaries in PR-wide patch series"],
         notes: [],
         incomplete: true
       };
@@ -3503,8 +3513,8 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   }
 
   if (pkgRoots.size > 15) {
-    warnings.push(`Package release bump audit skipped: PR modifies ${pkgRoots.size} packages. Batch updates of >15 packages are not automatically audited to prevent hitting API rate/subrequest limits.`);
-    return { errors, warnings, successes, notes: [], incomplete: true };
+    notices.push(`Package release bump audit skipped: PR modifies ${pkgRoots.size} packages. Batch updates of >15 packages are not automatically audited to prevent hitting API rate/subrequest limits.`);
+    return { errors, notices, successes, notes: [], incomplete: true };
   }
 
   // 2. Process each package root — each root's Makefile-diff analysis runs
@@ -3924,7 +3934,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
   // one package: a PR touching twelve Makefiles used to repeat it twelve times.
   const notes = errors.some(e => MISSING_BUMP_ERROR.test(e)) ? [MINOR_CHANGE_ADVICE] : [];
 
-  return { errors, warnings, successes, notes };
+  return { errors, notices, successes, notes };
 }
 
 // PKG_HASH (or PKG_MIRROR_HASH for repository checkouts) pins the exact
@@ -3948,10 +3958,13 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
   const errors = [];
   const warnings = [];
   const findings = [];
+  // The gaps that stopped the audit, apart from whatever it found; see
+  // validateMakefileContext.
+  const notices = [];
   const successes = [];
 
   if (CONFIG.check_pkg_hash === false || CONFIG.check_pkg_hash === 'disabled') {
-    return { errors, warnings, findings, successes };
+    return { errors, warnings, notices, findings, successes };
   }
 
   const addedFiles = new Set();
@@ -3972,7 +3985,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       return {
         errors: [],
         successes: [],
-        warnings: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        warnings: [],
+        notices: ["Could not safely verify commit boundaries in PR-wide patch series"],
         findings: [],
         incomplete: true
       };
@@ -4011,8 +4025,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
 
   const paths = [...makefiles].filter(f => !deletedFiles.has(f) || addedFiles.has(f));
   if (paths.length > 15) {
-    warnings.push(`Package hash audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
-    return { errors, warnings, findings, successes, incomplete: true };
+    notices.push(`Package hash audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
+    return { errors, warnings, notices, findings, successes, incomplete: true };
   }
 
   // The raw right-hand side, unresolved: a '$(...)' reference marks the value
@@ -4140,7 +4154,7 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
     successes.push(...result.successes);
   }
 
-  return { errors, warnings, findings, successes };
+  return { errors, warnings, notices, findings, successes };
 }
 
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {
@@ -4148,11 +4162,11 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
   const successes = [];
 
   if (CONFIG.check_uci_config === false || CONFIG.check_uci_config === 'disabled') {
-    return { errors, successes, warnings: [], incomplete: false };
+    return { errors, successes, notices: [], incomplete: false };
   }
 
   if (!commitPatch) {
-    return { errors, successes, warnings: [], incomplete: false };
+    return { errors, successes, notices: [], incomplete: false };
   }
 
   const { deletedFiles } = parseDiffFileStates(commitPatch);
@@ -4278,7 +4292,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
         return {
           errors: [],
           successes: [],
-          warnings: [`Could not complete UCI config validation for '${file}': ${err?.message || err}`],
+          notices: [`Could not complete UCI config validation for '${file}': ${err?.message || err}`],
           incomplete: true
         };
       }
@@ -4286,7 +4300,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
         return {
           errors: [],
           successes: [],
-          warnings: [`Could not fetch content for configuration file '${file}' to validate UCI syntax`],
+          notices: [`Could not fetch content for configuration file '${file}' to validate UCI syntax`],
           incomplete: true
         };
       }
@@ -4317,16 +4331,18 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
     return empty;
   }
 
-  const warnings = [];
+  // Findings here are errors; `notices` carries the files the audit could not
+  // read, which is what leaves it incomplete.
+  const notices = [];
   let incomplete = false;
   const results = await Promise.all(changedFiles.map(processFile));
   for (const result of results) {
     if (result.errors) errors.push(...result.errors);
     if (result.successes) successes.push(...result.successes);
-    if (result.warnings) warnings.push(...result.warnings);
+    if (result.notices) notices.push(...result.notices);
     if (result.incomplete) incomplete = true;
   }
 
-  return { errors, successes, warnings, incomplete };
+  return { errors, successes, notices, incomplete };
 }
 

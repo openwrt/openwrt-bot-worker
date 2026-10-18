@@ -1,5 +1,6 @@
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from '../../config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from '../../labeler.js';
+import { ensureLabelExists } from '../../github.js';
 import { fetchLivePrState, type PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult } from './patches.ts';
 import type { AggregatedReport } from './report.ts';
@@ -11,7 +12,7 @@ export async function syncLabels(
   report: AggregatedReport,
   queue: GitHubWriteQueue
 ): Promise<void> {
-  const { prNumber, repoFullname, baseBranch, client, existingLabels, config, labelerText, action } = ctx;
+  const { prNumber, repoFullname, baseBranch, token, client, existingLabels, config, labelerText, action } = ctx;
   const { allPassed } = report;
   const { packageState, packageStateKnown, usePrWidePatch, prPatch, commitDetails } = patchesResult;
 
@@ -47,7 +48,12 @@ export async function syncLabels(
     if (!verdictMoved && !currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       requestLabel(LABEL_GUIDELINES, 'e11d48', 'Pull request does not follow formatting guidelines');
     }
-  } else if (!report.isValidationIncomplete) {
+  } else {
+    // The label says a violation was found, and none was. An audit that could
+    // not read everything says so through its neutral check run, which is
+    // where that uncertainty belongs: leaving the label on instead would keep
+    // it on a pull request whose every reported problem is fixed, and the
+    // nightly scan acts on this label - it would mark that pull request stale.
     if (!verdictMoved && currentPrLabels.has(LABEL_GUIDELINES.toLowerCase())) {
       enqueueRemove(spelledAsOnPr(LABEL_GUIDELINES));
     }
@@ -112,27 +118,19 @@ export async function syncLabels(
     }
   }
 
-  // Ensure labels exist before adding them to the PR
+  // Ensure labels exist before adding them to the PR. The shared helper is
+  // what keeps the 422 GitHub answers for a label another writer created
+  // first out of the error log. It says false both for a label that was
+  // already there and for a create GitHub refused, and the set it records
+  // confirmed labels in is what tells the two apart: a 403 on POST /labels is
+  // what a missing issues:write permission looks like, and it has to answer
+  // the webhook 502 instead of passing as a write that never happened.
+  // The set is this run's own when the repository listing could not be read.
+  const confirmedLabels = existingLabels ?? new Set<string>();
   for (const lbl of labelsToEnsure) {
     queue.enqueue(`ensure label "${lbl.name}"`, async () => {
-      if (existingLabels?.has(lbl.name.toLowerCase())) {
-        return { code: 200 };
-      }
-      const url = `https://api.github.com/repos/${repoFullname}/labels`;
-      const res = await client.trackedApiCall(url, 'POST', {
-        name: lbl.name,
-        color: lbl.color || 'ededed',
-        description: lbl.description || ''
-      });
-      if (res.code === 422) {
-        existingLabels?.add(lbl.name.toLowerCase());
-        return { code: 200 };
-      }
-      if (res.code >= 200 && res.code < 300) {
-        existingLabels?.add(lbl.name.toLowerCase());
-        return { code: 200 };
-      }
-      return res;
+      const created = await ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, confirmedLabels, () => { client.budget.used++; });
+      return (created || confirmedLabels.has(lbl.name.toLowerCase())) ? { code: 200 } : { code: 502 };
     });
   }
 

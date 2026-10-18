@@ -18,12 +18,22 @@ export interface CommitDetail {
   upstreamFetchError: string | null;
 }
 
+// Counted per pass: an abandoned per-commit pass keeps resolving after the
+// PR-wide pass has taken over, and a comparison one of its commits skips then
+// is not one the pass whose result is used ever made.
+interface UpstreamCounts {
+  comparisonSkips: number;
+  fetchFailures: number;
+}
+
 export interface ResolvedPatchesResult {
   usePrWidePatch: boolean;
   prPatch: string | null;
   patchUnavailable: boolean;
   commitDetails: CommitDetail[];
   upstreamComparisonSkips: number;
+  upstreamFetchFailures: number;
+  commitDetailsIncomplete: boolean;
   packageState: { isNewPackage: boolean; isDroppedPackage: boolean };
   packageStateKnown: boolean;
   splitCommitPatches?: Map<string, string>;
@@ -35,7 +45,10 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
   let usePrWidePatch = commits.length > 15;
   let prPatch: string | null = null;
   let patchUnavailable = false;
-  let upstreamComparisonSkips = 0;
+  // Comparisons the budget never allowed, kept apart from the ones GitHub
+  // refused to serve: only the first is a matter of this PR being too large.
+  let upstreamCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0 };
+  let commitDetailsIncomplete = false;
 
   let prWidePatchText: string | null = null;
   if (commits.length > 1) {
@@ -87,7 +100,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     usePrWidePatch = true;
   }
 
-  const mapCommitData = async (commitData: any, fetchPatch: boolean): Promise<CommitDetail> => {
+  const mapCommitData = async (commitData: any, fetchPatch: boolean, counts: UpstreamCounts): Promise<CommitDetail> => {
     const commitItemType = (commitData === null)
       ? 'null'
       : (Array.isArray(commitData) ? 'array' : typeof commitData);
@@ -117,8 +130,13 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
         fileBatchLoader.setRefSource(sha, 'base');
       }
 
+      // The headroom is asked again here: canFetchCommits above budgeted one
+      // call per commit, and this retry is a second one for the same commit.
+      // Without the question a fork PR whose commits all miss in the base
+      // repo spends the reserve the closing writes are kept for.
       const headRepoFullname = prData.head?.repo?.full_name;
-      if (patchRes && (patchRes.code === 404 || patchRes.code === 422) && headRepoFullname && headRepoFullname !== repoFullname) {
+      if (patchRes && (patchRes.code === 404 || patchRes.code === 422) && headRepoFullname && headRepoFullname !== repoFullname
+          && (typeof client.hasHeadroom !== 'function' || client.hasHeadroom())) {
         console.warn(`Commit ${sha} not found in base repo ${repoFullname} (HTTP ${patchRes.code}). Retrying fetch from head repo ${headRepoFullname}...`);
         const forkDetailUrl = `https://api.github.com/repos/${headRepoFullname}/commits/${sha}`;
         patchRes = await client.optionalApiCall(forkDetailUrl, 'GET', null, 'application/vnd.github.patch', { silent: true });
@@ -142,11 +160,15 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     if (isBackportPr) {
       const commitMsg = commitData.commit?.message || '';
       const match = commitMsg.match(CHERRY_PICK_MARKER);
-      if (match && (!fetchPatch || !commitPatch)) {
-        upstreamComparisonSkips++;
-      } else if (match && client.hasHeadroom && !client.hasHeadroom()) {
-        upstreamComparisonSkips++;
-      } else if (match && commitPatch) {
+      // One upstream lookup per cherry-picked commit, and a backport PR can
+      // carry hundreds of them, so the headroom decides. It does not depend on
+      // this commit's own patch: without it the two cannot be compared for a
+      // verbatim match, but the upstream diff is still what the release-bump
+      // and style audits filter the downstream findings against, and in
+      // PR-wide mode no commit has a patch of its own.
+      if (match && client.hasHeadroom && !client.hasHeadroom()) {
+        counts.comparisonSkips++;
+      } else if (match) {
         const targetSha = match[1];
         upstreamSha = targetSha;
         const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${targetSha}`;
@@ -156,9 +178,14 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
             fileBatchLoader.setRefSource(targetSha, 'base');
           }
           upstreamPatch = upstreamRes.raw;
-          isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
+          // "Verbatim" is what lets the per-commit audits be skipped, so it is
+          // only claimed where those audits run: in PR-wide mode the whole
+          // diff is audited at once and no commit is waved through.
+          if (fetchPatch && commitPatch) {
+            isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
+          }
         } else {
-          upstreamComparisonSkips++;
+          counts.fetchFailures++;
           upstreamFetchError = `Could not fetch upstream commit ${targetSha.slice(0, 7)} from GitHub API (HTTP ${upstreamRes?.code})`;
         }
       }
@@ -178,8 +205,10 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
 
   let commitDetails: CommitDetail[] = [];
   if (!usePrWidePatch) {
+    const perCommitCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0 };
+    upstreamCounts = perCommitCounts;
     try {
-      commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, true)));
+      commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, true, perCommitCounts)));
     } catch (e: any) {
       console.warn(`Failed to fetch individual commit patches, falling back to PR-wide patch: ${e.message}`);
       usePrWidePatch = true;
@@ -199,7 +228,21 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
   }
 
   if (usePrWidePatch) {
-    commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false)));
+    // This pass recomputes every commit from scratch, so it counts into its
+    // own object: what the abandoned per-commit pass counted, before or after
+    // this one took over, is not what the reported numbers are about.
+    const prWideCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0 };
+    upstreamCounts = prWideCounts;
+    try {
+      commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false, prWideCounts)));
+    } catch (e: any) {
+      // Without this the whole webhook answers 500 and the pull request gets
+      // no check-runs at all. An audit with no commits to show is reported as
+      // incomplete, which is neutral rather than a pass.
+      console.warn(`Failed to resolve commit details for the PR-wide patch: ${e.message}`);
+      commitDetails = [];
+      commitDetailsIncomplete = true;
+    }
   }
 
   const scannedPatches = usePrWidePatch
@@ -223,7 +266,9 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     prPatch,
     patchUnavailable,
     commitDetails,
-    upstreamComparisonSkips,
+    upstreamComparisonSkips: upstreamCounts.comparisonSkips,
+    upstreamFetchFailures: upstreamCounts.fetchFailures,
+    commitDetailsIncomplete,
     packageState,
     packageStateKnown,
     splitCommitPatches

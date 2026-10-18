@@ -155,7 +155,9 @@ describe('comment-report', () => {
       assert.strictEqual(queue.statusWrites[0].code, 200);
     });
 
-    test('skips PR comment sync when live PR state verification fails with HTTP error', async () => {
+    // The payload is the state this run was sent for, so a re-read GitHub did
+    // not answer is no reason to leave the contributor without the report.
+    test('still posts the PR comment when the live PR state could not be re-read', async () => {
       const queue = new GitHubWriteQueue(1);
       const ctx = {
         config: { enable_comments: true },
@@ -167,7 +169,40 @@ describe('comment-report', () => {
         client: {
           optionalApiCall: async () => ({ code: 500, data: null, raw: 'Internal Server Error' })
         },
-        getCommentsScanWithRetry: async () => ({ existingCommentId: null })
+        getCommentsScanWithRetry: async () => ({ existingCommentId: null, incomplete: false })
+      };
+      const report = {
+        allPassed: false,
+        allFormalityErrors: ['Error'],
+        allMakefileErrors: [],
+        allPatchesErrors: [],
+        allPrWarnings: []
+      };
+
+      await syncPrComment(ctx, report, queue, {});
+      assert.deepStrictEqual(queue.queue.map(([what]) => what), ['PR comment']);
+    });
+
+    // An unfinished scan cannot say whether this app already reported here, and
+    // a second report on the same pull request is worse than none.
+    test('leaves the comment alone when the thread could not be read in full', async () => {
+      const queue = new GitHubWriteQueue(1);
+      const ctx = {
+        config: { enable_comments: true },
+        repoFullname: 'openwrt/openwrt',
+        prNumber: 100,
+        headSha: 'head123',
+        baseBranch: 'main',
+        prData: { body: 'original body' },
+        client: {
+          optionalApiCall: async () => ({ code: 200, data: { head: { sha: 'head123' }, base: { ref: 'main' }, body: 'original body' } })
+        },
+        getCommentsScanWithRetry: async () => ({
+          hasBranchBypassComment: false,
+          hasCherryPickBypassComment: false,
+          existingCommentId: null,
+          incomplete: true
+        })
       };
       const report = {
         allPassed: false,

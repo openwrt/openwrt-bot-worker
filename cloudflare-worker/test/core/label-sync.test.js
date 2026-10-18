@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import { syncLabels } from '../../src/handlers/pull-request/label-sync.ts';
 import { loadPullRequestContext } from '../../src/handlers/pull-request/context.ts';
 import { GitHubWriteQueue } from '../../src/core/github-write-queue.ts';
+import { createGitHubClient } from '../../src/core/github-client.ts';
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE } from '../../src/config.js';
 
 describe('label-sync lifecycle phase and error handling', () => {
@@ -69,6 +70,21 @@ describe('label-sync lifecycle phase and error handling', () => {
     allPrWarnings: []
   });
 
+  // Label creation goes through the shared ensureLabelExists, which issues its
+  // own request, so a test that executes the queue has to answer that one too.
+  const withLabelCreates = async (answer, fn) => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      if (url.endsWith('/labels') && options?.method === 'POST') return answer();
+      return new Response('{}', { status: 200 });
+    };
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  };
+
   test('enqueues label creation and PR label assignment in correct order', async () => {
     const queue = new GitHubWriteQueue(42);
     const ctx = createMockContext();
@@ -81,14 +97,17 @@ describe('label-sync lifecycle phase and error handling', () => {
     assert.ok(queue.queue.some(([what]) => what === `ensure label "${LABEL_ADD_PACKAGE}"`));
     assert.ok(queue.queue.some(([what]) => what === 'labels'));
 
-    const error = await queue.execute();
+    const error = await withLabelCreates(
+      () => new Response(JSON.stringify({ id: 1 }), { status: 201 }),
+      () => queue.execute()
+    );
     assert.strictEqual(error, null);
     assert.strictEqual(queue.statusWrites.every(w => w.code === 200), true);
   });
 
-  test('returns 502 Bad Gateway when label creation fails in GitHubWriteQueue', async () => {
+  test('returns 502 Bad Gateway when the label assignment fails in GitHubWriteQueue', async () => {
     const queue = new GitHubWriteQueue(42);
-    // Simulating API failure (HTTP 500) during label creation or addition
+    // Simulating API failure (HTTP 500) during label addition
     const ctx = createMockContext({
       trackedApiResult: { code: 500, data: null, raw: 'Internal Server Error', headers: { get: () => null } }
     });
@@ -97,12 +116,84 @@ describe('label-sync lifecycle phase and error handling', () => {
 
     await syncLabels(ctx, patches, report, queue);
 
-    const errorResponse = await queue.execute();
+    const errorResponse = await withLabelCreates(
+      () => new Response(JSON.stringify({ id: 1 }), { status: 201 }),
+      () => queue.execute()
+    );
     assert.ok(errorResponse instanceof Response);
     assert.strictEqual(errorResponse.status, 502);
     const body = await errorResponse.text();
     assert.match(body, /Failed to report status for PR #42/);
     assert.match(body, /HTTP 500/);
+  });
+
+  // The shared helper says false both for a label that was already there and
+  // for a create GitHub refused, so a 403 on POST /repos/:o/:r/labels - what
+  // a missing issues:write permission looks like - was recorded as a write
+  // that succeeded, and the webhook answered 200 with nothing to show for it.
+  test('returns 502 Bad Gateway when the label create is refused', async () => {
+    const queue = new GitHubWriteQueue(42);
+    const ctx = createMockContext();
+    const patches = createMockPatches();
+    const report = createMockReport({ allPassed: false });
+
+    await syncLabels(ctx, patches, report, queue);
+
+    const errorResponse = await withLabelCreates(
+      () => new Response('Resource not accessible by integration', { status: 403 }),
+      () => queue.execute()
+    );
+    assert.ok(errorResponse instanceof Response, 'a refused label create is a failed write');
+    assert.strictEqual(errorResponse.status, 502);
+    const body = await errorResponse.text();
+    assert.match(body, /ensure label/, body);
+  });
+
+  // Same on the Dependabot path, where the label listing is never fetched and
+  // the create is blind: a refused one still has to reach the delivery log.
+  test('returns 502 response when a blind Dependabot label create is refused', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      // The repository's label collection, not the pull request's labels: the
+      // labels themselves go on fine, only creating them is refused.
+      if (url.endsWith('/labels') && !url.includes('/issues/') && options?.method === 'POST') {
+        return new Response('Resource not accessible by integration', { status: 403 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    try {
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          url: 'https://api.github.com/repos/openwrt/openwrt/pulls/99',
+          user: { login: 'dependabot[bot]', type: 'Bot' },
+          head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'sha123' },
+          base: { ref: 'main', sha: 'base123' },
+          labels: []
+        },
+        repository: { full_name: 'openwrt/openwrt' },
+        installation: { id: 123 }
+      };
+
+      const result = await loadPullRequestContext(
+        payload,
+        'pull_request',
+        {},
+        'fake-token',
+        'openwrt/openwrt',
+        null,
+        0
+      );
+
+      assert.strictEqual(result.kind, 'response');
+      assert.strictEqual(result.response.status, 502);
+      const text = await result.response.text();
+      assert.match(text, /ensure label "dependencies"/, text);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test('returns 502 response when Dependabot label addition fails in context loading', async () => {
@@ -149,7 +240,12 @@ describe('label-sync lifecycle phase and error handling', () => {
     }
   });
 
-  test('does not remove guidelines label when validation is incomplete even if allPassed is true', async () => {
+  // The label says a violation was found, so when none was it comes off even
+  // if the audit could not read everything: the neutral check run is where
+  // that uncertainty belongs. Leaving it on would keep it on a pull request
+  // whose every reported problem is fixed, and the nightly scan acts on this
+  // label - it would mark that pull request stale and then close it.
+  test('removes the guidelines label on a clean run whose audit was incomplete', async () => {
     const queue = new GitHubWriteQueue(42);
     const existingLabels = new Set([LABEL_GUIDELINES.toLowerCase()]);
     const ctx = createMockContext({
@@ -181,11 +277,16 @@ describe('label-sync lifecycle phase and error handling', () => {
 
     await syncLabels(ctx, patches, report, queue);
 
-    const removedLabels = queue.queue.filter(([what]) => what === 'remove label');
-    assert.strictEqual(removedLabels.length, 0);
+    const removals = queue.queue
+      .map(([what]) => what)
+      .filter((what) => typeof what === 'string' && what.startsWith('label removal '));
+    assert.deepStrictEqual(removals, [`label removal "${LABEL_GUIDELINES}"`]);
   });
 
-  test('fails closed and does not touch labels when live PR fetch returns 500 error', async () => {
+  // The re-read is an improvement on the payload, not a precondition for it:
+  // the payload still describes the pull request this run was sent for, so a
+  // failed re-read falls back to it instead of suppressing every label.
+  test('decides from the payload when the live PR fetch returns 500', async () => {
     const queue = new GitHubWriteQueue(42);
     const existingLabels = new Set([LABEL_GUIDELINES.toLowerCase()]);
     const ctx = createMockContext({
@@ -209,10 +310,13 @@ describe('label-sync lifecycle phase and error handling', () => {
 
     await syncLabels(ctx, patches, report, queue);
 
-    assert.strictEqual(queue.queue.length, 0);
+    // The payload adds a package Makefile and carries no labels yet.
+    assert.ok(queue.queue.some(([what]) => what === `ensure label "${LABEL_ADD_PACKAGE}"`),
+      `labelling must carry on from the payload: ${JSON.stringify(queue.queue.map(([w]) => w))}`);
+    assert.ok(queue.queue.some(([what]) => what === 'labels'));
   });
 
-  test('does not remove stale label when live PR state verification returns HTTP 500 error', async () => {
+  test('removes the stale label from the payload when the live PR fetch returns 500', async () => {
     const queue = new GitHubWriteQueue(42);
     const existingLabels = new Set(['stale']);
     const ctx = createMockContext({
@@ -225,6 +329,7 @@ describe('label-sync lifecycle phase and error handling', () => {
       }
     });
     ctx.action = 'synchronize';
+    ctx.prData = { ...ctx.prData, labels: [{ name: 'stale' }] };
     const patches = createMockPatches();
     const report = {
       allPassed: true,
@@ -236,7 +341,46 @@ describe('label-sync lifecycle phase and error handling', () => {
     };
 
     await syncLabels(ctx, patches, report, queue);
-    assert.strictEqual(queue.queue.length, 0);
+
+    assert.ok(queue.queue.some(([what]) => what === 'label removal "stale"'),
+      `new commits take the stale marker off: ${JSON.stringify(queue.queue.map(([w]) => w))}`);
+  });
+
+  // 422 is GitHub for "that label already exists", which is a race with
+  // another writer rather than a failure. The shared helper silences it; an
+  // inline create logs it to console.error and makes the logs look broken.
+  test('does not log an error when a label create races another writer to 422', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalError = console.error;
+    const errors = [];
+    console.error = (...args) => { errors.push(args.join(' ')); };
+    globalThis.fetch = async (url, options) => {
+      // The repository's label collection, not the pull request's labels.
+      if (url.endsWith('/labels') && !url.includes('/issues/') && options?.method === 'POST') {
+        return new Response(JSON.stringify({ message: 'Validation Failed' }), { status: 422 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    try {
+      const queue = new GitHubWriteQueue(42);
+      // A real client, because whether the 422 is silenced is decided inside
+      // githubApiCall and a stubbed client never reaches it.
+      const ctx = createMockContext({
+        client: createGitHubClient('fake-token', { limit: 50, used: 0, reserve: 5 })
+      });
+      const patches = createMockPatches();
+      const report = createMockReport({ allPassed: false });
+
+      await syncLabels(ctx, patches, report, queue);
+      const error = await queue.execute();
+
+      assert.strictEqual(error, null, 'a label that already exists is not a failed write');
+      assert.deepStrictEqual(errors, [], `a benign 422 must not be logged: ${errors.join(' | ')}`);
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.error = originalError;
+    }
   });
 
   test('does not remove stale label when live PR head SHA moved (stale event)', async () => {

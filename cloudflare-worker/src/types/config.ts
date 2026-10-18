@@ -121,23 +121,37 @@ const STRING_ARRAY_FIELDS = new Set([
 export function parseAndValidateConfig(rawConfigText: string | null): {
   config: FormalitiesConfig;
   error: string | null;
+  // `true` when only the fields named in `error` fell back to their defaults
+  // and the rest of the file is in `config`; `false` when the file could not
+  // be read at all and every setting is a default.
+  partial: boolean;
 } {
   let config: FormalitiesConfig = { ...(DEFAULT_CONFIG as FormalitiesConfig) };
   let error: string | null = null;
+  let partial = false;
 
   if (!rawConfigText) {
-    return { config, error };
+    return { config, error, partial };
   }
 
   try {
     const parsed = JSON.parse(rawConfigText);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       error = `it does not contain a JSON object (got ${parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed})`;
-      return { config, error };
+      return { config, error, partial };
     }
 
     const fieldErrors: string[] = [];
+    // Every field that passed. One unusable setting is no reason to throw away
+    // the ones beside it: discarding the file wholesale silently turns options
+    // the repository did configure back to their defaults, which reads as the
+    // bot ignoring the configuration rather than as one typo.
+    // Null-prototype, so a field literally named `__proto__` is kept as an
+    // ordinary key the way spreading the parsed object kept it.
+    const accepted: Record<string, unknown> = Object.create(null);
+
     for (const [key, val] of Object.entries(parsed)) {
+      const before = fieldErrors.length;
       if (val === null || val === undefined) {
         fieldErrors.push(`field "${key}" must not be null`);
         continue;
@@ -169,29 +183,34 @@ export function parseAndValidateConfig(rawConfigText: string | null): {
         }
       }
       // Unknown fields are tolerated for forward/backward compatibility
-    }
-
-    if (fieldErrors.length === 0) {
-      const softLen = typeof parsed.max_subject_len_soft === 'number'
-        ? parsed.max_subject_len_soft
-        : (config.max_subject_len_soft ?? 50);
-      const hardLen = typeof parsed.max_subject_len_hard === 'number'
-        ? parsed.max_subject_len_hard
-        : (config.max_subject_len_hard ?? 72);
-      if (softLen > hardLen) {
-        fieldErrors.push(`max_subject_len_soft (${softLen}) must not be greater than max_subject_len_hard (${hardLen})`);
+      if (fieldErrors.length === before) {
+        accepted[key] = val;
       }
     }
 
-    if (fieldErrors.length > 0) {
-      error = fieldErrors.join('; ');
-      return { config, error };
+    const softLen = typeof accepted.max_subject_len_soft === 'number'
+      ? accepted.max_subject_len_soft
+      : (config.max_subject_len_soft ?? 50);
+    const hardLen = typeof accepted.max_subject_len_hard === 'number'
+      ? accepted.max_subject_len_hard
+      : (config.max_subject_len_hard ?? 72);
+    if (softLen > hardLen) {
+      // Neither limit can be honoured on its own here, so the pair goes back
+      // to the defaults together.
+      fieldErrors.push(`max_subject_len_soft (${softLen}) must not be greater than max_subject_len_hard (${hardLen})`);
+      delete accepted.max_subject_len_soft;
+      delete accepted.max_subject_len_hard;
     }
 
-    config = { ...(DEFAULT_CONFIG as FormalitiesConfig), ...parsed };
+    config = { ...(DEFAULT_CONFIG as FormalitiesConfig), ...accepted };
+
+    if (fieldErrors.length > 0) {
+      error = fieldErrors.join('; ');
+      partial = true;
+    }
   } catch (e: any) {
     error = e.message;
   }
 
-  return { config, error };
+  return { config, error, partial };
 }

@@ -775,6 +775,50 @@ diff --git a/package/plain-pkg/Makefile b/package/plain-pkg/Makefile
     });
   }
 
+  // The report caveats findings, so the audit has to keep the gap that stopped
+  // one check apart from the finding another one made - a single result can
+  // carry both, and both print as the same indented line.
+  test('keeps a gap apart from a finding the configuration downgraded', async () => {
+    const patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -20,2 +20,4 @@ define Package/foo/install
++\t$(INSTALL_DIR) $(1)/etc
++\t$(INSTALL_CONF) ./files/my.cnf $(1)/$(DYNAMIC_DEST)/my.cnf
+diff --git a/package/utils/foo/files/my.cnf b/package/utils/foo/files/my.cnf
+--- /dev/null
++++ b/package/utils/foo/files/my.cnf
+@@ -0,0 +1 @@
++key = value
+\\ No newline at end of file
+`;
+    const headMakefile = `
+define Package/foo
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Foo
+endef
+
+define Package/foo/conffiles
+/etc/my.cnf
+endef
+`;
+    const res = await validateMakefileContext(
+      makeCommit('foo: install my.cnf'),
+      patch,
+      { ...CONFIG, check_trailing_newline: 'warning' },
+      existingPackage(),
+      'openwrt/packages',
+      async () => headMakefile
+    );
+
+    assert.strictEqual(res.incomplete, true);
+    assertSomeIncludes(res.warnings, 'missing a trailing newline', 'warnings');
+    assertSomeIncludes(res.notices, 'Could not safely determine installed configuration path', 'notices');
+    assertNoneIncludes(res.warnings, 'Could not ', 'warnings');
+  });
+
   test('accepts files with trailing newline', () => {
     const res = validate('foo: test', diff(gitAdded(FOO), '@@ -0,0 +1,1 @@', '+PKG_NAME:=foo'), {
       config: focused({ check_trailing_newline: true })

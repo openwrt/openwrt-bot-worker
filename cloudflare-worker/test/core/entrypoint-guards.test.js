@@ -8,7 +8,127 @@ import {
 import { handlePullRequestEvent } from '../../src/handlers/pull-request/index.ts';
 import { handleIssuesEvent } from '../../src/handlers/issues.ts';
 import worker from '../../src/index.js';
-import { calculateHmac } from '../github-mocks.js';
+import { calculateHmac, graphqlLabelsHandler } from '../github-mocks.js';
+
+// Drives one pull_request event from a protected head branch through the whole
+// handler with the request budget already down to its reserve, and returns the
+// check-runs it published. `thread` is what the REST comment listing serves.
+async function runProtectedBranchPr(thread) {
+  const originalFetch = globalThis.fetch;
+  const checkRuns = [];
+  const commit = {
+    sha: 'c0ffee1234567890123456789012345678901234',
+    html_url: 'https://github.com/test/repo/commit/c0ffee1',
+    parents: [{ sha: 'parent' }],
+    commit: {
+      message: 'readme: fix a typo\n\nSigned-off-by: John Doe <john@doe.com>',
+      author: { name: 'John Doe', email: 'john@doe.com' },
+      committer: { name: 'John Doe', email: 'john@doe.com' }
+    }
+  };
+
+  globalThis.fetch = async (url, options) => {
+    const method = options?.method || 'GET';
+    { const lr = graphqlLabelsHandler(url, options, []); if (lr) return lr; }
+    if (url.includes('/contents/.github/formalities.json')) {
+      return new Response(JSON.stringify({
+        check_branch: true,
+        require_linked_github_account: false,
+        require_body: false,
+        check_uci_config: false,
+        check_pkg_release: false
+      }), { status: 200 });
+    }
+    if (url.includes('/contents/')) return new Response('Not Found', { status: 404 });
+    if (url.includes('/pulls/123/commits')) {
+      return new Response(JSON.stringify(url.includes('page=1') ? [commit] : []), { status: 200 });
+    }
+    if (url.includes('/issues/123/comments')) {
+      // The setup query re-enters this listing for its inline comments. A
+      // report by some other app there is what sends the run down the REST
+      // road, which is the path the scan's paging lives on.
+      if (url.includes('_setup=1')) {
+        return new Response(JSON.stringify([
+          { id: 7, body: '## Formality Check: Failed', user: { login: 'openwrt[bot]', type: 'Bot' }, author_association: 'NONE' }
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify(thread), { status: 200 });
+    }
+    if (url.includes(`/commits/${commit.sha}`)) {
+      return new Response('diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-teh\n+the\n', { status: 200 });
+    }
+    if (url.includes('/check-runs') && method === 'POST') {
+      checkRuns.push(JSON.parse(options.body));
+      return new Response('{}', { status: 201 });
+    }
+    return new Response('{}', { status: 200 });
+  };
+
+  try {
+    const response = await handlePullRequestEvent(
+      {
+        action: 'opened',
+        pull_request: {
+          number: 123,
+          title: 'readme: fix a typo',
+          body: 'A typo fix.',
+          url: 'https://api.github.com/repos/test/repo/pulls/123',
+          state: 'open',
+          labels: [],
+          user: { login: 'johndoe', type: 'User' },
+          author_association: 'CONTRIBUTOR',
+          head: { ref: 'main', sha: 'headsha' },
+          base: { ref: 'main', sha: 'basesha' }
+        }
+      },
+      'pull_request',
+      // Nothing but the reserve is left, so every optional lookup has to
+      // decide whether it is worth a request.
+      { SUBREQUEST_BUDGET_LIMIT: '15', SUBREQUEST_RESERVE_HEADROOM: '15' },
+      'fake-token',
+      'test/repo',
+      12345,
+      0
+    );
+    return { status: response.status, checkRuns };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+describe('override commands under an exhausted request budget', () => {
+  test('honours a maintainer\'s [allow branch] comment when only the reserve is left', async () => {
+    const { status, checkRuns } = await runProtectedBranchPr([
+      { id: 11, body: 'Looks intentional, [allow branch]', user: { login: 'maintainer' }, author_association: 'MEMBER' }
+    ]);
+
+    assert.strictEqual(status, 200);
+    const commits = checkRuns.find(r => r.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commits, 'the Git & Commits check is published');
+    assert.notStrictEqual(commits.conclusion, 'failure',
+      `a pull request a maintainer waved through must not be failed: ${commits.output.text}`);
+    assert.match(commits.output.text, /allowed via override command/);
+    assert.doesNotMatch(commits.output.text, /PR Targeting Violation/);
+  });
+
+  test('reports the targeting rule as neutral, not failed, when the thread could not be read', async () => {
+    // A full first page means more comments are due, and the reserve refuses
+    // the request for them: the override may be on the page never read.
+    const { status, checkRuns } = await runProtectedBranchPr(
+      Array.from({ length: 100 }, (_, i) => ({
+        id: i + 100, body: `comment ${i}`, user: { login: 'someone' }, author_association: 'NONE'
+      }))
+    );
+
+    assert.strictEqual(status, 200);
+    const commits = checkRuns.find(r => r.name === 'FormalityCheck / Git & Commits');
+    assert.ok(commits, 'the Git & Commits check is published');
+    assert.strictEqual(commits.conclusion, 'neutral',
+      `an unread thread leaves the rule unchecked, not broken: ${commits.output.text}`);
+    assert.doesNotMatch(commits.output.text, /PR Targeting Violation/);
+    assert.match(commits.output.text, /Could not check whether the pull request from `main` was allowed/);
+  });
+});
 
 describe('runtime type guards and entrypoint boundary validation', () => {
   describe('type guards', () => {

@@ -1,9 +1,9 @@
 import { parseAndValidateConfig } from '../../types/config.ts';
-import { graphqlFetchRepoSetup } from '../../github.js';
+import { graphqlFetchRepoSetup, ensureLabelExists } from '../../github.js';
 import { GitHubWriteQueue } from '../../core/github-write-queue.ts';
 import { parseEnvInt } from '../../core/utils.ts';
 import { createMaintainerResolver } from '../../core/maintainer-resolver.ts';
-import { scanCommentList, scanPrComments } from '../../core/comment-scanner.ts';
+import { scanCommentList, scanPrComments, incompleteCommentScan } from '../../core/comment-scanner.ts';
 import { createFileBatchLoader } from '../../core/file-batch-loader.ts';
 import { createGitHubClient } from '../../core/github-client.ts';
 import {
@@ -43,22 +43,25 @@ export interface PullRequestContext {
   client: GitHubClient;
   config: FormalitiesConfig;
   configError: string | null;
+  configPartial: boolean;
   existingLabels: Set<string> | null;
   labelerText: string | null;
   commits: CommitData[];
   commitsCount: number;
   commitScanCapped: boolean;
+  commitsPagingCapped: boolean;
   fileBatchLoader: FileBatchLoader;
   action: string;
   prData: PullRequestData;
   startPrPatchFetch: () => Promise<GitHubApiResponse<string>>;
-  getCommentsScanWithRetry: () => Promise<CommentScanResult | null>;
+  getCommentsScanWithRetry: () => Promise<CommentScanResult>;
   isMaintainerUser: (user: GitHubUser | null | undefined, assoc?: string | null) => Promise<boolean>;
   isAuthorMaintainer: (bodyRequestsBypass: boolean) => Promise<boolean>;
   bodyRequestsCherryPickBypass: boolean;
   branchCheckViolated: boolean;
   bypassBranchCheck: boolean;
   branchCheckError: string | null;
+  branchCheckWarning: string | null;
   branchCheckOutputText: string;
 }
 
@@ -77,6 +80,10 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
     cached = (async () => {
       const { prData, prNumber, repoFullname, headSha, headBranch, baseBranch, baseSha, client } = ctx;
       let verified = false;
+      // Set only when the re-read never happened for want of budget. A
+      // re-read that happened and failed is a different thing: the payload
+      // still describes the pull request the event was sent for.
+      let liveStateUnread = false;
       let livePr: any = prData || {};
 
       if (typeof client?.optionalApiCall === 'function') {
@@ -88,6 +95,7 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
           : true;
 
         if (!canCheckLiveState) {
+          liveStateUnread = true;
           console.warn(`Skipping live PR state check for #${prNumber}: no API budget headroom left. Treating PR as unverified/moved to preserve check-run writes.`);
         } else {
           const prUrl = prData?.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
@@ -102,7 +110,7 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
             }
             verified = true;
           } else {
-            console.warn(`Failed to verify current PR state for #${prNumber}; treating PR as moved to avoid stale operations`);
+            console.warn(`Failed to re-read current PR state for #${prNumber}; falling back to the state the event payload carries`);
           }
         }
       } else {
@@ -114,7 +122,11 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
         console.warn(`Skipping PR operations: PR #${prNumber} is no longer open (state: ${livePr.state})`);
       }
 
-      const branchMoved = !verified || prClosed ||
+      // A re-read that could not be made at all says nothing about the pull
+      // request, so it stays suppressed. A re-read that failed leaves the
+      // payload, which is as good as the event that triggered this run: the
+      // labels and the comment it describes are still worth writing.
+      const branchMoved = liveStateUnread || prClosed ||
         Boolean(livePr.head?.sha && headSha && livePr.head.sha !== headSha) ||
         Boolean(livePr.head?.ref && headBranch && livePr.head.ref !== headBranch) ||
         Boolean(livePr.base?.ref && baseBranch && livePr.base.ref !== baseBranch) ||
@@ -211,18 +223,16 @@ export async function loadPullRequestContext(
         const prNumber = prData.number || 0;
         const queue = new GitHubWriteQueue(prNumber);
 
+        // The label listing is not fetched on this path, so the create is
+        // blind and the 422 GitHub answers for a label that already exists is
+        // silenced rather than logged as an error. An empty set creates just
+        // as blindly, and records which of the creates the API confirmed: a
+        // refused one must answer the webhook 502, not 200.
+        const confirmedLabels = new Set<string>();
         for (const lbl of labelsToEnsure) {
           queue.enqueue(`ensure label "${lbl.name}"`, async () => {
-            const url = `https://api.github.com/repos/${repoFullname}/labels`;
-            const res = await client.trackedApiCall(url, 'POST', {
-              name: lbl.name,
-              color: lbl.color,
-              description: lbl.description
-            });
-            if (res.code === 422 || (res.code >= 200 && res.code < 300)) {
-              return { code: 200 };
-            }
-            return res;
+            const created = await ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, confirmedLabels, () => { subrequestBudget.used++; });
+            return (created || confirmedLabels.has(lbl.name.toLowerCase())) ? { code: 200 } : { code: 502 };
           });
         }
 
@@ -283,9 +293,9 @@ export async function loadPullRequestContext(
     prNumber
   );
 
-  const { config, error: configError } = parseAndValidateConfig(setup.configText);
+  const { config, error: configError, partial: configPartial } = parseAndValidateConfig(setup.configText);
   if (configError) {
-    console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be used, falling back to the defaults: ${configError}`);
+    console.warn(`Repository config .github/formalities.json in ${repoFullname}: ${configPartial ? 'the fields named below fell back to their defaults, the rest of the file was used' : 'could not be used at all, falling back to the defaults'}: ${configError}`);
   }
 
   const commits = setup.commits || [];
@@ -294,8 +304,9 @@ export async function loadPullRequestContext(
     throw new Error(`GraphQL setup fetch returned no commits for PR #${prNumber} in ${repoFullname}. Aborting validation to prevent premature pass.`);
   }
   const commitScanCapped = commitsCount > commits.length;
+  const commitsPagingCapped = Boolean(setup.commitsPagingCapped);
 
-  let fetchCommentsPromise: Promise<CommentScanResult | null> | null = null;
+  let fetchCommentsPromise: Promise<CommentScanResult> | null = null;
   let fetchCommentsRetried = false;
 
   // The comments came with the setup query. The one thing they cannot settle
@@ -308,21 +319,21 @@ export async function loadPullRequestContext(
   const inlineCommentsSuffice = Array.isArray(inlineComments) && !inlineComments.some((c: any) =>
     c.user?.type === 'Bot' && c.viewer_did_author !== true && (c.body || '').startsWith('## Formality Check:'));
 
-  const getCommentsScan = (): Promise<CommentScanResult | null> => {
+  const getCommentsScan = (): Promise<CommentScanResult> => {
     if (fetchCommentsPromise === null) {
       fetchCommentsPromise = inlineCommentsSuffice
-        ? scanCommentList(inlineComments, isMaintainerUser, appId).catch(() => null)
-        : scanPrComments(repoFullname, prNumber, token, client.countOptionalAttempt, isMaintainerUser, appId, client.hasHeadroom).catch(() => null);
+        ? scanCommentList(inlineComments, isMaintainerUser, appId).catch(() => incompleteCommentScan())
+        : scanPrComments(repoFullname, prNumber, token, client.countOptionalAttempt, isMaintainerUser, appId, client.hasHeadroom).catch(() => incompleteCommentScan());
     }
     return fetchCommentsPromise;
   };
 
-  const getCommentsScanWithRetry = async (): Promise<CommentScanResult | null> => {
+  const getCommentsScanWithRetry = async (): Promise<CommentScanResult> => {
     const result = await getCommentsScan();
     // A scan that stopped because the budget ran out is not a transient
     // failure: running it again would spend the very headroom it stopped to
     // protect, and end the same way.
-    if (result !== null || fetchCommentsRetried || !client.hasHeadroom()) {
+    if (!result.incomplete || fetchCommentsRetried || !client.hasHeadroom()) {
       return result;
     }
     fetchCommentsRetried = true;
@@ -354,16 +365,24 @@ export async function loadPullRequestContext(
 
   let bypassBranchCheck = false;
   let branchCheckError: string | null = null;
+  let branchCheckWarning: string | null = null;
   let branchCheckOutputText = '';
 
   if (config.check_branch) {
     if (isProtectedHeadBranch(headBranch)) {
       const isMaintainer = await isAuthorMaintainer(bodyRequestsBranchBypass);
-      const scanResult = await getCommentsScanWithRetry() || { hasBranchBypassComment: false, hasCherryPickBypassComment: false, existingCommentId: null };
+      const scanResult = await getCommentsScanWithRetry();
       bypassBranchCheck = scanResult.hasBranchBypassComment || (bodyRequestsBranchBypass && isMaintainer);
 
       if (bypassBranchCheck) {
         branchCheckOutputText = `⚠️ Pull request originates from protected branch \`${headBranch}\` but was allowed via override command\n\n`;
+      } else if (scanResult.incomplete) {
+        // The thread is what carries `[allow branch]`, and it could not be
+        // read to the end. Failing the pull request on that evidence is
+        // exactly what the override exists to prevent, so the violation is
+        // reported as unchecked and the check-run goes neutral.
+        branchCheckWarning = `Pull request originates from protected branch \`${headBranch}\`, but the comment thread could not be read in full, so an \`[allow branch]\` override may have been missed. The targeting rule was left unchecked rather than reported as a failure.`;
+        branchCheckOutputText = `⚠️ Could not check whether the pull request from \`${headBranch}\` was allowed via override command\n\n`;
       } else {
         let errorMsg = `### PR Targeting Violation\n- Pull requests must originate from a dedicated feature branch. Cannot use \`${headBranch}\` directly.`;
         if (isMaintainer) {
@@ -395,11 +414,13 @@ export async function loadPullRequestContext(
       client,
       config,
       configError,
+      configPartial,
       existingLabels: setup.labels,
       labelerText: setup.labelerText,
       commits,
       commitsCount,
       commitScanCapped,
+      commitsPagingCapped,
       fileBatchLoader,
       action: data.action || '',
       prData,
@@ -411,6 +432,7 @@ export async function loadPullRequestContext(
       branchCheckViolated,
       bypassBranchCheck,
       branchCheckError,
+      branchCheckWarning,
       branchCheckOutputText
     }
   };

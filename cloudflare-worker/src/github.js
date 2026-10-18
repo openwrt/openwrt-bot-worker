@@ -467,6 +467,7 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
     labelerText: typeof repo.labeler?.text === 'string' ? repo.labeler.text : null,
     commits: null,
     commitsTotal: 0,
+    commitsPagingCapped: false,
     comments: null
   };
   if (!withPr) return setup;
@@ -521,6 +522,10 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   // listing it leaves behind would be invisible to the caller.
   setup.commitsTotal = Math.max(pr.commits.totalCount ?? 0, nodesSeen);
   setup.commits = commits;
+  // A page left unfetched is the paging cap; a listing short of the total
+  // without one means GitHub withheld records it counted. The two read as the
+  // same shortfall and want different words, so which it was is recorded here.
+  setup.commitsPagingCapped = Boolean(commitsPage?.hasNextPage);
 
   const commentsErrors = Array.isArray(res.data?.errors)
     ? res.data.errors.filter(e => e.path && Array.isArray(e.path) && e.path.includes('comments'))

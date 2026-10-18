@@ -91,15 +91,18 @@ export async function syncPrComment(
     return;
   }
 
+  // A thread that could not be read to the end cannot say whether this app
+  // already reported here, and posting a second report is worse than posting
+  // none - so an unfinished scan leaves the comment alone.
   const scanResult = await getCommentsScanWithRetry();
-  if (scanResult === null) {
+  if (!scanResult || scanResult.incomplete) {
     return;
   }
 
   // Prevent older runs from overwriting comments if PR moved or verification fails
   const { verdictMoved } = await fetchLivePrState(ctx);
   if (verdictMoved) {
-    console.warn(`Skipping PR comment sync for #${prNumber}: PR state moved or could not be verified`);
+    console.warn(`Skipping PR comment sync for #${prNumber}: PR state moved since the event`);
     return;
   }
 

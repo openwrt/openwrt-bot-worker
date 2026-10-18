@@ -228,7 +228,7 @@ describe('validateUciConfigs on a renamed configuration file', () => {
     }));
 
     assertNoErrors(res);
-    assert.deepStrictEqual(res.warnings, []);
+    assert.deepStrictEqual(res.notices, []);
     assert.strictEqual(res.incomplete, false);
   });
 });

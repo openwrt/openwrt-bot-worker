@@ -482,7 +482,7 @@ diff --git a/package/utils/p${i}/Makefile b/package/utils/p${i}/Makefile
 +PKG_NAME:=p${i}
 `).join('');
     const tooMany = await validatePkgReleaseBumps([{ commitPatch: many }], defaultConf, async () => null, async () => null);
-    assertSomeIncludes(tooMany.warnings, 'audit skipped', 'warnings');
+    assertSomeIncludes(tooMany.notices, 'audit skipped', 'notices');
     assert.deepStrictEqual(tooMany.notes, []);
   });
 
@@ -513,7 +513,7 @@ index 123456..789012 100644
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, fetchFn, fetchFn);
     assertNoErrors(res);
     assert.strictEqual(res.successes.length, 0);
-    assert.ok(res.warnings.some(w => w.includes('Package release bump audit skipped') && w.includes('16 packages')));
+    assert.ok(res.notices.some(w => w.includes('Package release bump audit skipped') && w.includes('16 packages')));
     assert.strictEqual(fetchCalled, false);
   });
 

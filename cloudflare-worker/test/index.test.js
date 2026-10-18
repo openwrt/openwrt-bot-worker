@@ -5804,10 +5804,19 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
     const patches = runs.find(r => r.name === 'FormalityCheck / Code Patches');
     const makefiles = runs.find(r => r.name === 'FormalityCheck / OpenWrt Makefiles');
     assert.strictEqual(patches.conclusion, 'neutral', patches.output.text);
-    assert.strictEqual(makefiles.conclusion, 'success', makefiles.output.text);
+    // The file lives in a feed package, and the 16-commit series maps a single
+    // envelope, so the Makefile audit has no per-commit attribution either —
+    // and its own body has to say which gap left it neutral.
+    assert.strictEqual(makefiles.conclusion, 'neutral', makefiles.output.text);
+    assert.match(makefiles.output.text, /Could not safely verify commit boundaries or coverage in PR-wide patch series \(0\/16 commits mapped\)/);
     assert.match(patches.output.text, /could not be read, so its Git headers were not checked/, 'the details name the file that was skipped');
-    // Details short enough to post whole need no list above them.
-    assert.ok(patches.output.text.startsWith('### Checking PR #123: mypkg: refresh patches (Embedded Patches Compliance)\n\n#### '), patches.output.text);
+    // Details short enough to post whole need no list above them: the file is
+    // named once, in the block it belongs to, and not again as a summary list.
+    const namedTwice = patches.output.text.split('could not be read, so its Git headers were not checked').length - 1;
+    assert.strictEqual(namedTwice, 1, patches.output.text);
+    // The coverage note goes under the heading whatever the length, so the cut
+    // that takes a long body's tail cannot take the reason for the verdict.
+    assert.ok(patches.output.text.startsWith('### Checking PR #123: mypkg: refresh patches (Embedded Patches Compliance)\n\n⚠️ Warning: Deep file-content validation could not read 1 file(s)'), patches.output.text);
   });
 
   // A refresh of `readable` patch files, long enough that the Code Patches

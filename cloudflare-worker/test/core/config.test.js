@@ -127,6 +127,45 @@ describe('parseAndValidateConfig', () => {
     assert.match(resNullField.error, /field "check_signoff" must not be null/);
   });
 
+  // One unusable setting used to discard the whole file, which silently turned
+  // every other configured option back to its default - the repository looked
+  // as if the bot were ignoring its configuration rather than one typo.
+  test('falls back per field and keeps the settings that are usable', () => {
+    const res = parseAndValidateConfig(JSON.stringify({
+      check_signoff: 'yes please',          // unusable
+      enable_issue_labeller: true,          // usable
+      enable_comments: false,               // usable
+      check_pkg_release: 'error'            // usable
+    }));
+
+    assert.match(res.error, /field "check_signoff" must be a boolean/);
+    assert.strictEqual(res.partial, true);
+    assert.strictEqual(res.config.enable_issue_labeller, true, 'a valid setting beside a bad one is still honoured');
+    assert.strictEqual(res.config.enable_comments, false);
+    assert.strictEqual(res.config.check_pkg_release, 'error');
+    assert.strictEqual(res.config.check_signoff, DEFAULT_CONFIG.check_signoff, 'only the bad field falls back');
+  });
+
+  test('reports a file it could not read at all as a whole-file fallback', () => {
+    const res = parseAndValidateConfig('{ not json ');
+    assert.ok(res.error);
+    assert.strictEqual(res.partial, false);
+    assert.deepStrictEqual(res.config, DEFAULT_CONFIG);
+  });
+
+  test('sends both subject length limits back to their defaults when the pair is inconsistent', () => {
+    const res = parseAndValidateConfig(JSON.stringify({
+      max_subject_len_soft: 80,
+      max_subject_len_hard: 60,
+      enable_issue_labeller: true
+    }));
+
+    assert.match(res.error, /max_subject_len_soft \(80\) must not be greater than max_subject_len_hard \(60\)/);
+    assert.strictEqual(res.config.max_subject_len_soft, DEFAULT_CONFIG.max_subject_len_soft);
+    assert.strictEqual(res.config.max_subject_len_hard, DEFAULT_CONFIG.max_subject_len_hard);
+    assert.strictEqual(res.config.enable_issue_labeller, true);
+  });
+
   test('tolerates unknown fields and object prototype keys without error', () => {
     const res = parseAndValidateConfig(JSON.stringify({
       toString: 'custom-to-string',

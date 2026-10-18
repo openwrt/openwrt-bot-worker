@@ -599,7 +599,7 @@ endef
     const res = await validateMakefileContext(makeCommit('foo: install dynamic dest'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => headMakefile);
     assert.strictEqual(res.incomplete, true);
     assert.ok(!res.successes.some(s => s.includes('conffiles macro properly registers INSTALL_CONF')));
-    assert.ok(res.warnings.some(w => w.includes('Could not safely determine installed configuration path(s)')));
+    assert.ok(res.notices.some(w => w.includes('Could not safely determine installed configuration path(s)')));
   });
 
   // The hunk around an install line often names no package: git's funcname
@@ -942,7 +942,7 @@ endef
   test('reports an entry of four unresolved expansions as unchecked, not as missing', () => {
     const res = validate('foo: add new package', unresolvedEntryPatch('/etc/config/$(A)x$(B)x$(C)x$(D)', 'abcd'), newPackage());
     assertNoErrorIncludes(res, 'does not list it');
-    assertSomeIncludes(res.warnings, 'Could not verify', 'warnings');
+    assertSomeIncludes(res.notices, 'Could not verify', 'notices');
     assert.strictEqual(res.incomplete, true);
     // An unchecked path is no confirmation that the block is complete.
     assertNoneIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF', 'successes');
@@ -977,7 +977,7 @@ endef
       '+endef'
     ), newPackage());
     assertNoErrorIncludes(res, 'does not list it');
-    assertNoneIncludes(res.warnings, 'Could not verify', 'warnings');
+    assertNoneIncludes(res.notices, 'Could not verify', 'notices');
     assert.strictEqual(res.incomplete, false);
     assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF', 'successes');
   });

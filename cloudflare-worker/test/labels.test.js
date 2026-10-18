@@ -128,9 +128,9 @@ describe('Derived label cleanup', () => {
     });
   }
 
-  test('leaves labels alone when the pull request cannot be read again', async () => {
+  test('decides from the payload when the pull request cannot be read again', async () => {
     const removed = await labelsRemovedFor({ labels: ['Add package'], live: { status: 500, labels: [] }, patch: plainPatch });
-    assert.deepStrictEqual(removed, []);
+    assert.deepStrictEqual(removed, ['Add package']);
   });
 
   // The guidelines verdict belongs to the newest event too, and the
