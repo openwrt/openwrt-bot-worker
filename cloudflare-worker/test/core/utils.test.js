@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { parseEnvInt, safeTruncate, isBotUser, optionalAttemptCounter } from '../../src/core/utils.ts';
+import { parseEnvInt, safeTruncate, isBotUser, optionalAttemptCounter, reserveOptionalAttempt } from '../../src/core/utils.ts';
 
 describe('core/utils', () => {
   describe('parseEnvInt', () => {
@@ -61,11 +61,32 @@ describe('core/utils', () => {
   });
 
   describe('optionalAttemptCounter', () => {
-    test('increments used on first attempt regardless of headroom', () => {
-      const budget = { limit: 50, reserve: 5, used: 48 };
+    test('charges the first attempt while headroom is left', () => {
+      const budget = { limit: 50, reserve: 5, used: 40 };
       const counter = optionalAttemptCounter(budget);
       assert.strictEqual(counter(1), true);
-      assert.strictEqual(budget.used, 49);
+      assert.strictEqual(budget.used, 41);
+    });
+
+    // Replaces 'increments used on first attempt regardless of headroom',
+    // which asserted the opposite: that was the one test encoding the hole,
+    // an optional lookup spending out of the reserve the closing writes need.
+    test('refuses the first attempt once only the reserve is left', () => {
+      const budget = { limit: 50, reserve: 5, used: 45 };
+      const counter = optionalAttemptCounter(budget);
+      assert.strictEqual(counter(1), false);
+      assert.strictEqual(budget.used, 45);
+    });
+
+    // What the reviewer measured as the live cost of charging attempt 1: two
+    // optional lookups starting together both went out and left the loader
+    // nothing, with `used` past limit - reserve.
+    test('hands two lookups starting together only the attempt that exists', () => {
+      const budget = { limit: 10, reserve: 5, used: 4 };
+      const counter = optionalAttemptCounter(budget);
+      assert.deepStrictEqual([counter(1), counter(1)], [true, false]);
+      assert.strictEqual(budget.used, 5);
+      assert.strictEqual(budget.limit - budget.used, budget.reserve);
     });
 
     test('declines retry when headroom is exhausted', () => {
@@ -73,6 +94,30 @@ describe('core/utils', () => {
       const counter = optionalAttemptCounter(budget);
       assert.strictEqual(counter(2), false);
       assert.strictEqual(budget.used, 45);
+    });
+  });
+
+  describe('reserveOptionalAttempt', () => {
+    test('charges the budget when headroom is left', () => {
+      const budget = { limit: 50, reserve: 5, used: 40 };
+      assert.strictEqual(reserveOptionalAttempt(budget), true);
+      assert.strictEqual(budget.used, 41);
+    });
+
+    test('refuses without charging once only the reserve is left', () => {
+      const budget = { limit: 50, reserve: 5, used: 45 }; // 50 - 5 - 45 = 0
+      assert.strictEqual(reserveOptionalAttempt(budget), false);
+      assert.strictEqual(budget.used, 45, 'a refused attempt costs nothing');
+    });
+
+    // What a planning site relies on: reserving in a loop, with nothing
+    // charged in between, hands out exactly the attempts that exist.
+    test('hands out the affordable attempts and no more when called repeatedly', () => {
+      const budget = { limit: 10, reserve: 5, used: 0 };
+      const answers = Array.from({ length: 8 }, () => reserveOptionalAttempt(budget));
+      assert.deepStrictEqual(answers, [true, true, true, true, true, false, false, false]);
+      assert.strictEqual(budget.used, 5);
+      assert.strictEqual(budget.limit - budget.used, budget.reserve);
     });
   });
 });

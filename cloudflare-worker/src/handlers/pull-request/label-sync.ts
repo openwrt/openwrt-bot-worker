@@ -1,6 +1,6 @@
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from '../../config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from '../../labeler.js';
-import { ensureLabelExists } from '../../github.js';
+import { ensureLabelExists, DECLINED_ATTEMPT } from '../../github.js';
 import { fetchLivePrState, type PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult } from './patches.ts';
 import type { AggregatedReport } from './report.ts';
@@ -33,9 +33,13 @@ export async function syncLabels(
   const currentPrLabelNames = new Map<string, string>((livePr.labels || []).map((l: any) => [l.name.toLowerCase(), l.name]));
   const spelledAsOnPr = (name: string) => currentPrLabelNames.get(name.toLowerCase()) || name;
 
+  // Every label write is optional work: the write queue may skip it to keep
+  // the check-runs' attempts, so it goes through the counter that can also
+  // decline a retry once only those attempts are left. trackedApiCall counts
+  // an attempt without ever being able to refuse one.
   const enqueueRemove = (name: string) => {
     queue.enqueue(`label removal "${name}"`, async () => {
-      const res = await client.trackedApiCall(`${prLabelUrl}/${encodeURIComponent(name)}`, 'DELETE');
+      const res = await client.optionalApiCall(`${prLabelUrl}/${encodeURIComponent(name)}`, 'DELETE');
       return res.code === 404 ? { code: 200 } : res;
     });
   };
@@ -126,15 +130,25 @@ export async function syncLabels(
   // what a missing issues:write permission looks like, and it has to answer
   // the webhook 502 instead of passing as a write that never happened.
   // The set is this run's own when the repository listing could not be read.
+  // The create retries, so its attempts go through countOptionalAttempt
+  // rather than a bare `used++`, which counted an attempt but could never
+  // refuse one. A refused attempt leaves the create unconfirmed, which stays
+  // what it was: a failed write the run reports.
   const confirmedLabels = existingLabels ?? new Set<string>();
   for (const lbl of labelsToEnsure) {
     queue.enqueue(`ensure label "${lbl.name}"`, async () => {
-      const created = await ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, confirmedLabels, () => { client.budget.used++; });
+      const chargedBefore = client.budget.used;
+      const created = await ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, confirmedLabels, client.countOptionalAttempt);
+      // Nothing charged means nothing was sent: the counter declined the
+      // attempt to keep the reserve. That is this worker's decision, so it is
+      // reported as a request never made rather than as a create GitHub
+      // refused.
+      if (!created && client.budget.used === chargedBefore) return DECLINED_ATTEMPT;
       return (created || confirmedLabels.has(lbl.name.toLowerCase())) ? { code: 200 } : { code: 502 };
     });
   }
 
   if (labelsToAdd.length > 0) {
-    queue.enqueue('labels', () => client.trackedApiCall(prLabelUrl, 'POST', { labels: labelsToAdd }));
+    queue.enqueue('labels', () => client.optionalApiCall(prLabelUrl, 'POST', { labels: labelsToAdd }));
   }
 }

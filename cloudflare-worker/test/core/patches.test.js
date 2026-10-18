@@ -304,4 +304,168 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
       'two commits, two failed comparisons: a commit of the abandoned pass must not add a third');
     assert.strictEqual(result.upstreamComparisonSkips, 0);
   });
+
+  // A declined attempt and a request GitHub refused arrive as the same HTTP code
+  // here, and only the sentinel body tells them apart. Reporting the first as the
+  // second blames GitHub for a lookup the budget held back, and - where the
+  // report has a dedicated channel for it - claims a comparison was attempted.
+  describe('an attempt the budget declined', () => {
+    const DECLINED = () => ({
+      code: 599,
+      data: null,
+      raw: 'Request not made: the caller declined the attempt',
+      headers: { get: () => null }
+    });
+
+    const backportContext = (overrides = {}) => ({
+      commits: [{
+        sha: 'a'.repeat(40),
+        html_url: 'https://github.com/openwrt/openwrt/commit/aaa',
+        parents: [{ sha: 'parent' }],
+        commit: { message: `foo: backport fix\n\n(cherry picked from commit ${'f'.repeat(40)})` }
+      }],
+      client: {
+        budget: { limit: 50, used: 10, reserve: 15 },
+        hasHeadroom: () => true,
+        trackedApiCall: async () => ({ code: 200, raw: 'diff --git a/foo b/foo\n' }),
+        optionalApiCall: async () => ({ code: 200, raw: 'diff --git a/foo b/foo\n' })
+      },
+      fileBatchLoader: { getRefSource: () => undefined, hasRefSource: () => false, setRefSource: () => {} },
+      isBackportPr: true,
+      repoFullname: 'openwrt/openwrt',
+      prData: { url: 'https://api.github.com/repos/openwrt/openwrt/pulls/100' },
+      startPrPatchFetch: async () => ({ code: 200, raw: 'diff --git a/foo b/foo\n', data: null, headers: { get: () => null } }),
+      ...overrides
+    });
+
+    test('counts a refused upstream lookup as a skipped comparison, not as an upstream GitHub would not serve', async () => {
+      const ctx = backportContext();
+      let upstreamCalls = 0;
+      ctx.client.optionalApiCall = async (url) => {
+        if (/\/commits\/f+$/.test(url)) { upstreamCalls++; return DECLINED(); }
+        return { code: 200, raw: 'diff --git a/foo b/foo\n' };
+      };
+
+      const result = await resolvePatchesAndCommits(ctx);
+
+      assert.strictEqual(upstreamCalls, 1, 'the lookup was dispatched and declined inside the client');
+      assert.strictEqual(result.upstreamComparisonSkips, 1, 'a declined attempt is a skipped comparison');
+      assert.strictEqual(result.upstreamFetchFailures, 0, 'nothing GitHub did can be reported here');
+      assert.strictEqual(result.commitDetails[0].upstreamFetchError, null);
+      assert.strictEqual(result.commitDetails[0].upstreamPatch, null);
+      // A comparison that never happened must not leave the sha behind: the
+      // commit's own block would otherwise say the backport deviates from an
+      // upstream commit nobody read.
+      assert.strictEqual(result.commitDetails[0].upstreamSha, null);
+      assert.strictEqual(result.commitDetails[0].isVerbatim, false);
+    });
+
+    // A single commit has no PR-wide patch behind it, so its patch is the only
+    // diff the audit will ever see: declining that attempt loses every content
+    // check and reports a pass for files nobody read. It is charged, not
+    // declined - which is what the fallback already did, one request later.
+    test('spends a charged attempt on the one patch the audit cannot do without', async () => {
+      const ctx = backportContext({ isBackportPr: false, startPrPatchFetch: async () => null });
+      const asked = [];
+      ctx.client.budget = { limit: 15, used: 2, reserve: 15 };
+      ctx.client.hasHeadroom = () => false;
+      ctx.client.optionalApiCall = async (url) => { asked.push(['optional', url]); return DECLINED(); };
+      ctx.client.trackedApiCall = async (url) => { asked.push(['tracked', url]); return { code: 200, raw: 'diff --git a/foo b/foo\n' }; };
+
+      const result = await resolvePatchesAndCommits(ctx);
+
+      assert.deepStrictEqual(asked.map(([kind]) => kind), ['tracked'],
+        'one tracked request, and no second one through the fallback');
+      assert.strictEqual(result.usePrWidePatch, false);
+      assert.strictEqual(result.patchUnavailable, false);
+      assert.strictEqual(result.commitDetails[0].commitPatch, 'diff --git a/foo b/foo\n');
+    });
+
+    test('still reports a genuinely unfetchable upstream commit as a fetch failure', async () => {
+      const ctx = backportContext();
+      ctx.client.optionalApiCall = async (url) => {
+        if (/\/commits\/f+$/.test(url)) return { code: 404, raw: 'Not Found' };
+        return { code: 200, raw: 'diff --git a/foo b/foo\n' };
+      };
+
+      const result = await resolvePatchesAndCommits(ctx);
+
+      assert.strictEqual(result.upstreamFetchFailures, 1);
+      assert.strictEqual(result.upstreamComparisonSkips, 0);
+      assert.match(result.commitDetails[0].upstreamFetchError, /HTTP 404/);
+      assert.strictEqual(result.commitDetails[0].upstreamSha, 'f'.repeat(40));
+    });
+
+    test('names the budget, not GitHub, when a commit patch is the attempt declined', async () => {
+      const warnings = [];
+      const originalWarn = console.warn;
+      console.warn = (...args) => { warnings.push(args.join(' ')); };
+      let result;
+      try {
+        const ctx = backportContext({
+          isBackportPr: false,
+          // Two commits and no PR-wide patch, so the run goes commit by commit
+          // and has nothing to fall back on but "could not run".
+          commits: [0, 1].map(i => ({
+            sha: String(i).repeat(40),
+            html_url: `https://github.com/openwrt/openwrt/commit/${i}`,
+            parents: [{ sha: 'parent' }],
+            commit: { message: `foo: change ${i}` }
+          })),
+          startPrPatchFetch: async () => ({ code: 404, raw: 'Not Found', data: null, headers: { get: () => null } })
+        });
+        ctx.client.optionalApiCall = async () => DECLINED();
+
+        result = await resolvePatchesAndCommits(ctx);
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      // The pass is abandoned either way: a commit left without a patch reads
+      // downstream as a commit that changed no text file, which would report a
+      // pass for an audit that never ran.
+      assert.strictEqual(result.usePrWidePatch, true);
+      assert.strictEqual(result.patchUnavailable, true, 'the audits report themselves unable to run');
+      const fallback = warnings.find(w => w.includes('falling back to PR-wide patch'));
+      assert.ok(fallback, 'the fallback is logged');
+      assert.match(fallback, /no request budget left/);
+      assert.doesNotMatch(fallback, /HTTP 599/, 'a declined attempt is not an answer GitHub sent');
+    });
+
+    test('keeps the base repository answer when the fork fallback is the attempt declined', async () => {
+      const warnings = [];
+      const originalWarn = console.warn;
+      console.warn = (...args) => { warnings.push(args.join(' ')); };
+      let result;
+      try {
+        const ctx = backportContext({
+          isBackportPr: false,
+          commits: [0, 1].map(i => ({
+            sha: String(i).repeat(40),
+            html_url: `https://github.com/openwrt/openwrt/commit/${i}`,
+            parents: [{ sha: 'parent' }],
+            commit: { message: `foo: change ${i}` }
+          })),
+          prData: {
+            url: 'https://api.github.com/repos/openwrt/openwrt/pulls/100',
+            head: { repo: { full_name: 'contributor/openwrt' } }
+          },
+          startPrPatchFetch: async () => ({ code: 404, raw: 'Not Found', data: null, headers: { get: () => null } })
+        });
+        ctx.client.optionalApiCall = async (url) => (
+          url.includes('contributor/openwrt') ? DECLINED() : { code: 404, raw: 'No commit found for SHA' }
+        );
+
+        result = await resolvePatchesAndCommits(ctx);
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      assert.strictEqual(result.patchUnavailable, true);
+      assert.ok(warnings.some(w => /Fork fallback for commit .* not attempted/.test(w)),
+        'the unchecked fork is said out loud');
+      const fallback = warnings.find(w => w.includes('falling back to PR-wide patch'));
+      assert.match(fallback, /HTTP 404/, 'the base repository did answer, and that answer is what is reported');
+    });
+  });
 });

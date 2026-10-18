@@ -1,4 +1,5 @@
 import { graphqlBatchFetchFiles } from '../github.js';
+import { reserveOptionalAttempt } from './utils.ts';
 import type { SubrequestBudget } from '../types/env.ts';
 
 export interface FileBatchLoaderOptions {
@@ -137,13 +138,20 @@ export function createFileBatchLoader(options: FileBatchLoaderOptions): FileBatc
     const fires: Array<Promise<void>> = [];
     for (let i = 0; i < probes.length; i += safeChunkSize) {
       const chunk = probes.slice(i, i + safeChunkSize);
-      const available = subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used;
-      if (available <= 0) {
+      // Every chunk is planned in this one synchronous pass and they all fire
+      // together, so the chunk's first attempt is taken out of the budget here
+      // rather than only compared against it: a guard that merely read `used`
+      // would depend on the request charging before the next iteration runs,
+      // which is a detail of githubApiCall this loop cannot see. A chunk that
+      // no longer fits is skipped, not missing.
+      if (!reserveOptionalAttempt(subrequestBudget)) {
         for (const p of chunk) resultsByProbeKey.set(p.key, { content: null, skipped: true });
         continue;
       }
       fires.push(
-        graphqlBatchFetchFiles(token, chunk, countOptionalAttempt)
+        // Attempt 1 is already paid for; retries are charged, and refused at
+        // the reserve, by the shared counter.
+        graphqlBatchFetchFiles(token, chunk, (attempt: number) => attempt <= 1 || countOptionalAttempt(attempt))
           .then((map: Map<string, any>) => { for (const [k, v] of map) resultsByProbeKey.set(k, v); })
           .catch((err: any) => { for (const p of chunk) resultsByProbeKey.set(p.key, { error: err }); })
       );

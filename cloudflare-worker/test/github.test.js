@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, graphqlFetchRepoLabels, graphqlCheckExistence, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, GRAPHQL_URL } from '../src/github.js';
+import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, graphqlFetchRepoLabels, graphqlCheckExistence, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, wasAttemptDeclined, MAX_ATTEMPTS, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -1368,5 +1368,95 @@ describe('graphqlCheckExistence when nothing was answered', { concurrency: 1 }, 
 
     const results = await probeQuietly();
     assert.deepStrictEqual([...results.entries()], [['tag', true], ['path', false]]);
+  });
+});
+
+// A declined attempt and a request that never reached GitHub both answer 599,
+// so only the sentinel body separates "not asked" from "asked and lost". Every
+// caller that reports an input as unread rather than as a verdict depends on
+// that distinction, so it is drawn in one place.
+describe('wasAttemptDeclined', { concurrency: 1 }, () => {
+  let originalFetch;
+  before(() => { originalFetch = globalThis.fetch; });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  test('is true for the answer a declined first attempt returns', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return new Response('{}', { status: 200 }); };
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    let res;
+    try {
+      res = await githubApiCall('https://api.github.com/x', 'token', 'GET', null,
+        'application/vnd.github+json', { onAttempt: () => false });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.strictEqual(served, 0, 'a declined attempt makes no request');
+    assert.strictEqual(res.code, 599);
+    assert.strictEqual(wasAttemptDeclined(res), true);
+  });
+
+  test('is false for a 599 that means the request was made and lost', async () => {
+    globalThis.fetch = async () => { throw new Error('connection reset'); };
+
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    console.warn = () => {};
+    console.error = () => {};
+    let res;
+    try {
+      res = await githubApiCall('https://api.github.com/x', 'token', 'GET', null,
+        'application/vnd.github+json', { onAttempt: () => true });
+    } finally {
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+
+    assert.strictEqual(res.code, 599);
+    assert.strictEqual(wasAttemptDeclined(res), false, 'GitHub was asked; the answer was lost');
+  });
+
+  test('is false for anything that is not a 599 carrying the sentinel', () => {
+    assert.strictEqual(wasAttemptDeclined(null), false);
+    assert.strictEqual(wasAttemptDeclined(undefined), false);
+    assert.strictEqual(wasAttemptDeclined({ code: 200, raw: 'ok' }), false);
+    assert.strictEqual(wasAttemptDeclined({ code: 599, raw: 'something else' }), false);
+    assert.strictEqual(wasAttemptDeclined({ code: 500, raw: 'Request not made: the caller declined the attempt' }), false);
+  });
+});
+
+// The write queue reserves pendingCritical * MAX_ATTEMPTS subrequests for the
+// writes that must still go out, so the constant has to keep saying what
+// githubApiCall actually spends. Pinned here rather than read off the source,
+// so raising the retry ceiling without the reserve following fails a test.
+describe('MAX_ATTEMPTS', { concurrency: 1 }, () => {
+  let originalFetch;
+  before(() => { originalFetch = globalThis.fetch; });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  test('is how many subrequests one request that keeps failing really costs', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return new Response('boom', { status: 500 }); };
+
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    console.warn = () => {};
+    console.error = () => {};
+    let charged = 0;
+    let res;
+    try {
+      res = await githubApiCall('https://api.github.com/repos/o/r/check-runs', 'token', 'POST', { name: 'x' },
+        'application/vnd.github+json', { onAttempt: () => { charged++; return true; } });
+    } finally {
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+
+    assert.strictEqual(res.code, 500);
+    assert.strictEqual(served, MAX_ATTEMPTS);
+    assert.strictEqual(charged, served, 'and every one of them is charged');
   });
 });

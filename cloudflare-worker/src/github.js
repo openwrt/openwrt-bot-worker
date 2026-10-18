@@ -20,6 +20,26 @@ const MAX_RETRY_AFTER_SECONDS = 5;
 // code alone is also what a network failure reports.
 const DECLINED_ATTEMPT_RAW = 'Request not made: the caller declined the attempt';
 
+// Says whether an answer is that body rather than one GitHub sent. A caller
+// that cannot tell the two apart reports a request the budget held back as a
+// request GitHub refused, which is an audit result claimed about input nobody
+// read.
+export function wasAttemptDeclined(res) {
+  return !!res && res.code === 599 && res.raw === DECLINED_ATTEMPT_RAW;
+}
+
+// The answer a request that was never made carries. Exported so a wrapper
+// standing in for such a call - a label create that reports whether GitHub
+// confirmed it, say - can say "not asked" in the same words githubApiCall
+// uses, instead of picking a status code that blames GitHub.
+export const DECLINED_ATTEMPT = Object.freeze({ code: 599, data: null, raw: DECLINED_ATTEMPT_RAW });
+
+// How many times githubApiCall tries one request. Exported because the write
+// queue reserves room for the closing writes in attempts, not operations: the
+// two numbers are one truth, and a retry ceiling raised here without the
+// reserve following would leave two thirds of the worst case unreserved.
+export const MAX_ATTEMPTS = 3;
+
 /** @returns {Promise<{ code: number; data: any; raw: string; headers: any }>} */
 export async function githubApiCall(url, token, method = 'GET', payload = null, customAccept = 'application/vnd.github+json', options = {}) {
   const headers = {
@@ -38,7 +58,6 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
     headers['Content-Type'] = 'application/json';
   }
 
-  const maxAttempts = 3;
   const isTestEnv = typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test';
   let delay = isTestEnv ? 1 : 500;
 
@@ -51,7 +70,7 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
     raw: DECLINED_ATTEMPT_RAW,
     headers: { get: () => null }
   };
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       if (options.onAttempt?.(attempt) === false) {
         console.warn(`GitHub API call not retried, no request budget left: ${method} ${url}`);
@@ -62,9 +81,9 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
 
       // Retry on 5xx status codes for all requests (transient GitHub issues)
       const isRetryable5xx = response.status >= 500 && response.status < 600;
-      if (isRetryable5xx && attempt < maxAttempts) {
+      if (isRetryable5xx && attempt < MAX_ATTEMPTS) {
         lastResult = { code: response.status, data: null, raw: text, headers: response.headers };
-        console.warn(`GitHub API call failed with HTTP ${response.status} (attempt ${attempt}/${maxAttempts}). Retrying in ${delay}ms...`);
+        console.warn(`GitHub API call failed with HTTP ${response.status} (attempt ${attempt}/${MAX_ATTEMPTS}). Retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         delay *= 2;
         continue;
@@ -78,7 +97,7 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
       // refusal and is not retried.
       const retryAfterSeconds = Number(response.headers?.get?.('retry-after'));
       const isRateLimited = (response.status === 403 || response.status === 429) && retryAfterSeconds > 0;
-      if (isRateLimited && attempt < maxAttempts) {
+      if (isRateLimited && attempt < MAX_ATTEMPTS) {
         if (retryAfterSeconds > MAX_RETRY_AFTER_SECONDS) {
           console.warn(`GitHub API rate limited: ${method} ${url} -> HTTP ${response.status}, Retry-After ${retryAfterSeconds}s is longer than a webhook can wait. Giving up.`);
         } else {
@@ -86,7 +105,7 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
           // follows, this rate-limited answer is what it must be told about.
           lastResult = { code: response.status, data: null, raw: text, headers: response.headers };
           const wait = isTestEnv ? 1 : retryAfterSeconds * 1000;
-          console.warn(`GitHub API rate limited: ${method} ${url} -> HTTP ${response.status} (attempt ${attempt}/${maxAttempts}). Retrying in ${wait}ms...`);
+          console.warn(`GitHub API rate limited: ${method} ${url} -> HTTP ${response.status} (attempt ${attempt}/${MAX_ATTEMPTS}). Retrying in ${wait}ms...`);
           await new Promise(resolve => setTimeout(resolve, wait));
           continue;
         }
@@ -122,9 +141,9 @@ export async function githubApiCall(url, token, method = 'GET', payload = null, 
     } catch (error) {
       // Retry network/fetch errors for all requests
       const isRetryableError = true;
-      if (isRetryableError && attempt < maxAttempts) {
+      if (isRetryableError && attempt < MAX_ATTEMPTS) {
         lastResult = { code: 599, data: null, raw: error.message, headers: { get: () => null } };
-        console.warn(`GitHub API call network error (attempt ${attempt}/${maxAttempts}): ${error.message}. Retrying in ${delay}ms...`);
+        console.warn(`GitHub API call network error (attempt ${attempt}/${MAX_ATTEMPTS}): ${error.message}. Retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         delay *= 2;
         continue;
@@ -729,7 +748,7 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes, on
     // failure is raised instead, which leaves the issue alone and shows up in
     // the delivery log. A query that went out but failed and one the caller
     // declined are the same case here; only the wording tells them apart.
-    const unanswered = res.code === 599 && res.raw === DECLINED_ATTEMPT_RAW
+    const unanswered = wasAttemptDeclined(res)
       ? 'was not sent (no request budget left)'
       : `was not answered (HTTP ${res.code}: ${(res.raw || '').trim().slice(0, 200)})`;
     throw new Error(`GraphQL existence probe for ${repoFullname} ${unanswered}, so existence is unknown`);

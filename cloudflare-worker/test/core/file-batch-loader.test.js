@@ -1,6 +1,9 @@
 import { describe, test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createFileBatchLoader } from '../../src/core/file-batch-loader.ts';
+import { optionalAttemptCounter } from '../../src/core/utils.ts';
+import { createGitHubClient } from '../../src/core/github-client.ts';
+import { wasAttemptDeclined } from '../../src/github.js';
 
 describe('FileBatchLoader', () => {
   let originalFetch;
@@ -305,6 +308,183 @@ describe('FileBatchLoader', () => {
     assert.strictEqual(loader.isFileMissing('package/foo/Makefile', 'main'), false, 'should not be recorded as missing file');
     assert.strictEqual(loader.getFetchFailureCount(), 1);
     assert.strictEqual(loader.getStats().fetchFailureCount, 1);
+  });
+
+  // The chunks of one flush are planned in a single synchronous pass and fire
+  // together, so what matters here is the number of requests that really went
+  // out, the budget they really spent, and that the reserve the closing writes
+  // live on was never touched.
+  describe('concurrent chunk dispatch against the reserve', () => {
+    const blobResponse = () => new Response(JSON.stringify({
+      data: { repo0: { f0: { oid: 'blob', text: 'content\n', isBinary: false } } }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    // The five writes a run has to be able to make after all optional work:
+    // three check-runs, the PR comment and the label update.
+    const CLOSING_WRITES = 5;
+
+    test('fires only the chunks that fit and marks the rest skipped, with the counter the loader hands down', async () => {
+      let fetches = 0;
+      globalThis.fetch = async () => { fetches++; return blobResponse(); };
+
+      // available = 50 - 5 - 43 = 2, so two of the four chunks fit.
+      const budget = { limit: 50, used: 43, reserve: 5 };
+      const loader = createFileBatchLoader({
+        token: 'fake-token',
+        repoFullname: 'openwrt/openwrt',
+        subrequestBudget: budget,
+        // What the loader passes to graphqlBatchFetchFiles for a chunk it has
+        // reserved: the first attempt is already paid for, so the counter it
+        // sees only has to allow it.
+        countOptionalAttempt: () => true,
+        graphqlChunkSize: 1
+      });
+
+      const contents = await Promise.all([
+        loader.fetchFileContentCached('a/Makefile', 'main'),
+        loader.fetchFileContentCached('b/Makefile', 'main'),
+        loader.fetchFileContentCached('c/Makefile', 'main'),
+        loader.fetchFileContentCached('d/Makefile', 'main')
+      ]);
+
+      assert.strictEqual(fetches, 2, 'only the two affordable chunks may reach the network');
+      assert.strictEqual(budget.used, 45, 'each dispatched chunk spends exactly one attempt');
+      assert.strictEqual(budget.limit - budget.used, budget.reserve, 'the reserve is untouched');
+      assert.strictEqual(loader.getBudgetSkipCount(), 2, 'the two unaffordable lookups are skipped, not missing');
+      assert.strictEqual(loader.getFetchFailureCount(), 0);
+      assert.strictEqual(loader.isFileMissing('c/Makefile', 'main'), false);
+      assert.strictEqual(loader.isFileMissing('d/Makefile', 'main'), false);
+      assert.deepStrictEqual(contents, ['content\n', 'content\n', null, null]);
+      assert.ok(budget.limit - budget.used >= CLOSING_WRITES, 'the closing writes still have room');
+    });
+
+    test('spends the same budget when the shared optional counter does the charging', async () => {
+      let fetches = 0;
+      globalThis.fetch = async () => { fetches++; return blobResponse(); };
+
+      const budget = { limit: 50, used: 43, reserve: 5 };
+      const loader = createFileBatchLoader({
+        token: 'fake-token',
+        repoFullname: 'openwrt/openwrt',
+        subrequestBudget: budget,
+        countOptionalAttempt: optionalAttemptCounter(budget),
+        graphqlChunkSize: 1
+      });
+
+      await Promise.all([
+        loader.fetchFileContentCached('a/Makefile', 'main'),
+        loader.fetchFileContentCached('b/Makefile', 'main'),
+        loader.fetchFileContentCached('c/Makefile', 'main'),
+        loader.fetchFileContentCached('d/Makefile', 'main')
+      ]);
+
+      assert.strictEqual(fetches, 2);
+      // 45, not 47: the attempt the loader reserves is not charged a second
+      // time when the request goes out.
+      assert.strictEqual(budget.used, 45, 'a reserved attempt is charged once');
+      assert.strictEqual(loader.getBudgetSkipCount(), 2);
+      assert.ok(budget.limit - budget.used >= CLOSING_WRITES, 'the closing writes still have room');
+    });
+
+    // What charging the first attempt unconditionally cost in practice: two
+    // optional lookups starting together both went out, `used` landed past
+    // limit - reserve, and the loader that comes after had nothing left - with
+    // the reserve the closing writes depend on already part spent.
+    test('leaves the loader its reserve when two optional lookups start together', async () => {
+      let fetches = 0;
+      globalThis.fetch = async () => { fetches++; return blobResponse(); };
+
+      const budget = { limit: 10, used: 4, reserve: 5 };
+      const client = createGitHubClient('fake-token', budget);
+      const loader = createFileBatchLoader({
+        token: 'fake-token',
+        repoFullname: 'openwrt/openwrt',
+        subrequestBudget: budget,
+        countOptionalAttempt: client.countOptionalAttempt,
+        graphqlChunkSize: 1
+      });
+
+      const originalWarn = console.warn;
+      console.warn = () => {};
+      let answers;
+      try {
+        answers = await Promise.all([
+          client.optionalApiCall('https://api.github.com/repos/openwrt/openwrt/commits/aaa'),
+          client.optionalApiCall('https://api.github.com/repos/openwrt/openwrt/commits/bbb')
+        ]);
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      assert.strictEqual(fetches, 1, 'only the one affordable attempt may reach the network');
+      assert.strictEqual(answers[0].code, 200);
+      assert.strictEqual(wasAttemptDeclined(answers[1]), true,
+        'the second is told it was not asked, not that GitHub refused');
+      assert.strictEqual(budget.used, 5);
+      assert.strictEqual(budget.limit - budget.used, budget.reserve, 'the reserve is intact');
+
+      // And the loader behind them reports a skip rather than a missing file.
+      const content = await loader.fetchFileContentCached('a/Makefile', 'main');
+      assert.strictEqual(content, null);
+      assert.strictEqual(fetches, 1, 'nothing more may go out');
+      assert.strictEqual(budget.used, 5);
+      assert.strictEqual(loader.getBudgetSkipCount(), 1);
+      assert.strictEqual(loader.getFetchFailureCount(), 0);
+      assert.strictEqual(loader.isFileMissing('a/Makefile', 'main'), false);
+      assert.ok(budget.limit - budget.used >= CLOSING_WRITES, 'the closing writes still have room');
+    });
+
+    test('charges a single chunk once and leaves its retry to the shared counter', async () => {
+      let fetches = 0;
+      globalThis.fetch = async () => { fetches++; return new Response('upstream down', { status: 500 }); };
+
+      // available = 1: the chunk fits, its retry does not.
+      const budget = { limit: 50, used: 44, reserve: 5 };
+      const loader = createFileBatchLoader({
+        token: 'fake-token',
+        repoFullname: 'openwrt/openwrt',
+        subrequestBudget: budget,
+        countOptionalAttempt: optionalAttemptCounter(budget)
+      });
+
+      await assert.rejects(
+        () => loader.fetchFileContentCached('a/Makefile', 'main'),
+        /GraphQL batch file fetch failed \(HTTP 500\)/
+      );
+
+      assert.strictEqual(fetches, 1, 'the retry was declined, so it never went out');
+      assert.strictEqual(budget.used, 45, 'the declined retry charges nothing');
+      assert.strictEqual(budget.limit - budget.used, budget.reserve);
+      assert.ok(budget.limit - budget.used >= CLOSING_WRITES, 'the closing writes still have room');
+    });
+
+    test('single affordable chunk behaves as before: one request, one attempt charged', async () => {
+      let fetches = 0;
+      globalThis.fetch = async () => {
+        fetches++;
+        return new Response(JSON.stringify({
+          data: { repo0: { f0: { oid: 'b1', text: 'one\n', isBinary: false }, f1: { oid: 'b2', text: 'two\n', isBinary: false } } }
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      };
+
+      const budget = { limit: 50, used: 0, reserve: 5 };
+      const loader = createFileBatchLoader({
+        token: 'fake-token',
+        repoFullname: 'openwrt/openwrt',
+        subrequestBudget: budget,
+        countOptionalAttempt: optionalAttemptCounter(budget)
+      });
+
+      const contents = await Promise.all([
+        loader.fetchFileContentCached('a/Makefile', 'main'),
+        loader.fetchFileContentCached('b/Makefile', 'main')
+      ]);
+
+      assert.deepStrictEqual(contents, ['one\n', 'two\n']);
+      assert.strictEqual(fetches, 1);
+      assert.strictEqual(budget.used, 1, 'two files in one chunk cost one subrequest');
+      assert.strictEqual(loader.getBudgetSkipCount(), 0);
+    });
   });
 });
 

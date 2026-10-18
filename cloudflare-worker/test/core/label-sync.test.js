@@ -4,6 +4,7 @@ import { syncLabels } from '../../src/handlers/pull-request/label-sync.ts';
 import { loadPullRequestContext } from '../../src/handlers/pull-request/context.ts';
 import { GitHubWriteQueue } from '../../src/core/github-write-queue.ts';
 import { createGitHubClient } from '../../src/core/github-client.ts';
+import { optionalAttemptCounter } from '../../src/core/utils.ts';
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE } from '../../src/config.js';
 
 describe('label-sync lifecycle phase and error handling', () => {
@@ -12,7 +13,8 @@ describe('label-sync lifecycle phase and error handling', () => {
     trackedApiResult = { code: 200, data: null, raw: '', headers: { get: () => null } },
     client = null,
     headBranch = 'feature',
-    baseSha = 'base123'
+    baseSha = 'base123',
+    mockBudget = { limit: 50, used: 0, reserve: 5 }
   } = {}) => ({
     prNumber: 42,
     repoFullname: 'openwrt/openwrt',
@@ -29,10 +31,14 @@ describe('label-sync lifecycle phase and error handling', () => {
       head: { ref: 'feature', sha: 'head123' },
       base: { ref: 'main', sha: 'base123' }
     },
+    // The label writes are charged through the declining counter, so the stub
+    // answers them on optionalApiCall - the GET is the live PR re-read, every
+    // other method is a label write.
     client: client || {
-      budget: { limit: 50, used: 0, reserve: 5 },
+      budget: mockBudget,
       hasHeadroom: () => true,
-      optionalApiCall: async () => ({
+      countOptionalAttempt: optionalAttemptCounter(mockBudget),
+      optionalApiCall: async (_url, method = 'GET') => (method === 'GET' ? {
         code: 200,
         data: {
           labels: [],
@@ -40,7 +46,7 @@ describe('label-sync lifecycle phase and error handling', () => {
           base: { ref: 'main', sha: 'base123' },
           body: 'PR Body'
         }
-      }),
+      } : trackedApiResult),
       trackedApiCall: async () => trackedApiResult
     },
     existingLabels,
@@ -125,6 +131,87 @@ describe('label-sync lifecycle phase and error handling', () => {
     const body = await errorResponse.text();
     assert.match(body, /Failed to report status for PR #42/);
     assert.match(body, /HTTP 500/);
+  });
+
+  // Label creation is the write path that used to count its attempts without
+  // being able to refuse one: three attempts per label, plus the `labels`
+  // POST, all charged against the attempts the three check-runs are holding.
+  // The budget here leaves one attempt above that reserve (45 - 35 = 10,
+  // reserve 3 * 3 = 9), so the create may start but its retry may not.
+  test('declines the retry of a label create that would spend a check-run attempt', async () => {
+    // 34 used, plus the live PR re-read below, leaves 10 of the 45 at the
+    // moment the writes start.
+    const budget = { limit: 45, used: 34, reserve: 15 };
+    const client = createGitHubClient('fake-token', budget);
+    const queue = new GitHubWriteQueue(42);
+    const ctx = createMockContext({ client });
+    const patches = createMockPatches();
+    const report = createMockReport({ allPassed: false });
+
+    const originalFetch = globalThis.fetch;
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push(`${options?.method || 'GET'} ${url}`);
+      // The repository's label collection: creating a label keeps failing.
+      if (url.endsWith('/labels') && !url.includes('/issues/')) {
+        return new Response('{}', { status: 500 });
+      }
+      if (url.endsWith('/pulls/42')) {
+        return new Response(JSON.stringify({
+          state: 'open',
+          labels: [],
+          head: { ref: 'feature', sha: 'head123' },
+          base: { ref: 'main', sha: 'base123' },
+          body: 'PR Body'
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+    };
+
+    let errorResponse;
+    try {
+      await syncLabels(ctx, patches, report, queue);
+      assert.strictEqual(
+        queue.queue.filter(([what]) => what.startsWith('ensure label')).length, 2,
+        'two labels are missing on the pull request, so two creates are queued'
+      );
+      assert.strictEqual(budget.used, 35, 'the live PR re-read is one attempt');
+
+      // Production enqueues the three check-runs after the label writes.
+      const checkRunsUrl = 'https://api.github.com/repos/openwrt/openwrt/check-runs';
+      for (const name of ['Git & Commits', 'OpenWrt Makefiles', 'Code Patches']) {
+        queue.enqueue(`check-run "${name}"`, () =>
+          client.trackedApiCall(checkRunsUrl, 'POST', { name: `FormalityCheck / ${name}` }), { isCritical: true });
+      }
+
+      errorResponse = await queue.execute(budget);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const labelCreates = calls.filter(c => c === 'POST https://api.github.com/repos/openwrt/openwrt/labels');
+    assert.strictEqual(labelCreates.length, 1,
+      `the create is attempted once and not retried: ${JSON.stringify(calls)}`);
+    assert.strictEqual(calls.length, 5,
+      `the PR re-read, one label create and three check-runs: ${JSON.stringify(calls)}`);
+    assert.strictEqual(budget.used, 39, 'every attempt is charged exactly once');
+    assert.ok(budget.used <= budget.limit, 'the internal limit holds');
+    assert.strictEqual(budget.reserve, 15, 'the reading-phase reserve is left as it was');
+
+    // The second create and the `labels` POST had nothing left to spend.
+    assert.deepStrictEqual(queue.statusWrites.map(w => w.what), [
+      `ensure label "${LABEL_GUIDELINES}"`,
+      'check-run "Git & Commits"',
+      'check-run "OpenWrt Makefiles"',
+      'check-run "Code Patches"'
+    ]);
+    assert.strictEqual(queue.statusWrites.filter(w => w.code === 201).length, 3,
+      'all three check-runs were written');
+
+    // A create that was refused is still a create that did not happen.
+    assert.ok(errorResponse instanceof Response);
+    assert.strictEqual(errorResponse.status, 502);
+    assert.match(await errorResponse.text(), /ensure label "[^"]+" \(HTTP 502\)/);
   });
 
   // The shared helper says false both for a label that was already there and

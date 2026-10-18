@@ -106,6 +106,13 @@ export async function syncPrComment(
     return;
   }
 
+  // This report is the one closing write a run may drop: only the three
+  // check-runs have to go out. So it is written through the refusable call,
+  // which lets the queue skip it outright while the critical writes' reserve
+  // is all that is left (logged, not recorded, the run still reports success)
+  // and declines its retries at the same line. A retry declined that way
+  // still carries GitHub's own last answer, so a write GitHub refused is
+  // reported as the failure it is - the budget only stopped the retrying.
   const commentsUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments`;
   const existingCommentId = scanResult.existingCommentId;
 
@@ -123,17 +130,17 @@ export async function syncPrComment(
 
     if (existingCommentId) {
       queue.enqueue('PR comment update', () =>
-        client.trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'PATCH', { body: commentBody })
+        client.optionalApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'PATCH', { body: commentBody })
       );
     } else {
       queue.enqueue('PR comment', () =>
-        client.trackedApiCall(commentsUrl, 'POST', { body: commentBody })
+        client.optionalApiCall(commentsUrl, 'POST', { body: commentBody })
       );
     }
   } else if (!isValidationIncomplete) {
     if (existingCommentId) {
       queue.enqueue('PR comment removal', async () => {
-        const res = await client.trackedApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'DELETE');
+        const res = await client.optionalApiCall(`https://api.github.com/repos/${repoFullname}/issues/comments/${existingCommentId}`, 'DELETE');
         return res.code === 404 ? { code: 200 } : res;
       });
     }

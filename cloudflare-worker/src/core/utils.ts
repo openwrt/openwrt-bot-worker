@@ -40,17 +40,27 @@ export function isBotUser(user: { login?: string; type?: string } | null | undef
   return user?.type === 'Bot' || (!!login && login.toLowerCase().endsWith('[bot]'));
 }
 
-// Counts an outgoing attempt for a lookup the run can do without. The first
-// attempt was already checked against the headroom by its caller, but a retry
-// starts later, when other requests may have used it up - so a retry is
-// declined (githubApiCall then returns the answer it already had) once only
-// the reserve kept for the terminal writes is left.
+// Takes one attempt for an optional lookup out of the budget, or refuses when
+// nothing but the reserve kept for the terminal writes is left. The check and
+// the charge are deliberately one step: a caller that plans several lookups in
+// one synchronous pass and fires them together would otherwise hand every one
+// of them the same answer, and spend as many attempts as it planned.
+export function reserveOptionalAttempt(subrequestBudget: SubrequestBudget): boolean {
+  if (subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used <= 0) {
+    return false;
+  }
+  subrequestBudget.used++;
+  return true;
+}
+
+// Counts an outgoing attempt for a lookup the run can do without, and refuses
+// it once only the reserve is left. Every attempt is treated alike: charging
+// the first one whatever the headroom let an optional lookup spend out of the
+// room the terminal writes are kept for, and two lookups starting together
+// could take two attempts out of a reserve that had none to give. A declined
+// attempt comes back as HTTP 599 with the sentinel body githubApiCall
+// documents, which wasAttemptDeclined tells apart from a request GitHub
+// refused, so a caller reports an input it never read rather than a verdict.
 export function optionalAttemptCounter(subrequestBudget: SubrequestBudget): (attempt: number) => boolean {
-  return (attempt: number): boolean => {
-    if (attempt > 1 && subrequestBudget.limit - subrequestBudget.reserve - subrequestBudget.used <= 0) {
-      return false;
-    }
-    subrequestBudget.used++;
-    return true;
-  };
+  return (_attempt: number): boolean => reserveOptionalAttempt(subrequestBudget);
 }

@@ -5,6 +5,7 @@ import {
 } from '../../core/patch-utils.ts';
 import { CHERRY_PICK_MARKER } from '../../core/policy.ts';
 import { collectPackageMakefiles } from '../../validators.js';
+import { wasAttemptDeclined } from '../../github.js';
 import type { PullRequestContext } from './context.ts';
 
 export interface CommitDetail {
@@ -125,7 +126,16 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
       commitPatch = splitCommitPatches.get(sha)!;
     } else if (fetchPatch) {
       const detailUrl = `https://api.github.com/repos/${repoFullname}/commits/${sha}`;
-      let patchRes = await client.optionalApiCall(detailUrl, 'GET', null, 'application/vnd.github.patch');
+      // With no PR-wide patch behind it, a single commit's patch is the only
+      // copy of the diff the whole audit reads, and the fallback below already
+      // re-fetches it with a tracked call for exactly that reason. Spending the
+      // attempt here keeps the one request the run cannot do without from being
+      // made twice and from being declined at the reserve; where there is a
+      // fallback, the attempt is optional and a decline costs only this pass.
+      const patchIsOnlySource = prWidePatchText === null && commits.length <= 1;
+      let patchRes = patchIsOnlySource
+        ? await client.trackedApiCall(detailUrl, 'GET', null, 'application/vnd.github.patch')
+        : await client.optionalApiCall(detailUrl, 'GET', null, 'application/vnd.github.patch');
       if (patchRes && patchRes.code === 200 && !fileBatchLoader.hasRefSource(sha)) {
         fileBatchLoader.setRefSource(sha, 'base');
       }
@@ -139,12 +149,27 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
           && (typeof client.hasHeadroom !== 'function' || client.hasHeadroom())) {
         console.warn(`Commit ${sha} not found in base repo ${repoFullname} (HTTP ${patchRes.code}). Retrying fetch from head repo ${headRepoFullname}...`);
         const forkDetailUrl = `https://api.github.com/repos/${headRepoFullname}/commits/${sha}`;
+        const baseRes = patchRes;
         patchRes = await client.optionalApiCall(forkDetailUrl, 'GET', null, 'application/vnd.github.patch', { silent: true });
-        if (patchRes && patchRes.code === 200 && !fileBatchLoader.hasRefSource(sha)) {
+        if (wasAttemptDeclined(patchRes)) {
+          // The retry never went out, so the base repo's answer is still the
+          // only one there is. Keeping it is what makes the failure below name
+          // what GitHub said instead of the 599 a declined attempt reports.
+          console.warn(`Fork fallback for commit ${sha} not attempted: no request budget left outside the reserve kept for the closing writes.`);
+          patchRes = baseRes;
+        } else if (patchRes && patchRes.code === 200 && !fileBatchLoader.hasRefSource(sha)) {
           fileBatchLoader.setRefSource(sha, 'fork');
         }
       }
 
+      // A declined attempt is not an answer, and a commit left without a patch
+      // reads downstream as a commit that changed no text file - a pass for an
+      // audit that never ran. So this pass is abandoned either way and the
+      // caller falls back to the PR-wide patch; only a budget decline must not
+      // be reported as something GitHub refused to serve.
+      if (wasAttemptDeclined(patchRes)) {
+        throw new Error(`Commit patch for SHA ${sha} was not fetched: no request budget left outside the reserve kept for the closing writes`);
+      }
       if (!patchRes || patchRes.code !== 200) {
         const cleanRaw = (patchRes?.raw || "").trim().slice(0, 200);
         throw new Error(`Failed to fetch commit patch for SHA ${sha} (HTTP ${patchRes?.code}): ${cleanRaw}`);
@@ -184,6 +209,14 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
           if (fetchPatch && commitPatch) {
             isVerbatim = normalizeDiff(getDiffFromPatch(commitPatch)) === normalizeDiff(getDiffFromPatch(upstreamPatch));
           }
+        } else if (wasAttemptDeclined(upstreamRes)) {
+          // Nothing was asked, so nothing is known: counted and reported
+          // exactly like the lookup the headroom refused up front, rather than
+          // as an upstream GitHub would not serve. upstreamSha goes back to
+          // null because a comparison that never happened must not be
+          // described below as a diff that deviates from its original.
+          counts.comparisonSkips++;
+          upstreamSha = null;
         } else {
           counts.fetchFailures++;
           upstreamFetchError = `Could not fetch upstream commit ${targetSha.slice(0, 7)} from GitHub API (HTTP ${upstreamRes?.code})`;

@@ -359,4 +359,71 @@ describe('loadPullRequestContext', { concurrency: 1 }, () => {
       assert.strictEqual(report.patchesConclusion, 'success');
     });
   });
+
+  // The Dependabot path writes labels and nothing else: no check-run follows
+  // it, so the flat reserve is the only thing keeping its retries inside the
+  // invocation's subrequest cap. loadPullRequestContext answers a Response
+  // here and never builds a context, so the real attempt count is read off
+  // the fetches themselves - every one of them is charged.
+  describe('the labels a Dependabot pull request is opened with', () => {
+    const dependabotPayload = () => ({
+      action: 'opened',
+      pull_request: {
+        number: 123,
+        title: 'build(deps): bump serde from 1.0.1 to 1.0.2',
+        body: '',
+        state: 'open',
+        commits: 1,
+        url: 'https://api.github.com/repos/openwrt/openwrt/pulls/123',
+        user: { login: 'dependabot[bot]', type: 'Bot' },
+        author_association: 'CONTRIBUTOR',
+        labels: [],
+        base: { ref: 'main', sha: 'b'.repeat(40), repo: { full_name: 'openwrt/openwrt' } },
+        head: { ref: 'dependabot/cargo/serde-1.0.2', sha: 'c'.repeat(40), repo: { full_name: 'openwrt/openwrt' } }
+      }
+    });
+
+    const labelWritesRefused = async (tokenMintAttempts) => {
+      const originalError = console.error;
+      console.error = () => {};
+      try {
+        mockFetch((url) => {
+          if (url.includes('/labels')) return new Response('upstream hiccup', { status: 500 });
+          throw new Error(`unexpected request: ${url}`);
+        });
+        const result = await loadPullRequestContext(
+          dependabotPayload(), 'pull_request', ENV, 'token', 'openwrt/openwrt', APP_ID, tokenMintAttempts
+        );
+        assert.strictEqual(result.kind, 'response', 'this path never builds a context');
+        return result.response;
+      } finally {
+        console.error = originalError;
+      }
+    };
+
+    const countOf = (part) => fetchUrls.filter(u => u.includes(part)).length;
+
+    // Entering with the budget down to its reserve, neither write is made at
+    // all: these labels are optional, and every attempt - the first one too -
+    // is now reserved. A write this worker held back is not a write GitHub
+    // refused, so the delivery still answers success and says so in the log.
+    test('neither label write spends the reserve', async () => {
+      const response = await labelWritesRefused(30);
+
+      assert.strictEqual(countOf('/repos/openwrt/openwrt/labels'), 0, 'the create is not attempted');
+      assert.strictEqual(countOf('/issues/123/labels'), 0, 'and neither is the apply');
+      assert.strictEqual(fetchUrls.length, 0);
+      assert.strictEqual(response.status, 200, 'a write the budget held back is not a failed write');
+    });
+
+    // Control: with the budget untouched both writes retry as before, so the
+    // declining counter costs a healthy run nothing.
+    test('a run with room left still retries both of them', async () => {
+      const response = await labelWritesRefused(TOKEN_MINT_ATTEMPTS);
+
+      assert.strictEqual(countOf('/repos/openwrt/openwrt/labels'), 3);
+      assert.strictEqual(countOf('/issues/123/labels'), 3);
+      assert.strictEqual(response.status, 502);
+    });
+  });
 });

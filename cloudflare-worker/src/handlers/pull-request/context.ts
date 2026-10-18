@@ -1,5 +1,5 @@
 import { parseAndValidateConfig } from '../../types/config.ts';
-import { graphqlFetchRepoSetup, ensureLabelExists } from '../../github.js';
+import { graphqlFetchRepoSetup, ensureLabelExists, DECLINED_ATTEMPT } from '../../github.js';
 import { GitHubWriteQueue } from '../../core/github-write-queue.ts';
 import { parseEnvInt } from '../../core/utils.ts';
 import { createMaintainerResolver } from '../../core/maintainer-resolver.ts';
@@ -224,6 +224,10 @@ export async function loadPullRequestContext(
 
       if (labelsToEnsure.length > 0) {
         const prNumber = prData.number || 0;
+        // Both writes count every attempt they make and stop retrying once
+        // only the reserve is left: this path has no check-run to protect,
+        // but it shares the invocation's subrequest cap with nothing to spare
+        // either, and a counter that cannot refuse would retry past it.
         const queue = new GitHubWriteQueue(prNumber);
 
         // The label listing is not fetched on this path, so the create is
@@ -234,7 +238,13 @@ export async function loadPullRequestContext(
         const confirmedLabels = new Set<string>();
         for (const lbl of labelsToEnsure) {
           queue.enqueue(`ensure label "${lbl.name}"`, async () => {
-            const created = await ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, confirmedLabels, () => { subrequestBudget.used++; });
+            const chargedBefore = client.budget.used;
+            const created = await ensureLabelExists(token, repoFullname, lbl.name, lbl.color, lbl.description, confirmedLabels, client.countOptionalAttempt);
+            // Nothing charged means nothing was sent: the counter declined the
+            // attempt to keep the reserve. That is this worker's decision, so
+            // it is reported as a request never made rather than as a create
+            // GitHub refused.
+            if (!created && client.budget.used === chargedBefore) return DECLINED_ATTEMPT;
             return (created || confirmedLabels.has(lbl.name.toLowerCase())) ? { code: 200 } : { code: 502 };
           });
         }
@@ -242,7 +252,7 @@ export async function loadPullRequestContext(
         if (prNumber) {
           const prLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/labels`;
           queue.enqueue('apply Dependabot labels', () =>
-            client.trackedApiCall(prLabelUrl, 'POST', { labels: labelsToEnsure.map(l => l.name) })
+            client.optionalApiCall(prLabelUrl, 'POST', { labels: labelsToEnsure.map(l => l.name) })
           );
         }
 

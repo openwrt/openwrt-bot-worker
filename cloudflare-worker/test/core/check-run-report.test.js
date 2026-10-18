@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import { buildCheckRunPayloads, enqueueCheckRuns } from '../../src/handlers/pull-request/check-run-report.ts';
 import { aggregateReport } from '../../src/handlers/pull-request/report.ts';
 import { GitHubWriteQueue } from '../../src/core/github-write-queue.ts';
+import { createGitHubClient } from '../../src/core/github-client.ts';
 
 describe('check-run-report lifecycle phase', () => {
   const mockReport = {
@@ -61,6 +62,58 @@ describe('check-run-report lifecycle phase', () => {
     assert.strictEqual(postedPayloads.length, 3);
     assert.strictEqual(queue.statusWrites.length, 3);
     assert.strictEqual(queue.statusWrites.every(w => w.code === 201), true);
+  });
+
+  // What the queue exists for: a pull request too large to audit fully still
+  // has to end with its three check-runs, retries included, after the
+  // optional writes were refused.
+  test('writes all three check-runs with their conclusions once the budget is spent', async () => {
+    const budget = { limit: 45, used: 44, reserve: 15 };
+    const client = createGitHubClient('fake-token', budget);
+    const queue = new GitHubWriteQueue(123);
+    const ctx = { repoFullname: 'openwrt/openwrt', headSha: 'sha-abc-123', client };
+
+    queue.enqueue('labels', () => client.optionalApiCall(
+      'https://api.github.com/repos/openwrt/openwrt/issues/123/labels', 'POST', { labels: ['x'] }));
+    enqueueCheckRuns(ctx, mockReport, queue);
+
+    const originalFetch = globalThis.fetch;
+    const calls = [];
+    const written = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push(`${options?.method} ${url}`);
+      const body = JSON.parse(options.body);
+      // One transient failure, on the middle check-run.
+      if (body.name === 'FormalityCheck / OpenWrt Makefiles' &&
+          !calls.some(c => c === 'retried')) {
+        calls.push('retried');
+        return new Response('{}', { status: 500 });
+      }
+      written.push({ name: body.name, conclusion: body.conclusion });
+      return new Response(JSON.stringify({ id: written.length }), { status: 201 });
+    };
+
+    let result;
+    try {
+      result = await queue.execute(budget);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.strictEqual(result, null);
+    assert.deepStrictEqual(written, [
+      { name: 'FormalityCheck / Git & Commits', conclusion: 'success' },
+      { name: 'FormalityCheck / OpenWrt Makefiles', conclusion: 'failure' },
+      { name: 'FormalityCheck / Code Patches', conclusion: 'neutral' }
+    ]);
+    assert.strictEqual(calls.filter(c => c.endsWith('/check-runs')).length, 4,
+      `three check-runs, one of them attempted twice: ${JSON.stringify(calls)}`);
+    assert.strictEqual(calls.filter(c => c.endsWith('/labels')).length, 0,
+      'the optional label write had nothing left to spend');
+    assert.strictEqual(budget.used, 48, 'the check-run attempts are charged, the reserve is what pays');
+    assert.deepStrictEqual(queue.statusWrites.map(w => w.what), [
+      'check-run "Git & Commits"', 'check-run "OpenWrt Makefiles"', 'check-run "Code Patches"'
+    ]);
   });
 
   test('returns 502 Bad Gateway response when a check-run API call fails', async () => {
