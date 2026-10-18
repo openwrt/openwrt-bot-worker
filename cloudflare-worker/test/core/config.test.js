@@ -96,6 +96,17 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(resPin.config.check_pkg_hash, 'error');
     }
 
+    // check_patch_refresh takes check_patch_headers' five values, and an
+    // invalid one falls back to the default 'warning' without discarding the
+    // rest.
+    for (const val of ['warnning', 1, ['warning']]) {
+      const resRefresh = parseAndValidateConfig(JSON.stringify({ check_patch_refresh: val, check_patch_headers: 'warning' }));
+      assert.match(resRefresh.error, /field "check_patch_refresh" must be one of \[true, false, "warning", "error", "disabled"\]/);
+      assert.strictEqual(resRefresh.partial, true);
+      assert.strictEqual(resRefresh.config.check_patch_refresh, 'warning');
+      assert.strictEqual(resRefresh.config.check_patch_headers, 'warning');
+    }
+
     const resInvalidBinary = parseAndValidateConfig(JSON.stringify({ check_binary_files: 'warnning' }));
     assert.match(resInvalidBinary.error, /field "check_binary_files" must be one of/);
 
@@ -237,6 +248,7 @@ describe('parseAndValidateConfig', () => {
     for (const val of [true, false, 'warning', 'error', 'disabled']) {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_buildbot_default: val })).error, null);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_patch_headers: val })).error, null);
+      assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_patch_refresh: val })).config.check_patch_refresh, val);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_release: val })).error, null);
     }
 

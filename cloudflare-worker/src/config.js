@@ -42,6 +42,9 @@ export const DEFAULT_CONFIG = {
 
   // Patches Check features
   check_patch_headers: true,
+  // 'warning' by default: the rule is openwrt/packages' CONTRIBUTING.md, and
+  // openwrt/openwrt, which has none, merges upstream-format patches.
+  check_patch_refresh: 'warning',
 
   // Package Release Check features
   check_pkg_release: 'warning',

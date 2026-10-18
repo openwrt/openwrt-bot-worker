@@ -43,6 +43,7 @@ export interface FormalitiesConfig {
 
   // Patches Check features
   check_patch_headers?: boolean | 'warning' | 'error' | 'disabled';
+  check_patch_refresh?: boolean | 'warning' | 'error' | 'disabled';
 
   // Package Release Check features
   check_pkg_release?: boolean | 'warning' | 'error' | 'disabled';
@@ -113,6 +114,7 @@ const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_uci_config: new Set([true, false, 'disabled']),
   check_buildbot_default: new Set([true, false, 'warning', 'error', 'disabled']),
   check_patch_headers: new Set([true, false, 'warning', 'error', 'disabled']),
+  check_patch_refresh: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_release: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_hash: new Set([false, 'warning', 'error', 'disabled']),
   check_pkg_source_pin: new Set([false, 'warning', 'error', 'disabled'])

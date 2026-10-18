@@ -42,6 +42,38 @@ describe('check-run-report lifecycle phase', () => {
 
   // A passing check that reported a patch finding reported it as a warning,
   // and must not say every patch file has its headers.
+  // Two rules can fail the Code Patches check, and its summary names the one
+  // that did: a refresh failure is not a missing header, nor the other way.
+  test('names the rule that failed the Code Patches check', () => {
+    const header = "- Embedded patch file 'p/001-a.patch' is missing the 'From:' author line. Regenerate the patch with 'git format-patch'.";
+    const refresh = "- Embedded patch file 'p/002-b.patch' carries a diff the buildroot's refresh target did not write: it still has git's `diff --git` file header, which quilt never emits. The mail header and the description above the diff are preserved, so this does not undo the patch-header check.";
+    const failing = (...lines) => buildCheckRunPayloads({
+      ...mockReport, patchesPassed: false, patchesConclusion: 'failure', unreadPatchNotes: new Set(),
+      allPatchesErrors: [`**Commit [abc1234](url)** - *foo: bar*:\n${lines.join('\n')}`]
+    }, 'sha-abc-123')[2].payload.output.summary;
+
+    assert.match(failing(header), /missing the required Git headers/);
+    assert.doesNotMatch(failing(header), /refresh target/);
+    assert.match(failing(refresh), /were not written by the refresh target/);
+    assert.doesNotMatch(failing(refresh), /Git headers/);
+    assert.match(failing(header, refresh), /missing required Git headers or were not written by the refresh target/);
+  });
+
+  // A clean pass says what was checked: the headers, or only the refresh rule
+  // when a repository switched the header rule off.
+  test('says what a clean Code Patches pass checked', () => {
+    const passing = (patchRules) => buildCheckRunPayloads({
+      ...mockReport, patchesConclusion: 'success', unreadPatchNotes: new Set(), patchRules
+    }, 'sha-abc-123')[2].payload.output.summary;
+
+    assert.match(passing({ headers: true, refresh: true }), /correct Git tracking headers/);
+    assert.match(passing({ headers: false, refresh: true }), /match what the refresh target writes/);
+    assert.doesNotMatch(passing({ headers: false, refresh: true }), /Git tracking headers/);
+    assert.match(passing({ headers: false, refresh: false }), /No patch rule is enabled/);
+    // A report from before the rules were recorded reads as the header rule.
+    assert.match(passing(undefined), /correct Git tracking headers/);
+  });
+
   test('titles a passing Code Patches check that carries warnings as such', () => {
     const passing = { ...mockReport, patchesConclusion: 'success', unreadPatchNotes: new Set() };
     const clean = buildCheckRunPayloads(passing, 'sha-abc-123')[2].payload.output;

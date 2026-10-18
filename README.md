@@ -64,6 +64,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 Scans the contribution tree for nested downstream patch targets:
 
 *   **Git-Am Compliance:** Checks that each changed `.patch` file carries the `From <hash> Mon Sep 17 00:00:00 2001` envelope line, `From:` and `Subject:`, as `git format-patch` writes them. The envelope is required because patches are also concatenated into one mbox stream for `git am`, where it is the only thing separating them; `Date:` is optional, `git am` fills it in. The report names only the headers that are missing. A patch the pull request adds, or an edit that removes a header, fails the check (customizable level: warning/error/disabled); editing an older patch that already lacks them only warns.
+*   **Refreshed Patches (`check_patch_refresh`):** Reports a patch under `patches*/`, `backport-*/`, `pending-*/` or `hack-*/` whose diff was not produced by `make package/<pkg>/refresh`: a `diff --git` or `index` line from `git format-patch`, an `Index:` line, `---`/`+++` timestamps, or paths without the `a/` and `b/` prefixes. Only what the pull request itself introduces counts: a marker already in the file, or carried over with it by a rename, is left alone. The two rules read different parts of the file: the headers above the diff come from `git format-patch`, the diff below them from the refresh target, which keeps those headers, so a patch made with `git format-patch` and then refreshed meets both. The rule is openwrt/packages' CONTRIBUTING.md, and openwrt/openwrt has merged `git format-patch` output, so these are **warnings by default**, reported next to the header warnings, and filtered against the upstream commit of a backport the same way.
 
 ---
 
@@ -147,7 +148,8 @@ If individual source repositories wish to tweak defaults or scale back rule rest
 
 Some configuration keys offer advanced options:
 *   `check_openwrt_meta`: Can be `true` (enforces standard `PKG_MAINTAINER`, `PKG_LICENSE`, and `PKG_LICENSE_FILES` for new packages), `false` (disabled), or an array of custom required fields (e.g., `["PKG_MAINTAINER", "PKG_LICENSE"]`).
-*   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
+*   `check_patch_headers`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable. Even at `true`, only a patch the pull request adds, or an edit that removes a header, fails; an edit to an older patch that already lacks the headers is reported as a warning.
+*   `check_patch_refresh`: Can be `"warning"` (default, non-blocking), `true`/`"error"` (hard error), or `false`/`"disabled"` to disable. Graded on its own, whatever `check_patch_headers` is set to.
 *   `check_trailing_newline`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false` to disable.
 *   `check_binary_files`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable. Rejects a file git carries as binary, in any encoding, since such a file reaches none of the content checks and cannot be reviewed in a diff. Deleting one is always allowed.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
@@ -209,6 +211,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_pkg_name_reuse": true,
   "check_buildbot_default": "warning",
   "check_patch_headers": true,
+  "check_patch_refresh": "warning",
   "check_pkg_release": "warning",
   "check_pkg_hash": "warning",
   "check_pkg_source_pin": "warning",

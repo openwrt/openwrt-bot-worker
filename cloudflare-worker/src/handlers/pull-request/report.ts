@@ -23,6 +23,9 @@ export interface AggregatedReport {
   // Whether the patch audit reported a finding. With the check still passing
   // it was reported as a warning, which the check-run title has to say.
   patchesReportedFinding: boolean;
+  // Which patch rules this repository has on: a summary that names the Git
+  // headers must not appear when the header rule never ran.
+  patchRules: { headers: boolean; refresh: boolean };
 }
 
 export function aggregateReport(
@@ -200,6 +203,10 @@ export function aggregateReport(
     patchesOutputText: finalPatchesOutput,
     patchesHeading,
     unreadPatchNotes,
-    patchesReportedFinding
+    patchesReportedFinding,
+    patchRules: {
+      headers: ctx.config?.check_patch_headers !== false && ctx.config?.check_patch_headers !== 'disabled',
+      refresh: ctx.config?.check_patch_refresh !== false && ctx.config?.check_patch_refresh !== 'disabled'
+    }
   };
 }

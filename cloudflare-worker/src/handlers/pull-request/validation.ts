@@ -9,6 +9,7 @@ import {
   validateUciConfigs,
   groupReleaseErrors,
   getFastPkgRoot,
+  isPatchRefreshFinding,
   MISSING_BUMP_ERROR,
   MISSING_BUMP_SUMMARY,
   MISSING_BUMP_ACTION
@@ -174,6 +175,24 @@ export async function runValidations(
       skipped: [],
       incomplete: true
     }));
+  // An older patch file a commit edits is a header finding that does not
+  // fail, and `check_patch_headers: warning` makes every other header finding
+  // one too. The refresh rule grades its own findings by its own key, so an
+  // error from it stays one whatever the header rule's level is. Header
+  // findings come first, so a file breaking both rules reads the same way at
+  // every level.
+  const gradePatchFindings = (res: { errors: string[]; warnings: string[] }): { nonBlocking: string[]; blocking: string[] } => {
+    const headersWarn = config.check_patch_headers === 'warning';
+    const isHeaderFinding = (finding: string): boolean => !isPatchRefreshFinding(finding);
+    return {
+      nonBlocking: [
+        ...res.warnings.filter(isHeaderFinding),
+        ...(headersWarn ? res.errors.filter(isHeaderFinding) : []),
+        ...res.warnings.filter(isPatchRefreshFinding)
+      ].map((w: string) => w.replace(/^- /, '')),
+      blocking: headersWarn ? res.errors.filter(isPatchRefreshFinding) : res.errors
+    };
+  };
 
   let makefileChecksIncomplete = false;
 
@@ -534,27 +553,19 @@ export async function runValidations(
         patchesOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
         reportPatches.successes.forEach((s: string) => { patchesOutputText += `  ${s}\n`; });
         for (const note of reportPatches.skipped) { unreadPatchNotes.add(note); patchesOutputText += `  ${note}\n`; }
-        if (reportPatches.notices && reportPatches.notices.length > 0) {
-          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.notices.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
-          reportPatches.notices.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+        // Gaps before findings, as in the Makefile audit above: everything that
+        // does not block goes out as one block under the heading, each line once.
+        const { nonBlocking, blocking } = gradePatchFindings(reportPatches);
+        const patchWarnings = [...(reportPatches.notices || []).map((w: string) => w.replace(/^- /, '')), ...nonBlocking];
+        if (patchWarnings.length > 0) {
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + patchWarnings.map((w: string) => `- ⚠️ ${w}`).join("\n"));
+          patchWarnings.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
         }
-        // An older patch file the commit edits is a finding that does not fail,
-        // and with the check set to warn so is every other one. They go out as
-        // one block under the commit, each line once.
-        const isPatchWarning = config.check_patch_headers === 'warning';
-        const nonBlocking = [
-          ...(findingInWarnings(reportPatches) ? reportPatches.warnings : []),
-          ...(isPatchWarning ? reportPatches.errors : [])
-        ].map((w: string) => w.replace(/^- /, ''));
-        if (nonBlocking.length > 0) {
+        if (nonBlocking.length > 0) patchesReportedFinding = true;
+        if (blocking.length > 0) {
           patchesReportedFinding = true;
-          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + nonBlocking.map((w: string) => `- ⚠️ ${w}`).join("\n"));
-          nonBlocking.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
-        }
-        if (reportPatches.errors.length > 0 && !isPatchWarning) {
-          patchesReportedFinding = true;
-          allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
-          reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+          allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + blocking.join("\n"));
+          blocking.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
         }
         patchesOutputText += "\n";
       }
@@ -593,24 +604,19 @@ export async function runValidations(
     patchesOutputText += `#### Pull Request Overall Diff:\n`;
     reportPatches.successes.forEach((s: string) => { patchesOutputText += `  ${s}\n`; });
     for (const note of reportPatches.skipped) { unreadPatchNotes.add(note); patchesOutputText += `  ${note}\n`; }
-    if (reportPatches.notices && reportPatches.notices.length > 0) {
-      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.notices.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
-      reportPatches.notices.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    // Gaps before findings, as in the Makefile audit above: everything that
+    // does not block goes out as one block under the heading, each line once.
+    const { nonBlocking, blocking } = gradePatchFindings(reportPatches);
+    const patchWarnings = [...(reportPatches.notices || []).map((w: string) => w.replace(/^- /, '')), ...nonBlocking];
+    if (patchWarnings.length > 0) {
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + patchWarnings.map((w: string) => `- ⚠️ ${w}`).join("\n"));
+      patchWarnings.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
     }
-    const isPatchWarning = config.check_patch_headers === 'warning';
-    const nonBlocking = [
-      ...(findingInWarnings(reportPatches) ? reportPatches.warnings : []),
-      ...(isPatchWarning ? reportPatches.errors : [])
-    ].map((w: string) => w.replace(/^- /, ''));
-    if (nonBlocking.length > 0) {
+    if (nonBlocking.length > 0) patchesReportedFinding = true;
+    if (blocking.length > 0) {
       patchesReportedFinding = true;
-      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + nonBlocking.map((w: string) => `- ⚠️ ${w}`).join("\n"));
-      nonBlocking.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
-    }
-    if (reportPatches.errors.length > 0 && !isPatchWarning) {
-      patchesReportedFinding = true;
-      allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.join("\n"));
-      reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+      allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + blocking.join("\n"));
+      blocking.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     patchesOutputText += "\n";
   }

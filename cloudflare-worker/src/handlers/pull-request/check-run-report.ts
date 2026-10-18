@@ -1,4 +1,5 @@
 import { safeTruncate } from '../../core/utils.ts';
+import { isPatchRefreshFinding } from '../../validators.js';
 import type { PullRequestContext } from './context.ts';
 import type { AggregatedReport } from './report.ts';
 import type { GitHubWriteQueue } from '../../core/github-write-queue.ts';
@@ -33,13 +34,34 @@ export function buildCheckRunPayloads(
     patchesOutputText,
     patchesHeading,
     unreadPatchNotes,
-    patchesReportedFinding
+    patchesReportedFinding,
+    allPatchesErrors,
+    patchRules
   } = report;
 
   // A passing check that reported a finding reported it as a warning: an
   // older patch file this pull request edits, or any patch with the check set
   // to warn. Its title and summary say so instead of claiming a clean pass.
   const patchesWarned = patchesPassed && Boolean(patchesReportedFinding);
+
+  // Two rules can fail the check. The summary names the one that did, so a
+  // header problem is not reported as a refresh one, or the other way round.
+  const blockingFindings = (allPatchesErrors || [])
+    .flatMap((block: string) => block.split('\n'))
+    .filter((line: string) => line.startsWith('- '));
+  const refreshBlocked = blockingFindings.some((line: string) => isPatchRefreshFinding(line));
+  const headersBlocked = blockingFindings.some((line: string) => !isPatchRefreshFinding(line));
+  const patchesFailedSummary = headersBlocked && refreshBlocked
+    ? 'Some patch files are missing required Git headers or were not written by the refresh target — open the details below to see what to change.'
+    : refreshBlocked
+      ? 'Some patch files were not written by the refresh target — open the details below to see what to change.'
+      : 'Some patch files are missing the required Git headers — open the details below to see what to change.';
+  const rules = patchRules ?? { headers: true, refresh: false };
+  const patchesCleanSummary = rules.headers
+    ? 'All downstream patch files contain correct Git tracking headers.'
+    : rules.refresh
+      ? 'All downstream patch files match what the refresh target writes.'
+      : 'No patch rule is enabled for this repository.';
 
   const UNREAD_PATCHES_LISTED = 20;
   let patchesText = patchesHeading + patchesOutputText;
@@ -107,8 +129,8 @@ export function buildCheckRunPayloads(
                 ? 'No patch file blocks this pull request, but some carry warnings — open the details below to see what they are.'
                 : (patchesConclusion === 'neutral'
                     ? 'No problems were found in the patch files that could be read.'
-                    : 'All downstream patch files contain correct Git tracking headers.'))
-            : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
+                    : patchesCleanSummary))
+            : patchesFailedSummary) +
             (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
           text: safeTruncate(patchesText)
         }

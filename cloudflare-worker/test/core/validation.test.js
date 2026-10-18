@@ -2,6 +2,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { runValidations } from '../../src/handlers/pull-request/validation.ts';
 import { aggregateReport } from '../../src/handlers/pull-request/report.ts';
+import { buildCheckRunPayloads } from '../../src/handlers/pull-request/check-run-report.ts';
 import { DEFAULT_CONFIG } from '../../src/config.js';
 
 describe('runValidations error containment', () => {
@@ -1678,5 +1679,247 @@ describe('an input the run could not read', () => {
     assert.strictEqual(outcome.allFormalityErrors.length, 0);
     assert.strictEqual(outcome.formalityChecksIncomplete, false);
     assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'success');
+  });
+});
+
+// The refresh rule grades its findings by check_patch_refresh, apart from the
+// header rule, which check_patch_headers grades in the renderer.
+describe('embedded patches the refresh target did not write', () => {
+  const P = 'package/utils/foo/patches/010-fix.patch';
+  // Headers git am reads, over a diff still in git's form.
+  const gitFormatted = `
+diff --git a/${P} b/${P}
+new file mode 100644
+--- /dev/null
++++ b/${P}
+@@ -0,0 +1,10 @@
++From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001
++From: A <a@b.c>
++Date: Mon, 1 Sep 2026 10:00:00 +0200
++Subject: [PATCH] fix
++---
++diff --git a/src/foo.c b/src/foo.c
++index 1234567..89abcde 100644
++--- a/src/foo.c
+++++ b/src/foo.c
++@@ -1 +1 @@
+`;
+  // The same file without the git-am headers either.
+  const bare = gitFormatted.replace(/^\+(?:From|Date|Subject).*\n/mg, '');
+  const finding = /Embedded patch file 'package\/utils\/foo\/patches\/010-fix\.patch' carries a diff the buildroot's refresh target did not write/;
+
+  const ctxFor = (config, over = {}) => ({
+    prNumber: 42,
+    prTitle: 'foo: add a fix',
+    baseBranch: 'main',
+    headSha: 'head123',
+    baseSha: 'base123',
+    isBackportPr: false,
+    repoFullname: 'openwrt/openwrt',
+    config: { ...DEFAULT_CONFIG, check_pkg_release: false, check_pkg_hash: false, ...config },
+    configError: null,
+    commitScanCapped: false,
+    commitsCount: 1,
+    commits: [],
+    fileBatchLoader: {
+      fetchFileContentCached: async () => null,
+      isFileMissing: () => false,
+      getRefSource: () => undefined,
+      hasRefSource: () => false,
+      setRefSource: () => {},
+      getBudgetSkipCount: () => 0,
+      getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+    },
+    getCommentsScanWithRetry: async () => ({ hasBranchBypassComment: false, hasCherryPickBypassComment: false, existingCommentId: null, incomplete: false }),
+    isMaintainerUser: async () => false,
+    isAuthorMaintainer: async () => false,
+    branchCheckError: null,
+    branchCheckOutputText: '',
+    ...over
+  });
+  const perCommit = (commitPatch, extra = {}) => ({
+    usePrWidePatch: false,
+    prPatch: null,
+    commitDetails: [{
+      sha: 'commit1234567890',
+      html_url: 'https://github.com/openwrt/openwrt/commit/commit1234567890',
+      fullCommit: { commit: { message: 'foo: add a fix\n\nSigned-off-by: Dev <dev@example.com>' } },
+      commitPatch,
+      isVerbatim: false,
+      ...extra
+    }],
+    packageState: { isNewPackage: false, isDroppedPackage: false }
+  });
+
+  test('reports a warning by default, and the patch check still passes', async () => {
+    const ctx = ctxFor({});
+    const patchesResult = perCommit(gitFormatted);
+    const outcome = await runValidations(ctx, patchesResult);
+    assert.deepStrictEqual(outcome.allPatchesErrors, []);
+    assert.match(outcome.patchesOutputText, /  ⚠️ Warning: Embedded patch file .* carries a diff the buildroot's refresh target did not write/);
+    assert.ok(outcome.allPrWarnings.some(w => /^- ⚠️ Embedded patch file .* refresh target did not write/m.test(w)), outcome.allPrWarnings.join('\n'));
+    assert.strictEqual(outcome.patchesReportedFinding, true);
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).patchesConclusion, 'success');
+  });
+
+  test('fails the patch check when the repository asks for an error', async () => {
+    const ctx = ctxFor({ check_patch_refresh: true });
+    const patchesResult = perCommit(gitFormatted);
+    const outcome = await runValidations(ctx, patchesResult);
+    assert.strictEqual(outcome.allPatchesErrors.length, 1);
+    assert.match(outcome.allPatchesErrors[0], finding);
+    assert.match(outcome.patchesOutputText, /  ❌ Embedded patch file .* refresh target did not write/);
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).patchesConclusion, 'failure');
+  });
+
+  // check_patch_headers: warning turns the header rule's errors into
+  // warnings; it has no say over the refresh rule's.
+  test('keeps a refresh error an error when the header rule only warns', async () => {
+    const outcome = await runValidations(ctxFor({ check_patch_headers: 'warning', check_patch_refresh: 'error' }), perCommit(bare));
+    assert.strictEqual(outcome.allPatchesErrors.length, 1);
+    assert.match(outcome.allPatchesErrors[0], finding);
+    assert.doesNotMatch(outcome.allPatchesErrors[0], /is missing the 'From <commit hash>/);
+    assert.match(outcome.patchesOutputText, /  ⚠️ Warning: Embedded patch file .* is missing the 'From <commit hash>/);
+  });
+
+  test('drops a warning the upstream commit of a backport carries too', async () => {
+    const ctx = ctxFor({}, { isBackportPr: true, baseBranch: 'openwrt-24.10' });
+    const backport = (upstreamPatch) => runValidations(ctx, perCommit(gitFormatted, {
+      upstreamPatch,
+      upstreamSha: '0987654321098765432109876543210987654321'
+    }));
+
+    const inherited = await backport(gitFormatted);
+    assert.doesNotMatch(inherited.patchesOutputText, finding);
+    assert.ok(!inherited.allPrWarnings.some(w => finding.test(w)), inherited.allPrWarnings.join('\n'));
+    assert.strictEqual(inherited.patchesReportedFinding, false);
+
+    // Upstream wrote the patch the way the refresh target does, so the
+    // cherry-pick introduced the git header itself.
+    const introduced = await backport(gitFormatted.replace(/^\+diff --git .*\n\+index .*\n/m, ''));
+    assert.match(introduced.patchesOutputText, finding);
+    assert.strictEqual(introduced.patchesReportedFinding, true);
+  });
+
+  test('reports a warning in a pull request audited as one diff', async () => {
+    const commits = [{ sha: 'a'.repeat(40), parents: [{ sha: 'p' }], changed_files: 1, commit: { message: 'foo: add a fix' } }];
+    const prPatch = `From ${'a'.repeat(40)} Mon Sep 17 00:00:00 2001\nFrom: A <a@b.c>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] foo: add a fix\n\n---\n${gitFormatted.slice(1)}`;
+    const ctx = ctxFor({}, { commits, commitsCount: 1 });
+    const patchesResult = { usePrWidePatch: true, prPatch, commitDetails: [], packageState: { isNewPackage: false, isDroppedPackage: false } };
+    const outcome = await runValidations(ctx, patchesResult);
+    assert.deepStrictEqual(outcome.allPatchesErrors, []);
+    assert.match(outcome.patchesOutputText, /#### Pull Request Overall Diff:\n(?:  .*\n)*  ⚠️ Warning: Embedded patch file .* refresh target did not write/);
+    assert.ok(outcome.allPrWarnings.some(w => w.startsWith('**Pull Request Overall Diff**:\n- ⚠️ Embedded patch file')), outcome.allPrWarnings.join('\n'));
+    assert.strictEqual(outcome.patchesReportedFinding, true);
+  });
+
+  const checkRunOf = (ctx, patchesResult, outcome) =>
+    buildCheckRunPayloads(aggregateReport(ctx, patchesResult, outcome), ctx.headSha)[2].payload;
+
+  // A refresh warning is the patch check's finding like an older patch's
+  // missing header: the check passes, and says it has something to read.
+  test('titles a check whose only finding is a refresh warning as passed with warnings', async () => {
+    const ctx = ctxFor({});
+    const patchesResult = perCommit(gitFormatted);
+    const check = checkRunOf(ctx, patchesResult, await runValidations(ctx, patchesResult));
+    assert.strictEqual(check.conclusion, 'success');
+    assert.strictEqual(check.output.title, 'Code Patches: Passed with warnings');
+    assert.doesNotMatch(check.output.summary, /correct Git tracking headers/);
+    assert.match(check.output.summary, /some carry warnings/);
+
+    // The same patch with the rule off has nothing to warn about.
+    const offCtx = ctxFor({ check_patch_refresh: false });
+    const off = checkRunOf(offCtx, patchesResult, await runValidations(offCtx, patchesResult));
+    assert.strictEqual(off.output.title, 'Code Patches: Passed');
+  });
+
+  test('does not call a check failed by a refresh error a header problem', async () => {
+    const ctx = ctxFor({ check_patch_refresh: 'error' });
+    const patchesResult = perCommit(gitFormatted);
+    const check = checkRunOf(ctx, patchesResult, await runValidations(ctx, patchesResult));
+    assert.strictEqual(check.conclusion, 'failure');
+    assert.strictEqual(check.output.title, 'Code Patches: Failed');
+    assert.doesNotMatch(check.output.summary, /Git headers/);
+  });
+
+  test('leaves a backport whose upstream commit has the same unrefreshed patch passing', async () => {
+    const ctx = ctxFor({}, { isBackportPr: true, baseBranch: 'openwrt-24.10' });
+    const patchesResult = perCommit(gitFormatted, {
+      upstreamPatch: gitFormatted,
+      upstreamSha: '0987654321098765432109876543210987654321'
+    });
+    const outcome = await runValidations(ctx, patchesResult);
+    assert.deepStrictEqual(outcome.allPrWarnings.filter(w => w.includes('Embedded patch file')), []);
+    assert.strictEqual(checkRunOf(ctx, patchesResult, outcome).output.title, 'Code Patches: Passed');
+  });
+
+  // One file breaking both rules: a line per rule, header rule first, each
+  // at its own rule's level, and the non-blocking ones in one block.
+  describe('a patch file that breaks both rules', () => {
+    const headerLine = /Embedded patch file 'package\/utils\/foo\/patches\/010-fix\.patch' is missing the 'From <commit hash>/;
+    const lines = (block) => block.split('\n').filter(l => l.startsWith('- '));
+
+    test('fails on the headers of an added patch and warns about its diff', async () => {
+      const ctx = ctxFor({});
+      const patchesResult = perCommit(bare);
+      const outcome = await runValidations(ctx, patchesResult);
+      assert.strictEqual(outcome.allPatchesErrors.length, 1);
+      assert.match(outcome.allPatchesErrors[0], headerLine);
+      assert.doesNotMatch(outcome.allPatchesErrors[0], finding);
+      const blocks = outcome.allPrWarnings.filter(w => w.startsWith('**Commit [commit1]'));
+      assert.strictEqual(blocks.length, 1, outcome.allPrWarnings.join('\n'));
+      assert.strictEqual(lines(blocks[0]).length, 1);
+      assert.match(blocks[0], finding);
+      assert.strictEqual(checkRunOf(ctx, patchesResult, outcome).output.title, 'Code Patches: Failed');
+    });
+
+    test('puts both lines in one block when the header rule only warns', async () => {
+      const ctx = ctxFor({ check_patch_headers: 'warning' });
+      const patchesResult = perCommit(bare);
+      const outcome = await runValidations(ctx, patchesResult);
+      assert.deepStrictEqual(outcome.allPatchesErrors, []);
+      const blocks = outcome.allPrWarnings.filter(w => w.startsWith('**Commit [commit1]'));
+      assert.strictEqual(blocks.length, 1, outcome.allPrWarnings.join('\n'));
+      const [header, refresh, ...rest] = lines(blocks[0]);
+      assert.deepStrictEqual(rest, []);
+      assert.match(header, headerLine);
+      assert.match(refresh, finding);
+      assert.doesNotMatch(blocks[0], /- ⚠️ - /, 'one dash per line');
+      assert.strictEqual(checkRunOf(ctx, patchesResult, outcome).output.title, 'Code Patches: Passed with warnings');
+    });
+
+    // An older patch file without headers that this change puts git's diff
+    // header into: two warnings, in the same order as above.
+    test('warns twice, in one block, about an older patch an edit puts a git diff into', async () => {
+      const edit = `
+diff --git a/${P} b/${P}
+index 1111111..2222222 100644
+--- a/${P}
++++ b/${P}
+@@ -1,2 +1,7 @@
+ fix foo
+
++diff --git a/src/foo.c b/src/foo.c
++index 1234567..89abcde 100644
++--- a/src/foo.c
+++++ b/src/foo.c
++@@ -1 +1 @@
+`;
+      const file = 'fix foo\n\ndiff --git a/src/foo.c b/src/foo.c\nindex 1234567..89abcde 100644\n--- a/src/foo.c\n+++ b/src/foo.c\n@@ -1 +1 @@\n';
+      const ctx = ctxFor({}, {
+        fileBatchLoader: { ...ctxFor({}).fileBatchLoader, fetchFileContentCached: async (path) => (path === P ? file : null) }
+      });
+      const patchesResult = perCommit(edit);
+      const outcome = await runValidations(ctx, patchesResult);
+      assert.deepStrictEqual(outcome.allPatchesErrors, []);
+      const blocks = outcome.allPrWarnings.filter(w => w.startsWith('**Commit [commit1]'));
+      assert.strictEqual(blocks.length, 1, outcome.allPrWarnings.join('\n'));
+      const [header, refresh, ...rest] = lines(blocks[0]);
+      assert.deepStrictEqual(rest, []);
+      assert.match(header, /010-fix\.patch' is missing .* It predates this pull request/);
+      assert.match(refresh, finding);
+      assert.doesNotMatch(blocks[0], /- ⚠️ - /, 'one dash per line');
+      assert.strictEqual(checkRunOf(ctx, patchesResult, outcome).output.title, 'Code Patches: Passed with warnings');
+    });
   });
 });

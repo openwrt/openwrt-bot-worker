@@ -2662,7 +2662,13 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   const warnings = [];
   const successes = [];
 
-  if (CONFIG.check_patch_headers === false || CONFIG.check_patch_headers === 'disabled') {
+  const checkHeaders = CONFIG.check_patch_headers !== false && CONFIG.check_patch_headers !== 'disabled';
+  // Unset reads as off, like its siblings in a config that never names it;
+  // DEFAULT_CONFIG is what turns it on.
+  const refreshLevel = CONFIG.check_patch_refresh;
+  const checkRefresh = Boolean(refreshLevel) && refreshLevel !== 'disabled';
+
+  if (!checkHeaders && !checkRefresh) {
     return { errors: [], warnings: [], successes: [], skipped: [], incomplete: false };
   }
 
@@ -2769,7 +2775,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     return { warning: `Embedded patch file '${patchFile}' is missing ${names(missing)}. It predates this pull request, so this does not block it. ${howToFix}` };
   }
 
-  const results = await Promise.all(matches.map(checkPatchHeader));
+  const results = checkHeaders ? await Promise.all(matches.map(checkPatchHeader)) : [];
   const skipped = [];
   // A file in more than one chunk is judged once per chunk, alike.
   const reported = new Set();
@@ -2788,6 +2794,14 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     } else if (result.success) {
       successes.push(result.success);
     }
+  }
+
+  // Judged from the diff alone: it reads no file, so it has nothing it could
+  // fail to read and never makes the result incomplete.
+  if (checkRefresh) {
+    const refresh = checkPatchRefresh(fileChunks, matches);
+    successes.push(...refresh.successes);
+    (refreshLevel === 'warning' ? warnings : errors).push(...refresh.findings);
   }
 
   // A file that was skipped was not checked, so the result is not a pass.
@@ -2921,6 +2935,227 @@ function followPatchFiles(fileChunks) {
     for (const match of held) match.patchFile = path;
   }
   return matches.filter(match => match.patchFile !== null);
+}
+
+// The buildroot's refresh target runs quilt as `QUILT_DIFF_OPTS="-p" quilt
+// refresh -p ab --no-index --no-timestamps` (openwrt/packages CONTRIBUTING.md,
+// "Refreshing"). Each signal below is something that invocation never writes,
+// so a diff carrying one did not come out of it. Who or what wrote it instead
+// is not something the text can tell, and the finding does not guess.
+//
+// Only a quilt series is judged: a `.patch` under `files/` is installed and
+// applied at run time, not by quilt.
+const QUILT_PATCH_DIR = /(^|\/)(?:patches(?:-[^/]+)?|backport-[^/]+|pending-[^/]+|hack-[^/]+)\//;
+
+const DIFF_GIT = 1;
+const GIT_INDEX = 2;
+const QUILT_INDEX = 4;
+const TIMESTAMP = 8;
+const NO_AB_PREFIX = 16;
+const REFRESH_SIGNAL_CLAUSES = [
+  [DIFF_GIT, "it still has git's `diff --git` file header, which quilt never emits"],
+  [GIT_INDEX, "it still has git's `index <hash>..<hash>` line, which quilt never emits"],
+  [QUILT_INDEX, 'it has an `Index:` line, which `--no-index` removes'],
+  [TIMESTAMP, 'its `---`/`+++` lines still carry working-copy timestamps, which `--no-timestamps` removes'],
+  [NO_AB_PREFIX, 'its `---`/`+++` lines do not use the `a/` and `b/` prefixes that `-p ab` gives']
+];
+
+// One pass over a file's hunks finds the lines that can carry a signal: the
+// outer diff's `+`, `-` or space, then the line. A `--- ` line counts only
+// with a `+++ ` line of the same side straight under it: alone it is a hunk
+// line, one removing a `-- comment`, and a `+++ ` line alone is one adding
+// `++ x`. An `index` line counts only in git's full form. Every branch is
+// literal after a line break, `[^\n]*` cannot run past one, and the hex runs
+// are bounded, so nothing here backtracks further than one line. In a series,
+// the next commit's mail envelope ends the file: its message is not part of
+// it.
+const REFRESH_CANDIDATE = /\n(?:([-+ ])(?:diff --git |index [0-9a-f]{7,64}\.\.[0-9a-f]{7,64}(?: [0-7]{6})?\r?(?=\n|$)|Index: |--- [^\n]*\n\1\+\+\+ )|From [0-9a-f]{40,64} Mon Sep 17 00:00:00 2001)/g;
+// What git writes on the line straight under `diff --git`. A description
+// that quotes a `diff --git` line has none of these under it.
+const GIT_EXTENDED_HEADER = /(?:index |--- |new file mode |old mode |deleted file mode |similarity index |dissimilarity index |rename from |copy from )/y;
+
+// A u-boot bump can move dozens of upstream-format patches at once.
+const REFRESH_FINDINGS_LISTED = 10;
+const REFRESH_FINDING_TAIL = 'so this does not undo the patch-header check.';
+const REFRESH_OVERFLOW_TAIL = 'with a diff the refresh target did not write.';
+
+// The renderer grades the header rule's errors by that rule's key, and these
+// by their own. Both kinds end in fixed text, after the file name.
+export function isPatchRefreshFinding(message) {
+  return message.endsWith(REFRESH_FINDING_TAIL) || message.endsWith(REFRESH_OVERFLOW_TAIL);
+}
+
+// isHiddenOrSpecial, without splitting the path.
+const isQuiltPatch = (path) =>
+  path.endsWith('.patch') && !path.startsWith('.') && !path.includes('/.') && QUILT_PATCH_DIR.test(path);
+
+// The signals of one `---`/`+++` line whose path runs from `from` to `to`,
+// read in place: a patch repeats the pair once per file it touches.
+function headerLineSignals(body, from, to, prefix) {
+  let signals = 0;
+  // Not indexOf: with no tab on this line it would search the rest of the
+  // patch, once per pair.
+  let pathEnd = from;
+  while (pathEnd < to && body.charCodeAt(pathEnd) !== 9) pathEnd++;
+  if (pathEnd < to) signals |= TIMESTAMP;
+  else if (body.charCodeAt(to - 1) === 13) pathEnd = to - 1;
+  const devNull = pathEnd - from === 9 && body.startsWith('/dev/null', from);
+  if (!devNull && !body.startsWith(prefix, from)) signals |= NO_AB_PREFIX;
+  return signals;
+}
+
+const SIDE_ADDED = 43; // '+'
+const SIDE_REMOVED = 45; // '-'
+const SIDE_KEPT = 32; // ' '
+
+// Whether the line under the `diff --git` line at `at` is one git writes
+// there, on the same side or as context. git prints a change as its removed
+// lines and then its added ones, so the old line under a removed one, or under
+// a kept one, comes after the other side's lines of the same change. Each of
+// those is passed over once, by the one line above them.
+function followedByGitHeader(body, at, side) {
+  let next = body.indexOf('\n', at) + 1;
+  while (next !== 0) {
+    const lead = body.charCodeAt(next);
+    if (lead === side || lead === SIDE_KEPT) {
+      GIT_EXTENDED_HEADER.lastIndex = next + 1;
+      return GIT_EXTENDED_HEADER.test(body);
+    }
+    if (lead !== SIDE_ADDED && lead !== SIDE_REMOVED) return false;
+    next = body.indexOf('\n', next) + 1;
+  }
+  return false;
+}
+
+// The signals on each side of one file's hunks, which start at `from`: what
+// the pull request added, what it removed, and what it left standing.
+function scanRefreshMarkers(body, from) {
+  let added = 0;
+  let removed = 0;
+  let kept = 0;
+  REFRESH_CANDIDATE.lastIndex = from;
+  let match;
+  while ((match = REFRESH_CANDIDATE.exec(body)) !== null) {
+    const at = match.index + 1;
+    const side = body.charCodeAt(at);
+    let signals;
+    switch (body.charCodeAt(at + 1)) {
+      case 100: // diff --git
+        signals = (side === SIDE_ADDED ? added : side === SIDE_REMOVED ? removed : kept) & DIFF_GIT ||
+          (followedByGitHeader(body, at, side) ? DIFF_GIT : 0);
+        break;
+      case 105: signals = GIT_INDEX; break; // index
+      case 73: signals = QUILT_INDEX; break; // Index:
+      case 45: { // --- and the +++ line under it
+        const oldEnd = body.indexOf('\n', at);
+        let newEnd = body.indexOf('\n', oldEnd + 1);
+        if (newEnd === -1) newEnd = body.length;
+        signals = headerLineSignals(body, at + 5, oldEnd, 'a/') | headerLineSignals(body, oldEnd + 6, newEnd, 'b/');
+        break;
+      }
+      default: // the next commit's envelope
+        return { added, removed, kept };
+    }
+    if (side === SIDE_ADDED) added |= signals;
+    else if (side === SIDE_REMOVED) removed |= signals;
+    else kept |= signals;
+  }
+  return { added, removed, kept };
+}
+
+// How to regenerate the file, read off its path alone. A path the package
+// name cannot be read off gets no command: `make toolchain/gcc/refresh`, for
+// one, is documented nowhere.
+function refreshRemedy(patchFile) {
+  const owner = patchFile.slice(0, QUILT_PATCH_DIR.exec(patchFile).index);
+  if (owner === 'target/linux' || owner.startsWith('target/linux/')) {
+    return 'Regenerate it with `make target/linux/refresh` (with the matching target selected in `.config`)';
+  }
+  const segments = owner.split('/');
+  const name = segments[segments.length - 1];
+  // The resolver knows fewer layouts than the path does, so it only gets a
+  // say when it is sure: then it must name the same package.
+  const root = owner && segments[0] !== 'tools' && segments[0] !== 'toolchain' ? getFastPkgRoot(patchFile) : null;
+  if (!owner || root === null || (typeof root === 'string' && root !== owner)) {
+    return owner
+      ? `Regenerate it with the buildroot's refresh target for \`${owner}\``
+      : "Regenerate it with the buildroot's refresh target for the package that applies it";
+  }
+  return `Regenerate it with \`make package/${name}/{clean,prepare} QUILT=1\` followed by \`make package/${name}/refresh\``;
+}
+
+// Patch files whose diff the pull request wrote in a form the refresh target
+// does not. Only what the pull request introduces counts: a signal also on a
+// removed line of the same file was there already, and one on a removed line
+// of a file with the same name travelled with it, as when a kernel bump shows
+// up as a delete and an add rather than a rename.
+function checkPatchRefresh(fileChunks, matches) {
+  const scans = new Map();
+  const scanOf = (chunk, hunkStart) => {
+    let scan = scans.get(chunk);
+    if (!scan) {
+      scan = scanRefreshMarkers(chunk, hunkStart);
+      scans.set(chunk, scan);
+    }
+    return scan;
+  };
+  const baseName = (path) => path.slice(path.lastIndexOf('/') + 1);
+
+  const removedByName = new Map();
+  for (const chunk of fileChunks) {
+    const hunkStart = chunk.indexOf('\n@@');
+    if (hunkStart === -1) continue;
+    const oldPath = chunk.slice(0, hunkStart).match(/^--- a\/(.*?)\r?$/m)?.[1];
+    if (!oldPath || !isQuiltPatch(oldPath)) continue;
+    const { removed } = scanOf(chunk, hunkStart);
+    if (removed === 0) continue;
+    const name = baseName(oldPath);
+    removedByName.set(name, (removedByName.get(name) || 0) | removed);
+  }
+
+  const files = new Map();
+  for (const { chunk, patchFile } of matches) {
+    if (!isQuiltPatch(patchFile)) continue;
+    // A rename or mode change with no hunks introduces nothing.
+    const hunkStart = chunk.indexOf('\n@@');
+    if (hunkStart === -1) continue;
+    const head = chunk.slice(0, hunkStart);
+    const { added, removed, kept } = scanOf(chunk, hunkStart);
+    const carried = /^(?:new file mode |--- \/dev\/null)/m.test(head)
+      ? removedByName.get(baseName(head.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m)[1])) || 0
+      : 0;
+    const file = files.get(patchFile) || { introduced: 0, added: 0, removed: 0, kept: 0 };
+    // A signal left standing in this chunk's context is already in the file:
+    // a bump that adds a section to a git-format patch repeats its markers.
+    file.introduced |= added & ~removed & ~kept & ~carried;
+    file.added |= added;
+    file.removed |= removed;
+    file.kept |= kept;
+    files.set(patchFile, file);
+  }
+
+  const offending = [];
+  const successes = [];
+  for (const [patchFile, file] of files) {
+    if (file.introduced !== 0) {
+      offending.push([patchFile, file.introduced]);
+    } else if (file.kept === 0 && (file.removed & ~file.added) !== 0) {
+      // Only when nothing is left standing in the context either: a refresh
+      // takes every marker out, not just the ones on the lines it touched.
+      successes.push(`✅ Embedded patch '${patchFile}' was regenerated with the buildroot's refresh target`);
+    }
+  }
+
+  const findings = offending.slice(0, REFRESH_FINDINGS_LISTED).map(([patchFile, signals]) => {
+    const clause = REFRESH_SIGNAL_CLAUSES.find(([signal]) => (signals & signal) !== 0)[1];
+    return `- Embedded patch file '${patchFile}' carries a diff the buildroot's refresh target did not write: ${clause}. ${refreshRemedy(patchFile)}, which rewrites the diff the way quilt writes it (\`quilt refresh -p ab --no-index --no-timestamps\`). The mail header and the description above the diff are preserved, ${REFRESH_FINDING_TAIL}`;
+  });
+  const more = offending.length - findings.length;
+  if (more > 0) findings.push(`- … and ${more} more embedded patch file(s) ${REFRESH_OVERFLOW_TAIL}`);
+  if (files.size > 0 && offending.length === 0) {
+    successes.push("✅ Embedded patch diffs match what the buildroot's refresh target writes");
+  }
+  return { findings, successes };
 }
 
 // The added and deleted lines of a patch, per file. The input is GitHub's
