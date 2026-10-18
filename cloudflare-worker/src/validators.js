@@ -27,8 +27,9 @@ const SUBJECT_PREFIX_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}`);
 const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^(?:${SUBJECT_PREFIX_SOURCE})+\\s*`);
 
 // Subject prefixes that stand for the whole tree rather than for one package.
-// `treewide: ` is what openwrt/packages uses for a change applied everywhere.
-const TREEWIDE_SUBJECT_ENTITIES = new Set(['treewide']);
+// `treewide: ` is what openwrt/packages uses for a change applied everywhere;
+// four of its merged commits spell it `tree-wide: `.
+const TREEWIDE_SUBJECT_ENTITIES = new Set(['treewide', 'tree-wide']);
 
 export function isValidName(name) {
   const nameRegex = /^[\p{L}'.-]+(?: [\p{L}'.-]+)+$/u;
@@ -687,6 +688,566 @@ export async function validateFormalities(fullCommit, CONFIG) {
   }
 
   return { errors, successes, warnings };
+}
+
+// --- SUBJECT SCOPE ---
+// openwrt.org/submitting-patches: the subject "must have a prefix that depends
+// from what you are doing in the commit" - a package, a target, a tool, or a
+// part of the build - and openwrt/packages' CONTRIBUTING.md asks for the
+// package name. This compares that prefix with the paths the commit changes,
+// and only when no path explains it with the package names the touched
+// Makefiles define. A commit is reported when the prefix explains none of its
+// files. Over 18,000 merged commits that was 0.54% of the ones graded, and
+// about half of those were deliberate: `dropbear:` on a base-files change is
+// the same input as `hostapd:` typed on dropbear's files, which is why the
+// check warns by default.
+//
+// The file list and the Makefiles are contributor-writable, hence every cap.
+const SUBJECT_SCOPE_FILE_CAP = 120;
+const SUBJECT_SCOPE_TOKEN_CAP = 12;
+const SUBJECT_SCOPE_FUZZY_DIRS = 48;
+const SUBJECT_SCOPE_PROBE_DIRS = 8;
+const SUBJECT_SCOPE_ROOT_CAP = 5;
+const SUBJECT_SCOPE_NAME_CAP = 512;
+// Longer than any package or directory name a prefix could spell: a segment
+// past it is never rewritten or looked up, so a path of long segments costs
+// what one of short segments does.
+const SUBJECT_SCOPE_SEGMENT_CHARS = 64;
+// Where `git revert` and GitHub put the reference, with room to spare. Read
+// no further: a revert-shaped subject over megabytes of body must not pay
+// for all of it.
+const SUBJECT_SCOPE_REVERT_BODY_CHARS = 8192;
+
+// One per run, shared by every commit in it: the path segments the exact pass
+// may still scan (about 3 ms of CPU), the commits that may still read their
+// Makefiles, and how much Makefile text those may still read, the probed
+// ones included, before anything scans it (about 1.3 ms;
+// the largest package Makefile in the feeds, telephony's asterisk, is 61 KB).
+// Fifteen commits of 120 deep paths each cost ~24 ms without the first, and
+// three commits of five 256 KB Makefiles over 50 ms without the last.
+export function createSubjectScopeBudget() {
+  return { segments: 3000, passBCommits: 3, makefileChars: 96 * 1024, segmentsScanned: 0 };
+}
+
+const scopeUnder = (...dirs) => (path) => dirs.some(dir => path.startsWith(dir));
+const scopeBaseName = (path) => path.slice(path.lastIndexOf('/') + 1);
+const SCOPE_COVERS_CI = scopeUnder('.github/', '.ci/', '.gitlab', '.keys/', '.circleci/');
+const SCOPE_COVERS_BUILD = (path) =>
+  scopeUnder('include/', 'scripts/', 'config/', 'build/', 'tools/', 'toolchain/')(path) ||
+  path === 'Makefile' || path === 'Config.in' || (!path.includes('/') && path.endsWith('.mk'));
+const SCOPE_COVERS_TARGET = scopeUnder('target/');
+
+// The subsystem words the submission guidelines name, and what each covers.
+// A feed has no kernel, target, tools or toolchain of its own.
+const SUBJECT_SCOPE_SUBSYSTEMS = new Map([
+  ['kernel', { inFeeds: false, covers: scopeUnder('target/linux/', 'include/kernel', 'config/Config-kernel', 'package/kernel/') }],
+  ['build', { inFeeds: true, covers: SCOPE_COVERS_BUILD }],
+  ['buildsystem', { inFeeds: true, covers: SCOPE_COVERS_BUILD }],
+  ['ci', { inFeeds: true, covers: SCOPE_COVERS_CI }],
+  ['github', { inFeeds: true, covers: SCOPE_COVERS_CI }],
+  ['actions', { inFeeds: true, covers: SCOPE_COVERS_CI }],
+  ['toolchain', { inFeeds: false, covers: scopeUnder('toolchain/') }],
+  ['tools', { inFeeds: false, covers: scopeUnder('tools/') }],
+  ['target', { inFeeds: false, covers: SCOPE_COVERS_TARGET }],
+  ['targets', { inFeeds: false, covers: SCOPE_COVERS_TARGET }],
+  ['scripts', { inFeeds: true, covers: scopeUnder('scripts/') }],
+  ['config', { inFeeds: false, covers: scopeUnder('config/') }],
+  ['docs', { inFeeds: true, covers: (path) => path.startsWith('docs/') || path.endsWith('.md') || scopeBaseName(path).startsWith('README') || scopeBaseName(path).startsWith('LICENSE') }],
+  ['i18n', { inFeeds: true, covers: (path) => path.startsWith('po/') || path.includes('/po/') || path.endsWith('.po') || path.endsWith('.pot') }],
+  ['imagebuilder', { inFeeds: false, covers: scopeUnder('target/imagebuilder', 'include/image') }],
+]);
+
+// A quilt or upstream patch keeps the upstream subject, whose prefix names an
+// upstream subsystem (`net: phy: as21xxx:`, `kbuild:`), not an OpenWrt path.
+function isQuiltPatchPath(path) {
+  if (path.endsWith('.patch') || path.endsWith('.diff')) return true;
+  const segments = path.split('/');
+  for (let i = 0; i < segments.length - 1; i++) {
+    const s = segments[i];
+    if (s === 'patches' || s.startsWith('patches-') || s.startsWith('pending-') ||
+        s.startsWith('hack-') || s.startsWith('backport-')) return true;
+  }
+  return false;
+}
+
+// Shared machinery, legitimately named after what it serves: `base-files: add
+// warning to distfeeds.list` edits include/feeds.mk.
+const SCOPE_SHARED_DIRS = new Set(['include', 'scripts', 'config', 'build', '.github', '.ci',
+  '.keys', '.vscode', '.devcontainer', 'docs', 'test', 'tests']);
+function isSharedBuildPath(path) {
+  const slash = path.indexOf('/');
+  return slash < 0 || SCOPE_SHARED_DIRS.has(path.slice(0, slash));
+}
+
+function scopeNorm(s) {
+  let i = 0;
+  while (i < s.length && s.charCodeAt(i) === 46) i++;
+  return s.slice(i).toLowerCase().replaceAll('_', '-').replaceAll('+', 'plus');
+}
+
+const scopeIsAlnum = (c) => (c >= 48 && c <= 57) || (c >= 97 && c <= 122);
+
+// `rules.mk` -> `rules`, `asterisk-13.x` -> `asterisk-13`: a last dotted part
+// of one to six letters or digits. Written out rather than as a pattern, and
+// so are the two below, because they run on contributor-written path segments.
+function scopeStripExt(s) {
+  const dot = s.lastIndexOf('.');
+  const tail = s.length - dot - 1;
+  if (dot <= 0 || tail < 1 || tail > 6) return null;
+  for (let i = dot + 1; i < s.length; i++) {
+    if (!scopeIsAlnum(s.charCodeAt(i))) return null;
+  }
+  return s.slice(0, dot);
+}
+
+// `patches-6.12` -> `patches`: a trailing `-<digit>` run of digits and dots.
+function scopeStripVersion(s) {
+  let i = s.length;
+  while (i > 0) {
+    const c = s.charCodeAt(i - 1);
+    if ((c >= 48 && c <= 57) || c === 46) i--;
+    else break;
+  }
+  if (i === s.length || i < 1 || s.charCodeAt(i - 1) !== 45) return null;
+  const first = s.charCodeAt(i);
+  if (first < 48 || first > 57) return null;
+  return s.slice(0, i - 1);
+}
+
+// Letters and digits only, a trailing `x` dropped: `asterisk-13.x` and
+// `asterisk13` are the same name.
+function scopeSquash(s) {
+  const out = s.replace(/[^a-z0-9]+/g, '');
+  return out.endsWith('x') ? out.slice(0, -1) : out;
+}
+
+const SCOPE_LANG_PREFIX = /^(?:python3?|lua|perl|php[78]?|ruby|node|golang)-(.+)$/;
+const SCOPE_LUCI_KIND = /^luci-(?:app|mod|proto|theme|lib|base|compat|ssl)-(.+)$/;
+
+// Every spelling a subject token may stand for, built once per token so that
+// each path segment costs a handful of lookups whatever the subject says:
+// `libtiff` for `tiff`, `python3-lxml` for `lxml`, `luci-app-vpnc` for
+// `luci-proto-vpnc`, `targets` for `target`. These are the forms measured
+// against the merged history; every widening costs typos it no longer sees.
+function scopeTokenVariants(raw) {
+  const out = new Set();
+  const add = (v) => {
+    if (!v || v.length < 2) return;
+    out.add(v);
+    out.add(v.endsWith('s') ? v.slice(0, -1) : `${v}s`);
+  };
+  const base = scopeNorm(raw);
+  add(base);
+  add(scopeStripExt(base));
+  for (const v of [...out]) {
+    add(scopeStripVersion(v));
+    if (v.startsWith('lib')) add(v.slice(3));
+    add(`lib${v}`);
+    const lang = v.match(SCOPE_LANG_PREFIX);
+    if (lang) add(lang[1]);
+    const luci = v.match(SCOPE_LUCI_KIND);
+    if (luci) add(`luci-x-${luci[1]}`);
+    if (v.startsWith('python3-')) add(`python-${v.slice(8)}`);
+    else if (v.startsWith('python-')) add(`python3-${v.slice(7)}`);
+  }
+  for (const v of [...out]) {
+    const squashed = scopeSquash(v);
+    if (squashed.length >= 2) out.add(squashed);
+  }
+  return out;
+}
+
+// The raw token one of a name's few cheap forms stands for, or undefined.
+function scopeExactMatch(name, tokenForms) {
+  if (name.length > SUBJECT_SCOPE_SEGMENT_CHARS) return undefined;
+  const n = scopeNorm(name);
+  if (tokenForms.has(n)) return tokenForms.get(n);
+  const ext = scopeStripExt(n);
+  if (ext && tokenForms.has(ext)) return tokenForms.get(ext);
+  const ver = scopeStripVersion(ext || n);
+  if (ver && tokenForms.has(ver)) return tokenForms.get(ver);
+  const squashed = scopeSquash(n);
+  if (squashed.length >= 2 && tokenForms.has(squashed)) return tokenForms.get(squashed);
+  if (n.startsWith('luci-')) {
+    const luci = n.match(SCOPE_LUCI_KIND);
+    if (luci && tokenForms.has(`luci-x-${luci[1]}`)) return tokenForms.get(`luci-x-${luci[1]}`);
+  }
+  return undefined;
+}
+
+const scopeComponents = (v) => v.split('-').filter(Boolean);
+
+// `a` in order inside `b`, gaps allowed.
+function scopeSubsequence(a, b) {
+  let i = 0;
+  for (const x of b) {
+    if (x === a[i] && ++i === a.length) return true;
+  }
+  return false;
+}
+
+// One component list contains the other in order: `luci-app-ipsec` and
+// `luci-app-strongswan-ipsec`, `mediatek` and `uboot-mediatek`. No bare
+// string-prefix rule (`olsr` ~ `olsrd`): measured, it lost more real typos
+// (`onigumura`, `libmvme`, `xl2tp`) than it spared deliberate prefixes.
+function scopeFuzzyMatch(name, tokenComps) {
+  if (name.length > SUBJECT_SCOPE_SEGMENT_CHARS) return undefined;
+  const n = scopeNorm(name);
+  const comps = scopeComponents(n);
+  if (comps.length === 0) return undefined;
+  for (const token of tokenComps) {
+    if (scopeSubsequence(token.comps, comps) || scopeSubsequence(comps, token.comps)) return token.raw;
+  }
+  return undefined;
+}
+
+// hasRevertReference's two patterns, one line at a time, over the start of
+// the body. Its multiline `^\s*` lets every line start rescan all the
+// whitespace after it - a body of blank lines costs it quadratic time - and
+// anchored to one line each the same lines match.
+function hasRevertReferenceByLine(body) {
+  for (const line of body.slice(0, SUBJECT_SCOPE_REVERT_BODY_CHARS).split('\n')) {
+    if (/^\s*this reverts commit\s+[0-9a-f]{7,40}\b/i.test(line) ||
+        /^\s*reverts\s+[\w.-]+\/[\w.-]+#\d+\s*$/i.test(line)) return true;
+  }
+  return false;
+}
+
+function scopePrefixChain(text) {
+  const match = text.match(SUBJECT_PREFIX_STRIP_RE);
+  if (!match) return null;
+  const chain = match[0].trim().replace(/:$/, '');
+  return { chain, parts: chain.split(/:\s+/).filter(Boolean) };
+}
+
+// The prefix chain as written, and the tokens it is graded on: every part of
+// `ci: labeler:` and every piece of `tools/cmake:`. A revert is graded on the
+// subject `git revert` quoted, which belongs to the files it puts back, and
+// the outer `<pkg>: Revert "..."` prefix counts as well. Null when the
+// subject has no prefix at all, which is the shape check's complaint alone.
+function subjectScopePrefix(message, CONFIG) {
+  if (typeof message !== 'string' || !message) return null;
+  const nl = message.indexOf('\n');
+  const hard = Number.isInteger(CONFIG.max_subject_len_hard) ? CONFIG.max_subject_len_hard : 80;
+  // Room for a few `Revert "..."` wrappers, which the length limit ignores.
+  const subject = (nl < 0 ? message : message.slice(0, nl)).trim().slice(0, hard + 36);
+  if (CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(subject)) return null;
+
+  let graded = subject;
+  let outer = null;
+  const revert = parseRevertSubject(subject);
+  if (revert && hasRevertReferenceByLine(nl < 0 ? '' : message.slice(nl + 1))) {
+    graded = revert.original;
+    outer = revert.prefix ? scopePrefixChain(revert.prefix) : null;
+  }
+  const inner = scopePrefixChain(graded.slice(0, hard));
+  if (!inner && !outer) return null;
+
+  const tokens = [];
+  for (const part of [...(inner ? inner.parts : []), ...(outer ? outer.parts : [])]) {
+    for (const token of [part, ...(part.includes('/') ? part.split('/') : [])]) {
+      if (token && tokens.length < SUBJECT_SCOPE_TOKEN_CAP && !tokens.includes(token)) tokens.push(token);
+    }
+  }
+  return { chain: (inner || outer).chain, tokens };
+}
+
+// The package names a Makefile defines: PKG_NAME, every `define Package/<x>`
+// and every kernel module as `kmod-<x>`. `templated` when a name is still a
+// make expansion after resolving (`define Package/gnunet-$(1)`): such a
+// Makefile generates names that cannot be listed.
+//
+// Only `$(PKG_NAME)` is resolved, the one variable the feeds spell package
+// names with, and within a few expansions; a name built from any other
+// variable counts as templated. Resolving every variable a name used cost
+// 12 ms for one 8 KB Makefile of `define Package/$(Vn)-x` over a chain of
+// variables, and a PKG_NAME chained past the budget is no name to compare.
+const SUBJECT_SCOPE_NAME_EXPANSIONS = 16;
+const SUBJECT_SCOPE_NAME_CHARS = 1024;
+
+function subjectScopeMakefileNames(text) {
+  const names = new Set();
+  let templated = false;
+  let pkgName;
+  const ownName = () => {
+    if (pkgName === undefined) {
+      // The text makefilePkgNameResolver resolves against, so a name comes
+      // out the same as the package audits read it.
+      const unmarked = text.split('\n')
+        .filter(line => !line.startsWith('-'))
+        .map(line => line.replace(/^[ +]/, ''))
+        .join('\n');
+      const limits = { expansions: SUBJECT_SCOPE_NAME_EXPANSIONS, chars: SUBJECT_SCOPE_NAME_CHARS, raw: new Map() };
+      const value = resolveMakefileVar(unmarked, 'PKG_NAME', new Set(), limits);
+      // A resolution that ran out returned '' for what it did not reach.
+      pkgName = value && limits.expansions > 0 && limits.chars > 0 ? value : null;
+    }
+    return pkgName;
+  };
+  const resolve = (name) => (/\$[({]/.test(name) ? name.replace(/\$\(PKG_NAME\)|\$\{PKG_NAME\}/g, (ref) => ownName() ?? ref) : name);
+  const take = (name) => {
+    if (!name) return;
+    if (/\$[({]/.test(name)) templated = true;
+    else if (names.size <= SUBJECT_SCOPE_NAME_CAP) names.add(name);
+  };
+  if (parseMakefileVar(text, 'PKG_NAME') !== null) take(resolve('$(PKG_NAME)'));
+  // extractDefinedPackages' pattern, without its resolution of every variable.
+  for (const m of text.matchAll(/(?:^|\n)[ \t+]*define\s+Package\/([^\s/]+)/g)) take(resolve(m[1]));
+  for (const m of text.matchAll(/(?:^|\n)[ \t]*define[ \t]+KernelPackage\/([^\s/]+)/g)) take(`kmod-${resolve(m[1])}`);
+  for (const m of text.matchAll(/\$\(call[ \t]+KernelPackage[ \t]*,[ \t]*([^)\s]+)/g)) take(`kmod-${resolve(m[1])}`);
+  return { names: [...names], templated };
+}
+
+/**
+ * Whether the commit subject's prefix names something the commit changes.
+ * Returns { errors, warnings, successes, notices, incomplete }: a finding goes
+ * to `errors` or `warnings` by `check_subject_scope`, a commit left unchecked
+ * says why in `notices`, and `incomplete` is set only when an input could not
+ * be read or a per-run budget ran out.
+ *
+ * Pass A reads nothing: the prefix against every path segment, then against
+ * the directory names with a component match. Pass B, only on a miss, reads
+ * the Makefiles of the touched packages, and only ever widens what passes.
+ *
+ * `options`: `isMissing(path)`, whether a null read is a file that is not
+ * there rather than one that failed; `budget`, from createSubjectScopeBudget()
+ * and shared by every commit of one run; `patchUnavailable`, the reason this
+ * commit's diff could not be had, when the caller knows it was expected.
+ */
+export async function validateSubjectScope(fullCommit, commitPatch, CONFIG, repoFullname, fetchFileContent, options = {}) {
+  const errors = [];
+  const warnings = [];
+  const successes = [];
+  const notices = [];
+  let incomplete = false;
+  const result = () => ({ errors, warnings, successes, notices, incomplete });
+  const unchecked = (reason, gap = true) => {
+    notices.push(`Could not check the subject prefix against the files this commit changes (${reason}), so the prefix was left unchecked rather than reported as wrong.`);
+    if (gap) incomplete = true;
+    return result();
+  };
+
+  const level = CONFIG.check_subject_scope;
+  if (!level || level === 'disabled') return result();
+  const findings = (level === true || level === 'error') ? errors : warnings;
+
+  const prefix = subjectScopePrefix(fullCommit?.commit?.message, CONFIG);
+  if (!prefix) return result();
+  if (!commitPatch) {
+    return options.patchUnavailable ? unchecked(options.patchUnavailable) : result();
+  }
+
+  const files = getChangedFilesFromPatch(commitPatch);
+  if (files.length === 0) return result();
+  const mainRepo = isMainRepo(repoFullname);
+  const repoName = typeof repoFullname === 'string' ? repoFullname.slice(repoFullname.lastIndexOf('/') + 1).toLowerCase() : '';
+  const normTokens = prefix.tokens.map(scopeNorm);
+
+  // Whole-commit exemptions: no finding and no success line.
+  if (normTokens.some(t => TREEWIDE_SUBJECT_ENTITIES.has(t) || (repoName && t === repoName))) return result();
+  const allowed = new Set((Array.isArray(CONFIG.subject_scope_prefixes) ? CONFIG.subject_scope_prefixes : [])
+    .filter(p => typeof p === 'string').map(scopeNorm));
+  if (normTokens.some(t => allowed.has(t))) return result();
+  // A commit this big is tree-wide in effect, and costs nothing past here.
+  if (files.length > SUBJECT_SCOPE_FILE_CAP) return result();
+  for (const t of normTokens) {
+    const subsystem = SUBJECT_SCOPE_SUBSYSTEMS.get(t);
+    if (subsystem && (mainRepo || subsystem.inFeeds) && files.some(subsystem.covers)) return result();
+  }
+  if (files.every(isQuiltPatchPath)) return result();
+  if (files.every(isSharedBuildPath)) return result();
+  // A target, subtarget, SoC or device family (`sata:`, `ipq50xx:`,
+  // `chromium:`) names no path, and listing them takes reads.
+  if (mainRepo && files.every(SCOPE_COVERS_TARGET)) return result();
+
+  const budget = options.budget || createSubjectScopeBudget();
+  const outOfScanBudget = 'the commits before it used up the paths one run may scan';
+
+  // Pass A, exact: a handful of forms per distinct path segment, looked up
+  // among the token spellings. One hit explains the commit.
+  const tokenForms = new Map();
+  for (const token of prefix.tokens) {
+    for (const form of scopeTokenVariants(token)) {
+      if (!tokenForms.has(form)) tokenForms.set(form, token);
+    }
+  }
+  const seen = new Set();
+  const dirs = new Set();
+  for (const file of files) {
+    const segments = file.split('/');
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      if (!segment) continue;
+      if (i < segments.length - 1 && dirs.size < SUBJECT_SCOPE_FUZZY_DIRS) dirs.add(segment);
+      if (seen.has(segment)) continue;
+      if (budget.segments <= 0) return unchecked(outOfScanBudget);
+      budget.segments--;
+      budget.segmentsScanned++;
+      seen.add(segment);
+      const hit = scopeExactMatch(segment, tokenForms);
+      if (hit !== undefined) {
+        successes.push(`✅ Subject prefix \`${hit}\` names a path this commit changes`);
+        return result();
+      }
+    }
+  }
+
+  // Pass A, fuzzy: the directory names only, component lists precomputed.
+  const tokenComps = [];
+  for (const token of prefix.tokens) {
+    const n = scopeNorm(token);
+    for (const form of new Set([n, scopeStripExt(n)])) {
+      if (form && form.length >= 2) {
+        const comps = scopeComponents(form);
+        if (comps.length > 0) tokenComps.push({ raw: token, comps });
+      }
+    }
+  }
+  for (const dir of dirs) {
+    const hit = scopeFuzzyMatch(dir, tokenComps);
+    if (hit !== undefined) {
+      successes.push(`✅ Subject prefix \`${hit}\` names a path this commit changes`);
+      return result();
+    }
+  }
+
+  // Pass B: the touched packages' own names. Roots are settled before the
+  // first await, so these reads join the batch the Makefile audit fills with
+  // the same Makefiles, and the budget is spent in commit order.
+  const deleted = parseDiffFileStates(commitPatch).deletedFiles;
+  const fastRoots = new Set();
+  const probeFiles = [];
+  const probeDirs = new Set();
+  for (const file of files) {
+    if (isSharedBuildPath(file) || (mainRepo && SCOPE_COVERS_TARGET(file))) continue;
+    const fast = getFastPkgRoot(file);
+    if (fast === null) continue;
+    if (typeof fast === 'string') {
+      // A dropped package has no Makefile at the head, and that is no failed read.
+      if (!deleted.has(`${fast}/Makefile`)) fastRoots.add(fast);
+      continue;
+    }
+    probeFiles.push(file);
+    for (const dir of pkgRootProbeCandidates(file)) probeDirs.add(dir);
+  }
+  if (probeDirs.size > SUBJECT_SCOPE_PROBE_DIRS) {
+    return unchecked(`finding its packages would take more than ${SUBJECT_SCOPE_PROBE_DIRS} directories looked up`);
+  }
+  if (fastRoots.size > SUBJECT_SCOPE_ROOT_CAP) {
+    return unchecked(`it changes more than ${SUBJECT_SCOPE_ROOT_CAP} packages`);
+  }
+  // No package among the files: nothing a Makefile could add, and nothing to
+  // say the prefix should have named instead.
+  if (fastRoots.size === 0 && probeFiles.length === 0) return result();
+  if (budget.passBCommits <= 0) {
+    return unchecked('only the first commits of a run whose prefix matched no path have their Makefiles read');
+  }
+  budget.passBCommits--;
+
+  const isMissing = typeof options.isMissing === 'function' ? options.isMissing : () => false;
+  const unread = new Set();
+  // Every text is charged to the run's budget as it arrives, before the
+  // probe's tests or the name parse read any of it, once per commit: the
+  // probe and the root it finds read the same Makefile. A text past what is
+  // left is never looked at, and the commit is left unchecked.
+  const charged = new Set();
+  let overBudget = false;
+  const outOfTextBudget = 'its Makefiles are larger than what is left for one run to read';
+  // Called synchronously, so the read joins the current batch. A null for a
+  // path the loader does not know to be absent is a read that failed.
+  const read = (path) => {
+    let pending;
+    try {
+      pending = Promise.resolve(fetchFileContent(path));
+    } catch (err) {
+      pending = Promise.reject(err);
+    }
+    return pending.then(
+      (content) => {
+        if (typeof content === 'string') {
+          if (!charged.has(path)) {
+            if (content.length > budget.makefileChars) {
+              overBudget = true;
+              return null;
+            }
+            budget.makefileChars -= content.length;
+            charged.add(path);
+          }
+          return content;
+        }
+        if (!isMissing(path)) unread.add(path);
+        return null;
+      },
+      () => { unread.add(path); return null; });
+  };
+  const probeCache = Object.create(null);
+  const fastReads = [...fastRoots].map(root => read(`${root}/Makefile`).then(text => [root, text]));
+  const probed = probeFiles.map(file => findPkgRoot(file, read, probeCache).catch(() => { unread.add(file); return null; }));
+  const [fastTexts, probedRoots] = await Promise.all([Promise.all(fastReads), Promise.all(probed)]);
+  const unreadReason = () => `\`${[...unread][0]}\` could not be read`;
+  if (unread.size > 0) return unchecked(unreadReason());
+  if (overBudget) return unchecked(outOfTextBudget);
+
+  const roots = new Map(fastTexts);
+  const found = [...new Set(probedRoots.filter(root => typeof root === 'string' && !roots.has(root)))];
+  if (roots.size + found.length > SUBJECT_SCOPE_ROOT_CAP) {
+    return unchecked(`it changes more than ${SUBJECT_SCOPE_ROOT_CAP} packages`);
+  }
+  // The probe already read these; the loader answers from its cache.
+  for (const [root, text] of await Promise.all(found.map(root => read(`${root}/Makefile`).then(text => [root, text])))) {
+    roots.set(root, text);
+  }
+  if (unread.size > 0) return unchecked(unreadReason());
+  if (overBudget) return unchecked(outOfTextBudget);
+  if (roots.size === 0) return result();
+
+  const ownNames = new Map();
+  let unlisted = null;
+  let nameCount = 0;
+  for (const [root, text] of roots) {
+    const collected = text ? subjectScopeMakefileNames(text) : { names: [], templated: false };
+    ownNames.set(root, collected.names);
+    nameCount += collected.names.length;
+    if (!unlisted && collected.templated) unlisted = `\`${root}/Makefile\` builds package names from make expansions`;
+    // An included `.mk` beside the Makefile (lang/perl/perlbase.mk) defines
+    // packages the Makefile itself does not show.
+    if (!unlisted) {
+      const mk = files.find(f => f.startsWith(`${root}/`) && f.endsWith('.mk') && !f.slice(root.length + 1).includes('/'));
+      if (mk) unlisted = `\`${mk}\` defines package names the package Makefile does not show`;
+    }
+  }
+  if (!unlisted && nameCount > SUBJECT_SCOPE_NAME_CAP) unlisted = `the packages it changes define more than ${SUBJECT_SCOPE_NAME_CAP} names`;
+
+  let checked = 0;
+  for (const names of ownNames.values()) {
+    for (const name of names) {
+      if (++checked > SUBJECT_SCOPE_NAME_CAP) break;
+      const hit = scopeExactMatch(name, tokenForms) ?? scopeFuzzyMatch(name, tokenComps);
+      if (hit !== undefined) {
+        successes.push(`✅ Subject prefix \`${hit}\` names a package this commit changes`);
+        return result();
+      }
+    }
+  }
+  // Not a gap in this run: the names are generated, and no read would list them.
+  if (unlisted) return unchecked(unlisted, false);
+
+  const rootList = [...roots.keys()];
+  const describe = (root) => {
+    const name = (ownNames.get(root) || [])[0];
+    return name ? `\`${root}/\` (package \`${name}\`)` : `\`${root}/\``;
+  };
+  const shown = rootList.slice(0, 3).map(describe);
+  const more = rootList.length - shown.length;
+  const list = more > 0
+    ? `${shown.join(', ')} and ${more} more`
+    : (shown.length > 1 ? `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}` : shown[0]);
+  const suggestion = (ownNames.get(rootList[0]) || [])[0] || rootList[0].slice(rootList[0].lastIndexOf('/') + 1);
+  findings.push(`Subject prefix \`${prefix.chain}\` does not name anything this commit changes: it changes ${list}. ` +
+    `Name the package or subsystem the commit changes (\`${suggestion}: …\`), or \`treewide: \` for a change that spans the tree. ` +
+    `If the prefix is deliberate — the fix belongs to a different package than the file it edits, or it names a device, ` +
+    `a subtarget or an upstream kernel subsystem — nothing needs changing here.`);
+  return result();
 }
 
 export function matchVersionString(subject, version) {
@@ -3347,41 +3908,37 @@ export function getFastPkgRoot(filePath) {
   return undefined;
 }
 
-export async function findPkgRoot(filePath, fetchFileContent, cache = Object.create(null)) {
-  const fast = getFastPkgRoot(filePath);
-  if (fast !== undefined) return fast;
-
-  let parts = filePath.split('/');
+// The directories findPkgRoot probes for a package Makefile, deepest first:
+// every ancestor of the file's directory once payload directories (`files/`,
+// `patches/`, ...) are cut off, leaving out category levels and `package`
+// itself. Single-segment candidates cover feeds that keep packages at the
+// repository root - the routing feed is `babeld/`, `batman-adv/`, ... with no
+// category level at all; whether such a directory really is a package is
+// decided by the Makefile probe, so non-package roots still resolve to null.
+// Shared with the subject scope check, which caps how many it will ask for.
+export function pkgRootProbeCandidates(filePath) {
+  const parts = filePath.split('/');
   if (parts.length > 0) {
     parts.pop();
   }
-  const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git',
-    'root', 'htdocs', 'luasrc', 'ucode', 'po']);
-  const isSkippableDir = (name) =>
-    skipDirs.has(name) ||
-    name.startsWith('.') ||
-    name.startsWith('patches-') ||
-    name.startsWith('files-');
-  const CATEGORIES = new Set([
-    'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
-    'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
-  ]);
-  const isCategoryLevel = (parts) => {
-    if (parts.length === 0) return true;
-    if (parts.length === 1 && CATEGORIES.has(parts[0])) return true;
-    if (parts[0] === 'package' && parts.length === 2 && CATEGORIES.has(parts[1])) return true;
-    if (parts.length === 2 && CATEGORIES.has(parts[1])) return true;
-    return false;
-  };
-  const isPayloadDir = (dirParts) =>
-    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
-  while (parts.length > 0) {
-    if (isPayloadDir(parts)) {
-      parts.pop();
-    } else {
-      break;
-    }
+  while (parts.length > 0 && fastRootPayloadDir(parts)) {
+    parts.pop();
   }
+  const candidates = [];
+  for (let i = parts.length; i >= 1; i--) {
+    const candidateParts = parts.slice(0, i);
+    const last = candidateParts[candidateParts.length - 1];
+    if (last === 'package' || fastRootPayloadDir(candidateParts)) continue;
+    if (fastRootCategoryLevel(candidateParts)) continue;
+    const candidate = candidateParts.join('/');
+    if (candidate) candidates.push(candidate);
+  }
+  return candidates;
+}
+
+export async function findPkgRoot(filePath, fetchFileContent, cache = Object.create(null)) {
+  const fast = getFastPkgRoot(filePath);
+  if (fast !== undefined) return fast;
 
   const hasPkgName = async (dir) => {
     if (!fetchFileContent) return false;
@@ -3397,31 +3954,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = Object.cre
     return ok;
   };
 
-  const candidates = [];
-  const seen = new Set();
-  const pushCandidate = (candidate) => {
-    if (!candidate) return;
-    if (seen.has(candidate)) return;
-    seen.add(candidate);
-    candidates.push(candidate);
-  };
-
-  // Fallback candidates for uncommon feed/category layouts. Single-segment
-  // candidates cover feeds that keep packages at the repository root - the
-  // routing feed is `babeld/`, `batman-adv/`, ... with no category level at
-  // all. Whether such a directory really is a package is decided by the
-  // Makefile probe below, so non-package roots still resolve to null.
-  for (let i = parts.length; i >= 1; i--) {
-    pushCandidate(parts.slice(0, i).join('/'));
-  }
-
-  const viableCandidates = candidates.filter(candidate => {
-    const candidateParts = candidate.split('/');
-    const last = candidateParts[candidateParts.length - 1];
-    if (last === 'package' || isPayloadDir(candidateParts)) return false;
-    if (isCategoryLevel(candidateParts)) return false;
-    return true;
-  });
+  const viableCandidates = pkgRootProbeCandidates(filePath);
 
   if (!fetchFileContent) {
     // Dry mode (unit tests / no fetch available): trust the first viable

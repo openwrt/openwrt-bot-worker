@@ -107,6 +107,30 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(resNew.config.check_pkg_hash, 'error');
     }
 
+    // check_subject_scope takes check_pkg_release's five values, and an
+    // invalid one keeps the default 'warning' without discarding the rest.
+    // Its allowlist is an array of strings like stale_ignored_users.
+    assert.strictEqual(parseAndValidateConfig(null).config.check_subject_scope, 'warning');
+    assert.ok(parseAndValidateConfig(null).config.subject_scope_prefixes.includes('treewide'));
+    for (const val of ['warn', 'on', 1, ['warning']]) {
+      const resScope = parseAndValidateConfig(JSON.stringify({ check_subject_scope: val, check_pkg_hash: 'error' }));
+      assert.match(resScope.error, /field "check_subject_scope" must be one of \[true, false, "warning", "error", "disabled"\]/);
+      assert.strictEqual(resScope.partial, true);
+      assert.strictEqual(resScope.config.check_subject_scope, 'warning');
+      assert.strictEqual(resScope.config.check_pkg_hash, 'error');
+    }
+    for (const val of ['olsr', [1, 'olsr'], { olsr: true }]) {
+      const resAllow = parseAndValidateConfig(JSON.stringify({ subject_scope_prefixes: val, check_subject_scope: 'error' }));
+      assert.match(resAllow.error, /field "subject_scope_prefixes" must be an array of strings/);
+      assert.strictEqual(resAllow.partial, true);
+      assert.deepStrictEqual(resAllow.config.subject_scope_prefixes, DEFAULT_CONFIG.subject_scope_prefixes);
+      assert.strictEqual(resAllow.config.check_subject_scope, 'error');
+    }
+    const resOlsr = parseAndValidateConfig(JSON.stringify({ check_subject_scope: 'disabled', subject_scope_prefixes: ['olsr'] }));
+    assert.strictEqual(resOlsr.error, null);
+    assert.strictEqual(resOlsr.config.check_subject_scope, 'disabled');
+    assert.deepStrictEqual(resOlsr.config.subject_scope_prefixes, ['olsr']);
+
     // check_dts_checklist takes the same four values; `true` would not say
     // which level it means, and an invalid one keeps the default 'warning'.
     for (const val of ['strict', true, 'on']) {

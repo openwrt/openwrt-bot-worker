@@ -21,6 +21,8 @@ export interface FormalitiesConfig {
   require_release_notes?: boolean;
   require_body?: boolean;
   check_openwrt_spelling?: boolean;
+  check_subject_scope?: boolean | 'warning' | 'error' | 'disabled';
+  subject_scope_prefixes?: string[];
 
   // Makefile Check features
   check_pkg_version?: boolean;
@@ -123,11 +125,13 @@ const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_pkg_release: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_hash: new Set([false, 'warning', 'error', 'disabled']),
   check_pkg_source_pin: new Set([false, 'warning', 'error', 'disabled']),
-  check_new_package_on_stable: new Set([true, false, 'warning', 'error', 'disabled'])
+  check_new_package_on_stable: new Set([true, false, 'warning', 'error', 'disabled']),
+  check_subject_scope: new Set([true, false, 'warning', 'error', 'disabled'])
 };
 
 const STRING_ARRAY_FIELDS = new Set([
-  'stale_ignored_users'
+  'stale_ignored_users',
+  'subject_scope_prefixes'
 ]);
 
 export function parseAndValidateConfig(rawConfigText: string | null): {

@@ -9,6 +9,8 @@ import {
   validateDeviceTrees,
   validateNewPackageOnStable,
   validateUciConfigs,
+  validateSubjectScope,
+  createSubjectScopeBudget,
   groupReleaseErrors,
   getFastPkgRoot,
   isPatchRefreshFinding,
@@ -169,6 +171,21 @@ export async function runValidations(
       incomplete: true
     }));
 
+  const safeSubjectScope = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[]; notices: string[]; incomplete: boolean }> =>
+    promise.then((res: any) => ({
+      successes: res?.successes || [],
+      errors: res?.errors || [],
+      warnings: res?.warnings || [],
+      notices: res?.notices || [],
+      incomplete: Boolean(res?.incomplete)
+    })).catch((err: any) => ({
+      successes: [],
+      errors: [],
+      warnings: [],
+      notices: [`Could not check the subject prefix against the files this commit changes: ${err?.message || err}`],
+      incomplete: true
+    }));
+
   const safePatches = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[]; notices?: string[]; skipped: string[]; incomplete?: boolean }> =>
     promise.catch((err: any) => ({
       successes: [],
@@ -275,6 +292,33 @@ export async function runValidations(
         ? patchesResult.splitCommitPatches
         : (prWideEnvelopeMatches.length > 0 ? splitPrPatchByCommit(prPatch, ctx.commits) : new Map<string, string>()))
     : new Map<string, string>();
+
+  // Each commit's subject against its own diff, in the same tick as the
+  // checks above so the Makefiles it may read join their batch. Those are read
+  // at the head, where the release and hash audits read the same package
+  // Makefiles: the loader answers both from one lookup, and the names they
+  // add only ever widen what passes. Audited as one diff, a commit is graded
+  // only on its part of the split: the series' subjects against the whole
+  // diff would be a verdict on nothing.
+  const subjectScopeBudget = createSubjectScopeBudget();
+  const subjectScopeChecks = commitDetails.map((item: CommitDetail) => {
+    if (item.isVerbatim || (item.fullCommit?.parents || []).length > 1) return null;
+    let patch = item.commitPatch;
+    let patchUnavailable: string | null = null;
+    if (usePrWidePatch) {
+      patch = splitMap.get(item.sha) || (ctx.commits.length === 1 ? prPatch : null) || null;
+      // A commit GitHub says changed no files has no part to tell apart.
+      if (!patch && item.fullCommit?.changed_files === 0) return null;
+      if (!patch) patchUnavailable = "this pull request is audited as one diff, and this commit's part of it could not be told apart";
+    }
+    return safeSubjectScope(validateSubjectScope(item.fullCommit, patch, config, repoFullname,
+      (path: string) => fileBatchLoader.fetchFileContentCached(path, headSha),
+      {
+        isMissing: (path: string) => fileBatchLoader.isFileMissing(path, headSha),
+        budget: subjectScopeBudget,
+        patchUnavailable
+      }));
+  });
 
   const changedFiles = (usePrWidePatch && prPatch) ? getChangedFilesFromPatch(prPatch) : [];
   // The prefixes cover the openwrt tree. A feed in openwrt/packages layout
@@ -449,6 +493,16 @@ export async function runValidations(
 
     const reportFormality = await safeFormalities(fullCommit);
     if (reportFormality.incomplete) formalityChecksIncomplete = true;
+    // Reported in the commit's own block, its gaps ahead of its finding.
+    const scopeCheck = subjectScopeChecks[commitIndex];
+    if (scopeCheck) {
+      const reportScope = await scopeCheck;
+      if (reportScope.incomplete) formalityChecksIncomplete = true;
+      reportFormality.successes.push(...reportScope.successes);
+      reportFormality.notices.push(...reportScope.notices);
+      reportFormality.warnings.push(...reportScope.warnings);
+      reportFormality.errors.push(...reportScope.errors.map((e: string) => `- ${e}`));
+    }
     formalityOutputText += `#### Commit [${sha.slice(0, 7)}](${html_url}) - ${commitSubject}:\n`;
     reportFormality.successes.forEach((s: string) => { formalityOutputText += `  ${s}\n`; });
 

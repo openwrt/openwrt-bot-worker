@@ -2178,8 +2178,11 @@ describe('a new package on a release branch', { concurrency: 1 }, () => {
   });
 
   test('passes a backport of a package master already carries', async () => {
+    // The subject names the package it adds: a prefix naming another one
+    // would send the subject scope check to a Makefile this loader cannot read.
     const { result: outcome } = await withGitHub(history(() => 3, 'main'),
-      () => runValidations(ctxFor({}, { defaultBranch: 'main' }), perCommit(addMakefile('lang/perl-future/Makefile'))));
+      () => runValidations(ctxFor({}, { defaultBranch: 'main' }), perCommit(addMakefile('lang/perl-future/Makefile'),
+        `perl-future: add package\n\nAdd the Future module.\n\nSigned-off-by: Jane Doe <jane@example.com>\n${TRAILER}`)));
     assert.match(outcome.formalityOutputText, /#### New Package on a Release Branch:\n  ✅ Packages added by this pull request already exist on 'main'\n/);
     assert.deepStrictEqual(ownWarnings(outcome), []);
     assert.strictEqual(outcome.formalityChecksIncomplete, false);
@@ -2272,5 +2275,168 @@ describe('a new package on a release branch', { concurrency: 1 }, () => {
     }
     assert.deepStrictEqual(ownWarnings(prWide.outcome), ownWarnings(split.outcome));
     assert.strictEqual(prWide.outcome.formalityOutputText.match(SECTION)[0], split.outcome.formalityOutputText.match(SECTION)[0]);
+  });
+});
+
+describe('the subject prefix against what the commit changes', () => {
+  const DROPBEAR = 'package/network/services/dropbear/Makefile';
+  const CURL = 'package/network/utils/curl/Makefile';
+  const HEAD = 'head123';
+  const TREE = {
+    [DROPBEAR]: 'PKG_NAME:=dropbear\nPKG_VERSION:=2025.88\n',
+    [CURL]: 'PKG_NAME:=curl\nPKG_VERSION:=8.23.0\n'
+  };
+  const change = (path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-# old\n+# new\n`;
+  const TRAILER = `(cherry picked from commit ${'d'.repeat(40)})`;
+  const FINDING = /Subject prefix `hostapd` does not name anything this commit changes: it changes `package\/network\/services\/dropbear\/` \(package `dropbear`\)/;
+  const UNSPLIT = /Could not check the subject prefix against the files this commit changes \(this pull request is audited as one diff, and this commit's part of it could not be told apart\)/;
+
+  const loader = (reads) => ({
+    fetchFileContentCached: async (path, ref) => {
+      reads.push(`${ref}:${path}`);
+      return ref === HEAD && Object.hasOwn(TREE, path) ? TREE[path] : null;
+    },
+    isFileMissing: (path, ref) => ref === HEAD && !Object.hasOwn(TREE, path),
+    getRefSource: () => undefined,
+    hasRefSource: () => false,
+    setRefSource: () => {},
+    getBudgetSkipCount: () => 0,
+    getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+  });
+  const ctxFor = (config = {}, over = {}) => {
+    const reads = [];
+    return {
+      reads,
+      prNumber: 42,
+      prTitle: 'dropbear: fix WPS',
+      baseBranch: 'main',
+      headSha: HEAD,
+      baseSha: 'base123',
+      isBackportPr: false,
+      repoFullname: 'openwrt/openwrt',
+      config: { ...DEFAULT_CONFIG, check_pkg_release: false, check_pkg_hash: false, check_pkg_source_pin: false, ...config },
+      configError: null,
+      commitScanCapped: false,
+      commitsCount: 1,
+      commits: [],
+      fileBatchLoader: loader(reads),
+      getCommentsScanWithRetry: async () => ({ hasBranchBypassComment: false, hasCherryPickBypassComment: false, existingCommentId: null, incomplete: false }),
+      isMaintainerUser: async () => false,
+      isAuthorMaintainer: async () => false,
+      branchCheckError: null,
+      branchCheckOutputText: '',
+      ...over
+    };
+  };
+  const commitOf = (sha, subject, extraBody = '') => ({
+    sha,
+    author: { login: 'janedoe' },
+    committer: { login: 'janedoe' },
+    parents: [{ sha: 'p' }],
+    changed_files: 1,
+    commit: {
+      message: `${subject}\n\nExplain the change.\n\nSigned-off-by: Jane Doe <jane@example.com>${extraBody}`,
+      author: { name: 'Jane Doe', email: 'jane@example.com' },
+      committer: { name: 'Jane Doe', email: 'jane@example.com' },
+      verification: { verified: true, key_id: 'GPGKEYID' }
+    }
+  });
+  const detail = (sha, subject, commitPatch, extra = {}) => ({
+    sha,
+    html_url: `https://github.com/openwrt/openwrt/commit/${sha}`,
+    fullCommit: commitOf(sha, subject, extra.extraBody || ''),
+    commitPatch,
+    isVerbatim: false,
+    upstreamPatch: null,
+    upstreamSha: null,
+    upstreamFetchError: null,
+    ...extra
+  });
+  const perCommit = (...details) => ({
+    usePrWidePatch: false,
+    prPatch: null,
+    commitDetails: details,
+    packageState: { isNewPackage: false, isDroppedPackage: false }
+  });
+
+  test('warns by default inside the commit\'s own block, and the check still passes', async () => {
+    const ctx = ctxFor();
+    const patches = perCommit(detail('commit1234567890', 'hostapd: fix WPS', change(DROPBEAR)));
+    const outcome = await runValidations(ctx, patches);
+    assert.match(outcome.formalityOutputText, /#### Commit \[commit1\]\(.*\) - hostapd: fix WPS:\n(?:  .*\n)*  ⚠️ Warning: Subject prefix `hostapd` does not name/);
+    const entries = outcome.allPrWarnings.filter(w => FINDING.test(w));
+    assert.strictEqual(entries.length, 1, outcome.allPrWarnings.join('\n'));
+    assert.ok(entries[0].startsWith('**Commit [commit1](https://github.com/openwrt/openwrt/commit/commit1234567890)**:\n- ⚠️ Subject prefix'), entries[0]);
+    assert.deepStrictEqual(outcome.allFormalityErrors, []);
+    assert.strictEqual(outcome.formalityChecksIncomplete, false);
+    assert.strictEqual(aggregateReport(ctx, patches, outcome).formalityConclusion, 'success');
+    // The Makefile was read at the head, where the release audit reads it.
+    assert.ok(ctx.reads.includes(`${HEAD}:${DROPBEAR}`), ctx.reads.join('\n'));
+
+    const named = await runValidations(ctxFor(), perCommit(detail('commit1234567890', 'dropbear: fix WPS', change(DROPBEAR))));
+    assert.match(named.formalityOutputText, /  ✅ Subject prefix `dropbear` names a path this commit changes\n/);
+    assert.ok(!named.allPrWarnings.some(w => w.includes('Subject prefix')), named.allPrWarnings.join('\n'));
+  });
+
+  test('fails the formalities check when the repository asks for an error', async () => {
+    for (const level of ['error', true]) {
+      const ctx = ctxFor({ check_subject_scope: level });
+      const patches = perCommit(detail('commit1234567890', 'hostapd: fix WPS', change(DROPBEAR)));
+      const outcome = await runValidations(ctx, patches);
+      assert.strictEqual(outcome.allFormalityErrors.length, 1, String(level));
+      assert.ok(outcome.allFormalityErrors[0].startsWith('**Commit [commit1](https://github.com/openwrt/openwrt/commit/commit1234567890)** - *hostapd: fix WPS*:\n- Subject prefix `hostapd`'), outcome.allFormalityErrors[0]);
+      assert.match(outcome.formalityOutputText, /  ❌ Subject prefix `hostapd` does not name/);
+      assert.ok(!outcome.allPrWarnings.some(w => FINDING.test(w)), String(level));
+      assert.strictEqual(aggregateReport(ctx, patches, outcome).formalityConclusion, 'failure');
+    }
+    const off = await runValidations(ctxFor({ check_subject_scope: false }), perCommit(detail('commit1234567890', 'hostapd: fix WPS', change(DROPBEAR))));
+    assert.ok(!off.formalityOutputText.includes('Subject prefix'), off.formalityOutputText);
+  });
+
+  test('never grades a verbatim backport', async () => {
+    const backport = (isVerbatim) => {
+      const ctx = ctxFor({}, { isBackportPr: true, baseBranch: 'openwrt-24.10' });
+      return runValidations(ctx, perCommit(detail('commit1234567890', 'hostapd: fix WPS', change(DROPBEAR), { isVerbatim, extraBody: `\n${TRAILER}` })))
+        .then(outcome => ({ outcome, reads: ctx.reads }));
+    };
+    const verbatim = await backport(true);
+    assert.ok(!verbatim.outcome.formalityOutputText.includes('Subject prefix'), verbatim.outcome.formalityOutputText);
+    assert.ok(!verbatim.outcome.allPrWarnings.some(w => w.includes('Subject prefix')));
+    assert.ok(!verbatim.reads.some(r => r.endsWith(DROPBEAR)), verbatim.reads.join('\n'));
+    // Control: the same cherry-pick that deviates from upstream is graded.
+    const deviating = await backport(false);
+    assert.ok(deviating.outcome.allPrWarnings.some(w => FINDING.test(w)), deviating.outcome.allPrWarnings.join('\n'));
+  });
+
+  test('audited as one diff, grades the commits the split covers and says so for the rest', async () => {
+    const shas = ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40)];
+    const subjects = ['curl: update to 8.23.0', 'hostapd: fix WPS', 'dropbear: fix the init script'];
+    const parts = [change(CURL), change(DROPBEAR), change(DROPBEAR)];
+    const run = (covered) => {
+      const ctx = ctxFor({}, { commits: shas.map((sha, i) => commitOf(sha, subjects[i])), commitsCount: 3 });
+      const split = new Map(covered.map(i => [shas[i], parts[i]]));
+      const patches = {
+        usePrWidePatch: true,
+        prPatch: parts.join(''),
+        splitCommitPatches: split,
+        commitDetails: shas.map((sha, i) => detail(sha, subjects[i], split.get(sha) || null)),
+        packageState: { isNewPackage: false, isDroppedPackage: false }
+      };
+      return runValidations(ctx, patches);
+    };
+
+    const partial = await run([0, 1]);
+    assert.match(partial.formalityOutputText, /  ✅ Subject prefix `curl` names a path this commit changes\n/);
+    assert.ok(partial.allPrWarnings.some(w => w.startsWith(`**Commit [bbbbbbb]`) && FINDING.test(w)), partial.allPrWarnings.join('\n'));
+    const third = partial.allPrWarnings.filter(w => w.startsWith('**Commit [ccccccc]'));
+    assert.strictEqual(third.length, 1, partial.allPrWarnings.join('\n'));
+    assert.match(third[0], UNSPLIT);
+    assert.strictEqual(partial.formalityChecksIncomplete, true);
+
+    const none = await run([]);
+    assert.ok(!none.formalityOutputText.includes('names a path'), none.formalityOutputText);
+    assert.ok(!none.allPrWarnings.some(w => FINDING.test(w)), none.allPrWarnings.join('\n'));
+    assert.strictEqual(none.allPrWarnings.filter(w => UNSPLIT.test(w)).length, 3, none.allPrWarnings.join('\n'));
+    assert.strictEqual(none.formalityChecksIncomplete, true);
   });
 });

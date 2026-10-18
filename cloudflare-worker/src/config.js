@@ -21,6 +21,15 @@ export const DEFAULT_CONFIG = {
   require_body: true,
   check_openwrt_spelling: true,
 
+  // Whether the subject prefix names anything the commit changes. 'warning'
+  // by default: a prefix naming the package a change is for, not the file it
+  // edits, is legitimate and looks exactly like a typo; about half of what it
+  // reported in the merged history was the first kind.
+  check_subject_scope: 'warning',
+  // Prefixes that name no directory, always accepted by the check above.
+  subject_scope_prefixes: ['lint', 'css', 'housekeeping', 'meta', 'wiki', 'npm', 'vscode',
+    'editor', 'devcontainer', 'i18n', 'docs', 'treewide', 'tree-wide'],
+
   // Makefile Check features
   check_pkg_version: true,
   check_binary_files: true,
