@@ -1,5 +1,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
+import { Worker } from 'node:worker_threads';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
 import { findPkgRoot } from '../../src/validators.js';
 
 describe('findPkgRoot', () => {
@@ -219,5 +222,120 @@ describe('findPkgRoot for feeds without category directories', () => {
     const noFetch = async () => { throw new Error('should not probe fast-path categories'); };
     assert.strictEqual(await findPkgRoot('frameworks/gstreamer1/Makefile', noFetch, {}), 'frameworks/gstreamer1');
     assert.strictEqual(await findPkgRoot('games/prboom/Makefile', noFetch, {}), 'games/prboom');
+  });
+});
+
+// A Makefile with no PKG_NAME is a package when it includes luci.mk, u-boot.mk,
+// trusted-firmware-a.mk or optee-os.mk. That was decided by
+// /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m,
+// whose `\s` ran across line breaks: quadratic on blank lines, and findPkgRoot
+// reads Makefiles a pull request writes. Its replacement must answer exactly
+// what the regex answered, so the regex stays here as the reference.
+describe('findPkgRoot on the package helper include', () => {
+  const REFERENCE = /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m;
+  const resolves = async (content) => (await findPkgRoot('foo/bar/x.c', async () => content, {})) === 'foo/bar';
+
+  test('accepts exactly the Makefiles the regex accepted, the awkward ones included', async () => {
+    const awkward = [
+      'include ../../luci.mk', 'include ../../luci.mk\n', 'include ../../luci.mk  \n\n\n', 'include ../../luci.mk\t\r\n',
+      '  include $(INCLUDE_DIR)/u-boot.mk', '\tinclude\t$(INCLUDE_DIR)/trusted-firmware-a.mk\r', 'include ../optee-os.mk\u00a0',
+      'include\n../../luci.mk', 'include \r\n \r\n ../../luci.mk', 'include\u2028luci.mk', 'x\rinclude luci.mk', 'x\u2029include luci.mk',
+      'include luci.mk', 'include x-u-boot.mk', 'include xu-boot.mk', 'include x_luci.mk', 'include x.luci.mk', 'include $(X)luci.mk',
+      'include foo.mk # luci.mk', 'include a.mk include luci.mk', 'include luci.mk include b.mk', 'include luci.mk x', 'include luci.mkx',
+      '# include ../../luci.mk', '-include ../../luci.mk', 'sinclude ../../luci.mk', 'includes luci.mk', 'include', 'include ', 'include\n',
+      'define Package/x\n  include ../../luci.mk\nendef\n', 'define Package/x\ninclude ../../luci.mk\nendef',
+      'include ../../luci.mk\\\n', 'include \\\n\t../../luci.mk', 'include ../../luci.MK', 'INCLUDE luci.mk', 'include\v\fluci.mk\v',
+      'include\ninclude luci.mk', 'include x\ninclude luci.mk', '\n\n\n  \t\ninclude luci.mk\n\n', 'include luci.mk\u2028x', 'include luci.mk\u3000\ufeff',
+      'include ../../luci.mk\n# x\n', 'PKG_X:=1\ninclude $(TOPDIR)/feeds/luci/luci.mk\n', 'include u-boot.mk trusted-firmware-a.mk', 'include optee-os.mk\r\r\r',
+      '\ufeffinclude luci.mk', 'include\u00a0luci.mk', 'include\u200bluci.mk', '', '\n', ' ', 'luci.mk', 'include .mk', 'include -luci.mk'
+    ];
+    const pieces = ['include', 'include ', ' ', '\t', '\n', '\r\n', '\r', '\v', '\u00a0', '\u2028', '#', '-', 'x', '_', '/', '../', '$(TOPDIR)/',
+      'luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk', 'xluci.mk', 'luci', '.mk', 'mk', 'a.mk', 'define Package/x\n', 'endef', '\\'];
+    let seed = 0x2545f491;
+    const random = (n) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 8) % n; };
+    const pick = (list) => list[random(list.length)];
+    const some = (list, most) => Array.from({ length: random(most + 1) }, () => pick(list)).join('');
+    // Free-form strings, and lines shaped like an include with every part
+    // varied: what comes before the keyword, the keyword, the whitespace
+    // after it, the text, the helper, what follows it and the line end.
+    const blanks = [' ', '\t', '\v', '\f', '\u00a0', '\u3000', '\ufeff', '\u200b'];
+    const breaks = ['\n', '\r\n', '\r', '\u2028', '\u2029'];
+    const line = () => some([...blanks, '#', 'x'], 2) +
+      pick(['include', 'include', 'include', 'includes', '-include', 'sinclude', 'INCLUDE', 'define Package/x\ninclude']) +
+      some([...blanks, ...blanks, ...breaks], 3) +
+      some(['../', '$(TOPDIR)/', 'x', '-', '_', '.', '#', ' ', 'a.mk ', 'include ', '\\'], 3) +
+      pick(['luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk', 'luci', 'luci.MK', 'a.mk', '.mk', '']) +
+      some([...blanks, ...blanks, 'x', '#', '\\', ...breaks], 2) +
+      pick(['', ...breaks, '\n\n', '\nendef\n']);
+    const generated = [
+      ...Array.from({ length: 10000 }, () => Array.from({ length: 1 + random(10) }, () => pick(pieces)).join('')),
+      ...Array.from({ length: 30000 }, () => Array.from({ length: 1 + random(3) }, line).join(''))
+    ];
+    let accepted = 0;
+    for (const content of [...awkward, ...generated]) {
+      const expected = REFERENCE.test(content);
+      if (expected) accepted++;
+      // An empty Makefile is no Makefile to findPkgRoot, whatever the regex says.
+      assert.strictEqual(await resolves(content), expected && content !== '', JSON.stringify(content));
+    }
+    // Both answers are well represented, so the comparison means something.
+    assert.ok(accepted > 4000 && accepted < 36000, `${accepted} of ${awkward.length + generated.length} accepted`);
+  });
+
+  // Pinned without a clock: each shape against a Makefile of the same size
+  // whose lines are not blank, measured alternately in a worker thread, so a
+  // busy machine slows both arms at once. The regex cost hundreds of times
+  // more on each of these; the worker turns a hang into a failure.
+  const WORKER = `
+    import { findPkgRoot } from VALIDATORS;
+    import { parentPort, workerData } from 'node:worker_threads';
+    const { shapes, plain } = workerData;
+    const cost = async (text, reps) => {
+      const started = performance.now();
+      for (let i = 0; i < reps; i++) await findPkgRoot('foo/bar/x.c', async () => text, {});
+      return performance.now() - started;
+    };
+    await cost(plain, 3);
+    const ratios = {};
+    for (const [name, text] of Object.entries(shapes)) {
+      await cost(text, 1);
+      const rounds = [];
+      for (let round = 0; round < 5; round++) {
+        const base = await cost(plain, 10);
+        const measured = await cost(text, 10);
+        rounds.push(measured / Math.max(base, 0.001));
+      }
+      ratios[name] = rounds.sort((a, b) => a - b)[2];
+    }
+    parentPort.postMessage(ratios);
+  `;
+
+  test('costs what a Makefile of the same size costs, whatever its whitespace', async () => {
+    const size = 8000;
+    const shapes = {
+      'blank lines': '\n'.repeat(size),
+      'blank CRLF lines': ' \r\n'.repeat(size / 3),
+      'tab-indented blank lines': '\t\n'.repeat(size / 2),
+      'include and a run of spaces': `include${' '.repeat(size)}x\n`,
+      'include and a run of blank lines': `include${'\n'.repeat(size)}x\n`
+    };
+    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
+    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
+      eval: true,
+      workerData: { shapes, plain: 'x = 1\n'.repeat(size / 6) }
+    });
+    let ratios;
+    try {
+      ratios = await new Promise((settle, fail) => {
+        const cutOff = setTimeout(() => fail(new Error('findPkgRoot did not settle the whitespace shapes within 30 s')), 30000);
+        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
+        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
+      });
+    } finally {
+      await worker.terminate();
+    }
+    for (const [name, ratio] of Object.entries(ratios)) {
+      assert.ok(ratio < 20, `${name} cost ${ratio.toFixed(1)}x a Makefile of the same size`);
+    }
   });
 });

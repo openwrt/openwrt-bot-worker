@@ -3380,7 +3380,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = Object.cre
     const content = await fetchFileContent(makefilePath);
     const ok = !!(content && (
       /^PKG_(?:NAME|DISTNAME)\s*(?::=|=)/m.test(content) ||
-      /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m.test(content)
+      includesPackageHelperMk(content)
     ));
     cache[dir] = ok;
     return ok;
@@ -3436,6 +3436,63 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = Object.cre
   }
 
   return null;
+}
+
+// Whether a Makefile includes one of the helpers that make a directory a
+// package without a PKG_NAME. It answers exactly what
+// /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m
+// answers, without its backtracking: with the m flag that `\s*` ran across
+// line breaks, so every line start of a Makefile of blank lines rescanned the
+// rest - a quarter of a second for 20 KB, which any pull request can write.
+// Read the way the regex reads it: lines end at \n, \r, U+2028 and U+2029,
+// whitespace is JavaScript's \s, the whitespace after `include` may span
+// lines, and the helper must end the line it is on, after a word boundary.
+const PACKAGE_HELPER_MKS = ['luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk'];
+const PACKAGE_HELPER_BY_LAST_LETTER = new Map(PACKAGE_HELPER_MKS.map(mk => [mk.charCodeAt(mk.length - 4), mk]));
+// What the regex made of each UTF-16 unit: a blank is \s less the line
+// breaks, a word character is \w. A table, because the scan reads every
+// character of the lines it looks at.
+const CHAR_BLANK = 1;
+const CHAR_BREAK = 2;
+const CHAR_WORD = 4;
+const CHAR_CLASS = new Uint8Array(65536);
+for (const c of [9, 11, 12, 32, 0xa0, 0x1680, 0x202f, 0x205f, 0x3000, 0xfeff]) CHAR_CLASS[c] = CHAR_BLANK;
+for (let c = 0x2000; c <= 0x200a; c++) CHAR_CLASS[c] = CHAR_BLANK;
+for (const c of [10, 13, 0x2028, 0x2029]) CHAR_CLASS[c] = CHAR_BREAK;
+for (const [from, to] of [[48, 57], [65, 90], [97, 122], [95, 95]]) {
+  for (let c = from; c <= to; c++) CHAR_CLASS[c] = CHAR_WORD;
+}
+
+function includesPackageHelperMk(content) {
+  const n = content.length;
+  // Each walk below covers the blanks in front of one `include`, the
+  // whitespace after it or the line that ends, so no character is walked
+  // more than twice.
+  for (let at = content.indexOf('include'); at !== -1; at = content.indexOf('include', at + 7)) {
+    // `^\s*`: only blanks between the line start and the keyword. Blank
+    // lines before it are the same match from a later line start.
+    let lineStart = at;
+    while (lineStart > 0 && CHAR_CLASS[content.charCodeAt(lineStart - 1)] === CHAR_BLANK) lineStart--;
+    if (lineStart > 0 && CHAR_CLASS[content.charCodeAt(lineStart - 1)] !== CHAR_BREAK) continue;
+    // `\s+`: at least one, line breaks included. The text it stops at is on
+    // the line the helper has to end.
+    let textStart = at + 7;
+    while (textStart < n && (CHAR_CLASS[content.charCodeAt(textStart)] & (CHAR_BLANK | CHAR_BREAK)) !== 0) textStart++;
+    if (textStart === at + 7 || textStart === n) continue;
+    let end = textStart;
+    while (end < n && CHAR_CLASS[content.charCodeAt(end)] !== CHAR_BREAK) end++;
+    // `\.mk\s*$`: nothing but blanks after the helper.
+    while (end > textStart && CHAR_CLASS[content.charCodeAt(end - 1)] === CHAR_BLANK) end--;
+    // The letter before `.mk` tells the four helpers apart.
+    if (content.charCodeAt(end - 1) !== 107 || content.charCodeAt(end - 2) !== 109 || content.charCodeAt(end - 3) !== 46) continue;
+    const mk = PACKAGE_HELPER_BY_LAST_LETTER.get(content.charCodeAt(end - 4));
+    if (mk === undefined) continue;
+    const from = end - mk.length;
+    // `.*\b`: anywhere in that text, after a character that is no word
+    // character. At textStart that is the whitespace before it.
+    if (from >= textStart && content.startsWith(mk, from) && CHAR_CLASS[content.charCodeAt(from - 1)] !== CHAR_WORD) return true;
+  }
+  return false;
 }
 
 // `cache`, when given, holds what this same content already yielded for a
