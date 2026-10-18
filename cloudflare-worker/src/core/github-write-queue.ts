@@ -33,12 +33,6 @@ export class GitHubWriteQueue {
     this.queue.push([what, operation, options]);
   }
 
-  enqueueAll(operations: Array<[string, () => Promise<GitHubApiResponse<any> | { code?: number }>, WriteOptions?] | WriteOperation>): void {
-    for (const op of operations) {
-      this.queue.push([op[0], op[1], op[2]]);
-    }
-  }
-
   recordWrite(what: string, code?: number): void {
     this.statusWrites.push({ what, code });
   }

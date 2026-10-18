@@ -74,7 +74,6 @@ export interface PullRequestContext {
 }
 
 export interface LivePrState {
-  verified: boolean;
   livePr: any;
   branchMoved: boolean;
   verdictMoved: boolean;
@@ -87,7 +86,6 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
   if (!cached) {
     cached = (async () => {
       const { prData, prNumber, repoFullname, headSha, headBranch, baseBranch, baseSha, client } = ctx;
-      let verified = false;
       // Set only when the re-read never happened for want of budget. A
       // re-read that happened and failed is a different thing: the payload
       // still describes the pull request the event was sent for.
@@ -104,7 +102,7 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
 
         if (!canCheckLiveState) {
           liveStateUnread = true;
-          console.warn(`Skipping live PR state check for #${prNumber}: no API budget headroom left. Treating PR as unverified/moved to preserve check-run writes.`);
+          console.warn(`Skipping live PR state check for #${prNumber}: no API budget headroom left. Treating PR as moved to preserve check-run writes.`);
         } else {
           const prUrl = prData?.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
           const isBudgetExhausted = typeof client?.hasHeadroom === 'function' && !client.hasHeadroom();
@@ -116,13 +114,10 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
             if (Array.isArray(liveRes.data.labels) || liveRes.data.head || liveRes.data.base) {
               livePr = { ...prData, ...liveRes.data };
             }
-            verified = true;
           } else {
             console.warn(`Failed to re-read current PR state for #${prNumber}; falling back to the state the event payload carries`);
           }
         }
-      } else {
-        verified = true;
       }
 
       const prClosed = Boolean(livePr?.state && livePr.state !== 'open');
@@ -142,7 +137,7 @@ export function fetchLivePrState(ctx: PullRequestContext): Promise<LivePrState> 
       const verdictMoved = branchMoved ||
         Boolean(livePr.body !== undefined && prData?.body !== undefined && livePr.body !== prData.body);
 
-      return { verified, livePr, branchMoved, verdictMoved };
+      return { livePr, branchMoved, verdictMoved };
     })();
     livePrStateCache.set(ctx, cached);
   }
