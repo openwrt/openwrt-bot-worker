@@ -1,5 +1,5 @@
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-licenses.js';
-import { MBOX_ENVELOPE_PATTERN, getChangedFilesFromPatch as parseChangedFiles, splitMboxPatch } from './core/patch-utils.ts';
+import { getChangedFilesFromPatch as parseChangedFiles, getPresentFilesFromPatch as parsePresentFiles, splitMboxPatch } from './core/patch-utils.ts';
 export { splitMboxPatch };
 
 // The grammar of a commit subject prefix: a package name (`bash`, `lua5.4`),
@@ -8,10 +8,26 @@ export { splitMboxPatch };
 // (`tools/cmake`, `toolchain/musl`, `.github/workflows`), followed by `: `.
 // Defined once and reused by every place that has to recognize one, so the
 // subject check and the revert parser cannot drift apart again.
-const SUBJECT_PREFIX_SEGMENT = '\\.?[a-zA-Z0-9]+(?:[a-zA-Z0-9_+-]*[a-zA-Z0-9+])?(?:\\.[a-zA-Z0-9]+(?:[a-zA-Z0-9_+-]*[a-zA-Z0-9+])?)*';
+//
+// The grammar is written so that no two parts of it can match the same
+// character: a word is alphanumeric runs joined by non-empty `_+-` runs, and
+// `.` and `/` only ever separate. An earlier spelling put `[a-zA-Z0-9]+` next
+// to `[a-zA-Z0-9_+-]*`, which let both consume the same letters - every
+// alphanumeric run then had as many parses as it had characters, multiplied
+// per dotted segment and again by the `(?:...)+` in the strip pattern. One
+// call on the 70-character subject
+// `lua5.1.foo.bar.baz.qux.quux.corge.grault.garply.waldo.fred.plugh.xyzzy`
+// cost seconds of CPU against the Worker's 10 ms budget, so the invocation
+// died before any check-run was written. The language is unchanged.
+const SUBJECT_PREFIX_WORD = '[a-zA-Z0-9]+(?:[_+-]+[a-zA-Z0-9]+)*\\+*';
+const SUBJECT_PREFIX_SEGMENT = `\\.?${SUBJECT_PREFIX_WORD}(?:\\.${SUBJECT_PREFIX_WORD})*`;
 export const SUBJECT_PREFIX_SOURCE = `${SUBJECT_PREFIX_SEGMENT}(?:\\/${SUBJECT_PREFIX_SEGMENT})*: `;
 const SUBJECT_PREFIX_RE = new RegExp(`^${SUBJECT_PREFIX_SOURCE}`);
 const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^(?:${SUBJECT_PREFIX_SOURCE})+\\s*`);
+
+// Subject prefixes that stand for the whole tree rather than for one package.
+// `treewide: ` is what openwrt/packages uses for a change applied everywhere.
+const TREEWIDE_SUBJECT_ENTITIES = new Set(['treewide']);
 
 export function isValidName(name) {
   const nameRegex = /^[\p{L}'.-]+(?: [\p{L}'.-]+)+$/u;
@@ -315,6 +331,25 @@ export async function validateFormalities(fullCommit, CONFIG) {
 
   const revert = CONFIG.allow_revert === false ? null : parseRevertCommit(message);
 
+  // Measure a revert against the subject underneath the `Revert "..."` wrapper:
+  // the wrapper is generated from the reverted commit, so the author cannot
+  // shorten it without breaking the reference. Everything else is measured on
+  // the normalized subject, so an `fixup!`/`squash!` marker that disappears on
+  // autosquash does not eat into the budget of the subject it is applied to.
+  //
+  // The length is settled before the prefix grammar runs, and the grammar then
+  // reads only the subject cut to the hard limit (below), so the cost of an
+  // abnormally long subject is bounded by the limit itself rather than by its
+  // length.
+  const subjectLen = revert ? (revert.prefix + revert.original).length : subject.length;
+  const lenSuffix = revert ? ' chars, excluding the `Revert "..."` wrapper' : ' chars';
+  const subjectOverHardLimit = subjectLen > CONFIG.max_subject_len_hard;
+  if (subjectOverHardLimit) {
+    subjectErrors.push(`Subject line exceeds hard limit (${subjectLen}/${CONFIG.max_subject_len_hard}${lenSuffix})`);
+  } else if (subjectLen > CONFIG.max_subject_len_soft) {
+    warnings.push(`Subject line exceeds soft limit (${subjectLen}/${CONFIG.max_subject_len_soft}${lenSuffix})`);
+  }
+
   if (!isAutosquash) {
     if (/^\s/.test(lines[0])) subjectErrors.push("Commit subject must not start with whitespace");
 
@@ -332,10 +367,17 @@ export async function validateFormalities(fullCommit, CONFIG) {
       // The prefix is a package name (`bash: `) or a source tree path with
       // subdirectories (`tools/cmake: `, `toolchain/musl: `) - openwrt.git
       // history uses both shapes, so any of them satisfies the prefix rule.
-      if (!SUBJECT_PREFIX_RE.test(subject)) {
+      //
+      // Measured on the subject cut to the hard limit: an overlong subject
+      // earns these verdicts as well, or the contributor hears about the
+      // capital and the period only after shortening the line and pushing
+      // again. Both the prefix and the word after it sit at the start, so the
+      // cut cannot change either verdict; the period is read off the real end.
+      const gradedSubject = subject.slice(0, CONFIG.max_subject_len_hard);
+      if (!SUBJECT_PREFIX_RE.test(gradedSubject)) {
         subjectErrors.push("Commit subject must start with `<package name or prefix>: `");
       } else {
-        const afterPrefix = subject.replace(SUBJECT_PREFIX_STRIP_RE, '');
+        const afterPrefix = gradedSubject.replace(SUBJECT_PREFIX_STRIP_RE, '');
         if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
           subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
         }
@@ -346,23 +388,11 @@ export async function validateFormalities(fullCommit, CONFIG) {
     }
   }
 
-  // Measure a revert against the subject underneath the `Revert "..."` wrapper:
-  // the wrapper is generated from the reverted commit, so the author cannot
-  // shorten it without breaking the reference. Everything else is measured on
-  // the normalized subject, so an `fixup!`/`squash!` marker that disappears on
-  // autosquash does not eat into the budget of the subject it is applied to.
-  const subjectLen = revert ? (revert.prefix + revert.original).length : subject.length;
-  const lenSuffix = revert ? ' chars, excluding the `Revert "..."` wrapper' : ' chars';
-  if (subjectLen > CONFIG.max_subject_len_hard) {
-    subjectErrors.push(`Subject line exceeds hard limit (${subjectLen}/${CONFIG.max_subject_len_hard}${lenSuffix})`);
-  } else if (subjectLen > CONFIG.max_subject_len_soft) {
-    warnings.push(`Subject line exceeds soft limit (${subjectLen}/${CONFIG.max_subject_len_soft}${lenSuffix})`);
-  }
-
   // A subject shaped like a revert but without the reference in the body is held
   // to the regular rules. Say why, because the prefix and lower-case complaints
   // that follow from the `Revert "..."` wrapper do not point at what is missing.
-  if (subjectErrors.length > 0 && !revert && CONFIG.allow_revert !== false && parseRevertSubject(subject)) {
+  if (subjectErrors.length > 0 && !revert && !subjectOverHardLimit &&
+      CONFIG.allow_revert !== false && parseRevertSubject(subject)) {
     subjectErrors.push('Subject is formatted as a revert, but the body does not reference the reverted commit. Keep the `This reverts commit <sha>.` line that `git revert` generates, or reword the subject to follow the regular `<package name or prefix>: ` format');
   }
 
@@ -915,6 +945,43 @@ const NON_VERSION_MAKEFILE_VARS = new Set([
   'TARGET_LDFLAGS', 'TARGET_CPPFLAGS', 'HOST_CFLAGS', 'HOST_LDFLAGS'
 ]);
 
+// A package name written as a make expansion - `define Package/$(PKG_NAME)/...`,
+// the near-universal recipe spelling across the feeds - still names one real
+// package: resolve it against the Makefile's own variables so the install
+// recipe and the conffiles block are matched by the package they both stand
+// for, however each of them is spelled. A name that cannot be resolved (built
+// by $(shell ...), or assigned outside the diff window) is returned unchanged
+// and stays unsettled for the caller.
+//
+// One resolver per text, because every name resolved against it wants the same
+// two things: the patch markers stripped off, and what each variable resolves
+// to. Rebuilding both per name made a Makefile of N package blocks cost N
+// passes over the whole text.
+function makefilePkgNameResolver(makefileText) {
+  const settled = new Map();
+  let resolveVar = null;
+  return (name) => {
+    if (!name || !/\$[({]/.test(name) || !makefileText) return name;
+    const known = settled.get(name);
+    if (known !== undefined) return known;
+    if (resolveVar === null) {
+      // In a patch every assignment carries its own +/space marker, which the
+      // line anchor in parseMakefileVar does not allow for. Removed lines are
+      // dropped, as everywhere else in this audit.
+      resolveVar = makefileVarResolver(makefileText.split('\n')
+        .filter(line => !line.startsWith('-'))
+        .map(line => line.replace(/^[ +]/, ''))
+        .join('\n'));
+    }
+    const value = name.replace(/\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g, (match, p1, p2) => {
+      const resolved = resolveVar((p1 || p2).trim());
+      return resolved ? resolved : match;
+    });
+    settled.set(name, value);
+    return value;
+  };
+}
+
 export function extractConffilesMap(makefileText) {
   const map = new Map();
   if (!makefileText) return map;
@@ -927,7 +994,13 @@ export function extractConffilesMap(makefileText) {
 
   for (const rawLine of rawLines) {
     if (currentMacro === null) {
-      const match = rawLine.match(/^[ \t+]*define\s+([^\s\(\)]+)\b/);
+      // A define name runs to the first whitespace, parentheses included:
+      // `define Package/$(PKG_NAME)/conffiles` is the ordinary spelling across
+      // the feeds, and stopping at `(` captured `Package/$` instead, so the
+      // block was invisible and the Makefile was reported as having none. The
+      // expansion is captured whole and resolved where the map is keyed
+      // below, so both halves compare the same package.
+      const match = rawLine.match(/^[ \t+]*define\s+(\S+)/);
       if (match) {
         currentMacro = match[1];
         currentLines = [];
@@ -948,6 +1021,14 @@ export function extractConffilesMap(makefileText) {
     }
   }
 
+  // Every block resolves against this one text, so a name's value is the same
+  // wherever it appears: resolve it once for the whole extraction rather than
+  // once per occurrence.
+  const resolveOnce = makefileVarResolver(makefileText);
+  // The block names resolve against the same text with its patch markers
+  // stripped, which is a different text, so it gets a resolver of its own.
+  const resolvePkgName = makefilePkgNameResolver(makefileText);
+
   function expandLines(lines, seenMacros = new Set()) {
     const result = [];
     for (const line of lines) {
@@ -964,12 +1045,12 @@ export function extractConffilesMap(makefileText) {
         const expandedLine = line.replace(/\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g, (match, p1, p2) => {
           const varName = (p1 || p2).trim();
           if (varName === 'CONF_DIR') {
-            return resolveMakefileVar(makefileText, 'CONF_DIR') || '/etc';
+            return resolveOnce('CONF_DIR') || '/etc';
           }
           if (varName === 'config_directory') {
-            return resolveMakefileVar(makefileText, 'config_directory') || '/etc/config';
+            return resolveOnce('config_directory') || '/etc/config';
           }
-          const resolved = resolveMakefileVar(makefileText, varName);
+          const resolved = resolveOnce(varName);
           return resolved !== null ? resolved : match;
         });
         result.push(expandedLine);
@@ -981,7 +1062,7 @@ export function extractConffilesMap(makefileText) {
   for (const [name, lines] of defineBlocks.entries()) {
     const conffilesMatch = name.match(/^Package\/([^\/\s]+)\/conffiles$/);
     if (conffilesMatch) {
-      const pkg = conffilesMatch[1];
+      const pkg = resolvePkgName(conffilesMatch[1]);
       if (!map.has(pkg)) map.set(pkg, new Set());
       const expanded = expandLines(lines);
       for (const l of expanded) {
@@ -996,28 +1077,92 @@ export function extractConffilesMap(makefileText) {
 export function extractDefinedPackages(makefileText) {
   const pkgs = new Set();
   if (!makefileText) return pkgs;
-  const regex = /(?:^|\n)[ \t+]*define\s+Package\/([^\s\/\(\)]+)(?:\/Default)?\b/g;
+  // The name runs to the next `/` or to whitespace, parentheses included, so
+  // `define Package/$(PKG_NAME)` names the package `$(PKG_NAME)` the same way
+  // the conffiles map and the install scanner do. The `\b` this replaces could
+  // not follow a `)`, so an expansion was dropped here too.
+  const regex = /(?:^|\n)[ \t+]*define\s+Package\/([^\s/]+)/g;
+  const resolvePkgName = makefilePkgNameResolver(makefileText);
   let m;
   while ((m = regex.exec(makefileText)) !== null) {
-    pkgs.add(m[1]);
+    pkgs.add(resolvePkgName(m[1]));
   }
   return pkgs;
 }
 
-export function extractInstalledConfigPath(contentLine, makefileText) {
-  const match = contentLine.match(/(?:([^\s;&|]+)\s+)?\$(?:\(1\)|\{1\})([^\s;&|]+)/);
-  if (!match) return { path: null, unresolvable: true };
-  const rawSource = match[1] ? match[1].replace(/['"]/g, '') : null;
+// The paths an install line puts under the destination root, or
+// `unresolvable: true` when the line names a set that cannot be known from the
+// Makefile. `paths` is always an array: one install line can install several
+// files, and resolving only the one next to `$(1)` left the rest unchecked
+// while the line still reported a pass.
+// Which package's install recipe each line of a Makefile sits in, keyed by the
+// line's own text. A diff is a window: the hunk that changes an install line
+// often shows neither its `define Package/<pkg>/install` nor a funcname
+// context naming it, and the whole file does. Reads a diff chunk as well as a
+// plain Makefile - a removed line is skipped and the markers stripped, as in
+// extractConffilesMap. A line that appears in two recipes maps to null,
+// because then it names no single package.
+export function extractInstallLinePackages(makefileText) {
+  const map = new Map();
+  if (!makefileText) return map;
+
+  let currentPkg = null;
+  for (const rawLine of makefileText.split('\n')) {
+    if (rawLine.startsWith('-')) continue;
+    const defineMatch = rawLine.match(/^[ \t+]*define\s+(\S+)/);
+    if (defineMatch) {
+      const installMatch = defineMatch[1].match(/^Package\/([^\/\s]+)\/install$/);
+      currentPkg = installMatch ? installMatch[1] : null;
+      continue;
+    }
+    if (/^[ \t+]*endef\b/.test(rawLine)) {
+      currentPkg = null;
+      continue;
+    }
+    if (currentPkg === null) continue;
+    const key = rawLine.replace(/^[ \t+]/, '').trim();
+    if (!key) continue;
+    map.set(key, map.has(key) && map.get(key) !== currentPkg ? null : currentPkg);
+  }
+  return map;
+}
+
+// `resolveVar` lets the caller resolve a name once for all the install lines it
+// reads out of one Makefile, instead of once per line: resolution is a pure
+// function of the text and the name, so a resolver belonging to one text
+// answers exactly as a fresh resolution would. Omit it and every line builds
+// its own.
+export function extractInstalledConfigPath(contentLine, makefileText, resolveVar = null) {
+  const match = contentLine.match(/^(.*?)\$(?:\(1\)|\{1\})([^\s;&|]+)/);
+  if (!match) return { paths: [], unresolvable: true };
+
+  // Everything between the install macro and the destination is a source. The
+  // leading word is the macro or command - `$(INSTALL_CONF)`, `$(CP)`, `ln` -
+  // which a source is told apart from by carrying a path. An option is not a
+  // source either, and only `install`'s mode, owner and group take a value of
+  // their own; `cp -r` does not, so a flag must not swallow the file after it.
+  const TAKES_A_VALUE = /^(?:-[mog]|--mode|--owner|--group)$/;
+  const words = match[1].trim().split(/\s+/).filter(Boolean);
+  if (words.length > 0 && !words[0].includes('/')) words.shift();
+  const rawSources = [];
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].startsWith('-')) {
+      if (TAKES_A_VALUE.test(words[i])) i++;
+      continue;
+    }
+    rawSources.push(words[i].replace(/['"]/g, ''));
+  }
   let target = match[2];
 
+  let resolve = resolveVar;
   const expandVars = (str) => {
     let out = str
       .replace(/\$(?:\(CONF_DIR\)|\{CONF_DIR\})/g, '/etc')
       .replace(/\$(?:\(config_directory\)|\{config_directory\})/g, '/etc/config');
     if (makefileText) {
+      if (!resolve) resolve = makefileVarResolver(makefileText);
       out = out.replace(/\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g, (m, p1, p2) => {
-        const varName = (p1 || p2).trim();
-        const resolved = resolveMakefileVar(makefileText, varName);
+        const resolved = resolve((p1 || p2).trim());
         return resolved !== null ? resolved : m;
       });
     }
@@ -1026,27 +1171,202 @@ export function extractInstalledConfigPath(contentLine, makefileText) {
 
   target = expandVars(target).replace(/['"]/g, '').replace(/\/+/g, '/');
 
-  if ((target === '/etc' || target === '/etc/config' || target.endsWith('/')) && rawSource && !rawSource.startsWith('-')) {
-    const expandedSource = expandVars(rawSource).replace(/['"]/g, '');
-    const basename = expandedSource.split('/').pop();
-    if (basename && !/[*?$({]/.test(basename)) {
-      target = (target.endsWith('/') ? target : target + '/') + basename;
-    }
-  }
-
   if (/\$[({]/.test(target)) {
-    return { path: null, unresolvable: true };
+    return { paths: [], unresolvable: true };
   }
 
-  if (target === '/etc' || target.startsWith('/etc/')) {
-    return { path: target, unresolvable: false };
+  const underEtc = (path) => path === '/etc' || path.startsWith('/etc/');
+
+  // A destination that is a directory takes each source under its own name.
+  if (target === '/etc' || target === '/etc/config' || target.endsWith('/')) {
+    const dir = target.endsWith('/') ? target : target + '/';
+    const paths = [];
+    for (const rawSource of rawSources) {
+      const basename = expandVars(rawSource).replace(/['"]/g, '').split('/').pop();
+      // A glob, an unresolved expansion or a directory source ('.', '..', a
+      // trailing slash) names no single file, so what lands in the directory
+      // is unknowable - not equal to the directory itself. Returning the bare
+      // directory made a Makefile that correctly lists '/etc/config/foo' look
+      // as though it were missing an entry for '/etc/config/'.
+      if (!basename || basename === '.' || basename === '..' || /[*?[\]$({]/.test(basename)) {
+        return { paths: [], unresolvable: true };
+      }
+      paths.push(dir + basename);
+    }
+    // Nothing recognisable to append: judge the destination on its own, as
+    // before, rather than claiming the line installs nothing.
+    if (paths.length === 0) {
+      return { paths: underEtc(target) ? [target] : [], unresolvable: false };
+    }
+    return { paths: paths.filter(underEtc), unresolvable: false };
   }
 
-  return { path: null, unresolvable: false };
+  return { paths: underEtc(target) ? [target] : [], unresolvable: false };
 }
 
-export function validateConffilesCoverage(conffilesMap, installedFiles, defaultPkg, errors, successes, definedPackages = new Set()) {
+// A conffiles entry that still holds make expansions is compared with an
+// installed path piece by piece rather than through a regex built from it.
+// Turning each expansion into one '[^/]+' group gave the engine every way of
+// splitting a path segment between adjacent groups, which is seconds of CPU on
+// a path that does not match - the whole Worker budget on an entry a
+// contributor can write. The expansions a group was built for are the ones
+// recognised here; anything else (a nested call, a name holding a regex
+// metacharacter) stays literal and so matches no resolved path, exactly as the
+// escaped pattern did.
+const MAKEFILE_EXPANSION_IN_PATH = /\$\([^.*+?^${}()|[\]\\]+\)|\$\{[^.*+?^${}()|[\]\\]+\}/g;
+
+// The entry as literal pieces with a number for each run of unknown
+// characters. Two expansions side by side are one run, not two: that leaves no
+// ambiguity about where the first ends and the second begins. The number is how
+// many expansions the run collapses, and so the fewest characters it can stand
+// for - an expansion was a `[^/]+` group, which never matched an empty string,
+// so `$(A)$(B)` must still need two characters rather than one.
+function tokenizeConffilesEntry(entry) {
+  const parts = [];
+  const pushLiteral = (text) => { if (text) parts.push(text); };
+  let last = 0;
+  let match;
+  MAKEFILE_EXPANSION_IN_PATH.lastIndex = 0;
+  while ((match = MAKEFILE_EXPANSION_IN_PATH.exec(entry)) !== null) {
+    pushLiteral(entry.slice(last, match.index));
+    if (typeof parts[parts.length - 1] === 'number') parts[parts.length - 1]++;
+    else parts.push(1);
+    last = match.index + match[0].length;
+  }
+  pushLiteral(entry.slice(last));
+  return parts;
+}
+
+// An expansion names characters inside one path segment, never a '/' of its
+// own, so the two sides must have the same number of segments.
+function conffilesEntrySegments(parts) {
+  const segments = [[]];
+  for (const part of parts) {
+    if (typeof part === 'number') {
+      segments[segments.length - 1].push(part);
+      continue;
+    }
+    const chunks = part.split('/');
+    if (chunks[0]) segments[segments.length - 1].push(chunks[0]);
+    for (let i = 1; i < chunks.length; i++) segments.push(chunks[i] ? [chunks[i]] : []);
+  }
+  return segments;
+}
+
+// One segment: the literals before and after an unknown run are anchored, the
+// ones between it and the next are found left to right, and every run must eat
+// as many characters as it collapsed expansions. Taking the leftmost occurrence
+// of each literal leaves the most room for the rest, so one pass decides the
+// segment.
+function conffilesSegmentMatches(items, text) {
+  if (!items.some(item => typeof item === 'number')) return items.join('') === text;
+
+  let pos = 0;
+  let from = 0;
+  let to = items.length;
+  if (typeof items[0] !== 'number') {
+    if (!text.startsWith(items[0])) return false;
+    pos = items[0].length;
+    from = 1;
+  }
+  let end = text.length;
+  if (typeof items[items.length - 1] !== 'number') {
+    const suffix = items[items.length - 1];
+    if (!text.endsWith(suffix)) return false;
+    end = text.length - suffix.length;
+    to = items.length - 1;
+  }
+
+  for (let i = from; i < to; i++) {
+    if (typeof items[i] === 'number') {
+      pos += items[i];
+      continue;
+    }
+    const at = text.indexOf(items[i], pos);
+    if (at < 0 || at + items[i].length > end) return false;
+    pos = at + items[i].length;
+  }
+  return pos <= end;
+}
+
+function conffilesEntryCoversPath(entrySegments, pathSegments) {
+  if (entrySegments.length !== pathSegments.length) return false;
+  for (let i = 0; i < entrySegments.length; i++) {
+    if (!conffilesSegmentMatches(entrySegments[i], pathSegments[i])) return false;
+  }
+  return true;
+}
+
+// What a set of conffiles entries can cover, read once for the whole set
+// instead of once per entry per install line.
+//
+// `literals` holds every entry's own text, because the three questions asked
+// of that text - is it the path, is it a directory holding the path - are
+// answered below by looking the path's own prefixes up rather than by walking
+// the entries. Only an entry that still holds a make expansion reaches the
+// segment matcher, and the tokenizer keeps no variable names, so entries that
+// differ only in which variables they name are one shape to it.
+function conffilesEntryIndex(entries) {
+  const literals = new Set();
+  const shapesBySegmentCount = new Map();
+  const seenShapes = new Set();
+  let anyTooVague = false;
+  for (const entry of entries) {
+    literals.add(entry);
+    if (!entry.includes('$')) continue;
+    const segments = conffilesEntrySegments(tokenizeConffilesEntry(entry));
+    // What makes an entry unjudgeable is several runs competing for the
+    // characters of one path segment. Runs in different segments do not
+    // compete - '/etc/$(A)/$(B)/$(C)/$(D)' names one path per segment and is
+    // as clear as a single expansion - so the count below is per segment.
+    let maxRuns = 0;
+    for (const items of segments) {
+      let runs = 0;
+      for (const item of items) if (typeof item === 'number') runs++;
+      if (runs > maxRuns) maxRuns = runs;
+    }
+    // More unresolved runs in one segment than any recipe in the feeds
+    // writes: such a segment stands for too many paths to hold an install
+    // line to, so the entry is not judged at all rather than judged on a
+    // guess. It is still reported, below, for every path it leaves unchecked.
+    if (maxRuns > 3) {
+      anyTooVague = true;
+      continue;
+    }
+    if (maxRuns === 0) continue;
+    const shapeKey = JSON.stringify(segments);
+    if (seenShapes.has(shapeKey)) continue;
+    seenShapes.add(shapeKey);
+    const bucket = shapesBySegmentCount.get(segments.length);
+    if (bucket) bucket.push(segments);
+    else shapesBySegmentCount.set(segments.length, [segments]);
+  }
+  return { literals, shapesBySegmentCount, anyTooVague };
+}
+
+// An entry covers a path by its own text when it is the path, when it ends in
+// '/' and the path starts with it, or when the path starts with it plus a '/'.
+// Each of those says the entry is the join of a prefix of the path's own
+// segments, with or without a trailing slash, and a path has a handful of
+// prefixes however many entries the block lists.
+function conffilesLiteralCovers(literals, path, pathSegments) {
+  if (literals.has(path)) return true;
+  let prefix = '';
+  for (let i = 0; i < pathSegments.length - 1; i++) {
+    prefix = i === 0 ? pathSegments[0] : `${prefix}/${pathSegments[i]}`;
+    if (literals.has(prefix) || literals.has(`${prefix}/`)) return true;
+  }
+  return false;
+}
+
+export function validateConffilesCoverage(conffilesMap, installedFiles, defaultPkg, errors, successes, definedPackages = new Set(), isAddedMakefile = true, warnings = null) {
   if (conffilesMap.size === 0) {
+    // A Makefile with no conffiles block at all is only asked for one when the
+    // pull request wrote the Makefile. Asking an established package for a
+    // block it never had turns a pull request red over lines nobody in it
+    // wrote - it only starts installing configuration from a recipe that was
+    // already there. What a block that does exist must list is verified below.
+    if (!isAddedMakefile) return { incomplete: false };
     errors.push("- Makefile installs configuration files under /etc/, but is missing the required 'conffiles' section. Please add a 'define Package/<pkgname>/conffiles' block listing each installed config file path (e.g. '/etc/config/<pkgname>'), terminated with 'endef'.");
     return { incomplete: false };
   }
@@ -1055,24 +1375,64 @@ export function validateConffilesCoverage(conffilesMap, installedFiles, defaultP
     return { incomplete: false };
   }
 
+  // Reading a set of entries is a pure function of the set, so each one is
+  // read once for the whole pairing rather than once per install line.
+  const indexes = new Map();
+  const indexOf = (entries) => {
+    let index = indexes.get(entries);
+    if (index === undefined) {
+      index = conffilesEntryIndex(entries);
+      indexes.set(entries, index);
+    }
+    return index;
+  };
+
+  // The union of every block the Makefile really defines, for an install line
+  // whose own package is unsettled. It is the same union for every such line,
+  // so build it once instead of per line.
+  let definedUnion;
+  const definedBlocks = () => {
+    if (definedUnion === undefined) {
+      const candidates = [...conffilesMap.keys()]
+        .filter(pkg => definedPackages.size === 0 || definedPackages.has(pkg));
+      definedUnion = candidates.length > 0
+        ? new Set(candidates.flatMap(pkg => [...conffilesMap.get(pkg)]))
+        : null;
+    }
+    return definedUnion;
+  };
+
   let missingCount = 0;
+  let unverifiableCount = 0;
   for (const item of installedFiles) {
     let pkgEntries = null;
     let targetPkg = item.pkg || defaultPkg;
 
     if (item.pkg) {
       pkgEntries = conffilesMap.get(item.pkg);
-    } else {
-      if (defaultPkg && conffilesMap.has(defaultPkg)) {
-        pkgEntries = conffilesMap.get(defaultPkg);
-        targetPkg = defaultPkg;
-      } else if (conffilesMap.size === 1 && definedPackages.size === 1) {
-        const singlePkg = conffilesMap.keys().next().value;
-        if (definedPackages.has(singlePkg)) {
-          pkgEntries = conffilesMap.get(singlePkg);
-          targetPkg = singlePkg;
-        }
-      }
+    } else if (defaultPkg && conffilesMap.has(defaultPkg)) {
+      pkgEntries = conffilesMap.get(defaultPkg);
+      targetPkg = defaultPkg;
+    }
+
+    // The package behind the install line is not settled: the recipe was not
+    // in the diff window, or the funcname context for the hunk was an `ifeq`
+    // from inside it rather than its `define`. Judge the path against every
+    // conffiles block the Makefile really defines, rather than insisting on
+    // the directory name - which a Makefile shipping only sub-packages
+    // (foo-server, foo-client) never uses - or on the Makefile defining
+    // exactly one package.
+    //
+    // A name that is still a make expansion got here unresolved, so it names
+    // no package either. A resolved one does, and is held to its own block:
+    // accepting the union for it passed a '$(PKG_NAME)/install' recipe whose
+    // package has no block at all, on the strength of a sub-package's. Either
+    // way the finding below names the recipe the install line sits in - naming
+    // the first block in the map instead told the contributor to add the path
+    // to a package their line has nothing to do with.
+    const pkgUnsettled = !item.pkg || item.pkgCertain === false || /\$[({]/.test(item.pkg);
+    if (!pkgEntries && pkgUnsettled) {
+      pkgEntries = definedBlocks();
     }
 
     if (!pkgEntries) {
@@ -1082,32 +1442,33 @@ export function validateConffilesCoverage(conffilesMap, installedFiles, defaultP
       continue;
     }
 
-    const hasPath = [...pkgEntries].some(entry => {
-      if (entry === item.path) return true;
-      if (entry.endsWith('/') && item.path.startsWith(entry)) return true;
-      if (item.path.startsWith(entry + '/')) return true;
-      if (entry.includes('$')) {
-        const regexPattern = '^' + entry
-          .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-          .replace(/\\\$\\\([^\\)]+\\\)/g, '[^/]+')
-          .replace(/\\\$\\\{[^\\}]+\\\}/g, '[^/]+') + '$';
-        try {
-          if (new RegExp(regexPattern).test(item.path)) return true;
-        } catch (_) {}
-      }
-      return false;
-    });
+    const { literals, shapesBySegmentCount, anyTooVague } = indexOf(pkgEntries);
+    const pathSegments = item.path.split('/');
+    let hasPath = conffilesLiteralCovers(literals, item.path, pathSegments);
+    if (!hasPath) {
+      const shapes = shapesBySegmentCount.get(pathSegments.length);
+      if (shapes) hasPath = shapes.some(segments => conffilesEntryCoversPath(segments, pathSegments));
+    }
+    // An entry too vague to judge only matters for a path nothing else covers.
+    const tooVague = !hasPath && anyTooVague;
 
     if (!hasPath) {
+      if (tooVague) {
+        unverifiableCount++;
+        warnings?.push(`Could not verify that 'define Package/${targetPkg}/conffiles' lists '${item.path}': its entries name the path only through unresolved make expansions.`);
+        continue;
+      }
       missingCount++;
       errors.push(`- Makefile installs '${item.path}', but 'define Package/${targetPkg}/conffiles' does not list it. Please add it to the conffiles section, terminated with 'endef'.`);
     }
   }
 
-  if (missingCount === 0) {
+  // An entry nobody could resolve leaves a path unchecked, so the block is not
+  // confirmed either: say what was skipped and let the check go neutral.
+  if (missingCount === 0 && unverifiableCount === 0) {
     successes.push("✅ Makefile conffiles macro properly registers INSTALL_CONF tracking parameters");
   }
-  return { incomplete: false };
+  return { incomplete: unverifiableCount > 0 };
 }
 
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
@@ -1172,16 +1533,34 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
         const rawSubject = cMsg.split('\n')[0].trim();
         const unPrefixed = rawSubject.replace(/^(fixup!|squash!)\s+/, '');
         const revertMatch = parseRevertCommit(cMsg);
-        const cleanSub = revertMatch ? (revertMatch.revertedSubject || unPrefixed) : unPrefixed;
+        // parseRevertCommit returns { prefix, original, depth }; the rest of
+        // this file reads `original`, and reading a field it never returns
+        // left every revert measured against its own `Revert "..."` wrapper.
+        const cleanSub = revertMatch ? (revertMatch.original || unPrefixed) : unPrefixed;
 
         let pertainsToPackage = false;
+        // Whether the commit's subject names no package at all - a tree-wide
+        // prefix, or no prefix to read a package name from.
+        let namesNoPackage = false;
         if (c.commitPatch && targetFilePath) {
-          if (c.commitPatch.includes(`b/${targetFilePath}`) || (pkgDir && c.commitPatch.includes(`b/${pkgDir}/`))) {
-            pertainsToPackage = true;
-          }
+          // The file list, not a substring of the patch body: a `b/<path>`
+          // written in an embedded patch or quoted in a commit message is not
+          // this commit touching that package.
+          const touched = getChangedFilesFromPatch(c.commitPatch);
+          pertainsToPackage = touched.some(file =>
+            file === targetFilePath || (pkgDir && file.startsWith(pkgDir + '/')));
         } else if (!c.commitPatch && pkgName) {
           const entities = extractSubjectEntity(cleanSub).map(e => e.toLowerCase());
-          if (entities.includes(pkgName) ||
+          // A tree-wide change names no package, and neither does a subject
+          // with no prefix at all, so neither can be narrowed to some other
+          // package: both still have to be read for this one. Without this,
+          // 'treewide: bump foo to 1.2.3' - the standard openwrt/packages
+          // prefix for exactly this - never matched the Makefile it bumped,
+          // and the autosquash and revert escapes below were unreachable.
+          namesNoPackage = entities.length === 0 ||
+            entities.every(entity => TREEWIDE_SUBJECT_ENTITIES.has(entity));
+          if (namesNoPackage ||
+              entities.includes(pkgName) ||
               cleanSub.toLowerCase().startsWith(pkgName + ':') ||
               (pkgDir && cleanSub.toLowerCase().startsWith(pkgDir.toLowerCase() + ':'))) {
             pertainsToPackage = true;
@@ -1196,8 +1575,18 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           continue;
         }
 
-        if (CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(rawSubject)) return true;
-        if (CONFIG.allow_revert !== false && revertMatch !== null) return true;
+        // A commit that names no package is read for this one for want of
+        // anything better, and its subject can still carry the version. The
+        // escapes are a different claim - that this commit's subject cannot
+        // name the version - and only answer for the package the commit is
+        // about: one `fixup!` or one `Revert "..."` anywhere in a series used
+        // to satisfy the check for every package in the pull request. A single
+        // commit with no patch to scope it by is all there is, so it keeps
+        // them.
+        if (!namesNoPackage || commitsList.length === 1) {
+          if (CONFIG.allow_autosquash && /^(fixup!|squash!)\s+/.test(rawSubject)) return true;
+          if (CONFIG.allow_revert !== false && revertMatch !== null) return true;
+        }
         if (matchVersionString(cleanSub, newVer)) return true;
       }
       return false;
@@ -1207,7 +1596,11 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       if (newVersion.includes('$')) {
         successes.push(`✅ PKG_VERSION is dynamically defined: '${newVersion}', skipping subject validation`);
       } else if (fullCommit.isPrWidePatch) {
-        if (!commitMatches(newVersion, filePath)) {
+        // The pull request title is the series' own summary, and in PR-wide
+        // mode it is the subject the whole patch is measured against: a
+        // seventeen-commit series titled 'foo: update to 1.2.4' names the
+        // version plainly, even when no single commit subject repeats it.
+        if (!matchVersionString(cleanSubject, newVersion) && !commitMatches(newVersion, filePath)) {
           errors.push(`- Makefile introduces PKG_VERSION '${newVersion}', but this version string is missing in pull request commit subjects. Please mention the new version in the relevant commit subject, e.g. '<package>: update to ${newVersion}'.`);
         } else {
           successes.push(`✅ PKG_VERSION bump matches context information inside commit subjects (${newVersion})`);
@@ -1454,6 +1847,9 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       let inConffiles = false;
       let currentPackage = '';
       let currentInstallPackage = '';
+      // Whether a `define` or `endef` settled `currentInstallPackage`, or it
+      // was only carried over from an earlier hunk whose context said nothing.
+      let installPackageCertain = true;
       const rawInstalledConfigLines = [];
 
       for (const line of lines) {
@@ -1476,6 +1872,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
               } else {
                 currentInstallPackage = '';
               }
+              installPackageCertain = true;
               if (/^Package\/[^\s]*conffiles$/.test(hunkDefineMatch[1])) {
                 inConffiles = true;
                 currentPackage = hunkDefineMatch[1];
@@ -1487,12 +1884,27 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             } else {
               inConffiles = false;
               currentPackage = '';
-              currentInstallPackage = '';
+              // Without a diff driver git picks any line starting with a
+              // letter, '_' or '$' as the funcname context, and `ifeq`,
+              // `endif` and `endef` are all written at column 0 inside an
+              // install recipe. `endef` does end the recipe; the others say
+              // nothing about where the hunk sits, so the package an install
+              // line belongs to must not be thrown away - doing so sent the
+              // entry to the directory name and reported a conffiles block
+              // that is right there in the Makefile as missing.
+              if (/^endef\b/.test(hunkContext)) {
+                currentInstallPackage = '';
+                installPackageCertain = true;
+              } else {
+                installPackageCertain = false;
+              }
             }
           } else {
+            // No funcname at all: the hunk sits above the first define.
             inConffiles = false;
             currentPackage = '';
             currentInstallPackage = '';
+            installPackageCertain = true;
           }
           continue;
         }
@@ -1510,6 +1922,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             } else {
               currentInstallPackage = '';
             }
+            installPackageCertain = true;
             if (/^Package\/[^\s]*conffiles$/.test(defineMatch[1])) {
               inConffiles = true;
               currentPackage = defineMatch[1];
@@ -1524,6 +1937,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             inConffiles = false;
             currentPackage = '';
             currentInstallPackage = '';
+            installPackageCertain = true;
             continue;
           }
 
@@ -1539,6 +1953,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
               MakefileInstallsConfig = true;
               rawInstalledConfigLines.push({
                 pkg: currentInstallPackage,
+                pkgCertain: installPackageCertain,
                 contentLine
               });
             }
@@ -1622,10 +2037,32 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       const resolveConfigEntries = (sourceText) => {
         const files = [];
         let undetermined = false;
+        // The text being resolved against also says which install recipe each
+        // line sits in, which the diff window often cannot.
+        const linePackages = extractInstallLinePackages(sourceText);
+        // Every line below resolves its variables against this one text, so
+        // they share what each name resolves to, and so do the recipe names.
+        const resolveVar = makefileVarResolver(sourceText);
+        const resolvePkgName = makefilePkgNameResolver(sourceText);
         for (const item of rawInstalledConfigLines) {
-          const { path: resolvedPath, unresolvable } = extractInstalledConfigPath(item.contentLine, sourceText);
-          if (resolvedPath) {
-            files.push({ pkg: item.pkg, path: resolvedPath });
+          const { paths: resolvedPaths, unresolvable } = extractInstalledConfigPath(item.contentLine, sourceText, resolveVar);
+          let pkg = item.pkg;
+          let pkgCertain = item.pkgCertain !== false;
+          if (!pkg || !pkgCertain) {
+            const fromText = linePackages.get(item.contentLine.trim());
+            if (typeof fromText === 'string') {
+              pkg = fromText;
+              pkgCertain = true;
+            }
+          }
+          // Both sides are named against the same text, so a recipe written as
+          // `define Package/$(PKG_NAME)/install` is compared with the block of
+          // the package it really installs.
+          pkg = resolvePkgName(pkg);
+          if (resolvedPaths.length > 0) {
+            for (const resolvedPath of resolvedPaths) {
+              files.push({ pkg, pkgCertain, path: resolvedPath });
+            }
           } else if (unresolvable || item.contentLine.includes('INSTALL_CONF')) {
             undetermined = true;
           }
@@ -1654,7 +2091,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
                 }
                 const headMap = extractConffilesMap(headText);
                 const headDefinedPkgs = extractDefinedPackages(headText);
-                const res = validateConffilesCoverage(headMap, resolvedFromHead.files, defaultPkgName, errors, successes, headDefinedPkgs);
+                const res = validateConffilesCoverage(headMap, resolvedFromHead.files, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, warnings);
                 if (res?.incomplete) return { incomplete: true };
               } catch (err) {
                 warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
@@ -1664,7 +2101,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           }
         } else if (isAddedMakefile) {
           const diffMap = extractConffilesMap(rawChunk);
-          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages);
+          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, warnings);
           if (res?.incomplete) isValidationIncomplete = true;
         } else if (typeof fetchFileContent === 'function') {
           pendingAsyncChecks.push(async () => {
@@ -1676,7 +2113,20 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
               }
               const headMap = extractConffilesMap(headText);
               const headDefinedPkgs = extractDefinedPackages(headText);
-              const res = validateConffilesCoverage(headMap, installedConfigFiles, defaultPkgName, errors, successes, headDefinedPkgs);
+              // The head Makefile shows the whole recipe each install line
+              // sits in, which the hunk around it often does not, so prefer
+              // what it resolves and keep the diff's entries when it resolves
+              // less. The conffiles blocks are read from the same text, so the
+              // two sides always name packages the same way.
+              const fromHead = resolveConfigEntries(headText);
+              const resolveHeadPkgName = makefilePkgNameResolver(headText);
+              const entries = (!fromHead.undetermined && fromHead.files.length > 0)
+                ? fromHead.files
+                // The hunk the diff's entries were named against need not carry
+                // the assignment behind a '$(PKG_NAME)' recipe name, so name
+                // them against the text the blocks are read from.
+                : installedConfigFiles.map(file => ({ ...file, pkg: resolveHeadPkgName(file.pkg) }));
+              const res = validateConffilesCoverage(headMap, entries, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, warnings);
               if (res?.incomplete) return { incomplete: true };
             } catch (err) {
               warnings.push(`Could not complete conffiles validation because of an error fetching '${filePath}': ${err?.message || err}`);
@@ -1685,7 +2135,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           });
         } else if (MakefileHasConffiles) {
           const diffMap = extractConffilesMap(rawChunk);
-          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages);
+          const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, warnings);
           if (res?.incomplete) isValidationIncomplete = true;
         }
       }
@@ -2326,6 +2776,10 @@ function rememberPerPatch(parse) {
 
 export const getChangedFilesFromPatch = rememberPerPatch((patch) => Object.freeze(parseChangedFiles(patch)));
 
+// Only the paths the patch leaves behind, for callers that read the file at
+// the head commit: the `a/` side of a rename is not there to be read.
+export const getPresentFilesFromPatch = rememberPerPatch((patch) => Object.freeze(parsePresentFiles(patch)));
+
 export const parseDiffFileStates = rememberPerPatch(function parseDiffFileStates(patch) {
   const addedFiles = new Set();
   const deletedFiles = new Set();
@@ -2399,7 +2853,10 @@ function followPatchFiles(fileChunks) {
 const MAIL_ENVELOPE = /^From [0-9a-f]{40,64} Mon Sep 17 00:00:00 2001\r?$/;
 
 export const collectFileLineChanges = rememberPerPatch(function collectFileLineChanges(patch) {
-  const changes = {};
+  // Keyed by a path the patch chooses, so a null prototype: on a plain object
+  // a file named `constructor` read back as Object.prototype.constructor
+  // instead of as absent, and the push below then crashed the whole audit.
+  const changes = Object.create(null);
   if (!patch) return Object.freeze(changes);
 
   let currentFile = null;
@@ -2567,7 +3024,7 @@ export function getFastPkgRoot(filePath) {
   return undefined;
 }
 
-export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
+export async function findPkgRoot(filePath, fetchFileContent, cache = Object.create(null)) {
   const fast = getFastPkgRoot(filePath);
   if (fast !== undefined) return fast;
 
@@ -2669,11 +3126,23 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = {}) {
   return null;
 }
 
-function parseMakefileVar(content, varName) {
+// `cache`, when given, holds what this same content already yielded for a
+// name. One resolution reads a handful of names up to its whole expansion
+// budget of times, and compiling a pattern and scanning the Makefile again for
+// an answer already in hand is what made a bounded resolution still cost
+// milliseconds. The caller owns the cache and never reuses one across two
+// different texts.
+function parseMakefileVar(content, varName, cache = null) {
   if (!content) return null;
+  if (cache) {
+    const cached = cache.get(varName);
+    if (cached !== undefined) return cached;
+  }
   const regex = new RegExp(`^${varName}\\s*(?::=|=)\\s*([^#\\r\\n]+)`, 'm');
   const match = content.match(regex);
-  return match ? match[1].replace(/["']/g, "").trim() : null;
+  const value = match ? match[1].replace(/["']/g, "").trim() : null;
+  if (cache) cache.set(varName, value);
+  return value;
 }
 
 // The transitive set of variable names a variable's value is built from:
@@ -2693,27 +3162,72 @@ export function collectResolutionVarNames(content, varName, out = new Set()) {
   return out;
 }
 
-export function resolveMakefileVar(content, varName, seen = new Set()) {
+// Each branch of the walk below carries its own `seen`, so `seen` only breaks a
+// cycle down one path: a doubling chain (V0:=$(V1)$(V1), V1:=$(V2)$(V2), ...)
+// expands both siblings in full, which costs 2^n calls and builds a
+// 2^n-character value - a 400-byte Makefile spends seconds here. One budget
+// shared by the whole resolution bounds both how many expansions it may do and
+// how long the value they build may grow; a real PKG_VERSION or PKG_RELEASE
+// needs a handful of expansions and a value of a few characters.
+const MAKEFILE_VAR_EXPANSIONS = 500;
+const MAKEFILE_VAR_VALUE_CHARS = 8192;
+
+export function resolveMakefileVar(content, varName, seen = new Set(), budget = null) {
   if (!content || !varName) return null;
   if (seen.has(varName)) {
     return '';
   }
+  const limits = budget || { expansions: MAKEFILE_VAR_EXPANSIONS, chars: MAKEFILE_VAR_VALUE_CHARS, raw: new Map() };
+  if (limits.expansions <= 0 || limits.chars <= 0) {
+    return '';
+  }
+  limits.expansions--;
 
-  const rawValue = parseMakefileVar(content, varName);
+  const rawValue = parseMakefileVar(content, varName, limits.raw);
   if (rawValue === null) {
     return null;
   }
 
-  const newSeen = new Set(seen);
-  newSeen.add(varName);
+  // `seen` is the names between the first resolution and this one, which is
+  // what breaks a cycle. The walk is depth first, so adding this name before
+  // its references and removing it after leaves every one of them the same
+  // view a copy of the set did, without copying it once per expansion.
+  seen.add(varName);
 
   // Find and replace variable references like $(VAR) or ${VAR}
   const varRegex = /\$\(([A-Za-z0-9_-]+)\)|\$\{([A-Za-z0-9_-]+)\}/g;
-  return rawValue.replace(varRegex, (match, p1, p2) => {
+  const value = rawValue.replace(varRegex, (match, p1, p2) => {
     const refVarName = (p1 || p2).trim();
-    const resolved = resolveMakefileVar(content, refVarName, newSeen);
+    const resolved = resolveMakefileVar(content, refVarName, seen, limits);
     return resolved !== null ? resolved : '';
   });
+  seen.delete(varName);
+  limits.chars -= value.length;
+  return value;
+}
+
+// Reading a name out of a text is a pure function of the two, so the raw
+// assignments a resolution reads belong to the text and not to that one
+// resolution: a text whose names lead into the same deep chain re-read it
+// once per name otherwise. Each top-level resolution keeps its own expansion
+// budget - sharing that would let one name spend another's - so what the
+// resolver shares changes the cost and never the answer. A top-level name
+// resolves to the same value every time, so that too is remembered.
+function makefileVarResolver(content) {
+  const raw = new Map();
+  const values = new Map();
+  return (varName) => {
+    let value = values.get(varName);
+    if (value === undefined) {
+      value = resolveMakefileVar(content, varName, new Set(), {
+        expansions: MAKEFILE_VAR_EXPANSIONS,
+        chars: MAKEFILE_VAR_VALUE_CHARS,
+        raw,
+      });
+      values.set(varName, value);
+    }
+    return value;
+  };
 }
 
 function isFileChangeMinor(filePath, added, deleted) {
@@ -2879,13 +3393,25 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     return { errors, warnings, successes, notes: [] };
   }
 
-  // 1. Collect all modified package roots and file changes
-  const pkgRootCache = {};
+  // 1. Collect all modified package roots and file changes.
+  // Every map below is keyed by a repository path, which comes from the patch
+  // and is therefore attacker-chosen: on a plain object a file named
+  // `constructor` or `__proto__` reads back as something inherited rather than
+  // as absent, so the audit either skipped its own bookkeeping or crashed on a
+  // value that is not a string.
+  const pkgRootCache = Object.create(null);
 
   const addedFiles = new Set();
   const deletedFiles = new Set();
+  // Paths an earlier commit of the series deleted and a later one added again.
+  // Folding those into addedFiles alone makes the final diff look like a fresh
+  // package, which it need not be - the base branch may well have the file and
+  // the series only replaced it. The patch cannot settle that, so the audit
+  // asks the base, instead of either assuming a new package or going back to
+  // skipping the path outright.
+  const readdedFiles = new Set();
   const modifiedFiles = new Set();
-  const fileChanges = {}; // filePath -> { added: [], deleted: [] }
+  const fileChanges = Object.create(null); // filePath -> { added: [], deleted: [] }
   const candidateFiles = [];
 
   // A revert puts PKG_VERSION and PKG_RELEASE back to the values that preceded
@@ -2920,12 +3446,14 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     if (item.commitPatch) {
       const states = parseDiffFileStates(item.commitPatch);
       states.addedFiles.forEach(f => {
+        if (deletedFiles.has(f)) readdedFiles.add(f);
         addedFiles.add(f);
         deletedFiles.delete(f);
       });
       states.deletedFiles.forEach(f => {
         deletedFiles.add(f);
         addedFiles.delete(f);
+        readdedFiles.delete(f);
       });
 
       // Changes per file in this commit patch
@@ -3023,6 +3551,17 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
         new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(content))
         || hasNothingToBump(content));
 
+    // `PKG_RELEASE:=$(AUTORELEASE)` leaves the number to the buildsystem,
+    // which is the supported way to carry none: there is nothing for a
+    // contributor to reset on a version bump, and nothing to bump on a plain
+    // change. resolveMakefileVar expands it to '' rather than to null, so the
+    // exemption above cannot see it - only the raw assignment can. Returns the
+    // assignment, so the report can quote what the Makefile says.
+    const derivedRelease = (content) => {
+      const raw = parseMakefileVar(content, 'PKG_RELEASE');
+      return raw !== null && raw.includes('$') ? raw : null;
+    };
+
     if (deletedFiles.has(makefilePath)) {
       // Package was deleted/dropped, skip checks
       return empty;
@@ -3051,14 +3590,20 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     let isReleaseExempt = false;
 
     if (modifiedFiles.has(makefilePath)) {
-      const isNew = addedFiles.has(makefilePath);
+      // A Makefile the series deletes and then adds again is only a new
+      // package when the base branch really does not have it, so the base
+      // content is fetched and decides; everything else keeps the state the
+      // final diff reports.
+      const isReadded = readdedFiles.has(makefilePath);
+      const addsMakefile = addedFiles.has(makefilePath);
       // Ask for both versions at once: the loader behind these callbacks
       // (fetchFileContentCached in index.js) batches lookups that are in
       // flight together into one request instead of one round trip each.
       const [headContent, baseContent] = await Promise.all([
         fetchFileContentAtHead(makefilePath),
-        isNew ? Promise.resolve(null) : fetchFileContentAtBase(makefilePath)
+        addsMakefile && !isReadded ? Promise.resolve(null) : fetchFileContentAtBase(makefilePath)
       ]);
+      const isNew = addsMakefile && (!isReadded || baseContent === null);
       headMakefileContent = headContent;
       baseMakefileContent = baseContent;
       if (headContent === null) {
@@ -3208,6 +3753,10 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       if (isReleaseExempt) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` has no PKG_RELEASE and no version to bump (a shared build helper provides it, or the version follows the kernel), skipping release bump requirement`] };
       }
+      const derivedOnChange = derivedRelease(headMakefileContent);
+      if (derivedOnChange) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` derives PKG_RELEASE from the build system ('${derivedOnChange}'), so there is nothing to bump`] };
+      }
       if (isNewSubPackageAddition) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` only registers a new sub-package via an existing template (e.g. an optional collector/module/kmod) without modifying already-shipped files, no PKG_RELEASE bump required`] };
       }
@@ -3302,6 +3851,10 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       if (isReleaseExempt) {
         return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}'; packages on a shared helper without PKG_RELEASE don't require a reset to 1`] };
       }
+      const derivedOnBump = derivedRelease(headMakefileContent);
+      if (derivedOnBump) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' and derives PKG_RELEASE from the build system ('${derivedOnBump}'), so there is nothing to reset`] };
+      }
       if (headRelease !== '1') {
         if (versionResetTo1InSeries && isStrictInt(headRelease)) {
           return { errors: [], successes: [`✅ Package \`${pkgRoot}\` version updated to '${headVersion || headSourceVer || headSourceDate}' (reset to 1 and subsequently bumped to '${headRelease}' in commit series)`] };
@@ -3315,8 +3868,26 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     const isNumericHead = isStrictInt(headRelease);
 
     if (!isNumericHead) {
+      // Not every PKG_RELEASE that fails to read as an integer is malformed,
+      // and the escapes the version path takes above apply here just the same:
+      // host tools and packages on a shared helper (luci.mk, u-boot.mk) may
+      // define none at all, so a LuCI package dropping the line reported the
+      // literal 'value null is not a valid integer'. `$(AUTORELEASE)` is the
+      // supported way to leave the number to the buildsystem, and it resolves
+      // to '' rather than to null, so the exemption above cannot see it -
+      // judge the raw assignment, as hasNothingToBump does.
+      if (isHostToolRoot && headRelease === null) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` is a host-side build tool without PKG_RELEASE, which tools/ and toolchain/ packages are not required to define`] };
+      }
+      if (isReleaseExempt) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` has no PKG_RELEASE of its own: it builds on a shared helper that does not use one, or defines no version anyone could bump`] };
+      }
+      const rawHeadRelease = derivedRelease(headMakefileContent);
+      if (rawHeadRelease !== null) {
+        return { errors: [], successes: [`✅ Package \`${pkgRoot}\` derives PKG_RELEASE from the build system ('${rawHeadRelease}'), so there is no integer to check`] };
+      }
       return {
-        errors: [`Package \`${pkgRoot}\` PKG_RELEASE value '${headRelease}' is not a valid integer.`],
+        errors: [`Package \`${pkgRoot}\` PKG_RELEASE value '${headRelease || 'not defined'}' is not a valid integer.`],
         successes: []
       };
     }
@@ -3385,12 +3956,14 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
 
   const addedFiles = new Set();
   const deletedFiles = new Set();
+  // Deleted and then added again in the same series; see the release audit.
+  const readdedFiles = new Set();
   const makefiles = new Set();
   // Per-Makefile added/deleted lines from the PR's own diff: like the release
   // audit, the bump comparison below must not trust a base/head content
   // difference alone, because pull_request.base.sha is frozen when the PR is
   // opened and drifts as the base branch moves.
-  const makefileLineChanges = {}; // path -> { added: [], deleted: [] }
+  const makefileLineChanges = Object.create(null); // path -> { added: [], deleted: [] }
 
   let effectiveCommitDetails = commitDetails;
   if (Array.isArray(commitDetails) && commitDetails.length === 1 && commitDetails[0]?.commitPatch) {
@@ -3413,12 +3986,14 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
     if (!item.commitPatch) continue;
     const states = parseDiffFileStates(item.commitPatch);
     states.addedFiles.forEach(f => {
+      if (deletedFiles.has(f)) readdedFiles.add(f);
       addedFiles.add(f);
       deletedFiles.delete(f);
     });
     states.deletedFiles.forEach(f => {
       deletedFiles.add(f);
       addedFiles.delete(f);
+      readdedFiles.delete(f);
     });
     for (const file of getChangedFilesFromPatch(item.commitPatch)) {
       if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
@@ -3476,7 +4051,15 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       return true;
     };
 
-    if (addedFiles.has(path)) {
+    // A Makefile the series deletes and then adds again is only new when the
+    // base branch really does not have it, so ask the base before judging it
+    // as a package addition; see validatePkgReleaseBumps. A plain addition
+    // still costs no base lookup.
+    const baseContent = addedFiles.has(path) && !readdedFiles.has(path)
+      ? null
+      : await fetchFileContentAtBase(path);
+
+    if (addedFiles.has(path) && baseContent === null) {
       // Only a plain archive download is judged here. A PKG_SOURCE_PROTO
       // checkout (git, svn, hg, ...) builds its own tarball, and the docs
       // name cases where that tarball is not reproducible and PKG_MIRROR_HASH
@@ -3495,7 +4078,6 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
       return out;
     }
 
-    const baseContent = await fetchFileContentAtBase(path);
     if (baseContent === null) return out;
 
     const baseHash = rawVar(baseContent, 'PKG_HASH');
@@ -3574,8 +4156,8 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
   }
 
   const { deletedFiles } = parseDiffFileStates(commitPatch);
-  const changedFiles = getChangedFilesFromPatch(commitPatch);
-  const pkgRootCache = {};
+  const changedFiles = getPresentFilesFromPatch(commitPatch);
+  const pkgRootCache = Object.create(null);
 
   // Each file's check chain runs in its own async function returning
   // { errors, successes } instead of pushing into shared arrays directly,

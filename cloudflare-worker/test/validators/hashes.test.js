@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { validatePkgHashes } from '../../src/validators.js';
-import { CONFIG, assertSomeIncludes } from './helpers.js';
+import { CONFIG, assertSomeIncludes, assertNoneIncludes } from './helpers.js';
 
 // A Makefile as the fetchers serve it: one assignment per line.
 const makefile = (lines) => `${lines.join('\n')}\n`;
@@ -197,5 +197,36 @@ diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
   test('does nothing when disabled', async () => {
     const res = await audit(bumpPatch, bash('5.3', pinned), bash('5.2', pinned), { ...CONFIG, check_pkg_hash: false });
     assertReported(res, { errors: [], successes: [] });
+  });
+
+  // A Makefile the series deletes and then adds again is not a new package
+  // when the base branch still has it, so the version/hash pair must still be
+  // compared instead of the file being judged as a fresh addition.
+  test('compares a Makefile deleted and re-added in the same series against its base', async () => {
+    const deletePatch = `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+deleted file mode 100644
+--- a/package/utils/bash/Makefile
++++ /dev/null
+-PKG_VERSION:=5.2
+`;
+    const readdPatch = `
+diff --git a/package/utils/bash/Makefile b/package/utils/bash/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/Makefile
++PKG_NAME:=bash
++PKG_VERSION:=5.3
++${sourceUrl}
++${pinned}
+`;
+    const res = await validatePkgHashes(
+      [{ commitPatch: deletePatch }, { commitPatch: readdPatch }],
+      HASH_CONFIG,
+      async () => makefile(bash('5.3', sourceUrl, pinned)),
+      async () => makefile(bash('5.2', sourceUrl, pinned))
+    );
+    assertReported(res, { findings: 'keeps the old PKG_HASH', errors: [] });
+    assertNoneIncludes(res.findings, 'New package Makefile', 'findings');
   });
 });

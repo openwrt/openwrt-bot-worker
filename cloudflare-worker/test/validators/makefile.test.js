@@ -146,7 +146,11 @@ diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
     assert.ok(res.successes.some(s => s.includes('PKG_VERSION bump matches context information inside commit subjects (2.4.0)')));
   });
 
-  test('flags missing version in commit subjects even if PR title mentions version in PR-wide patch mode', () => {
+  // The pull request title is the series' own summary: a seventeen-commit
+  // pull request titled 'mypkg: update to 2.4.0' names the version plainly,
+  // and no single commit subject has to repeat it. Reading only the commits
+  // turned those pull requests red.
+  test('accepts the pull request title as the subject naming the version in PR-wide patch mode', () => {
     const virtualCommit = {
       isPrWidePatch: true,
       commits: [
@@ -167,7 +171,8 @@ diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
 +PKG_VERSION:=2.4.0
 `;
     const res = validateMakefileContext(virtualCommit, patch, CONFIG, existingPackage(), 'openwrt/packages');
-    assert.ok(res.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+    assert.deepStrictEqual(res.errors, []);
+    assert.ok(res.successes.some(s => s.includes('PKG_VERSION bump matches context information inside commit subjects (2.4.0)')));
   });
 
   test('rejects version match in PR-wide mode when matching version belongs to unrelated package', () => {
@@ -327,6 +332,108 @@ diff --git a/package/utils/pkgB/Makefile b/package/utils/pkgB/Makefile
 
     const resB = validateMakefileContext(virtualCommit, commit2Patch, CONFIG, existingPackage(), 'openwrt/packages');
     assert.ok(resB.errors.some(err => err.includes("Makefile introduces PKG_VERSION '2.4.0', but this version string is missing in pull request commit subjects")));
+  });
+
+  const FOO_BUMP = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=1.2.2
++PKG_VERSION:=1.2.3
+`;
+  const MISSING_IN_SUBJECTS = "but this version string is missing in pull request commit subjects";
+
+  // `treewide: ` is the standard openwrt/packages prefix for a change applied
+  // across the tree. It names no package, so a commit carrying it was scoped
+  // away from every package and its version never counted - even though the
+  // version is right there in the subject.
+  test('reads a treewide commit subject for a package it cannot be scoped to', () => {
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        makeCommit('treewide: bump foo to 1.2.3'),
+        makeCommit('otherpkg: refresh patches')
+      ],
+      commit: { message: 'treewide maintenance\n\nFull PR body text' }
+    };
+    const res = validateMakefileContext(virtualCommit, FOO_BUMP, CONFIG, existingPackage(), 'openwrt/packages');
+    assertNoErrorIncludes(res, MISSING_IN_SUBJECTS);
+    assertSomeIncludes(res.successes, 'PKG_VERSION bump matches context information inside commit subjects (1.2.3)', 'successes');
+  });
+
+  // The autosquash and revert escapes say this commit's subject cannot name
+  // the version. That is only an answer for the package the commit is about:
+  // one `Revert "..."` of a tree-wide change, or one `fixup!`, used to satisfy
+  // the check for every package in the pull request.
+  for (const [what, message] of [
+    ['a revert of a tree-wide commit', 'Revert "treewide: drop something"\n\nThis reverts commit 1234567890123456789012345678901234567890.'],
+    ['a fixup that names no package', 'fixup! tidy up']
+  ]) {
+    test(`does not let ${what} satisfy the version check for another package`, () => {
+      const virtualCommit = {
+        isPrWidePatch: true,
+        commits: [makeCommit(message), makeCommit('foo: minor makefile cleanups')],
+        commit: { message: 'clean up the tree\n\nFull PR body text' }
+      };
+      const res = validateMakefileContext(virtualCommit, FOO_BUMP, CONFIG, existingPackage(), 'openwrt/packages');
+      assertErrorIncludes(res, MISSING_IN_SUBJECTS);
+    });
+  }
+
+  // parseRevertCommit returns { prefix, original, depth }. Reading a
+  // `revertedSubject` it never returns left the package prefix inside the
+  // quotes invisible, so the revert was scoped away from the package it undoes
+  // and its relaxed rules never applied.
+  test('scopes a plain git revert to the package named inside the wrapper', () => {
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        makeCommit('Revert "foo: update to 1.2.3"\n\nThis reverts commit 1234567890123456789012345678901234567890.'),
+        makeCommit('bar: refresh patches')
+      ],
+      commit: { message: 'revert the foo update\n\nFull PR body text' }
+    };
+    const restore = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=1.2.3
++PKG_VERSION:=1.2.2
+`;
+    const res = validateMakefileContext(virtualCommit, restore, CONFIG, existingPackage(), 'openwrt/packages');
+    assertNoErrorIncludes(res, MISSING_IN_SUBJECTS);
+  });
+
+  // Whether a commit touched a package is a question about its file list. A
+  // `b/<path>` written in the commit message - or in an embedded patch - is
+  // not that commit touching that package.
+  test('scopes a commit by its file list, not by a path mentioned in its message', () => {
+    const otherPkgCommit = `From aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Wed, 14 Oct 2026 10:00:00 +0200
+Subject: [PATCH 1/2] otherpkg: update to 1.2.3
+
+Drops the workaround that used to live in b/package/utils/foo/Makefile.
+---
+diff --git a/package/utils/otherpkg/Makefile b/package/utils/otherpkg/Makefile
+--- a/package/utils/otherpkg/Makefile
++++ b/package/utils/otherpkg/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=1.2.2
++PKG_VERSION:=1.2.3
+`;
+    const virtualCommit = {
+      isPrWidePatch: true,
+      commits: [
+        { ...makeCommit('otherpkg: update to 1.2.3'), commitPatch: otherPkgCommit },
+        { ...makeCommit('foo: minor makefile cleanups'), commitPatch: FOO_BUMP }
+      ],
+      commit: { message: 'update packages' }
+    };
+    const res = validateMakefileContext(virtualCommit, FOO_BUMP, CONFIG, existingPackage(), 'openwrt/packages');
+    assertErrorIncludes(res, MISSING_IN_SUBJECTS);
   });
 
   test('validates commit subject when version changes via indirect helper variable', async () => {

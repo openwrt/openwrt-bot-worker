@@ -1,5 +1,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
+import { Worker } from 'node:worker_threads';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
 import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, extractSubjectEntity } from '../../src/validators.js';
 import {
   CONFIG, JOHN, makeCommit, commitBy,
@@ -124,6 +127,18 @@ describe('validateFormalities', () => {
 
     const resSoft = await validateFormalities(makeCommit('bash: ' + 'a'.repeat(65), { author: JOHN }), CONFIG);
     assertWarningIncludes(resSoft, 'exceeds soft limit');
+  });
+
+  // A subject over the hard limit used to lose the prefix grammar entirely, so
+  // the author shortened it, pushed again, and only then heard about the
+  // capital and the period. All of it is one round of review.
+  test('still grades the prefix, the capital and the period over the hard limit', async () => {
+    const subject = `foo: Update the build flags ${'and refresh the patches '.repeat(3)}once more.`;
+    assert.ok(subject.length > CONFIG.max_subject_len_hard);
+    const res = await validateFormalities(signedOff(`${subject}\n\nSome body text.`, JANE), CONFIG);
+    assertErrorIncludes(res, 'exceeds hard limit');
+    assertErrorIncludes(res, 'must start with a lower-case word after the prefix');
+    assertErrorIncludes(res, 'must not end with a period');
   });
 
   test('measures the subject length without the autosquash marker', async () => {
@@ -684,5 +699,101 @@ describe('extractSubjectEntity', () => {
   test('returns empty array when subject has no prefix', () => {
     assert.deepStrictEqual(extractSubjectEntity('commit without prefix'), []);
     assert.deepStrictEqual(extractSubjectEntity(null), []);
+  });
+});
+
+// The whole invocation has 10 ms of CPU on the Cloudflare Free plan, and the
+// three check-runs are written at the end of it: a subject that costs seconds
+// in the prefix grammar kills the request before anything is reported. A
+// grammar whose parts can match the same characters has exponentially many
+// parses per dotted segment, so this is the shape that catches a regrowth -
+// 70 characters, every one of them legal, inside the hard limit so the length
+// guard does not short-circuit it, and no `: ` for the match to end on.
+describe('subject prefix grammar cost', () => {
+  const PATHOLOGICAL = 'lua5.1.foo.bar.baz.qux.quux.corge.grault.garply.waldo.fred.plugh.xyzzy';
+  // Same length, nothing for the grammar to backtrack over: the prefix is
+  // settled by the first colon.
+  const BENIGN = `netifd: ${'x'.repeat(PATHOLOGICAL.length - 8)}`;
+  const OVER_LIMIT = `${PATHOLOGICAL}.${'a.'.repeat(40)}b`;
+  const BENIGN_OVER_LIMIT = `netifd: ${'x'.repeat(OVER_LIMIT.length - 8)}`;
+  const commitFor = (subject) => signedOff(`${subject}\n\nSome body text.\nhttps://example.com/`, JANE);
+
+  // All of this runs in a worker thread, and that is the point. What the
+  // unambiguous grammar bought is that a dotted subject costs what any other
+  // subject of its length costs; the ambiguous one ran this one for tens of
+  // seconds. A regression that bad blocks the thread it runs on, so neither a
+  // test timeout nor an assertion after it would ever run - measured in
+  // process, the suite hangs instead of failing. A worker can be terminated
+  // from here, which turns "it never came back" into a failure with a message.
+  //
+  // The cost itself is pinned as a ratio against the plain subject of the same
+  // length, measured alternately so a loaded machine inflates both arms at
+  // once: an absolute bound tight enough to catch the old grammar is a flake
+  // on a busy CPU.
+  const WORKER = `
+    import { validateFormalities } from VALIDATORS;
+    import { parentPort, workerData } from 'node:worker_threads';
+    const { config, pairs } = workerData;
+    const cost = async (commit, reps) => {
+      const started = performance.now();
+      let last = null;
+      for (let i = 0; i < reps; i++) last = await validateFormalities(commit, config);
+      return { elapsed: performance.now() - started, errors: last.errors };
+    };
+    const out = {};
+    for (const [name, odd, plain] of pairs) {
+      await cost(plain, 1);
+      const ratios = [];
+      let errors = [];
+      for (let round = 0; round < 5; round++) {
+        const base = await cost(plain, 20);
+        const measured = await cost(odd, 20);
+        errors = measured.errors;
+        ratios.push(measured.elapsed / Math.max(base.elapsed, 0.001));
+      }
+      out[name] = { ratio: ratios.sort((a, b) => a - b)[2], errors };
+    }
+    parentPort.postMessage(out);
+  `;
+
+  const measureOutOfThread = async () => {
+    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
+    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
+      eval: true,
+      workerData: {
+        config: CONFIG,
+        pairs: [
+          ['withinLimit', commitFor(PATHOLOGICAL), commitFor(BENIGN)],
+          ['overLimit', commitFor(OVER_LIMIT), commitFor(BENIGN_OVER_LIMIT)]
+        ]
+      }
+    });
+    try {
+      return await new Promise((settle, fail) => {
+        const cutOff = setTimeout(() => fail(new Error('the grammar did not settle a 70-character dotted subject within 20 s')), 20000);
+        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
+        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
+      });
+    } finally {
+      await worker.terminate();
+    }
+  };
+
+  test('settles a dotted subject as fast as a plain one of its length, over the limit too', async () => {
+    assert.ok(PATHOLOGICAL.length <= CONFIG.max_subject_len_hard);
+    assert.strictEqual(BENIGN.length, PATHOLOGICAL.length);
+    assert.ok(OVER_LIMIT.length > CONFIG.max_subject_len_hard);
+
+    const measured = await measureOutOfThread();
+
+    assert.ok(measured.withinLimit.ratio < 20,
+      `the dotted subject cost ${measured.withinLimit.ratio.toFixed(1)}x a plain one of the same length`);
+    assert.ok(measured.overLimit.ratio < 20,
+      `the over-limit dotted subject cost ${measured.overLimit.ratio.toFixed(1)}x a plain one of the same length`);
+    // The grammar still runs on a subject cut to the hard limit, so the
+    // missing `<prefix>: ` is reported in the same round as the length.
+    const overLimitErrors = measured.overLimit.errors.join('\n');
+    assert.match(overLimitErrors, /exceeds hard limit/);
+    assert.match(overLimitErrors, /must start with/);
   });
 });

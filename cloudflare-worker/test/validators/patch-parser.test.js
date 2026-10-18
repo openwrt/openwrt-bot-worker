@@ -74,8 +74,8 @@ describe('collectFileLineChanges on crafted input', () => {
   });
 
   test('returns nothing for an empty patch or a commit mail without a diff', () => {
-    assert.deepStrictEqual(collectFileLineChanges(''), {});
-    assert.deepStrictEqual(collectFileLineChanges(mail('a'.repeat(40), 'docs: no diff')), {});
+    assert.deepStrictEqual(Object.keys(collectFileLineChanges('')), []);
+    assert.deepStrictEqual(Object.keys(collectFileLineChanges(mail('a'.repeat(40), 'docs: no diff'))), []);
   });
 
   test('records no lines for a binary file, a pure rename or a mode change', () => {
@@ -84,7 +84,7 @@ describe('collectFileLineChanges on crafted input', () => {
       'diff --git a/a.patch b/b.patch', 'similarity index 100%', 'rename from a.patch', 'rename to b.patch',
       'diff --git a/run.sh b/run.sh', 'old mode 100644', 'new mode 100755', '',
     ].join('\n');
-    assert.deepStrictEqual(collectFileLineChanges(patch), {});
+    assert.deepStrictEqual(Object.keys(collectFileLineChanges(patch)), []);
   });
 
   test('keeps a carriage return that belongs to the content and skips the no-newline marker', () => {
@@ -93,7 +93,7 @@ describe('collectFileLineChanges on crafted input', () => {
   });
 
   test('ignores lines outside any file and a file header with no hunk', () => {
-    assert.deepStrictEqual(collectFileLineChanges('+stray line\n-another\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n'), {});
+    assert.deepStrictEqual(Object.keys(collectFileLineChanges('+stray line\n-another\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n')), []);
   });
 });
 

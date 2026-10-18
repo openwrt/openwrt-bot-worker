@@ -125,6 +125,25 @@ export function getCommitMessageFromPatch(patch: string | null | undefined): str
   return (subject + '\n' + bodyLines.join('\n')).trim();
 }
 
+// The paths a patch leaves behind: the destination of every chunk, renames
+// included. getChangedFilesFromPatch below also reports the `a/` side, which a
+// package removal audit needs but a caller that reads the file at the head
+// commit must not see: a renamed path is not there any more.
+export function getPresentFilesFromPatch(patch: string | null | undefined): string[] {
+  if (!patch) return [];
+  const files = new Set<string>();
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('+++ b/')) {
+      const p = line.slice(6).trim().replace(/\r$/, '');
+      if (p && p !== '/dev/null') files.add(p);
+    } else if (line.startsWith('rename to ')) {
+      const p = line.slice(10).trim().replace(/\r$/, '');
+      if (p) files.add(p);
+    }
+  }
+  return Array.from(files);
+}
+
 export function getChangedFilesFromPatch(patch: string | null | undefined): string[] {
   if (!patch) return [];
   const files = new Set<string>();

@@ -1,4 +1,5 @@
 import { describe, test } from 'node:test';
+import assert from 'node:assert';
 import { validateUciConfigs } from '../../src/validators.js';
 import { CONFIG, fileDiff, assertNoErrors, assertErrorIncludes, assertSomeIncludes } from './helpers.js';
 
@@ -212,5 +213,22 @@ config timeserver 'ntp'
     const disabledConfig = { ...CONFIG, check_uci_config: false };
     const res = await validateUciConfigs(fileDiff('package/utils/foo/files/etc/config/foo', []), disabledConfig, fetchFn);
     assertNoErrors(res);
+  });
+});
+
+// A rename leaves the old path on the `a/` side of the diff only, so reading
+// that path at the head commit answers nothing.
+describe('validateUciConfigs on a renamed configuration file', () => {
+  test('checks the name the file ends up with, and calls no path unreadable', async () => {
+    const patch = 'diff --git a/net/foo/files/etc/config/foo b/net/foo/files/etc/config/bar\n' +
+      'similarity index 100%\nrename from net/foo/files/etc/config/foo\nrename to net/foo/files/etc/config/bar\n';
+    const res = await validateUciConfigs(patch, CONFIG, repo({
+      'net/foo/Makefile': 'PKG_NAME:=foo\n',
+      'net/foo/files/etc/config/bar': "config section 'name'\n\toption key 'value'\n"
+    }));
+
+    assertNoErrors(res);
+    assert.deepStrictEqual(res.warnings, []);
+    assert.strictEqual(res.incomplete, false);
   });
 });

@@ -878,6 +878,169 @@ new file mode 100644
     const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
     assertErrorIncludes(res, "New package `package/utils/mypkg` must start with PKG_RELEASE set to 1 (currently: '2')");
   });
+
+  // The same series against a base that does have the Makefile: the package is
+  // not new, it was replaced. Folding the re-add into addedFiles alone made it
+  // look brand new and demanded PKG_RELEASE 1 of a perfectly ordinary bump.
+  test('audits a package deleted and re-added in the same series against the base it still has', async () => {
+    const commit1Patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+deleted file mode 100644
+--- a/package/utils/foo/Makefile
++++ /dev/null
+@@ -1,3 +0,0 @@
+-PKG_NAME:=foo
+-PKG_VERSION:=1.0.0
+-PKG_RELEASE:=7
+`;
+    const commit2Patch = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/foo/Makefile
+@@ -0,0 +1,3 @@
++PKG_NAME:=foo
++PKG_VERSION:=1.0.0
++PKG_RELEASE:=8
+`;
+    const commitDetails = [
+      { fullCommit: makeCommit('foo: drop the old makefile'), commitPatch: commit1Patch },
+      { fullCommit: makeCommit('foo: re-add the makefile'), commitPatch: commit2Patch }
+    ];
+    const headFetch = makefileAt('package/utils/foo', 'PKG_NAME:=foo\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=8\n');
+    const baseFetch = makefileAt('package/utils/foo', 'PKG_NAME:=foo\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=7\n');
+
+    const res = await validatePkgReleaseBumps(commitDetails, defaultConf, headFetch, baseFetch);
+    assertNoErrors(res);
+    assertSuccessIncludes(res, "PKG_RELEASE bumped from '7' to '8'");
+  });
+
+  // PKG_RELEASE that does not read as an integer is not always malformed. The
+  // escapes the version path takes apply here too, and `$(AUTORELEASE)` is a
+  // supported value, so neither used to be reported - main reported a success.
+  const nonIntegerReleases = [
+    {
+      name: 'a LuCI package that drops its PKG_RELEASE line',
+      root: 'applications/luci-app-foo',
+      head: 'PKG_NAME:=luci-app-foo\ninclude $(TOPDIR)/feeds/luci/luci.mk\n',
+      base: 'PKG_NAME:=luci-app-foo\nPKG_RELEASE:=3\ninclude $(TOPDIR)/feeds/luci/luci.mk\n',
+      success: 'has no PKG_RELEASE of its own'
+    },
+    {
+      name: 'a package that switches to $(AUTORELEASE)',
+      root: 'package/utils/foo',
+      head: 'PKG_NAME:=foo\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=$(AUTORELEASE)\n',
+      base: 'PKG_NAME:=foo\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=3\n',
+      success: 'derives PKG_RELEASE from the build system'
+    },
+    {
+      name: 'a host tool that drops its PKG_RELEASE line',
+      root: 'tools/footool',
+      head: 'PKG_NAME:=footool\nPKG_VERSION:=1.0.0\n',
+      base: 'PKG_NAME:=footool\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=3\n',
+      success: 'host-side build tool without PKG_RELEASE'
+    }
+  ];
+
+  for (const { name, root, head, base, success } of nonIntegerReleases) {
+    test(`reports no malformed PKG_RELEASE for ${name}`, async () => {
+      const patch = `
+diff --git a/${root}/Makefile b/${root}/Makefile
+--- a/${root}/Makefile
++++ b/${root}/Makefile
+@@ -1,3 +1,3 @@
+-PKG_RELEASE:=3
++${head.includes('$(AUTORELEASE)') ? 'PKG_RELEASE:=$(AUTORELEASE)' : 'PKG_NAME_UNCHANGED:=1'}
+`;
+      const res = await validatePkgReleaseBumps(
+        [{ fullCommit: makeCommit('foo: drop the release line'), commitPatch: patch }],
+        defaultConf, makefileAt(root, head), makefileAt(root, base)
+      );
+      assertNoErrorIncludes(res, 'is not a valid integer');
+      assertSuccessIncludes(res, success);
+    });
+  }
+
+  // `PKG_RELEASE:=$(AUTORELEASE)` leaves the number to the buildsystem: there
+  // is nothing for a contributor to reset on a version bump and nothing to
+  // bump on a plain change. The escape sat behind the integer check, which
+  // neither of those paths reaches - both return first.
+  const AUTO_ROOT = 'package/utils/foo';
+  const autoMakefile = (version) => `PKG_NAME:=foo\nPKG_VERSION:=${version}\nPKG_RELEASE:=$(AUTORELEASE)\n`;
+
+  test('asks for no reset to 1 on a version bump when PKG_RELEASE is $(AUTORELEASE)', async () => {
+    const patch = `
+diff --git a/${AUTO_ROOT}/Makefile b/${AUTO_ROOT}/Makefile
+--- a/${AUTO_ROOT}/Makefile
++++ b/${AUTO_ROOT}/Makefile
+@@ -1,3 +1,3 @@
+-PKG_VERSION:=1.0.0
++PKG_VERSION:=1.1.0
+`;
+    const res = await validatePkgReleaseBumps(
+      [{ fullCommit: makeCommit('foo: update to 1.1.0'), commitPatch: patch }],
+      defaultConf, makefileAt(AUTO_ROOT, autoMakefile('1.1.0')), makefileAt(AUTO_ROOT, autoMakefile('1.0.0'))
+    );
+    assertNoErrorIncludes(res, 'was not reset to 1');
+    assertSuccessIncludes(res, 'derives PKG_RELEASE from the build system');
+  });
+
+  test('asks for no bump on a content change when PKG_RELEASE is $(AUTORELEASE)', async () => {
+    const patch = `
+diff --git a/${AUTO_ROOT}/files/foo.init b/${AUTO_ROOT}/files/foo.init
+--- a/${AUTO_ROOT}/files/foo.init
++++ b/${AUTO_ROOT}/files/foo.init
+@@ -1,3 +1,3 @@
+-START=90
++START=95
+`;
+    const res = await validatePkgReleaseBumps(
+      [{ fullCommit: makeCommit('foo: start later'), commitPatch: patch }],
+      defaultConf, makefileAt(AUTO_ROOT, autoMakefile('1.0.0')), makefileAt(AUTO_ROOT, autoMakefile('1.0.0'))
+    );
+    assertNoErrorIncludes(res, 'content changed without a PKG_RELEASE or version bump');
+    assertSuccessIncludes(res, 'derives PKG_RELEASE from the build system');
+  });
+
+  test("still reports a PKG_RELEASE that is genuinely not an integer, naming it as not defined", async () => {
+    const root = 'package/utils/foo';
+    const patch = `
+diff --git a/${root}/Makefile b/${root}/Makefile
+--- a/${root}/Makefile
++++ b/${root}/Makefile
+@@ -1,3 +1,2 @@
+-PKG_RELEASE:=3
+`;
+    const res = await validatePkgReleaseBumps(
+      [{ fullCommit: makeCommit('foo: drop the release line'), commitPatch: patch }],
+      defaultConf,
+      makefileAt(root, 'PKG_NAME:=foo\nPKG_VERSION:=1.0.0\n'),
+      makefileAt(root, 'PKG_NAME:=foo\nPKG_VERSION:=1.0.0\nPKG_RELEASE:=3\n')
+    );
+    assertErrorIncludes(res, "PKG_RELEASE value 'not defined' is not a valid integer");
+  });
+
+  // Every map in the audit is keyed by a repository path, which the patch
+  // chooses: on a plain object a file named `constructor` reads back as
+  // something inherited from Object.prototype rather than as absent, and the
+  // audit then worked with a value that is not a path at all.
+  test('survives a repository file whose name is an Object.prototype member', async () => {
+    for (const name of ['constructor', '__proto__', 'toString']) {
+      const patch = `
+diff --git a/${name} b/${name}
+--- a/${name}
++++ b/${name}
+@@ -1,2 +1,2 @@
+-old line
++new line
+`;
+      const res = await validatePkgReleaseBumps(
+        [{ fullCommit: makeCommit('treewide: touch the odd file'), commitPatch: patch }],
+        defaultConf, async () => null, async () => null
+      );
+      assert.ok(Array.isArray(res.errors), `errors for ${name}: ${JSON.stringify(res.errors)}`);
+    }
+  });
 });
 
 describe('validatePkgReleaseBumps lookups', () => {
