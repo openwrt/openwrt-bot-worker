@@ -129,5 +129,30 @@ describe('comment-report', () => {
       await queue.execute();
       assert.strictEqual(apiCalled, true);
     });
+
+    test('treats HTTP 404 on PR comment removal as success (idempotent)', async () => {
+      const queue = new GitHubWriteQueue(1);
+      const ctx = {
+        config: { enable_comments: true },
+        repoFullname: 'openwrt/openwrt',
+        prNumber: 100,
+        client: {
+          trackedApiCall: async () => ({ code: 404, data: null, raw: 'Not Found' })
+        },
+        getCommentsScanWithRetry: async () => ({ existingCommentId: 999 })
+      };
+      const report = {
+        allPassed: true,
+        allFormalityErrors: [],
+        allMakefileErrors: [],
+        allPatchesErrors: [],
+        allPrWarnings: []
+      };
+
+      await syncPrComment(ctx, report, queue, {});
+      const error = await queue.execute();
+      assert.strictEqual(error, null);
+      assert.strictEqual(queue.statusWrites[0].code, 200);
+    });
   });
 });

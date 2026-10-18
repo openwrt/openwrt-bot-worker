@@ -20,8 +20,8 @@ describe('label-sync lifecycle phase and error handling', () => {
       url: 'https://api.github.com/repos/openwrt/openwrt/pulls/42',
       body: 'PR Body',
       labels: [],
-      head: { sha: 'head123' },
-      base: { ref: 'main' }
+      head: { ref: 'feature', sha: 'head123' },
+      base: { ref: 'main', sha: 'base123' }
     },
     client: {
       budget: { limit: 50, used: 0, reserve: 5 },
@@ -30,8 +30,8 @@ describe('label-sync lifecycle phase and error handling', () => {
         code: 200,
         data: {
           labels: [],
-          head: { sha: 'head123' },
-          base: { ref: 'main' },
+          head: { ref: 'feature', sha: 'head123' },
+          base: { ref: 'main', sha: 'base123' },
           body: 'PR Body'
         }
       }),

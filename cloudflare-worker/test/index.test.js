@@ -147,7 +147,9 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
       action: 'opened',
       pull_request: {
         user: { login: 'someuser', type: 'User' },
-        number: 123
+        number: 123,
+        base: { ref: 'main', sha: 'basesha123' },
+        head: { ref: 'feature', sha: 'headsha123' }
       },
       installation: { id: 456 },
       repository: { full_name: 'test/repo' }
@@ -198,8 +200,8 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
-        head: { ref: 'feature' },
+        base: { ref: 'main', sha: 'basesha123' },
+        head: { ref: 'feature', sha: 'headsha123' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
       },
       installation: { id: 456 },
@@ -326,7 +328,7 @@ describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () =>
         number: 123,
         title: 'test pr crun: update to 1.15',
         body: 'Large PR test',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature-branch', sha: 'headsha' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         url: 'https://api.github.com/repos/test/repo/pulls/123'
@@ -447,7 +449,7 @@ index 123456..789012 100644
         number: 123,
         title: 'test pr: update many packages',
         body: 'Large PR test',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature-branch', sha: 'headsha' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         url: 'https://api.github.com/repos/test/repo/pulls/123'
@@ -564,7 +566,7 @@ index 123456..789012 100644
         number: 123,
         title: 'test pr: huge commit set',
         body: 'Large PR test',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature-branch', sha: 'headsha' },
         commits: 350,
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
@@ -1282,7 +1284,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         number: 123,
         title: 'test pr',
         body: prBody,
-        base: { ref: baseBranch },
+        base: { ref: baseBranch, sha: 'basesha1234567890' },
         head: { ref: headBranch, sha: 'abcdef1234567890' },
         author_association: authorAssociation,
         user: prUser,
@@ -1828,8 +1830,8 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         number: 123,
         title: 'test pr',
         body: 'Contribute feature',
-        base: { ref: 'openwrt-25.12' },
-        head: { ref: 'feature-branch' },
+        base: { ref: 'openwrt-25.12', sha: 'basesha123' },
+        head: { ref: 'feature-branch', sha: 'headsha123' },
         author_association: 'NONE',
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         user: { login: 'somecontributor', type: 'User' }
@@ -1929,8 +1931,8 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         number: 123,
         title: 'test pr',
         body: 'Contribute feature',
-        base: { ref: 'openwrt-25.12' },
-        head: { ref: 'feature-branch' },
+        base: { ref: 'openwrt-25.12', sha: 'basesha123' },
+        head: { ref: 'feature-branch', sha: 'headsha123' },
         author_association: 'NONE',
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         user: { login: 'somecontributor', type: 'User' }
@@ -2368,7 +2370,7 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         number: 123,
         title: prTitle,
         body: '',
-        base: { ref: baseBranch },
+        base: { ref: baseBranch, sha: 'basesha1234567890' },
         head: { ref: 'feature-branch', sha: 'abcdef1234567890' },
         author_association: 'NONE',
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
@@ -2527,8 +2529,8 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'openwrt-25.12' },
-        head: { ref: 'feature' },
+        base: { ref: 'openwrt-25.12', sha: 'basesha123' },
+        head: { ref: 'feature', sha: 'headsha123' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits'
       },
       installation: { id: 456 },
@@ -2549,11 +2551,20 @@ index 123456..789012 100644
     return { response, requests };
   }
 
-  test('pull_request: title-only edit is dropped before any API call', async () => {
+  test('pull_request: title edit is re-evaluated, it can affect backport detection', async () => {
     try {
-      const { response, requests } = await sendPullRequestEdit({ title: { from: 'old title' } });
+      const { requests } = await sendPullRequestEdit({ title: { from: 'old title' } });
+      assert.ok(requests.length > 0, 'a title change must reach the GitHub API, not be dropped');
+    } finally {
+      fetchMock = null;
+    }
+  });
+
+  test('pull_request: unrelated edit (e.g. milestone) is dropped before any API call', async () => {
+    try {
+      const { response, requests } = await sendPullRequestEdit({ milestone: { from: 'old milestone' } });
       assert.strictEqual(response.status, 200);
-      assert.strictEqual(await response.text(), 'Pull request edit changed neither the base branch nor the description');
+      assert.strictEqual(await response.text(), 'Pull request edit changed neither the title, base branch nor the description');
       assert.strictEqual(requests.length, 0);
     } finally {
       fetchMock = null;
@@ -2698,7 +2709,7 @@ index 123456..789012 100644
         number: 123,
         title: 'test pr: long output test',
         body: 'Large PR test',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature-branch', sha: 'headsha' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         url: 'https://api.github.com/repos/test/repo/pulls/123'
@@ -2804,7 +2815,7 @@ index 123456..789012 100644
         number: 123,
         title: 'test pr: non-truncated output',
         body: 'Small PR test',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature-branch', sha: 'headsha' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         url: 'https://api.github.com/repos/test/repo/pulls/123'
@@ -2894,7 +2905,7 @@ index 123456..789012 100644
         title: 'test pr: exact truncation cap',
         body: 'Large PR test',
         commits: 350,
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature-branch', sha: 'headsha' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         url: 'https://api.github.com/repos/test/repo/pulls/123'
@@ -3180,7 +3191,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature', sha: 'headsha123' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         labels: []
@@ -3298,7 +3309,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature', sha: 'headsha123' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         labels: []
@@ -3454,7 +3465,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: {
           ref: 'feature',
           sha: 'headsha123',
@@ -3581,7 +3592,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha456' },
         head: {
           ref: 'feature',
           sha: 'headsha123',
@@ -3596,11 +3607,9 @@ index 123456..789012 100644
     const secret = 'mysecret';
     const signature = await calculateHmac(secret, payload);
 
-    // Neither 'headsha123' (the PR head sha, distinct from the commit sha
-    // below) nor the base sha (intentionally omitted from the payload, so
-    // it stays 'undefined' and therefore unresolved) are known-resolvable
-    // ahead of time, so each lookup at these refs should proactively probe
-    // base AND fork together in a single GraphQL call.
+    // 'headsha123' (the PR head sha, distinct from the commit sha below)
+    // is not known-resolvable ahead of time, so each lookup at this ref
+    // proactively probes base AND fork together in a single GraphQL call.
     let graphqlCallCount = 0;
     const callsByRef = {}; // ref -> array of { hasBaseGroup, hasForkGroup }
 
@@ -3690,15 +3699,13 @@ index 123456..789012 100644
       assert.strictEqual(response.status, 200);
 
       // The head and base Makefile lookups go out together in one GraphQL
-      // call, and within it base and fork are probed together for each
-      // unresolved ref - not one call per repo, and not one per ref.
+      // call. For the unresolved ref ('headsha123'), base and fork are probed
+      // together in that single call.
       assert.strictEqual(graphqlCallCount, 1);
       assert.strictEqual(Object.keys(callsByRef).length, 2);
-      for (const calls of Object.values(callsByRef)) {
-        assert.strictEqual(calls.length, 1, 'expected exactly one GraphQL call for this ref');
-        assert.strictEqual(calls[0].hasBaseGroup, true);
-        assert.strictEqual(calls[0].hasForkGroup, true);
-      }
+      assert.strictEqual(callsByRef['headsha123'].length, 1);
+      assert.strictEqual(callsByRef['headsha123'][0].hasBaseGroup, true);
+      assert.strictEqual(callsByRef['headsha123'][0].hasForkGroup, true);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;
@@ -3982,7 +3989,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature', sha: 'headsha123' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         labels: []
@@ -4137,7 +4144,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'feature', sha: 'headsha123' },
         commits_url: 'https://api.github.com/repos/test/repo/pulls/123/commits',
         labels: []
@@ -4272,7 +4279,7 @@ index 123456..789012 100644
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: {
           ref: 'feature',
           sha: 'headsha123',
@@ -5860,7 +5867,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: {
           ref: 'feature',
           sha: 'headsha123',
@@ -5968,7 +5975,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         user: { login: 'someuser', type: 'User' },
         number: 123,
         title: 'test pr',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: {
           ref: 'feature',
           sha: 'headsha123',
@@ -6075,7 +6082,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         number: 99,
         title: 'Bump lodash from 4.17.20 to 4.17.21',
         body: 'Bumps [lodash](https://github.com/lodash/lodash).',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'abc123' },
         user: { login: 'dependabot[bot]', type: 'Bot' },
         labels: []
@@ -6163,7 +6170,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         number: 100,
         title: 'Bump actions/checkout from 3 to 4',
         body: 'Bumps [actions/checkout](https://github.com/actions/checkout).',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'dependabot/github_actions/actions/checkout-4', sha: 'def456' },
         user: { login: 'dependabot[bot]', type: 'Bot' },
         labels: []
@@ -6249,7 +6256,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         number: 101,
         title: 'Bump lodash from 4.17.20 to 4.17.21',
         body: 'Bumps [lodash](https://github.com/lodash/lodash).',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'abc123' },
         user: { login: 'dependabot[bot]', type: 'Bot' },
         labels: [{ name: 'dependencies' }, { name: 'javascript' }]
@@ -6316,7 +6323,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         number: 102,
         title: 'Bump actions/setup-npm-cache from 1 to 2',
         body: 'Bumps actions/setup-npm-cache.',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'dependabot/github_actions/actions/setup-npm-cache-2.0.0', sha: 'def789' },
         user: { login: 'dependabot[bot]', type: 'Bot' },
         labels: []
@@ -6397,7 +6404,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         number: 103,
         title: 'Bump actions/checkout from 3 to 4',
         body: 'Bumps actions/checkout.',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'dependabot/github_actions/actions/checkout-4', sha: 'def456' },
         user: { login: 'dependabot[bot]', type: 'Bot' },
         labels: [{ name: 'dependencies' }, { name: 'github_actions' }]
@@ -6478,7 +6485,7 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
         number: 99,
         title: 'Bump lodash from 4.17.20 to 4.17.21',
         body: 'Bumps [lodash](https://github.com/lodash/lodash).',
-        base: { ref: 'main' },
+        base: { ref: 'main', sha: 'basesha123' },
         head: { ref: 'dependabot/npm_and_yarn/lodash-4.17.21', sha: 'def456' },
         user: { login: 'dependabot[bot]', type: 'Bot' },
         labels: []

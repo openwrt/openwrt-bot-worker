@@ -14,7 +14,16 @@ import {
   isProtectedHeadBranch
 } from '../../core/policy.ts';
 import type { Env, SubrequestBudget } from '../../types/env.ts';
-import type { PullRequestData, GitHubApiResponse, CommitData, GitHubUser, PullRequestEventPayload, IssueCommentEventPayload } from '../../types/github.ts';
+import {
+  isIssueCommentPayload,
+  isPullRequestPayload,
+  type PullRequestData,
+  type GitHubApiResponse,
+  type CommitData,
+  type GitHubUser,
+  type PullRequestEventPayload,
+  type IssueCommentEventPayload
+} from '../../types/github.ts';
 import type { FormalitiesConfig } from '../../types/config.ts';
 import type { FileBatchLoader } from '../../core/file-batch-loader.ts';
 import type { GitHubClient } from '../../core/github-client.ts';
@@ -59,7 +68,7 @@ export type ContextResult =
 
 export async function loadPullRequestContext(
   data: PullRequestEventPayload | IssueCommentEventPayload,
-  event: string,
+  _event: string,
   env: Env,
   token: string,
   repoFullname: string,
@@ -75,39 +84,44 @@ export async function loadPullRequestContext(
   const client = createGitHubClient(token, subrequestBudget);
   const isMaintainerUser = createMaintainerResolver(repoFullname, token, subrequestBudget);
 
-  if (event === "issue_comment") {
-    const commentPayload = data as IssueCommentEventPayload;
-    const prNumberFromIssue = commentPayload.issue?.number;
+  let prData: PullRequestData;
+
+  if (isIssueCommentPayload(data)) {
+    const prNumberFromIssue = data.issue.number;
     if (!prNumberFromIssue) {
       console.error("Webhook processing failed: Missing pull request number in issue_comment payload.");
       return { kind: 'response', response: new Response("Missing pull request number", { status: 400 }) };
     }
 
-    if (!await isMaintainerUser(commentPayload.comment?.user, commentPayload.comment?.author_association)) {
+    if (!await isMaintainerUser(data.comment?.user, data.comment?.author_association)) {
       return { kind: 'response', response: new Response("Ignored non-maintainer issue comment", { status: 200 }) };
     }
 
     const prUrl = `https://api.github.com/repos/${repoFullname}/pulls/${prNumberFromIssue}`;
-    const prRes = await client.trackedApiCall(prUrl);
-    if (!prRes || prRes.code !== 200) {
+    const prRes = await client.trackedApiCall<PullRequestData>(prUrl);
+    if (!prRes || prRes.code !== 200 || !prRes.data) {
       throw new Error(`Failed to fetch PR details from ${prUrl} (HTTP ${prRes?.code})`);
     }
 
-    if (prRes.data?.state === 'closed') {
+    if (prRes.data.state === 'closed') {
       return { kind: 'response', response: new Response(`Ignored comment on ${prRes.data.merged ? 'merged' : 'closed'} pull request #${prNumberFromIssue}`, { status: 200 }) };
     }
-    data.pull_request = prRes.data;
+    prData = prRes.data;
+  } else if (isPullRequestPayload(data)) {
+    prData = data.pull_request;
+  } else {
+    return { kind: 'response', response: new Response("Invalid payload for pull request context", { status: 400 }) };
   }
 
-  const prAuthor = data.pull_request?.user?.login || 'unknown';
-  const senderType = data.pull_request?.user?.type || 'User';
+  const prAuthor = prData.user?.login || 'unknown';
+  const senderType = prData.user?.type || 'User';
 
   if (IGNORED_USERS.map(u => u.toLowerCase()).includes(prAuthor.toLowerCase()) || senderType === 'Bot') {
     if (prAuthor.toLowerCase().startsWith('dependabot') && (data.action === 'opened')) {
       const currentPrLabels = new Set(
-        (data.pull_request?.labels || []).map((l: any) => (typeof l === 'string' ? l : l.name).toLowerCase())
+        (prData.labels || []).map((l: any) => (typeof l === 'string' ? l : l.name).toLowerCase())
       );
-      const headRef = data.pull_request?.head?.ref || '';
+      const headRef = prData.head?.ref || '';
       const dependabotLabels = [
         { name: 'dependencies', color: '0366d6', description: 'Pull requests that update a dependency file' }
       ];
@@ -127,7 +141,7 @@ export async function loadPullRequestContext(
       const labelsToEnsure = dependabotLabels.filter(lbl => !currentPrLabels.has(lbl.name.toLowerCase()));
 
       if (labelsToEnsure.length > 0) {
-        const prNumber = data.pull_request?.number || 0;
+        const prNumber = prData.number || 0;
         const queue = new GitHubWriteQueue(prNumber);
 
         for (const lbl of labelsToEnsure) {
@@ -161,11 +175,6 @@ export async function loadPullRequestContext(
     return { kind: 'response', response: new Response(`Success: Ignored PR from bot/system user (@${prAuthor})`, { status: 200 }) };
   }
 
-  if (!data.pull_request) {
-    return { kind: 'response', response: new Response("Missing pull request data in payload", { status: 400 }) };
-  }
-
-  const prData: PullRequestData = data.pull_request;
   const baseBranch = prData.base.ref;
   const headBranch = prData.head.ref;
   const prNumber = prData.number;
@@ -188,7 +197,8 @@ export async function loadPullRequestContext(
   let prPatchPromise: Promise<GitHubApiResponse<string>> | null = null;
   const startPrPatchFetch = (): Promise<GitHubApiResponse<string>> => {
     if (prPatchPromise === null) {
-      prPatchPromise = client.trackedApiCall<string>(prData.url, 'GET', null, 'application/vnd.github.patch');
+      const prUrl = prData.url || `https://api.github.com/repos/${repoFullname}/pulls/${prNumber}`;
+      prPatchPromise = client.trackedApiCall<string>(prUrl, 'GET', null, 'application/vnd.github.patch');
     }
     return prPatchPromise;
   };

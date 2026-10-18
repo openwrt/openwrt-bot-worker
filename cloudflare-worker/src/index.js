@@ -3,6 +3,7 @@ import { handleScheduled } from './stale.js';
 import { isBotUser } from './core/utils.ts';
 import { handleIssuesEvent } from './handlers/issues.ts';
 import { handlePullRequestEvent } from './handlers/pull-request/index.ts';
+import { isPullRequestPayload, isIssueCommentPayload, isIssuesPayload } from './types/github.ts';
 
 // --- WEBHOOK HANDLER ---
 async function handleWebhook(request, env) {
@@ -21,18 +22,24 @@ async function handleWebhook(request, env) {
   }
 
   if (event === "issue_comment") {
+    if (!isIssueCommentPayload(data)) {
+      return new Response("Invalid payload: expected issue_comment event payload with issue and comment objects", { status: 400 });
+    }
     if (data.action !== "created") {
       return new Response("Ignored issue comment action", { status: 200 });
     }
 
-    if (!data.issue?.pull_request) {
+    if (!data.issue.pull_request) {
       return new Response("Comment is not on a pull request", { status: 200 });
     }
 
-    if (isBotUser(data.comment?.user)) {
+    if (isBotUser(data.comment.user)) {
       return new Response("Ignored non-maintainer issue comment", { status: 200 });
     }
   } else if (event === "issues") {
+    if (!isIssuesPayload(data)) {
+      return new Response("Invalid payload: expected issues event payload with issue object", { status: 400 });
+    }
     const action = data.action || '';
     if (!['opened', 'edited', 'reopened'].includes(action)) {
       return new Response("Ignored issues action", { status: 200 });
@@ -41,12 +48,15 @@ async function handleWebhook(request, env) {
       return new Response("Issue edit did not change the body", { status: 200 });
     }
   } else {
+    if (!isPullRequestPayload(data)) {
+      return new Response("Invalid payload: expected pull_request event payload with pull_request object", { status: 400 });
+    }
     const action = data.action || '';
     if (!['opened', 'synchronize', 'reopened', 'edited'].includes(action)) {
       return new Response("Ignored pull request action", { status: 200 });
     }
-    if (action === 'edited' && !data.changes?.base && !data.changes?.body) {
-      return new Response("Pull request edit changed neither the base branch nor the description", { status: 200 });
+    if (action === 'edited' && !data.changes?.base && !data.changes?.body && !data.changes?.title) {
+      return new Response("Pull request edit changed neither the title, base branch nor the description", { status: 200 });
     }
   }
 
@@ -72,7 +82,7 @@ async function handleWebhook(request, env) {
   }
 
   if (event === "issues") {
-    return await handleIssuesEvent(data, token, repoFullname, appId);
+    return await handleIssuesEvent(data, token, repoFullname, appId, env, tokenMintAttempts);
   }
 
   return await handlePullRequestEvent(data, event, env, token, repoFullname, appId, tokenMintAttempts);

@@ -7,7 +7,7 @@ import { syncPrComment } from './comment-report.ts';
 import { enqueueCheckRuns } from './check-run-report.ts';
 import { GitHubWriteQueue } from '../../core/github-write-queue.ts';
 import type { Env } from '../../types/env.ts';
-import type { PullRequestEventPayload, IssueCommentEventPayload } from '../../types/github.ts';
+import { isPullRequestPayload, isIssueCommentPayload, type PullRequestEventPayload, type IssueCommentEventPayload } from '../../types/github.ts';
 
 export async function handlePullRequestEvent(
   data: unknown,
@@ -18,10 +18,20 @@ export async function handlePullRequestEvent(
   appId: number | null,
   tokenMintAttempts: number
 ): Promise<Response> {
-  if (!data || typeof data !== 'object') {
-    return new Response("Invalid payload: expected JSON object", { status: 400 });
+  let payload: PullRequestEventPayload | IssueCommentEventPayload;
+  if (event === 'issue_comment') {
+    if (!isIssueCommentPayload(data)) {
+      return new Response("Invalid payload: expected issue_comment event payload with issue and comment objects", { status: 400 });
+    }
+    payload = data;
+  } else if (event === 'pull_request') {
+    if (!isPullRequestPayload(data)) {
+      return new Response("Invalid payload: expected pull_request event payload with pull_request object", { status: 400 });
+    }
+    payload = data;
+  } else {
+    return new Response("Invalid event for pull request handler", { status: 400 });
   }
-  const payload = data as PullRequestEventPayload | IssueCommentEventPayload;
 
   // 1. Context loading & early bot filtering
   const contextResult = await loadPullRequestContext(payload, event, env, token, repoFullname, appId, tokenMintAttempts);

@@ -40,12 +40,12 @@ export interface PullRequestData {
   body?: string;
   state?: string;
   merged?: boolean;
-  url: string;
+  url?: string;
   commits?: number;
   author_association?: string;
   user?: GitHubUser;
-  base: { ref: string; sha: string };
-  head: { ref: string; sha: string; repo?: { full_name?: string } };
+  base: { ref: string; sha: string; [key: string]: unknown };
+  head: { ref: string; sha: string; repo?: { full_name?: string }; [key: string]: unknown };
   labels?: Array<string | { name: string }>;
   [key: string]: unknown;
 }
@@ -142,30 +142,50 @@ export interface IssuesEventPayload extends BaseWebhookPayload {
 export type WebhookPayload = PullRequestEventPayload | IssueCommentEventPayload | IssuesEventPayload;
 
 export function isPullRequestPayload(payload: unknown): payload is PullRequestEventPayload {
+  if (typeof payload !== 'object' || payload === null || 'comment' in payload) {
+    return false;
+  }
+  const p = payload as Record<string, unknown>;
+  if (!p.pull_request || typeof p.pull_request !== 'object') {
+    return false;
+  }
+  const pr = p.pull_request as Record<string, unknown>;
+  if (typeof pr.number !== 'number') {
+    return false;
+  }
+  if (!pr.base || typeof pr.base !== 'object' || !pr.head || typeof pr.head !== 'object') {
+    return false;
+  }
+  const base = pr.base as Record<string, unknown>;
+  const head = pr.head as Record<string, unknown>;
   return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'pull_request' in payload &&
-    typeof (payload as any).pull_request === 'object' &&
-    (payload as any).pull_request !== null &&
-    !('comment' in payload)
+    typeof base.ref === 'string' && base.ref.trim().length > 0 &&
+    typeof base.sha === 'string' && base.sha.trim().length > 0 &&
+    typeof head.ref === 'string' && head.ref.trim().length > 0 &&
+    typeof head.sha === 'string' && head.sha.trim().length > 0
   );
 }
 
 export function isIssueCommentPayload(payload: unknown): payload is IssueCommentEventPayload {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'comment' in payload &&
-    'issue' in payload
-  );
+  if (typeof payload !== 'object' || payload === null) {
+    return false;
+  }
+  const p = payload as Record<string, unknown>;
+  if (!p.comment || typeof p.comment !== 'object' || !p.issue || typeof p.issue !== 'object') {
+    return false;
+  }
+  const issue = p.issue as Record<string, unknown>;
+  return typeof issue.number === 'number';
 }
 
 export function isIssuesPayload(payload: unknown): payload is IssuesEventPayload {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'issue' in payload &&
-    !('comment' in payload)
-  );
+  if (typeof payload !== 'object' || payload === null || 'comment' in payload) {
+    return false;
+  }
+  const p = payload as Record<string, unknown>;
+  if (!p.issue || typeof p.issue !== 'object') {
+    return false;
+  }
+  const issue = p.issue as Record<string, unknown>;
+  return typeof issue.number === 'number';
 }
