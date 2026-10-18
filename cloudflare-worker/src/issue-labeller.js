@@ -619,6 +619,7 @@ const MAX_COMMENT_PAGES = 10;
 // Applies the labelling result via GitHub REST API (mutations are still REST).
 // `appId` (the numeric GitHub App id) pins comment adoption to this app's own
 // comments; without it the match falls back to bot-authored comments only.
+/** @param {any} result @param {string} token @param {string} repoFullname @param {number} issueNumber @param {any} existingLabels @param {any} currentIssueLabels @param {any} onCall @param {number|null} [appId] */
 export async function applyIssueLabelling(result, token, repoFullname, issueNumber, existingLabels, currentIssueLabels, onCall, appId = null) {
   const issueLabelUrl = `https://api.github.com/repos/${repoFullname}/issues/${issueNumber}/labels`;
   const currentLabels = currentIssueLabels || new Set();
