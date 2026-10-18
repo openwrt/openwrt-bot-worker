@@ -2,6 +2,7 @@ import {
   validateFormalities,
   validateMakefileContext,
   validateEmbeddedPatches,
+  collectAddedPatchFiles,
   validatePkgReleaseBumps,
   validatePkgHashes,
   validateUciConfigs,
@@ -163,10 +164,11 @@ export async function runValidations(
       incomplete: true
     }));
 
-  const safePatches = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; notices?: string[]; skipped: string[]; incomplete?: boolean }> =>
+  const safePatches = (promise: Promise<any>): Promise<{ successes: string[]; errors: string[]; warnings: string[]; notices?: string[]; skipped: string[]; incomplete?: boolean }> =>
     promise.catch((err: any) => ({
       successes: [],
       errors: [],
+      warnings: [],
       notices: [`Could not complete embedded patch validation because of an error fetching file content: ${err?.message || err}`],
       skipped: [],
       incomplete: true
@@ -212,6 +214,16 @@ export async function runValidations(
   const findingInWarnings = (res: { warnings?: string[] }): boolean =>
     (res.warnings || []).length > 0;
 
+  // A patch file another commit of the series added is still one this pull
+  // request added, and a commit's own diff does not show that. Built on first
+  // use: most pull requests touch no patch file that lacks a header.
+  let addedInSeries: Set<string> | null = null;
+  const isAddedByPullRequest = (path: string): boolean => {
+    addedInSeries ??= collectAddedPatchFiles(commitDetails.flatMap((item: CommitDetail) =>
+      item.commitPatch ? item.commitPatch.split(/^diff\s+--git\s+/m) : []));
+    return addedInSeries.has(path);
+  };
+
   // Start all per-commit, PR-wide, release, and hash validations in the same
   // synchronous tick so FileBatchLoader coalesces every file lookup into a
   // single batched GraphQL query.
@@ -226,8 +238,10 @@ export async function runValidations(
       upstreamMakefile: hasUpstream ? safeMakefile(validateMakefileContext(upstreamCommit, item.upstreamPatch, config, { isNewPackage: false, isDroppedPackage: false }, repoFullname, fetchUpstream)) : null,
       uci: safeUci(validateUciConfigs(item.commitPatch, config, fetchFileContent)),
       upstreamUci: hasUpstream ? safeUci(validateUciConfigs(item.upstreamPatch, config, fetchUpstream)) : null,
-      patches: safePatches(validateEmbeddedPatches(item.commitPatch, config, fetchFileContent)),
-      upstreamPatches: hasUpstream ? safePatches(validateEmbeddedPatches(item.upstreamPatch, config, fetchUpstream)) : null
+      // The upstream audit is asked the same question about the same paths,
+      // so a finding it shares reads the same and the filter below drops it.
+      patches: safePatches(validateEmbeddedPatches(item.commitPatch, config, fetchFileContent, undefined, isAddedByPullRequest)),
+      upstreamPatches: hasUpstream ? safePatches(validateEmbeddedPatches(item.upstreamPatch, config, fetchUpstream, undefined, isAddedByPullRequest)) : null
     };
   });
 
@@ -499,6 +513,7 @@ export async function runValidations(
           const reportUpstreamPatches = await deepChecks[commitIndex]!.upstreamPatches;
           if (reportUpstreamPatches.incomplete) patchChecksIncomplete = true;
           reportPatches.errors = reportPatches.errors.filter((err: string) => !reportUpstreamPatches.errors.includes(err));
+          reportPatches.warnings = reportPatches.warnings.filter((warn: string) => !reportUpstreamPatches.warnings.includes(warn));
           reportPatches.successes.push("✅ Filtered out embedded patch issues already present in upstream commit");
         }
 
@@ -509,16 +524,23 @@ export async function runValidations(
           allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.notices.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
           reportPatches.notices.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
         }
-        if (reportPatches.errors.length > 0) {
+        // An older patch file the commit edits is a finding that does not fail,
+        // and with the check set to warn so is every other one. They go out as
+        // one block under the commit, each line once.
+        const isPatchWarning = config.check_patch_headers === 'warning';
+        const nonBlocking = [
+          ...(findingInWarnings(reportPatches) ? reportPatches.warnings : []),
+          ...(isPatchWarning ? reportPatches.errors : [])
+        ].map((w: string) => w.replace(/^- /, ''));
+        if (nonBlocking.length > 0) {
           patchesReportedFinding = true;
-          const isPatchWarning = config.check_patch_headers === 'warning';
-          if (isPatchWarning) {
-            allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.map((e: string) => `- ⚠️ ${e}`).join("\n"));
-            reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
-          } else {
-            allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
-            reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
-          }
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + nonBlocking.map((w: string) => `- ⚠️ ${w}`).join("\n"));
+          nonBlocking.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
+        }
+        if (reportPatches.errors.length > 0 && !isPatchWarning) {
+          patchesReportedFinding = true;
+          allPatchesErrors.push(`**Commit [${sha.slice(0, 7)}](${html_url})** - *${commitSubject}*:\n` + reportPatches.errors.join("\n"));
+          reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
         }
         patchesOutputText += "\n";
       }
@@ -561,16 +583,20 @@ export async function runValidations(
       allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.notices.map((w: string) => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
       reportPatches.notices.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
     }
-    if (reportPatches.errors.length > 0) {
+    const isPatchWarning = config.check_patch_headers === 'warning';
+    const nonBlocking = [
+      ...(findingInWarnings(reportPatches) ? reportPatches.warnings : []),
+      ...(isPatchWarning ? reportPatches.errors : [])
+    ].map((w: string) => w.replace(/^- /, ''));
+    if (nonBlocking.length > 0) {
       patchesReportedFinding = true;
-      const isPatchWarning = config.check_patch_headers === 'warning';
-      if (isPatchWarning) {
-        allPrWarnings.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.map((e: string) => `- ⚠️ ${e}`).join("\n"));
-        reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ⚠️ Warning: ${err.replace(/^- /, '')}\n`; });
-      } else {
-        allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.join("\n"));
-        reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
-      }
+      allPrWarnings.push(`**Pull Request Overall Diff**:\n` + nonBlocking.map((w: string) => `- ⚠️ ${w}`).join("\n"));
+      nonBlocking.forEach((w: string) => { patchesOutputText += `  ⚠️ Warning: ${w}\n`; });
+    }
+    if (reportPatches.errors.length > 0 && !isPatchWarning) {
+      patchesReportedFinding = true;
+      allPatchesErrors.push(`**Pull Request Overall Diff**:\n` + reportPatches.errors.join("\n"));
+      reportPatches.errors.forEach((err: string) => { patchesOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     patchesOutputText += "\n";
   }

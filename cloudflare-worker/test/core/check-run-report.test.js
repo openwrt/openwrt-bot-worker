@@ -40,6 +40,48 @@ describe('check-run-report lifecycle phase', () => {
     assert.match(patchesRun.payload.output.summary, /Some of this pull request could not be inspected/);
   });
 
+  // A passing check that reported a patch finding reported it as a warning,
+  // and must not say every patch file has its headers.
+  test('titles a passing Code Patches check that carries warnings as such', () => {
+    const passing = { ...mockReport, patchesConclusion: 'success', unreadPatchNotes: new Set() };
+    const clean = buildCheckRunPayloads(passing, 'sha-abc-123')[2].payload.output;
+    assert.strictEqual(clean.title, 'Code Patches: Passed');
+    assert.match(clean.summary, /correct Git tracking headers/);
+
+    const warned = buildCheckRunPayloads({ ...passing, patchesReportedFinding: true }, 'sha-abc-123')[2].payload.output;
+    assert.strictEqual(warned.title, 'Code Patches: Passed with warnings');
+    assert.doesNotMatch(warned.summary, /correct Git tracking headers/);
+    assert.match(warned.summary, /some carry warnings/);
+
+    // Partially checked stays the title, and the summary no longer says
+    // nothing was found.
+    const partial = buildCheckRunPayloads({ ...mockReport, patchesReportedFinding: true }, 'sha-abc-123')[2].payload.output;
+    assert.strictEqual(partial.title, 'Code Patches: Partially checked');
+    assert.doesNotMatch(partial.summary, /No problems were found/);
+
+    const failed = buildCheckRunPayloads({ ...passing, patchesPassed: false, patchesConclusion: 'failure', patchesReportedFinding: true }, 'sha-abc-123')[2].payload.output;
+    assert.strictEqual(failed.title, 'Code Patches: Failed');
+  });
+
+  // The flag has to survive aggregation for the title above to see it.
+  test('carries a reported patch finding through the aggregated report', () => {
+    const ctx = {
+      client: { budget: { limit: 50, used: 10, reserve: 15 } },
+      fileBatchLoader: { getBudgetSkipCount: () => 0 },
+      commitScanCapped: false,
+      commits: []
+    };
+    const patchesResult = { patchUnavailable: false, upstreamComparisonSkips: 0, upstreamFetchFailures: 0, commitDetailsIncomplete: false };
+    const outcome = {
+      allFormalityErrors: [], allPrWarnings: [], allMakefileErrors: [], allPatchesErrors: [],
+      formalityOutputText: '', makefileOutputText: '', patchesOutputText: '', patchesHeading: '## Patches\n',
+      patchChecksIncomplete: false, makefileChecksIncomplete: false, formalityChecksIncomplete: false,
+      makefileReportedFinding: false, patchesReportedFinding: true, unreadPatchNotes: new Set()
+    };
+    const report = aggregateReport(ctx, patchesResult, outcome);
+    assert.strictEqual(buildCheckRunPayloads(report, 'sha-abc-123')[2].payload.output.title, 'Code Patches: Passed with warnings');
+  });
+
   test('enqueueCheckRuns enqueues all 3 check runs into GitHubWriteQueue', async () => {
     const queue = new GitHubWriteQueue(777);
     const postedPayloads = [];

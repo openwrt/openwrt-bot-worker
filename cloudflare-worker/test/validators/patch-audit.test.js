@@ -115,11 +115,191 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
       assertSomeIncludes(res.successes, 'contains valid Git compliance headers', 'successes');
       assert.strictEqual(res.incomplete, false);
     });
+
+    const noHeaders = 'a patch with no headers\n';
+
+    test('warns about an older patch file under the name a later commit renames it to', async () => {
+      const res = await validateEmbeddedPatches(pullRequest(modify(P), rename(P, Q)), { check_patch_headers: true }, async () => noHeaders);
+      assertNoErrors(res);
+      assert.strictEqual(res.warnings.length, 1, JSON.stringify(res.warnings));
+      assert.match(res.warnings[0], new RegExp(`'${Q}' is missing .* It predates this pull request`));
+    });
+
+    // The edit's chunk alone looks like an older file; the series added it.
+    test('holds a patch file added by one commit and edited by the next to the rule', async () => {
+      const res = await validateEmbeddedPatches(pullRequest(add(P), modify(P)), { check_patch_headers: true }, async () => noHeaders);
+      assert.deepStrictEqual(res.warnings, [], 'the file does not predate the pull request');
+      assert.strictEqual(res.errors.length, 1, `one finding for one file: ${JSON.stringify(res.errors)}`);
+      assert.match(res.errors[0], new RegExp(`'${P}' is missing`));
+    });
+
+    test('holds a patch file added and then renamed to the rule under its new name', async () => {
+      const res = await validateEmbeddedPatches(pullRequest(add(P), rename(P, Q), modify(Q)), { check_patch_headers: true }, async () => noHeaders);
+      assert.deepStrictEqual(res.warnings, []);
+      assertErrorIncludes(res, `'${Q}' is missing`);
+    });
+
+    // One commit takes the envelope out, a later one edits something else:
+    // the series removed it, whichever chunk is looked at.
+    test('fails an older patch file one commit of the series took a header out of', async () => {
+      const dropEnvelope = `diff --git a/${P} b/${P}\n--- a/${P}\n+++ b/${P}\n@@ -1,3 +1,2 @@\n-From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\n From: A <a@b.c>\n Subject: [PATCH] fix\n\n`;
+      const res = await validateEmbeddedPatches(pullRequest(dropEnvelope, modify(P)), { check_patch_headers: true },
+        async () => 'From: A <a@b.c>\nSubject: [PATCH] fix\n');
+      assert.deepStrictEqual(res.warnings, []);
+      assert.strictEqual(res.errors.length, 1, JSON.stringify(res.errors));
+      assert.match(res.errors[0], /loses the 'From <commit hash> Mon Sep 17 00:00:00 2001' mbox separator line in this change/);
+    });
+
+    // An added blank line at the end of a new patch file is followed by the
+    // next commit's own mail header, which is not part of the file.
+    test('does not read the next commit\'s mail header as the headers of a new patch file', async () => {
+      const addEndingBlank = `diff --git a/${P} b/${P}\nnew file mode 100644\n--- /dev/null\n+++ b/${P}\n@@ -0,0 +1,2 @@\n+no headers\n+\n`;
+      const res = await validateEmbeddedPatches(pullRequest(addEndingBlank, modify('utils/mypkg/Makefile')), { check_patch_headers: true }, async () => null);
+      assert.strictEqual(res.errors.length, 1, JSON.stringify(res.errors));
+      assert.match(res.errors[0], /mbox separator line/);
+      assert.match(res.errors[0], /'From:' author line/);
+    });
   });
 
   test('catches patches missing From/Subject headers', async () => {
     const res = await validateEmbeddedPatches(newPatchWithoutHeaders, CONFIG);
-    assertErrorIncludes(res, 'Missing required Git header');
+    assertErrorIncludes(res, 'Regenerate the patch');
+  });
+
+  test('names only the mbox separator when everything else is present (issue #76)', async () => {
+    const patch = `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
++From: Name <someone@domain.tld>
++Subject: [PATCH] netfilter: flow: Add bridge_vid member
++
++Details of the fix
+    `;
+    const res = await validateEmbeddedPatches(patch, CONFIG);
+    assert.strictEqual(res.errors.length, 1, `Errors: ${res.errors.join(', ')}`);
+    assert.ok(res.errors[0].includes('mbox separator line'), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors[0].includes("the 'From:' author line"), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(!res.errors[0].includes("a 'Subject:' line"), `Errors: ${res.errors.join(', ')}`);
+    assert.ok(res.errors[0].includes('git format-patch'), `Errors: ${res.errors.join(', ')}`);
+  });
+
+  // The three shapes that occur in the OpenWrt trees: the full format-patch
+  // header, a bare quilt diff with no header at all, and From:/Subject:
+  // without the envelope.
+  describe('shapes found in the OpenWrt trees', () => {
+    const asNewPatch = (body) => `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+new file mode 100644
+--- /dev/null
++++ b/package/utils/bash/patches/001-fix.patch
+${body.split('\n').map(l => '+' + l).join('\n')}
+    `;
+    const asModifiedPatch = () => `
+diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -10,6 +10,6 @@
+-old_code
++new_code
+    `;
+
+    // Shape of e.g. target/linux/generic/pending-6.12/704-01-*.patch
+    const fullHeader = 'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nFrom: Eric Woudstra <ericwouds@gmail.com>\nDate: Fri, 24 Jan 2025 16:09:03 +0100\nSubject: [PATCH] netfilter: flow: Add bridge_vid member\n\n---\n--- a/x\n+++ b/x';
+    // Shape of the patches reported in issue #76
+    const noEnvelope = 'From: Felix Fietkau <nbd@nbd.name>\nSubject: [PATCH] netfilter: add xt_FLOWOFFLOAD target\n\n---\n--- a/x\n+++ b/x';
+    // Shape of e.g. packages/devel/scons/patches/001-platform_env.patch
+    const bareDiff = '--- a/scons-local-4.10.1/SCons/Platform/__init__.py\n+++ b/scons-local-4.10.1/SCons/Platform/__init__.py\n@@ -69,6 +69,8 @@\n+code';
+
+    test('accepts a new patch carrying the full format-patch header', async () => {
+      const res = await validateEmbeddedPatches(asNewPatch(fullHeader), CONFIG);
+      assert.strictEqual(res.errors.length, 0, `Unexpected errors: ${res.errors.join(', ')}`);
+      assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+    });
+
+    test('rejects a new patch that has no headers at all', async () => {
+      const res = await validateEmbeddedPatches(asNewPatch(bareDiff), CONFIG);
+      assert.strictEqual(res.errors.length, 1, `Errors: ${res.errors.join(', ')}`);
+      assert.match(res.errors[0], /mbox separator line/);
+      assert.match(res.errors[0], /'From:' author line/);
+      assert.match(res.errors[0], /'Subject:' line/);
+    });
+
+    test('warns instead of failing when an existing header-less patch is edited', async () => {
+      const res = await validateEmbeddedPatches(asModifiedPatch(), CONFIG, async () => bareDiff);
+      assert.strictEqual(res.errors.length, 0, `A pre-existing patch must not block the PR: ${res.errors.join(', ')}`);
+      assert.strictEqual(res.warnings.length, 1, `Warnings: ${res.warnings.join(', ')}`);
+      assert.match(res.warnings[0], /predates this pull request/);
+    });
+
+    test('fails when this change itself removes a header from an existing patch', async () => {
+      // The file is read after the change, so the missing envelope could be
+      // old news - but the diff shows this pull request deleting it.
+      const chunk = `diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -1,4 +1,3 @@
+-From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
+ From: John Doe <john@doe.com>
+ Subject: [PATCH] Fix
+
+`;
+      const res = await validateEmbeddedPatches(chunk, CONFIG, async () => noEnvelope);
+      assert.strictEqual(res.warnings.length, 0, `Unexpected warnings: ${res.warnings.join(', ')}`);
+      assert.strictEqual(res.errors.length, 1, `Errors: ${res.errors.join(', ')}`);
+      assert.match(res.errors[0], /loses the 'From <commit hash> Mon Sep 17 00:00:00 2001' mbox separator line/);
+    });
+
+    // An added line that still looks like the header is no repair when the
+    // file read afterwards lacks it: indented, 'git am' does not see it.
+    test('fails a change that replaces a header line with one git am does not read', async () => {
+      const chunk = `diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
+--- a/package/utils/bash/patches/001-fix.patch
++++ b/package/utils/bash/patches/001-fix.patch
+@@ -1,4 +1,4 @@
+-From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
++ From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
+ From: John Doe <john@doe.com>
+ Subject: [PATCH] Fix
+`;
+      const res = await validateEmbeddedPatches(chunk, CONFIG,
+        async () => ' From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\n' + noEnvelope);
+      assert.deepStrictEqual(res.warnings, []);
+      assert.strictEqual(res.errors.length, 1, JSON.stringify(res.errors));
+      assert.match(res.errors[0], /loses the 'From <commit hash> Mon Sep 17 00:00:00 2001' mbox separator line/);
+    });
+
+    test('warns instead of failing when an existing patch only lacks the envelope', async () => {
+      const res = await validateEmbeddedPatches(asModifiedPatch(), CONFIG, async () => noEnvelope);
+      assert.strictEqual(res.errors.length, 0, `Errors: ${res.errors.join(', ')}`);
+      assert.match(res.warnings[0], /mbox separator line/);
+      assert.doesNotMatch(res.warnings[0], /'Subject:' line/);
+    });
+
+    test('accepts an edit to an existing patch that already has the full header', async () => {
+      const res = await validateEmbeddedPatches(asModifiedPatch(), CONFIG, async () => fullHeader);
+      assert.strictEqual(res.errors.length, 0);
+      assert.strictEqual(res.warnings.length, 0);
+      assert.ok(res.successes.some(s => s.includes('valid Git compliance headers')));
+    });
+
+    // Why the separator is named is said only when it is the one missing.
+    test('explains the separator only when it is what is missing', async () => {
+      const withEnvelope = 'From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001\nSubject: [PATCH] fix\n';
+      const res = await validateEmbeddedPatches(asModifiedPatch(), CONFIG, async () => withEnvelope);
+      assert.strictEqual(res.warnings.length, 1, JSON.stringify(res.warnings));
+      assert.match(res.warnings[0], /is missing the 'From:' author line\./);
+      assert.doesNotMatch(res.warnings[0], /mbox/);
+    });
+
+    // A per-commit audit is told which files an earlier commit added.
+    test('holds an edited patch file to the rule when the caller says the pull request added it', async () => {
+      const res = await validateEmbeddedPatches(asModifiedPatch(), CONFIG, async () => bareDiff, undefined,
+        (path) => path === 'package/utils/bash/patches/001-fix.patch');
+      assert.deepStrictEqual(res.warnings, []);
+      assert.strictEqual(res.errors.length, 1, JSON.stringify(res.errors));
+    });
   });
 
   test('accepts patches with valid From/Subject headers', async () => {
@@ -169,7 +349,9 @@ diff --git a/utils/mypkg/patches/002-b.patch b/utils/mypkg/patches/002-b.patch
       'utils/mypkg/patches/001-a.patch',
       'utils/mypkg/patches/002-b.patch'
     ], 'one lookup per changed patch file');
-    assert.strictEqual(res.errors.length, 2, `one finding per file: ${JSON.stringify(res.errors)}`);
+    // Both files existed before this change, so each one is a warning.
+    assert.strictEqual(res.warnings.length, 2, `one finding per file: ${JSON.stringify(res.warnings)}`);
+    assertNoErrors(res);
   });
 
   test('does not read a leftover like 001-fix.patch.bak as a patch file', async () => {
@@ -208,22 +390,28 @@ new file mode 100644
     assert.strictEqual(new Set(lookups).size, lookups.length, 'no patch file looked up twice');
   });
 
-  test('rejects patches missing From hash or Date headers (user example)', async () => {
+  test('accepts a format-patch style patch without a Date line', async () => {
     const patch = `
 diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patches/001-fix.patch
 new file mode 100644
 --- /dev/null
 +++ b/package/utils/bash/patches/001-fix.patch
++From 939fb2bc7c770984925de3ad2d94829377488df2 Mon Sep 17 00:00:00 2001
 +From: Name <someone@domain.tld>
 +Subject: [PATCH] commit
++
++Details of the fix
     `;
     const res = await validateEmbeddedPatches(patch, CONFIG);
-    assertErrorIncludes(res, 'Missing required Git header');
+    assertNoErrors(res);
+    assertSomeIncludes(res.successes, 'contains valid Git compliance headers', 'successes');
   });
 
   test('reports a modified patch it could not read instead of passing it', async () => {
     const res = await validateEmbeddedPatches(modifiedPatch, CONFIG);
     assertNoErrors(res);
+    // A file that was not read is a gap, never a finding.
+    assert.deepStrictEqual(res.warnings, []);
     // Not looking is not the same as looking and finding it correct: the
     // caller turns this count into the neutral conclusion.
     assert.strictEqual(res.incomplete, true);
@@ -241,7 +429,7 @@ new file mode 100644
 
   test('still judges a new patch file from the diff when it is not there', async () => {
     const res = await validateEmbeddedPatches(newPatchWithoutHeaders, CONFIG, async () => null, () => true);
-    assertErrorIncludes(res, 'Missing required Git header');
+    assertErrorIncludes(res, 'Regenerate the patch');
   });
 
   test('counts a patch file whose fetch throws, and still judges the rest', async () => {
@@ -277,9 +465,10 @@ new file mode 100644
     assertSomeIncludes(res.successes, 'contains valid Git compliance headers', 'successes');
   });
 
-  test('catches missing headers in modified patches when fetched content lacks them', async () => {
+  test('reports missing headers in modified patches as a warning, not a failure', async () => {
     const res = await validateEmbeddedPatches(modifiedPatch, CONFIG, async () => 'Some content without headers');
-    assertErrorIncludes(res, 'Missing required Git header');
+    assertNoErrors(res);
+    assertSomeIncludes(res.warnings, 'Regenerate the patch', 'warnings');
   });
 
   // Only the two off switches change what comes back; how loudly a finding is
@@ -293,7 +482,7 @@ new file mode 100644
     test(title, async () => {
       const res = await validateEmbeddedPatches(newPatchWithoutHeaders, { ...CONFIG, check_patch_headers: level });
       if (reported) {
-        assertErrorIncludes(res, 'Missing required Git header');
+        assertErrorIncludes(res, 'Regenerate the patch');
       } else {
         assertNoErrors(res);
         assert.deepStrictEqual(res.successes, []);

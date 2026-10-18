@@ -20,6 +20,9 @@ export interface AggregatedReport {
   patchesOutputText: string;
   patchesHeading: string;
   unreadPatchNotes: Set<string>;
+  // Whether the patch audit reported a finding. With the check still passing
+  // it was reported as a warning, which the check-run title has to say.
+  patchesReportedFinding: boolean;
 }
 
 export function aggregateReport(
@@ -196,6 +199,7 @@ export function aggregateReport(
     makefileOutputText: finalMakefileOutput,
     patchesOutputText: finalPatchesOutput,
     patchesHeading,
-    unreadPatchNotes
+    unreadPatchNotes,
+    patchesReportedFinding
   };
 }

@@ -62,7 +62,7 @@ Inspects file modification trees targeting OpenWrt build recipes:
 ### 3. Patches Check
 Scans the contribution tree for nested downstream patch targets:
 
-*   **Git-Am Compliance:** Automatically isolates modified `.patch` assets and checks for the four headers `git am` reads — the `From <hash> Mon Sep 17 00:00:00 2001` envelope line, `From:`, `Date:` and `Subject:`. All four are required; `Date:` is the one most often missing (customizable level: warning/error/disabled).
+*   **Git-Am Compliance:** Checks that each changed `.patch` file carries the `From <hash> Mon Sep 17 00:00:00 2001` envelope line, `From:` and `Subject:`, as `git format-patch` writes them. The envelope is required because patches are also concatenated into one mbox stream for `git am`, where it is the only thing separating them; `Date:` is optional, `git am` fills it in. The report names only the headers that are missing. A patch the pull request adds, or an edit that removes a header, fails the check (customizable level: warning/error/disabled); editing an older patch that already lacks them only warns.
 
 ---
 

@@ -146,7 +146,7 @@ diff --git a/package/network/services/dropbear/patches/010-fix.patch b/package/n
 
     const found = await runValidations(mockCtx(async () => null), patchesResult(addedWithoutHeaders));
     assert.strictEqual(found.allPatchesErrors.length, 0, 'the check is set to warn, so nothing fails');
-    assert.match(found.patchesOutputText, /⚠️ Warning: Embedded patch file .* Missing required Git header/);
+    assert.match(found.patchesOutputText, /⚠️ Warning: Embedded patch file .* is missing .*mbox separator line/);
     assert.strictEqual(found.patchesReportedFinding, true, found.patchesOutputText);
 
     const unread = await runValidations(
@@ -1275,6 +1275,140 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
       assert.strictEqual(res.makefileReportedFinding, true, res.makefileOutputText);
     });
   });
+
+// A patch file the pull request only edits, and that lacked its headers
+// before it, is reported without failing the check.
+describe('patch files older than the pull request', () => {
+  const P = 'package/network/services/dropbear/patches/010-fix.patch';
+  const UPSTREAM = '0987654321098765432109876543210987654321';
+  const edit = `
+diff --git a/${P} b/${P}
+--- a/${P}
++++ b/${P}
+@@ -10,6 +10,6 @@
+-old
++new
+`;
+  const add = `
+diff --git a/${P} b/${P}
+new file mode 100644
+--- /dev/null
++++ b/${P}
+@@ -0,0 +1,1 @@
++no headers
+`;
+
+  const ctxFor = ({ fetch = async () => 'no headers', isBackportPr = false, config = {} } = {}) => ({
+    prNumber: 42,
+    prTitle: 'dropbear: touch a patch',
+    baseBranch: isBackportPr ? 'openwrt-24.10' : 'main',
+    headSha: 'head123',
+    baseSha: 'base123',
+    isBackportPr,
+    repoFullname: 'openwrt/openwrt',
+    config: { ...DEFAULT_CONFIG, check_pkg_release: false, check_pkg_hash: false, ...config },
+    configError: null,
+    commitScanCapped: false,
+    commitsCount: 1,
+    commits: [],
+    fileBatchLoader: {
+      fetchFileContentCached: fetch,
+      isFileMissing: () => false,
+      getRefSource: () => undefined,
+      hasRefSource: () => false,
+      setRefSource: () => {},
+      getBudgetSkipCount: () => 0,
+      getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+    },
+    getCommentsScanWithRetry: async () => ({ hasBranchBypassComment: false, hasCherryPickBypassComment: false, existingCommentId: null, incomplete: false }),
+    isMaintainerUser: async () => false,
+    isAuthorMaintainer: async () => false,
+    branchCheckError: null,
+    branchCheckOutputText: ''
+  });
+
+  const commit = (sha, commitPatch, extra = {}) => ({
+    sha,
+    html_url: `https://github.com/openwrt/openwrt/commit/${sha}`,
+    fullCommit: { commit: { message: `dropbear: touch a patch\n\n(cherry picked from commit ${UPSTREAM})\nSigned-off-by: Dev <dev@example.com>` } },
+    commitPatch,
+    isVerbatim: false,
+    upstreamPatch: null,
+    upstreamSha: null,
+    upstreamFetchError: null,
+    ...extra
+  });
+  const perCommit = (...commitDetails) => ({
+    usePrWidePatch: false,
+    prPatch: null,
+    commitDetails,
+    packageState: { isNewPackage: false, isDroppedPackage: false }
+  });
+
+  test('reports one in the details and the comment, as a finding that does not fail', async () => {
+    const res = await runValidations(ctxFor(), perCommit(commit('commit1234567890', edit)));
+
+    assert.deepStrictEqual(res.allPatchesErrors, []);
+    assert.match(res.patchesOutputText, /⚠️ Warning: Embedded patch file '.*010-fix\.patch' is missing .* It predates this pull request/);
+    assert.ok(res.allPrWarnings.some(w => w.startsWith('**Commit [commit1]') && w.includes('predates this pull request')),
+      res.allPrWarnings.join('\n'));
+    assert.strictEqual(res.patchesReportedFinding, true, 'a contributor has to read it');
+  });
+
+  // The first half is what the second filters: without it the second passes
+  // whether or not the warning is reported at all.
+  test('drops a warning the upstream commit carries too, as it does an error', async () => {
+    const own = await runValidations(ctxFor({ isBackportPr: true }), perCommit(commit('commit1234567890', edit)));
+    assert.match(own.patchesOutputText, /predates this pull request/);
+
+    const filtered = await runValidations(ctxFor({ isBackportPr: true }),
+      perCommit(commit('commit1234567890', edit, { upstreamPatch: edit, upstreamSha: UPSTREAM })));
+    assert.doesNotMatch(filtered.patchesOutputText, /predates this pull request/);
+    assert.match(filtered.patchesOutputText, /Filtered out embedded patch issues already present in upstream commit/);
+    assert.ok(!filtered.allPrWarnings.some(w => w.includes('predates this pull request')), filtered.allPrWarnings.join('\n'));
+    assert.strictEqual(filtered.patchesReportedFinding, false);
+  });
+
+  // Per commit, the second commit's diff does not show that the first one
+  // added the file; calling it older than the pull request would be untrue.
+  test('holds a later commit editing a patch file an earlier one added to the rule', async () => {
+    const res = await runValidations(ctxFor(), perCommit(commit('commit1111111111', add), commit('commit2222222222', edit)));
+
+    assert.doesNotMatch(res.patchesOutputText, /predates this pull request/, res.patchesOutputText);
+    const second = res.patchesOutputText.split('#### Commit [').find(s => s.startsWith('commit2'));
+    assert.match(second, /❌ Embedded patch file '.*010-fix\.patch' is missing/, res.patchesOutputText);
+  });
+
+  test('reports one in a whole pull request under the overall diff', async () => {
+    const res = await runValidations(ctxFor(), {
+      usePrWidePatch: true,
+      prPatch: edit,
+      commitDetails: [],
+      packageState: { isNewPackage: false, isDroppedPackage: false }
+    });
+
+    assert.deepStrictEqual(res.allPatchesErrors, []);
+    assert.match(res.patchesOutputText, /#### Pull Request Overall Diff:\n[^#]*⚠️ Warning: Embedded patch file .* It predates this pull request/);
+    assert.ok(res.allPrWarnings.some(w => w.startsWith('**Pull Request Overall Diff**') && w.includes('predates this pull request')),
+      res.allPrWarnings.join('\n'));
+    assert.strictEqual(res.patchesReportedFinding, true);
+  });
+  // With the check set to warn, an added patch's failure is reported the same
+  // way as an older patch's warning: one block under the commit, not two, and
+  // each line once with a single leading dash.
+  test('reports every non-blocking finding of a commit in one block', async () => {
+    const P2 = 'package/network/services/dropbear/patches/020-new.patch';
+    const res = await runValidations(ctxFor({ config: { check_patch_headers: 'warning' } }),
+      perCommit(commit('commit1234567890', edit + add.replaceAll(P, P2))));
+
+    const blocks = res.allPrWarnings.filter(w => w.startsWith('**Commit [commit1]'));
+    assert.strictEqual(blocks.length, 1, res.allPrWarnings.join('\n'));
+    assert.match(blocks[0], /010-fix\.patch' is missing .* It predates this pull request/);
+    assert.match(blocks[0], /020-new\.patch' is missing/);
+    assert.doesNotMatch(blocks[0], /- ⚠️ - /, 'one dash per line');
+    assert.deepStrictEqual(res.allPatchesErrors, [], 'nothing fails while the check is set to warn');
+  });
+});
 
 describe('an input the run could not read', () => {
   const silentLoader = {

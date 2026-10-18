@@ -4941,7 +4941,7 @@ new file mode 100644
 
     assert.deepStrictEqual(perCommitFetches, [], 'the quoted header is not a commit of this pull request');
     const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
-    assert.ok(patchesRun.output.text.includes('Missing required Git header'),
+    assert.ok(patchesRun.output.text.includes('mbox separator line'),
       `the second commit's diff must actually be inspected: ${patchesRun.output.text}`);
   });
 
@@ -4984,7 +4984,7 @@ new file mode 100644
 
     assert.deepStrictEqual(perCommitFetches, []);
     const patchesRun = checkRunsPosted.find(r => r.name === 'FormalityCheck / Code Patches');
-    assert.ok(patchesRun.output.text.includes('Missing required Git header'), patchesRun.output.text);
+    assert.ok(patchesRun.output.text.includes('mbox separator line'), patchesRun.output.text);
 
     // The finding has to sit under the commit that actually carries the patch
     // file. Splitting on the quoted header would hand the first commit the
@@ -4995,8 +4995,8 @@ new file mode 100644
       assert.ok(section, `no section for commit ${sha.slice(0, 7)} in ${patchesRun.output.text}`);
       return section;
     };
-    assert.ok(sectionFor(SPLIT_SHA_2).includes('Missing required Git header'), 'reported under the second commit');
-    assert.ok(!sectionFor(SPLIT_SHA_1).includes('Missing required Git header'), 'not under the first commit');
+    assert.ok(sectionFor(SPLIT_SHA_2).includes('mbox separator line'), 'reported under the second commit');
+    assert.ok(!sectionFor(SPLIT_SHA_1).includes('mbox separator line'), 'not under the first commit');
   });
 
   test('falls back to per-commit patches when the pull request patch is unavailable', async () => {
@@ -5915,16 +5915,18 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
   });
 
   // A refresh of `readable` patch files, long enough that the Code Patches
-  // details are cut, plus patch files whose lookups fail (`unread`) or whose
-  // content has no Git headers (`bad`). Returns the Code Patches check-run.
+  // details are cut, plus patch files whose lookups fail (`unread`), that the
+  // pull request adds with no Git headers (`bad`), or that it edits while they
+  // already have none (`old`). Returns the Code Patches check-run.
   const patchName = (i) => `target/linux/generic/pending-6.12/${String(i).padStart(3, '0')}-net-a-long-descriptive-name-for-a-refreshed-patch.patch`;
-  async function codePatchesFor({ readable = 800, unread = [], bad = [], commitCount = 16 }) {
-    const files = [...Array.from({ length: readable }, (_, i) => patchName(i)), ...bad, ...unread];
+  async function codePatchesFor({ readable = 800, unread = [], bad = [], old = [], commitCount = 16 }) {
+    const files = [...Array.from({ length: readable }, (_, i) => patchName(i)), ...bad, ...old, ...unread];
     const modify = (p) => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -10,6 +10,6 @@\n-old\n+new\n\n`;
+    const add = (p) => `diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,1 @@\n+no headers\n\n`;
     const headers = 'From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\nFrom: A <a@b.c>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] fix\n';
-    const runs = await checkRunsForPatch(mailEnvelope('a'.repeat(40)) + files.map(modify).join(''), {
+    const runs = await checkRunsForPatch(mailEnvelope('a'.repeat(40)) + files.map(p => (bad.includes(p) ? add(p) : modify(p))).join(''), {
       commitCount,
-      lookup: (owner, name, ref, path) => (unread.includes(path) ? undefined : (bad.includes(path) ? 'no headers' : headers))
+      lookup: (owner, name, ref, path) => (unread.includes(path) ? undefined : (bad.includes(path) || old.includes(path) ? 'no headers' : headers))
     });
     return runs.find(r => r.name === 'FormalityCheck / Code Patches');
   }
@@ -5956,6 +5958,17 @@ diff --git a/utils/mypkg/patches/00${i}-fix.patch b/utils/mypkg/patches/00${i}-f
     const patches = await codePatchesFor({ unread: [patchName(900)], bad: [patchName(901)] });
     assert.strictEqual(patches.conclusion, 'failure');
     assert.ok(!listedAboveDetails(patches.output.text).includes('could not be read'), listedAboveDetails(patches.output.text));
+  });
+
+  // An older patch file the pull request only edits is reported, not failed,
+  // and the check-run says it passed with warnings rather than that every
+  // patch file has its headers.
+  test('passes with warnings when an edited patch file already lacked its headers', async () => {
+    const patches = await codePatchesFor({ readable: 1, old: [patchName(902)] });
+    assert.strictEqual(patches.conclusion, 'success', patches.output.text);
+    assert.strictEqual(patches.output.title, 'Code Patches: Passed with warnings');
+    assert.doesNotMatch(patches.output.summary, /correct Git tracking headers/);
+    assert.match(patches.output.text, new RegExp(`⚠️ Warning: Embedded patch file '${patchName(902)}' is missing .* It predates this pull request`));
   });
 
   test('does not call a patch file that a later commit deletes unreadable', async () => {

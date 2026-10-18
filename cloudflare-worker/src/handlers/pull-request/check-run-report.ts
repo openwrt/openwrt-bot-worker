@@ -32,8 +32,14 @@ export function buildCheckRunPayloads(
     makefileOutputText,
     patchesOutputText,
     patchesHeading,
-    unreadPatchNotes
+    unreadPatchNotes,
+    patchesReportedFinding
   } = report;
+
+  // A passing check that reported a finding reported it as a warning: an
+  // older patch file this pull request edits, or any patch with the check set
+  // to warn. Its title and summary say so instead of claiming a clean pass.
+  const patchesWarned = patchesPassed && Boolean(patchesReportedFinding);
 
   const UNREAD_PATCHES_LISTED = 20;
   let patchesText = patchesHeading + patchesOutputText;
@@ -92,12 +98,16 @@ export function buildCheckRunPayloads(
         conclusion: patchesConclusion,
         output: {
           title: patchesPassed
-            ? (patchesConclusion === 'neutral' ? 'Code Patches: Partially checked' : 'Code Patches: Passed')
+            ? (patchesConclusion === 'neutral'
+                ? 'Code Patches: Partially checked'
+                : (patchesWarned ? 'Code Patches: Passed with warnings' : 'Code Patches: Passed'))
             : 'Code Patches: Failed',
           summary: (patchesPassed
-            ? (patchesConclusion === 'neutral'
-                ? 'No problems were found in the patch files that could be read.'
-                : 'All downstream patch files contain correct Git tracking headers.')
+            ? (patchesWarned
+                ? 'No patch file blocks this pull request, but some carry warnings — open the details below to see what they are.'
+                : (patchesConclusion === 'neutral'
+                    ? 'No problems were found in the patch files that could be read.'
+                    : 'All downstream patch files contain correct Git tracking headers.'))
             : 'Some patch files are missing the required Git headers — open the details below to see what to change.') +
             (patchesConclusion === 'neutral' ? INCOMPLETE_NOTE : ''),
           text: safeTruncate(patchesText)

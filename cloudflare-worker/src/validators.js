@@ -2653,16 +2653,21 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
   });
 }
 
-export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent, isMissing) {
+// A patch file the pull request added has to carry the headers; one it only
+// edits is reported without failing, unless the edit took a header out.
+// `isAddedByPullRequest` names the files any commit of the series added,
+// which a per-commit audit cannot see in its own diff.
+export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileContent, isMissing, isAddedByPullRequest) {
   const errors = [];
+  const warnings = [];
   const successes = [];
 
   if (CONFIG.check_patch_headers === false || CONFIG.check_patch_headers === 'disabled') {
-    return { errors: [], successes: [], skipped: [], incomplete: false };
+    return { errors: [], warnings: [], successes: [], skipped: [], incomplete: false };
   }
 
   if (!commitPatch) {
-    return { errors: [], successes: ["✅ No diff footprint present for patches validation"], skipped: [], incomplete: false };
+    return { errors: [], warnings: [], successes: ["✅ No diff footprint present for patches validation"], skipped: [], incomplete: false };
   }
 
   // Anchored at the end of the line: without that, the greedy match reads
@@ -2677,7 +2682,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   if (patchFiles.length === 0) {
-    return { errors: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"], skipped: [], incomplete: false };
+    return { errors: [], warnings: [], successes: ["✅ No downstream raw embedded patch files modified or introduced"], skipped: [], incomplete: false };
   }
 
   // Collect (chunk, patchFile) matches upfront rather than checking each
@@ -2692,32 +2697,33 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   // chunk against every patch file instead is quadratic in the number of
   // files: a kernel bump that refreshes 800 patches would spend ~180 ms of
   // CPU here alone, far past what a Worker invocation gets.
-  const matches = followPatchFiles(commitPatch.split(/^diff\s+--git\s+/m));
+  const fileChunks = commitPatch.split(/^diff\s+--git\s+/m);
+  const matches = followPatchFiles(fileChunks);
+  // Whether the pull request added a file, and whether it took a header out,
+  // are questions about the file, not about one chunk of it: a file added in
+  // one commit and edited in the next is still new.
+  const addedHere = collectAddedPatchFiles(fileChunks);
+  const chunksOf = new Map();
+  for (const { chunk, patchFile } of matches) {
+    chunksOf.set(patchFile, (chunksOf.get(patchFile) || []).concat(chunk));
+  }
 
   async function checkPatchHeader({ chunk, patchFile }) {
-    let hasFromHash = false;
-    let hasFrom = false;
-    let hasDate = false;
-    let hasSubject = false;
-    let checked = false;
+    let present = null;
 
     if (fetchFileContent) {
       try {
         const rawContent = await fetchFileContent(patchFile);
         if (rawContent !== null) {
-          hasFromHash = /^From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(rawContent);
-          hasFrom = /^From:\s+.+/m.test(rawContent);
-          hasDate = /^Date:\s+.+/m.test(rawContent);
-          hasSubject = /^Subject:\s+.+/m.test(rawContent);
-          checked = true;
+          present = PATCH_HEADERS.map(h => h.inFile.test(rawContent));
         }
       } catch (e) {
-        // The lookup failed outright. `checked` stays false, which the branch
+        // The lookup failed outright. `present` stays null, which the branch
         // below already treats as "this file was not read".
       }
     }
 
-    if (!checked) {
+    if (present === null) {
       // Fallback: only validate if it is a new file
       const isNewFile = /^(?:new file mode|--- \/dev\/null)/m.test(chunk);
       if (!isNewFile) {
@@ -2730,23 +2736,53 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
         // without the file there is nothing to judge.
         return { skipped: `⚠️ Embedded patch '${patchFile}' could not be read, so its Git headers were not checked` };
       }
-      hasFromHash = /^\+\s*From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/m.test(chunk);
-      hasFrom = /^\+\s*From:\s+.+/m.test(chunk);
-      hasDate = /^\+\s*Date:\s+.+/m.test(chunk);
-      hasSubject = /^\+\s*Subject:\s+.+/m.test(chunk);
+      present = PATCH_HEADERS.map(h => h.added.test(chunk));
     }
 
-    if (!hasFromHash || !hasFrom || !hasDate || !hasSubject) {
-      return { error: `- Embedded patch file '${patchFile}' violates standard guidelines. Missing required Git header parameters ('From <hash> Mon Sep 17 00:00:00 2001' / 'From:' / 'Date:' / 'Subject:') to ensure 'git am' application compatibility` };
+    const missing = PATCH_HEADERS.filter((_, i) => !present[i]);
+    if (missing.length === 0) {
+      return { success: `✅ Embedded patch '${patchFile}' contains valid Git compliance headers` };
     }
-    return { success: `✅ Embedded patch '${patchFile}' contains valid Git compliance headers` };
+
+    // Only the headers that are absent are named: listing all of them
+    // whatever was missing read as a false claim (issue #76).
+    const names = (headers) => headers.map(h => h.name).join(', ');
+    const howToFix = "Regenerate the patch with 'git format-patch' so that 'git am' can apply it" +
+      (missing.includes(PATCH_HEADERS[0])
+        ? ". Patches are also concatenated into a single mbox stream for 'git am', where the separator line is the only thing that keeps them apart"
+        : '');
+    if (addedHere.has(patchFile) || isAddedByPullRequest?.(patchFile)) {
+      return { error: `- Embedded patch file '${patchFile}' is missing ${names(missing)}. ${howToFix}` };
+    }
+
+    // The file is read after the change, so a header absent now may have
+    // been absent all along, or this change may have taken it out: a removed
+    // line carrying it. Nothing in the diff put it back, or the file would
+    // have it.
+    const removed = missing.filter(h => chunksOf.get(patchFile).some(c => h.removed.test(c)));
+    if (removed.length > 0) {
+      return { error: `- Embedded patch file '${patchFile}' loses ${names(removed)} in this change. ${howToFix}` };
+    }
+    // Over a third of the patches in the OpenWrt trees predate the rule.
+    // Editing one inherits a problem its author did not create, so it is
+    // reported without blocking the change.
+    return { warning: `Embedded patch file '${patchFile}' is missing ${names(missing)}. It predates this pull request, so this does not block it. ${howToFix}` };
   }
 
   const results = await Promise.all(matches.map(checkPatchHeader));
   const skipped = [];
+  // A file in more than one chunk is judged once per chunk, alike.
+  const reported = new Set();
   for (const result of results) {
+    const finding = result.error || result.warning;
+    if (finding) {
+      if (reported.has(finding)) continue;
+      reported.add(finding);
+    }
     if (result.error) {
       errors.push(result.error);
+    } else if (result.warning) {
+      warnings.push(result.warning);
     } else if (result.skipped) {
       skipped.push(result.skipped);
     } else if (result.success) {
@@ -2755,7 +2791,42 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
   }
 
   // A file that was skipped was not checked, so the result is not a pass.
-  return { errors, successes, skipped, incomplete: skipped.length > 0 };
+  return { errors, warnings, successes, skipped, incomplete: skipped.length > 0 };
+}
+
+// What an embedded patch needs for 'git am'. The envelope is required because
+// tree patches are also concatenated into one mbox stream, where it is the
+// only separator: without it, 'git am' makes a single commit of two patches.
+// 'Date:' is not required, 'git am' fills it in.
+const PATCH_HEADERS = [
+  ["the 'From <commit hash> Mon Sep 17 00:00:00 2001' mbox separator line", /From\s+[0-9a-fA-F]{40,64}\s+Mon\s+Sep\s+17\s+00:00:00\s+2001\r?$/],
+  ["the 'From:' author line", /From:\s+.+/],
+  ["a 'Subject:' line", /Subject:\s+.+/]
+].map(([name, { source }]) => ({
+  name,
+  inFile: new RegExp(`^${source}`, 'm'),
+  // Not \s*, which runs past the line end: in a whole pull request an added
+  // blank line can be followed by the next commit's own mail header.
+  added: new RegExp(`^\\+[ \\t]*${source}`, 'm'),
+  removed: new RegExp(`^-${source}`, 'm')
+}));
+
+// The patch files a diff adds, under every name a rename in it later gives
+// them. Takes the diff's chunks, split at each `diff --git`, in order.
+export function collectAddedPatchFiles(fileChunks) {
+  const added = new Set();
+  for (const chunk of fileChunks) {
+    const hunkStart = chunk.indexOf('\n@@');
+    const head = hunkStart === -1 ? chunk : chunk.slice(0, hunkStart);
+    const renamedFrom = head.match(/^rename from (.*?)\r?$/m);
+    const renamedTo = head.match(/^rename to (.*?)\r?$/m);
+    if (renamedFrom && renamedTo && added.has(renamedFrom[1])) added.add(renamedTo[1]);
+    if (/^(?:new file mode|--- \/dev\/null)/m.test(head)) {
+      const header = head.match(/^\+\+\+\s+b\/(.*\.patch)\r?$/m);
+      if (header) added.add(header[1]);
+    }
+  }
+  return added;
 }
 
 // The parsers below walk a whole patch line by line, and the validators
