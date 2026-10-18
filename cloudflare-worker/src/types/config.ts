@@ -35,6 +35,7 @@ export interface FormalitiesConfig {
   check_init_scripts?: boolean;
   check_conffiles?: boolean;
   check_uci_config?: boolean | 'disabled';
+  check_dts_checklist?: false | 'warning' | 'error' | 'disabled';
   check_space_after_assignment?: boolean;
   check_missing_colon?: boolean;
   check_makefile_indentation?: boolean;
@@ -112,6 +113,7 @@ const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_trailing_newline: new Set([true, false, 'warning', 'error', 'disabled']),
   require_linked_github_account: new Set([true, false, 'warning', 'error', 'disabled']),
   check_uci_config: new Set([true, false, 'disabled']),
+  check_dts_checklist: new Set([false, 'warning', 'error', 'disabled']),
   check_buildbot_default: new Set([true, false, 'warning', 'error', 'disabled']),
   check_patch_headers: new Set([true, false, 'warning', 'error', 'disabled']),
   check_patch_refresh: new Set([true, false, 'warning', 'error', 'disabled']),

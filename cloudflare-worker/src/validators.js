@@ -4838,6 +4838,361 @@ export async function validatePkgSourcePins(commitDetails, CONFIG, fetchFileCont
     : { errors, warnings, notices, findings, successes };
 }
 
+// The DTS checklist on openwrt.org/submitting-patches, reduced to the three
+// items a diff settles on its own, and only for device trees a pull request
+// adds: then the patch carries the whole file, so no read is needed. The rest
+// of the checklist was measured against the tree and left out on purpose -
+// re-measure before adding any of it back:
+// - `/dts-v1/;` presence: 1,638 of 2,527 in-tree files rightly rely on the
+//   parent .dtsi, and settling it needs the include chain.
+// - `device_type`: the 75 survivors are pci/ethernet-phy nodes whose
+//   bindings require it; both additions in 8 months were correct.
+// - model/compatible agreement: deriving one from the other disagrees,
+//   legitimately, in 17% of the tree.
+// - diag.sh LED aliases, node naming, tabs-only indentation, file placement:
+//   hardware judgement, the kernel's binding docs, or merged as written.
+// Every one of the 11 findings these three items produced on 120 added
+// device trees in 8 months sits on a commit maintainers merged unchanged,
+// which is why the check warns by default.
+
+// Measured: the largest device tree added in 8 months was 1,048 lines and a
+// three-file device-support pull request about 2,500, at ~22 characters a
+// line. The scan costs by the character, so lines alone do not bound it:
+// 6,000 lines at the 512-character limit below are 3 MB and took ~4 ms
+// locally, against ~1 ms for 6,000 lines inside 256 KiB. Both caps hold, and
+// 25 files bounds many tiny ones.
+const DTS_FILE_CAP = 25;
+const DTS_LINE_CAP = 6000;
+const DTS_CHAR_CAP = 256 * 1024;
+// One batched GraphQL request on the shared loader; past it the rest are
+// reported as unchecked.
+const DTS_CONFIRM_READ_CAP = 10;
+// No device-tree property line is this long. A longer line is skipped before
+// trim() copies it.
+const DTS_MAX_LINE_CHARS = 512;
+// The colour half of `label = "<colour>:<function>"`. Of 2,446 colon-bearing
+// labels in the tree, every one starting with one of these is an LED; `0:APPSBL`
+// partitions and the function-first `system:red` never match.
+const DTS_LED_COLOURS = new Set(['white', 'red', 'green', 'blue', 'amber', 'yellow', 'orange', 'purple', 'violet', 'cyan', 'pink', 'ir', 'rgb']);
+const DTS_EXCERPTS = 3;
+const DTS_NOTE_PATHS = 5;
+
+const isDeviceTreePath = (path) =>
+  (path.endsWith('.dts') || path.endsWith('.dtsi') || path.endsWith('.dtso')) && !isHiddenOrSpecial(path);
+
+// The first string of `<name> = "<value>"...`, or null. `line` is trimmed and
+// starts with `name`; a longer name (`label-mac-device`, `compatible-x`) is
+// not this one.
+function deviceTreeString(line, name) {
+  let i = name.length;
+  while (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9) i++;
+  if (line.charCodeAt(i) !== 61 /* = */) return null;
+  i++;
+  while (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9) i++;
+  if (line.charCodeAt(i) !== 34 /* " */) return null;
+  const end = line.indexOf('"', i + 1);
+  return end === -1 ? null : line.slice(i + 1, end);
+}
+
+// One pass over a device tree's lines, given as a list of line arrays so the
+// folded commits are not copied into one. `default-state = "off"` counts only
+// when the nearest enclosing node with a `compatible` is `gpio-leds`, which
+// is the scope of openwrt/openwrt 0d23fd2 ("from all gpio LED nodes"): a
+// `register-bit-led` node beside a `gpio-leds` one is not reported. The owner
+// is settled when the node closes, so a `compatible` written after the
+// property still counts. A frame is pushed for every line that opens a node,
+// `/ {` and `&leds {` included, so the stack stays balanced; an override
+// whose `gpio-leds` lives in an included .dtsi has no owner here and is not
+// reported.
+function scanDeviceTree(chunks) {
+  // `inherited` is the nearest ancestor's compatible, taken when the node
+  // opens: dtc requires properties before subnodes, so it is final by then,
+  // and settling a node costs the same however deep it sits.
+  const frames = [{ name: '', compatible: null, inherited: null, pending: null }];
+  const defaultOff = [];
+  const labels = [];
+  let sawSpdx = false;
+  let inBlockComment = false;
+
+  const settle = (frame) => {
+    if (frame.pending === null || (frame.compatible ?? frame.inherited) !== 'gpio-leds') return;
+    for (const name of frame.pending) defaultOff.push(name);
+  };
+
+  for (const lines of chunks) {
+    for (const raw of lines) {
+      if (raw.length > DTS_MAX_LINE_CHARS) continue;
+      // The header is a comment, so this comes before comments are skipped.
+      if (!sawSpdx && raw.includes('SPDX-License-Identifier')) sawSpdx = true;
+      const line = raw.trim();
+      if (inBlockComment) {
+        if (line.includes('*/')) inBlockComment = false;
+        continue;
+      }
+      if (line === '') continue;
+      const lead = line.charCodeAt(0);
+      if (lead === 47 /* / */ && (line.charCodeAt(1) === 47 || line.charCodeAt(1) === 42)) {
+        if (line.charCodeAt(1) === 42 && line.indexOf('*/', 2) === -1) inBlockComment = true;
+        continue;
+      }
+      // Comment continuations and preprocessor lines (#include, #define, and
+      // #address-cells, which matters to nothing here).
+      if (lead === 42 /* * */ || lead === 35 /* # */) continue;
+
+      const top = frames.length - 1;
+      if (lead === 125 /* } */) {
+        if (top > 0) {
+          settle(frames[top]);
+          frames.pop();
+        }
+        continue;
+      }
+      if (line.charCodeAt(line.length - 1) === 123 /* { */) {
+        const name = line.slice(0, -1).trim();
+        const colon = name.lastIndexOf(':');
+        const parent = frames[top];
+        frames.push({ name: colon === -1 ? name : name.slice(colon + 1).trim(), compatible: null, inherited: parent.compatible ?? parent.inherited, pending: null });
+        continue;
+      }
+      if (lead === 99 /* c */ && line.startsWith('compatible')) {
+        const value = deviceTreeString(line, 'compatible');
+        if (value !== null && frames[top].compatible === null) frames[top].compatible = value;
+      } else if (lead === 100 /* d */ && line.startsWith('default-state')) {
+        if (deviceTreeString(line, 'default-state') === 'off') {
+          (frames[top].pending ??= []).push(frames[top].name);
+        }
+      } else if (lead === 108 /* l */ && line.startsWith('label')) {
+        const value = deviceTreeString(line, 'label');
+        const colon = value === null ? -1 : value.indexOf(':');
+        if (colon > 0 && DTS_LED_COLOURS.has(value.slice(0, colon))) labels.push(value);
+      }
+    }
+  }
+  for (const frame of frames) settle(frame);
+  return { missingSpdx: !sawSpdx, defaultOff, labels };
+}
+
+// At most `limit` lines of `text`, or null when it has more: a head that a
+// later commit grew past the cap is not split whole.
+function boundedLines(text, limit) {
+  const lines = [];
+  let start = 0;
+  while (start <= text.length) {
+    if (lines.length === limit) return null;
+    const end = text.indexOf('\n', start);
+    if (end === -1) {
+      lines.push(text.slice(start));
+      break;
+    }
+    lines.push(text.slice(start, end));
+    start = end + 1;
+  }
+  return lines;
+}
+
+const quoteDeviceTreeValue = (value) => `'${value.length > 64 ? `${value.slice(0, 64)}…` : value}'`;
+
+function deviceTreeExcerpts(values) {
+  const shown = values.slice(0, DTS_EXCERPTS).map(quoteDeviceTreeValue).join(', ');
+  return values.length > DTS_EXCERPTS ? `${shown}, and ${values.length - DTS_EXCERPTS} more` : shown;
+}
+
+function deviceTreeFindings(path, result) {
+  const out = [];
+  if (result.missingSpdx) {
+    out.push(`- New device tree '${path}' has no 'SPDX-License-Identifier' comment in its file header. OpenWrt's [DTS checklist](https://openwrt.org/submitting-patches) asks for one on every new .dts/.dtsi; 1487 of the tree's device trees use '// SPDX-License-Identifier: GPL-2.0-or-later OR MIT', which is the usual choice — pick the identifier that matches the license you are placing the file under, not a full license text.`);
+  }
+  if (result.defaultOff.length > 0) {
+    const n = result.defaultOff.length;
+    out.push(`- New device tree '${path}' sets 'default-state = "off"' on ${n} LED node${n === 1 ? '' : 's'} inside a 'compatible = "gpio-leds"' block (${deviceTreeExcerpts(result.defaultOff)}). 'off' is already the default when the property is absent, so [the DTS checklist](https://openwrt.org/submitting-patches) asks for these to be dropped — see openwrt/openwrt commit 0d23fd2 ("treewide: dts: Remove default-state=off property from all gpio LED nodes"). LEDs that are not 'gpio-leds' are not reported.`);
+  }
+  if (result.labels.length > 0) {
+    const n = result.labels.length;
+    out.push(`- New device tree '${path}' names ${n} LED${n === 1 ? '' : 's'} with the deprecated 'label = "<colour>:<function>"' form (${deviceTreeExcerpts(result.labels)}). openwrt/openwrt's [.github/llm-review-rules.md](https://github.com/openwrt/openwrt/blob/main/.github/llm-review-rules.md) replaces it with 'color = <LED_COLOR_ID_<COLOUR>>;' plus 'function = LED_FUNCTION_<FUNC>;' from 'include/dt-bindings/leds/common.h' — and with 'function = "<func>";' where no 'LED_FUNCTION_*' constant matches, which is the case for names like 'rssi', 'signal1', 'sfp' or 'user'. Older device trees in the tree still use the label form; new ones are asked not to.`);
+  }
+  return out;
+}
+
+const hasDeviceTreeHit = (result) => result.missingSpdx || result.defaultOff.length > 0 || result.labels.length > 0;
+
+export async function validateDeviceTrees(commitDetails, CONFIG, fetchFileContentAtHead, isBackportPr = false) {
+  const errors = [];
+  const warnings = [];
+  const notices = [];
+  const successes = [];
+  // About scope, not about this run: what the check did not look at by
+  // design. It never sets `incomplete`.
+  const notes = [];
+  let incomplete = false;
+
+  if (CONFIG.check_dts_checklist === false || CONFIG.check_dts_checklist === 'disabled') {
+    return { errors, warnings, notices, successes, notes, incomplete };
+  }
+  const findings = CONFIG.check_dts_checklist === 'error' ? errors : warnings;
+
+  let effectiveCommitDetails = Array.isArray(commitDetails) ? commitDetails : [];
+  // Nearly every pull request touches no device tree; the file list is
+  // shared with the other audits, the mbox split below is not.
+  if (!effectiveCommitDetails.some(item => !item?.commitPatch || getChangedFilesFromPatch(item.commitPatch).some(isDeviceTreePath))) {
+    return { errors, warnings, notices, successes, notes, incomplete };
+  }
+  if (effectiveCommitDetails.length === 1 && effectiveCommitDetails[0]?.commitPatch) {
+    const splitResult = splitMboxPatch(effectiveCommitDetails[0].commitPatch);
+    if (splitResult === false) {
+      return {
+        errors, warnings, successes, notes,
+        notices: ['Could not safely verify commit boundaries in PR-wide patch series'],
+        incomplete: true
+      };
+    }
+    if (splitResult) effectiveCommitDetails = splitResult;
+  }
+
+  const addedFiles = new Set();
+  const deletedFiles = new Set();
+  // Deleted and added again: a replacement of a file the base may have, not
+  // a new one.
+  const readdedFiles = new Set();
+  // A revert restores a device tree as it was and is not asked to modernise it.
+  const revertedFiles = new Set();
+  const touchedFiles = new Set();
+  // Per path, the added lines of each commit, and how many commits changed
+  // it, skipped ones included: only a file more than one commit wrote can
+  // differ at the head from its folded added lines.
+  const addedLines = Object.create(null);
+  const touchCount = Object.create(null);
+  // A commit whose patch is missing could have changed anything.
+  let seriesUncertain = false;
+
+  for (const item of effectiveCommitDetails) {
+    if (!item?.commitPatch) {
+      seriesUncertain = true;
+      continue;
+    }
+    for (const file of getChangedFilesFromPatch(item.commitPatch)) {
+      if (isDeviceTreePath(file)) touchCount[file] = (touchCount[file] || 0) + 1;
+    }
+    if ((item.fullCommit?.parents?.length || 0) > 1) continue;
+    // llm-review-rules.md: a backport must match the upstream commit verbatim.
+    if (isBackportPr && item.isVerbatim) continue;
+    const isRevertCommit = CONFIG.allow_revert !== false &&
+      parseRevertCommit(item.fullCommit?.commit?.message || '') !== null;
+
+    const states = parseDiffFileStates(item.commitPatch);
+    states.addedFiles.forEach(f => {
+      if (deletedFiles.has(f)) readdedFiles.add(f);
+      addedFiles.add(f);
+      deletedFiles.delete(f);
+    });
+    states.deletedFiles.forEach(f => {
+      deletedFiles.add(f);
+      addedFiles.delete(f);
+      readdedFiles.delete(f);
+    });
+    for (const file of getPresentFilesFromPatch(item.commitPatch)) {
+      if (isDeviceTreePath(file)) touchedFiles.add(file);
+    }
+    for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+      if (!isDeviceTreePath(file)) continue;
+      if (isRevertCommit) {
+        revertedFiles.add(file);
+        continue;
+      }
+      if (!addedLines[file]) addedLines[file] = [];
+      addedLines[file].push(change.added);
+    }
+  }
+
+  // An added file with no added lines (empty, or a diff GitHub left out) has
+  // nothing to judge, and an empty diff is not a missing header.
+  const candidates = [...addedFiles].filter(f =>
+    isDeviceTreePath(f) && !readdedFiles.has(f) && !revertedFiles.has(f) && addedLines[f] !== undefined);
+
+  const notAdded = [...touchedFiles].filter(f => !addedFiles.has(f) && !deletedFiles.has(f) && !revertedFiles.has(f));
+  if (notAdded.length > 0) {
+    const shown = notAdded.slice(0, DTS_NOTE_PATHS).map(f => `'${f}'`).join(', ');
+    const more = notAdded.length > DTS_NOTE_PATHS ? `, and ${notAdded.length - DTS_NOTE_PATHS} more` : '';
+    notes.push(`The DTS checklist runs only on device trees a pull request adds, so the changes to ${shown}${more} were not checked against it.`);
+  }
+
+  // Both caps against the whole candidate set first, so the count reported
+  // is the true one.
+  const scanned = [];
+  let lineBudget = DTS_LINE_CAP;
+  let charBudget = DTS_CHAR_CAP;
+  for (const file of candidates) {
+    if (scanned.length === DTS_FILE_CAP) break;
+    let count = 0;
+    let chars = 0;
+    for (const lines of addedLines[file]) {
+      count += lines.length;
+      // A line the scan skips costs it nothing.
+      for (const line of lines) if (line.length <= DTS_MAX_LINE_CHARS) chars += line.length;
+    }
+    if (count > lineBudget || chars > charBudget) break;
+    lineBudget -= count;
+    charBudget -= chars;
+    scanned.push(file);
+  }
+  if (scanned.length < candidates.length) {
+    notices.push(`Device tree checklist not run on ${candidates.length - scanned.length} of ${candidates.length} added device trees: the diff is larger than this check scans in one run.`);
+    incomplete = true;
+  }
+
+  const results = scanned.map(file => ({ file, result: scanDeviceTree(addedLines[file]) }));
+
+  // Folded added lines can hold one a later commit took out again, so a hit
+  // in a file several commits wrote stands only if the head still shows it.
+  const toConfirm = results.filter(r => hasDeviceTreeHit(r.result) && (seriesUncertain || touchCount[r.file] > 1));
+  const confirmed = toConfirm.slice(0, DTS_CONFIRM_READ_CAP);
+  const unconfirmed = new Set(toConfirm.slice(DTS_CONFIRM_READ_CAP).map(r => r.file));
+  if (unconfirmed.size > 0) {
+    const names = [...unconfirmed].slice(0, DTS_NOTE_PATHS).map(f => `'${f}'`).join(', ');
+    const more = unconfirmed.size > DTS_NOTE_PATHS ? `, and ${unconfirmed.size - DTS_NOTE_PATHS} more` : '';
+    notices.push(`Device tree checklist findings in ${unconfirmed.size} added device trees (${names}${more}) were not confirmed at the head commit, which this check reads for at most ${DTS_CONFIRM_READ_CAP} files, so they are not reported.`);
+    incomplete = true;
+  }
+  // Fired together so the batching loader folds them into one request.
+  const heads = await Promise.all(confirmed.map(r =>
+    Promise.resolve().then(() => fetchFileContentAtHead(r.file)).catch(() => null)));
+  const headResult = new Map();
+  // The head scans draw on what the diff scan left of the same caps, so the
+  // whole check reads at most DTS_LINE_CAP lines.
+  let headLineBudget = lineBudget;
+  let headCharBudget = charBudget;
+  confirmed.forEach((r, i) => {
+    const head = heads[i];
+    const lines = typeof head === 'string' && head.length <= headCharBudget ? boundedLines(head, headLineBudget) : null;
+    if (lines === null) {
+      notices.push(typeof head === 'string'
+        ? `Device tree '${r.file}' is too large at the head commit for what is left of this check's scan limit, so the DTS checklist items it appeared to miss were not confirmed and are not reported.`
+        : `Device tree '${r.file}' could not be read at the head commit, so the DTS checklist items it appeared to miss were not confirmed and are not reported.`);
+      incomplete = true;
+      headResult.set(r.file, null);
+      return;
+    }
+    headLineBudget -= lines.length;
+    headCharBudget -= head.length;
+    const atHead = scanDeviceTree([lines]);
+    headResult.set(r.file, {
+      missingSpdx: r.result.missingSpdx && atHead.missingSpdx,
+      defaultOff: r.result.defaultOff.length > 0 ? atHead.defaultOff : [],
+      labels: r.result.labels.length > 0 ? atHead.labels : []
+    });
+  });
+
+  for (const { file, result } of results) {
+    if (unconfirmed.has(file)) continue;
+    const final = headResult.has(file) ? headResult.get(file) : result;
+    if (final === null) continue;
+    const fileFindings = deviceTreeFindings(file, final);
+    if (fileFindings.length > 0) findings.push(...fileFindings);
+    else successes.push(`✅ New device tree '${file}' carries an SPDX header and uses no deprecated LED pattern`);
+  }
+
+  return { errors, warnings, notices, successes, notes, incomplete };
+}
+
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {
   const errors = [];
   const successes = [];

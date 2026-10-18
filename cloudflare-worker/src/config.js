@@ -34,6 +34,9 @@ export const DEFAULT_CONFIG = {
   check_init_scripts: true,
   check_conffiles: true,
   check_uci_config: true,
+  // 'warning' by default: the wiki asks rather than requires ("consider
+  // adding"), and every finding measured in 8 months was on a merged commit.
+  check_dts_checklist: 'warning',
   check_space_after_assignment: true,
   check_missing_colon: true,
   check_makefile_indentation: true,

@@ -96,6 +96,16 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(resPin.config.check_pkg_hash, 'error');
     }
 
+    // check_dts_checklist takes the same four values; `true` would not say
+    // which level it means, and an invalid one keeps the default 'warning'.
+    for (const val of ['strict', true, 'on']) {
+      const resDts = parseAndValidateConfig(JSON.stringify({ check_dts_checklist: val, check_pkg_hash: 'error' }));
+      assert.match(resDts.error, /field "check_dts_checklist" must be one of \[false, "warning", "error", "disabled"\]/);
+      assert.strictEqual(resDts.partial, true);
+      assert.strictEqual(resDts.config.check_dts_checklist, 'warning');
+      assert.strictEqual(resDts.config.check_pkg_hash, 'error');
+    }
+
     // check_patch_refresh takes check_patch_headers' five values, and an
     // invalid one falls back to the default 'warning' without discarding the
     // rest.
@@ -256,6 +266,9 @@ describe('parseAndValidateConfig', () => {
     for (const val of [false, 'warning', 'error', 'disabled']) {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_hash: val })).error, null);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_source_pin: val })).error, null);
+      const dts = parseAndValidateConfig(JSON.stringify({ check_dts_checklist: val }));
+      assert.strictEqual(dts.error, null);
+      assert.strictEqual(dts.config.check_dts_checklist, val);
     }
   });
 });

@@ -1331,6 +1331,69 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
         assert.ok(!/Package Source Pin Audit:\n(  .*\n)*  ⚠️ Warning: PKG_SOURCE/.test(res.makefileOutputText), res.makefileOutputText);
       });
     });
+
+    // Graded inside the audit by check_dts_checklist, 'warning' by default.
+    describe('the device tree checklist', () => {
+      const dts = 'target/linux/ramips/dts/mt7621_vendor_board.dts';
+      const noHeader = `
+diff --git a/${dts} b/${dts}
+new file mode 100644
+--- /dev/null
++++ b/${dts}
+@@ -0,0 +1,4 @@
++#include "mt7621.dtsi"
++/ {
++	model = "Vendor Board";
++};
+`;
+      const modifiedDtsi = `
+diff --git a/target/linux/ramips/dts/mt7621.dtsi b/target/linux/ramips/dts/mt7621.dtsi
+--- a/target/linux/ramips/dts/mt7621.dtsi
++++ b/target/linux/ramips/dts/mt7621.dtsi
+@@ -1,1 +1,1 @@
++	label = "green:lan";
+`;
+
+      test('reports a finding as a warning by default', async () => {
+        const res = await runValidations(ctxFor({}), perCommit(noHeader));
+        assert.match(res.makefileOutputText, /#### Device Tree Checklist:\n  ⚠️ Warning: New device tree 'target\/linux\/ramips\/dts\/mt7621_vendor_board\.dts' has no 'SPDX-License-Identifier' comment/, res.makefileOutputText);
+        assert.ok(res.allPrWarnings.some(w => w.startsWith('**Device Tree Checklist**:\n- ⚠️ New device tree')), res.allPrWarnings.join('\n'));
+        assert.deepStrictEqual(res.allMakefileErrors, []);
+        assert.strictEqual(res.makefileReportedFinding, true);
+        assert.strictEqual(res.makefileChecksIncomplete, false);
+      });
+
+      test('reports a finding as an error when the repository asks for it', async () => {
+        const res = await runValidations(ctxFor({ check_dts_checklist: 'error' }), perCommit(noHeader));
+        assert.ok(res.allMakefileErrors.some(e => e.startsWith('**Device Tree Checklist**:\n- New device tree')), res.allMakefileErrors.join('\n'));
+        assert.match(res.makefileOutputText, /  ❌ New device tree 'target\/linux\/ramips\/dts\/mt7621_vendor_board\.dts'/);
+        assert.ok(!res.allPrWarnings.some(w => w.includes('Device Tree Checklist')), res.allPrWarnings.join('\n'));
+      });
+
+      test('names a modified device tree in the check-run body only', async () => {
+        const res = await runValidations(ctxFor({}), perCommit(modifiedDtsi));
+        assert.match(res.makefileOutputText, /#### Device Tree Checklist:\n  ℹ️ The DTS checklist runs only on device trees a pull request adds, so the changes to 'target\/linux\/ramips\/dts\/mt7621\.dtsi' were not checked against it\./, res.makefileOutputText);
+        assert.ok(!res.allPrWarnings.some(w => w.includes('Device Tree Checklist')), res.allPrWarnings.join('\n'));
+        assert.strictEqual(res.makefileChecksIncomplete, false);
+        assert.strictEqual(res.makefileReportedFinding, false);
+      });
+
+      test('says nothing on a pull request with no device tree', async () => {
+        const res = await runValidations(ctxFor({}), perCommit(noTrailingNewline));
+        assert.ok(!res.makefileOutputText.includes('Device Tree Checklist'), res.makefileOutputText);
+        // GUARD: the same pull request adding a device tree gets the section.
+        const withDts = await runValidations(ctxFor({}), perCommit(noTrailingNewline + noHeader));
+        assert.ok(withDts.makefileOutputText.includes('#### Device Tree Checklist:'), withDts.makefileOutputText);
+      });
+
+      test('reports an audit that throws as a gap', async () => {
+        const ctx = ctxFor({});
+        Object.defineProperty(ctx.config, 'check_dts_checklist', { get() { throw new Error('config exploded'); } });
+        const res = await runValidations(ctx, perCommit(noHeader));
+        assert.match(res.makefileOutputText, /⚠️ Warning: Could not complete the device tree checklist because of an error fetching file content: config exploded/, res.makefileOutputText);
+        assert.strictEqual(res.makefileChecksIncomplete, true);
+      });
+    });
   });
 
 // A patch file the pull request only edits, and that lacked its headers

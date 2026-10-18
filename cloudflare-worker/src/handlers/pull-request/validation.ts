@@ -6,6 +6,7 @@ import {
   validatePkgReleaseBumps,
   validatePkgHashes,
   validatePkgSourcePins,
+  validateDeviceTrees,
   validateUciConfigs,
   groupReleaseErrors,
   getFastPkgRoot,
@@ -349,6 +350,11 @@ export async function runValidations(
     releaseDetails = commitDetails.filter(item => (item.fullCommit?.parents || []).length <= 1);
   }
 
+  // The device tree audit skips merges and verbatim backports itself, but
+  // still has to see which files they changed: a device tree one of them
+  // changed after it was added is confirmed at the head.
+  const deviceTreeDetails = usePrWidePatch ? releaseDetails : commitDetails;
+
   if (isBackportPr) {
     releaseDetails = releaseDetails.filter((item: any) => !item.isVerbatim);
   }
@@ -390,6 +396,19 @@ export async function runValidations(
         warnings: [] as string[],
         notices: [`Could not complete package source pin audit because of an error fetching file content: ${e.message}`],
         findings: [] as string[],
+        incomplete: true
+      };
+    });
+
+  const deviceTreesPromise = validateDeviceTrees(deviceTreeDetails, config, fetchFileContentAtHead, isBackportPr)
+    .catch((e: any) => {
+      console.error(`Failed to audit device trees: ${e.message}`);
+      return {
+        successes: [] as string[],
+        errors: [] as string[],
+        warnings: [] as string[],
+        notices: [`Could not complete the device tree checklist because of an error fetching file content: ${e.message}`],
+        notes: [] as string[],
         incomplete: true
       };
     });
@@ -746,6 +765,28 @@ export async function runValidations(
     if (pinErrors.length > 0) {
       allMakefileErrors.push(`**Package Source Pin Audit**:\n` + pinErrors.join("\n"));
       pinErrors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+    }
+    makefileOutputText += "\n";
+  }
+
+  // Graded inside the audit. `notes` say what it does not look at by design,
+  // in the check-run body only: a modified device tree is out of scope, not
+  // a gap and not a finding.
+  const reportDts = await deviceTreesPromise;
+  if (reportDts.incomplete) makefileChecksIncomplete = true;
+  const dtsWarnings = [...reportDts.notices, ...reportDts.warnings];
+  if (reportDts.errors.length > 0 || findingInWarnings(reportDts)) makefileReportedFinding = true;
+  if (reportDts.successes.length > 0 || reportDts.notes.length > 0 || reportDts.errors.length > 0 || dtsWarnings.length > 0) {
+    makefileOutputText += `#### Device Tree Checklist:\n`;
+    reportDts.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    reportDts.notes.forEach(n => { makefileOutputText += `  ℹ️ ${n}\n`; });
+    if (dtsWarnings.length > 0) {
+      allPrWarnings.push(`**Device Tree Checklist**:\n` + dtsWarnings.map(w => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+      dtsWarnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    }
+    if (reportDts.errors.length > 0) {
+      allMakefileErrors.push(`**Device Tree Checklist**:\n` + reportDts.errors.join("\n"));
+      reportDts.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     makefileOutputText += "\n";
   }
