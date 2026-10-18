@@ -44,6 +44,12 @@ export interface PullRequestContext {
   config: FormalitiesConfig;
   configError: string | null;
   configPartial: boolean;
+  // The repository's own settings, and the labeler rules, could not be read at
+  // all - not "are not there". Every check below ran on the defaults, so what
+  // reads them has to report itself unchecked instead of answering for rules
+  // this repository may well have written differently.
+  configUnread: boolean;
+  labelerUnread: boolean;
   existingLabels: Set<string> | null;
   labelerText: string | null;
   commits: CommitData[];
@@ -55,8 +61,10 @@ export interface PullRequestContext {
   prData: PullRequestData;
   startPrPatchFetch: () => Promise<GitHubApiResponse<string>>;
   getCommentsScanWithRetry: () => Promise<CommentScanResult>;
-  isMaintainerUser: (user: GitHubUser | null | undefined, assoc?: string | null) => Promise<boolean>;
-  isAuthorMaintainer: (bodyRequestsBypass: boolean) => Promise<boolean>;
+  // Both answer null when the permission lookup itself failed; null is not
+  // false (see createMaintainerResolver).
+  isMaintainerUser: (user: GitHubUser | null | undefined, assoc?: string | null) => Promise<boolean | null>;
+  isAuthorMaintainer: (bodyRequestsBypass: boolean) => Promise<boolean | null>;
   bodyRequestsCherryPickBypass: boolean;
   branchCheckViolated: boolean;
   bypassBranchCheck: boolean;
@@ -293,6 +301,18 @@ export async function loadPullRequestContext(
     prNumber
   );
 
+  // parseAndValidateConfig answers the defaults, with no error, for a null
+  // text - which is the right answer for a repository that ships no config and
+  // the wrong one for a config GitHub would not serve.
+  const configUnread = Boolean(setup.configFailed);
+  const labelerUnread = Boolean(setup.labelerFailed);
+  if (configUnread) {
+    console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be read, so every check below ran with its default setting: the checks that read it report themselves unchecked rather than passing or failing on settings this repository may not have.`);
+  }
+  if (labelerUnread) {
+    console.warn(`Labeler rules .github/labeler.yml in ${repoFullname} could not be read, so no label was derived from them. This is not a repository without labeler rules.`);
+  }
+
   const { config, error: configError, partial: configPartial } = parseAndValidateConfig(setup.configText);
   if (configError) {
     console.warn(`Repository config .github/formalities.json in ${repoFullname}: ${configPartial ? 'the fields named below fell back to their defaults, the rest of the file was used' : 'could not be used at all, falling back to the defaults'}: ${configError}`);
@@ -372,16 +392,30 @@ export async function loadPullRequestContext(
     if (isProtectedHeadBranch(headBranch)) {
       const isMaintainer = await isAuthorMaintainer(bodyRequestsBranchBypass);
       const scanResult = await getCommentsScanWithRetry();
-      bypassBranchCheck = scanResult.hasBranchBypassComment || (bodyRequestsBranchBypass && isMaintainer);
+      bypassBranchCheck = scanResult.hasBranchBypassComment || (bodyRequestsBranchBypass && isMaintainer === true);
+      // An override whose author's write access GitHub would not confirm: not
+      // honoured, and not absent either. The description carries one as often
+      // as a comment does, and both ask the same unanswered question.
+      const overrideUnverified = scanResult.branchOverrideUnverified ||
+        (bodyRequestsBranchBypass && isMaintainer === null);
 
       if (bypassBranchCheck) {
         branchCheckOutputText = `⚠️ Pull request originates from protected branch \`${headBranch}\` but was allowed via override command\n\n`;
-      } else if (scanResult.incomplete) {
-        // The thread is what carries `[allow branch]`, and it could not be
-        // read to the end. Failing the pull request on that evidence is
-        // exactly what the override exists to prevent, so the violation is
-        // reported as unchecked and the check-run goes neutral.
-        branchCheckWarning = `Pull request originates from protected branch \`${headBranch}\`, but the comment thread could not be read in full, so an \`[allow branch]\` override may have been missed. The targeting rule was left unchecked rather than reported as a failure.`;
+      } else if (configUnread) {
+        // Whether this repository enables the rule at all was unreadable, so
+        // the default that filled in for it cannot carry a verdict.
+        branchCheckWarning = `Pull request originates from protected branch \`${headBranch}\`, but \`.github/formalities.json\` could not be read, so whether this repository enables the targeting rule is unknown. The rule was left unchecked rather than reported as a failure.`;
+        branchCheckOutputText = `⚠️ Could not check the origin branch of the pull request: this repository's own setting for the rule was unreadable\n\n`;
+      } else if (scanResult.incomplete || overrideUnverified) {
+        // The override is what the pull request would be waved through with,
+        // and this run could not read it: either the thread stopped short, or
+        // the author's write access could not be checked. Failing the pull
+        // request on that evidence is exactly what the override exists to
+        // prevent, so the violation is reported as unchecked and the check-run
+        // goes neutral.
+        branchCheckWarning = scanResult.incomplete
+          ? `Pull request originates from protected branch \`${headBranch}\`, but the comment thread could not be read in full, so an \`[allow branch]\` override may have been missed. The targeting rule was left unchecked rather than reported as a failure.`
+          : `Pull request originates from protected branch \`${headBranch}\`, and the \`[allow branch]\` override it carries was left by a user whose write access could not be verified, so the override was not honoured. The targeting rule was left unchecked rather than reported as a failure.`;
         branchCheckOutputText = `⚠️ Could not check whether the pull request from \`${headBranch}\` was allowed via override command\n\n`;
       } else {
         let errorMsg = `### PR Targeting Violation\n- Pull requests must originate from a dedicated feature branch. Cannot use \`${headBranch}\` directly.`;
@@ -415,6 +449,8 @@ export async function loadPullRequestContext(
       config,
       configError,
       configPartial,
+      configUnread,
+      labelerUnread,
       existingLabels: setup.labels,
       labelerText: setup.labelerText,
       commits,

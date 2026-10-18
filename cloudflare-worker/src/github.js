@@ -157,11 +157,14 @@ export const GRAPHQL_URL = 'https://api.github.com/graphql';
 // "does this repo know this ref at all", which a null file lookup cannot
 // (GraphQL returns the same null both for a missing path and for a ref the
 // repo cannot resolve).
-// Returns Map<key, { content, exists, isBinary } | { error: Error }>:
+// Returns Map<key, { content, exists, isBinary, failed? } | { error: Error }>:
 //   content  string when the path resolved to a readable text blob, else null
 //   exists   true when the ref (and path, if given) resolved at all — a
 //            binary or oversized blob has exists: true with content: null
 //   isBinary true when the path resolved to a binary blob
+//   failed   true when a partial GraphQL error took this field's content away,
+//            so the empty result says nothing about the file. Callers that
+//            treat an empty result as "not there" have to check it.
 export async function graphqlBatchFetchFiles(token, probes, onCall) {
   const results = new Map();
   if (!probes || probes.length === 0) return results;
@@ -331,14 +334,17 @@ export async function graphqlFetchRepoLabels(token, repoFullname, onCall) {
 // the REST commits listing delivered (see restCommitFromGraphql), so the
 // checks that consume them did not have to learn a second vocabulary.
 //
-// Returns { labels, configText, labelerText, commits, commitsTotal, comments }.
+// Returns { labels, configText, configFailed, labelerText, labelerFailed,
+// commits, commitsTotal, comments }.
 // A missing file yields null text (callers fall back to their defaults, like
-// the REST 404 used to). `comments` is null when the thread is longer than one
-// page, so the caller lists it through REST instead. Throws when the query
-// itself fails, matching the strictness of the config fetch this replaces; a
-// failure while paging labels past the first 100 degrades to labels: null
-// instead, because label bookkeeping is not worth failing the run over (see
-// ensureLabelExists).
+// the REST 404 used to), and `configFailed`/`labelerFailed` tell that absence
+// apart from a file a partial GraphQL error took away: only an unmarked null
+// text says the file is not there. `comments` is null when the thread is
+// longer than one page, so the caller lists it through REST instead. Throws
+// when the query itself fails, matching the strictness of the config fetch
+// this replaces; a failure while paging labels past the first 100 degrades to
+// labels: null instead, because label bookkeeping is not worth failing the
+// run over (see ensureLabelExists).
 const COMMIT_FIELDS = `oid
           url
           message
@@ -369,6 +375,17 @@ function commitsErrorMessages(errors) {
   if (!Array.isArray(errors) || errors.length === 0) return '';
   const atCommits = errors.filter(e => atOrAboveCommits(e.path));
   return (atCommits.length > 0 ? atCommits : errors).map(e => e.message).join('; ');
+}
+
+// Which selections a partial error emptied, keyed the way graphqlBatchFetchFiles
+// keys them: the field's alias under `repository`, or '*' when GitHub named no
+// path at all and any empty field may be the one it lost.
+function graphqlFailedFields(errors) {
+  const failedAt = new Set();
+  for (const error of Array.isArray(errors) ? errors : []) {
+    failedAt.add(Array.isArray(error.path) && error.path.length > 0 ? error.path.slice(0, 2).join('.') : '*');
+  }
+  return failedAt;
 }
 
 // Partial errors the response survived: logged once, never fatal.
@@ -463,15 +480,33 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
     }
   }
 
+  // The commits path raises and the comments path falls back to REST when a
+  // partial error takes their field away. These two files had no such answer:
+  // an emptied `cfg` read exactly like a repository that ships no config, so
+  // the audit ran on the defaults - possibly enabling a check the repository
+  // disabled - and still reported itself complete. Same for the labeler rules.
+  const failedFields = graphqlFailedFields(res.data?.errors);
+  const fieldLost = (alias) => failedFields.has('*') || failedFields.has('repository') || failedFields.has(`repository.${alias}`);
+  const configText = typeof repo.cfg?.text === 'string' ? repo.cfg.text : null;
+  const labelerText = typeof repo.labeler?.text === 'string' ? repo.labeler.text : null;
+
   const setup = {
     labels,
-    configText: typeof repo.cfg?.text === 'string' ? repo.cfg.text : null,
-    labelerText: typeof repo.labeler?.text === 'string' ? repo.labeler.text : null,
+    configText,
+    configFailed: configText === null && fieldLost('cfg'),
+    labelerText,
+    labelerFailed: labelerText === null && fieldLost('labeler'),
     commits: null,
     commitsTotal: 0,
     commitsPagingCapped: false,
     comments: null
   };
+  // Logged here rather than with the partial errors below, because the
+  // no-pull-request path returns before those are ever looked at.
+  const lost = [setup.configFailed && configPath, setup.labelerFailed && labelerPath].filter(Boolean);
+  if (lost.length > 0) {
+    console.warn(`GraphQL repository setup for ${repoFullname} lost ${lost.join(' and ')} to a partial error: reported as unread, not as absent`);
+  }
   if (!withPr) return setup;
 
   const pr = repo.pullRequest;
@@ -619,12 +654,39 @@ export async function ensureLabelExists(token, repoFullname, name, color, descri
   return false;
 }
 
+// A GraphQL error that only says the lookup missed. GitHub answers an unknown
+// repository with HTTP 200, a null `repository` and this error, which is a
+// real answer: the tag and the path are not there. Every other error leaves
+// the question unanswered, wherever it sits in the response.
+const GRAPHQL_NOT_FOUND_MESSAGE = /could not resolve to a/i;
+const isLookupMiss = (error) => error?.type === 'NOT_FOUND' || GRAPHQL_NOT_FOUND_MESSAGE.test(error?.message || '');
+
+// Whether an answer without a resolved repository still says something about
+// existence. Only two shapes do: a 404, and a 200 that carried a `data` object
+// and named the miss - at least one error, all of them lookup misses.
+// Everything else asked the question without getting it answered: a 5xx that
+// survived githubApiCall's retries, a network failure or a declined attempt
+// (both 599), a rejected token, a rate limit, a 200 whose `errors` report that
+// GitHub could not execute the query, and a null repository that comes with no
+// reason at all - GitHub names a NOT_FOUND for a repository that is really
+// gone. Reading any of those as "the tag is not there" is what stamps a
+// correct issue `invalid`.
+function existenceAnswerSaysAbsent(res) {
+  if (res.code === 404) return true;
+  if (res.code !== 200 || !res.data?.data) return false;
+  const errors = Array.isArray(res.data.errors) ? res.data.errors : [];
+  return errors.length > 0 && errors.every(isLookupMiss);
+}
+
 // --- GRAPHQL ISSUE VALIDATION HELPERS ---
 // Checks tag existence and file/directory presence in a single batched query.
 // probes: Array<{ key: string, type: 'tag' | 'path', value: string }>
 //   type 'tag': checks if refs/tags/<value> exists
 //   type 'path': checks if <ref>:<value> object exists (file or tree)
-// Returns Map<key, boolean>
+// Returns Map<key, boolean>, or raises when GitHub did not answer: the
+// consumer reads a probe as "absent" both when it is false and when its key is
+// missing, so there is no value that means "unknown" and a query that failed
+// has to leave the whole run rather than report into that map.
 export async function graphqlCheckExistence(token, repoFullname, ref, probes, onCall) {
   const results = new Map();
   if (!probes || probes.length === 0) return results;
@@ -655,23 +717,45 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes, on
   const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables }, 'application/vnd.github+json', { onAttempt: onCall });
 
   if (res.code !== 200 || !res.data?.data?.repository) {
-    // An attempt the caller declined asked GitHub nothing, so it must not read
-    // as "the tag and the path do not exist": the labeller would annotate the
-    // issue as if the repository were empty. It is raised instead, which leaves
-    // the failure in the delivery log. A real 404 or error is still an answer
-    // and keeps marking the probes non-existent.
-    if (res.code === 599 && res.raw === DECLINED_ATTEMPT_RAW) {
-      throw new Error(`GraphQL existence probe for ${repoFullname} was not sent (no request budget left), so existence is unknown`);
+    // GitHub saying the repository or the ref is not there is an answer, and
+    // keeps marking every probe non-existent.
+    if (existenceAnswerSaysAbsent(res)) {
+      for (const probe of probes) results.set(probe.key, false);
+      return results;
     }
-    // On failure, mark all as non-existent rather than throwing
-    for (const probe of probes) results.set(probe.key, false);
-    return results;
+    // Nothing was answered, so nothing may be reported: the labeller would
+    // annotate the issue as if the repository were empty - `invalid` added,
+    // the derived label lost, a comment calling a correct value invalid. The
+    // failure is raised instead, which leaves the issue alone and shows up in
+    // the delivery log. A query that went out but failed and one the caller
+    // declined are the same case here; only the wording tells them apart.
+    const unanswered = res.code === 599 && res.raw === DECLINED_ATTEMPT_RAW
+      ? 'was not sent (no request budget left)'
+      : `was not answered (HTTP ${res.code}: ${(res.raw || '').trim().slice(0, 200)})`;
+    throw new Error(`GraphQL existence probe for ${repoFullname} ${unanswered}, so existence is unknown`);
   }
 
   const repoData = res.data.data.repository;
+  // The repository resolved, but a partial error can still have emptied a
+  // single probe field - same HTTP 200, `errors` naming the field it lost.
+  // That field is empty because the answer went missing, not because the tag
+  // is, and the one probe decides a label on its own. An error that only
+  // reports the miss is left out: it draws the same line as the guard above.
+  const failedAt = new Set();
+  if (Array.isArray(res.data.errors)) {
+    for (const error of res.data.errors) {
+      if (isLookupMiss(error)) continue;
+      failedAt.add(Array.isArray(error.path) ? error.path.slice(0, 2).join('.') : '*');
+    }
+  }
+
   probes.forEach((probe, i) => {
     const field = repoData[`p${i}`];
-    results.set(probe.key, field !== null && field !== undefined);
+    const resolved = field !== null && field !== undefined;
+    if (!resolved && (failedAt.has('*') || failedAt.has('repository') || failedAt.has(`repository.p${i}`))) {
+      throw new Error(`GraphQL existence probe ${probe.key} for ${repoFullname} was lost to a partial GraphQL error, so existence is unknown`);
+    }
+    results.set(probe.key, resolved);
   });
 
   return results;

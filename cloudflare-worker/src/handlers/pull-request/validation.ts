@@ -174,6 +174,31 @@ export async function runValidations(
 
   let makefileChecksIncomplete = false;
 
+  // A config GitHub would not serve is not a repository without one: every
+  // check in this run read DEFAULT_CONFIG, so none of the three audits can
+  // report a verdict on rules this repository may have written differently -
+  // or switched off. All three say so in their own body: a check that reports
+  // neutral with silent details sends the reader looking for a reason that is
+  // not there. The labeler rules are reported the same way: labels they would
+  // have added are missing, which is not the same as having none.
+  if (ctx.configUnread) {
+    const unreadWarning = `\`.github/formalities.json\` in this repository could not be read (the setup query came back with a partial error), so every check ran with its default setting instead of the configured one. What follows is what could be verified, not a verdict on the rest. Re-running the checks may well succeed.`;
+    formalityOutputText += `⚠️ Warning: ${unreadWarning}\n\n`;
+    makefileOutputText += `⚠️ Warning: ${unreadWarning}\n\n`;
+    patchesOutputText += `⚠️ Warning: ${unreadWarning}\n\n`;
+    allPrWarnings.push(`**Repository Configuration**:\n- ⚠️ ${unreadWarning}`);
+    formalityChecksIncomplete = true;
+    makefileChecksIncomplete = true;
+    patchChecksIncomplete = true;
+  }
+  // A repository that switched the labeler off derives no label from the file
+  // either way, so it is not told the file was unreadable - unless whether it
+  // switched it off is itself what could not be read.
+  if (ctx.labelerUnread && (config.enable_labeler_yml || ctx.configUnread)) {
+    const labelerWarning = `\`.github/labeler.yml\` in this repository could not be read, so no label was derived from it. This is not a repository without labeler rules: labels they would have added may be missing from this pull request.`;
+    allPrWarnings.push(`**Repository Configuration**:\n- ⚠️ ${labelerWarning}`);
+  }
+
   // Whether an audit found anything is recorded here, where it is rendered,
   // rather than read back out of the markdown: only a finding can have been
   // inherited from an upstream commit, and the caveat the report puts above
@@ -358,16 +383,23 @@ export async function runValidations(
       if (!CHERRY_PICK_MARKER.test(fullCommit?.commit?.message || '')) {
         const isMaintainer = await ctx.isAuthorMaintainer(ctx.bodyRequestsCherryPickBypass);
         const scanResult = await getCommentsScanWithRetry();
-        const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (ctx.bodyRequestsCherryPickBypass && isMaintainer);
+        const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (ctx.bodyRequestsCherryPickBypass && isMaintainer === true);
+        // The override is there, and whether its author may give it could not
+        // be established: not honoured, and not absent either.
+        const overrideUnverified = scanResult.cherryPickOverrideUnverified ||
+          (ctx.bodyRequestsCherryPickBypass && isMaintainer === null);
 
         if (bypassCherryPickCheck) {
           formalityOutputText += "  ⚠️ Commit to stable branch bypasses cherry-pick requirement via override command\n";
-        } else if (scanResult.incomplete) {
+        } else if (scanResult.incomplete || overrideUnverified) {
           // Same as the branch rule above: the comment that waves this commit
           // through may be sitting in the part of the thread that could not be
-          // read, so the missing marker is reported as unchecked.
+          // read, or its author's write access could not be checked, so the
+          // missing marker is reported as unchecked.
           formalityChecksIncomplete = true;
-          const scanWarning = `The comment thread could not be read in full, so an \`[allow cherry-pick]\` override may have been missed. The missing cherry-pick marker was left unchecked rather than reported as a failure.`;
+          const scanWarning = scanResult.incomplete
+            ? `The comment thread could not be read in full, so an \`[allow cherry-pick]\` override may have been missed. The missing cherry-pick marker was left unchecked rather than reported as a failure.`
+            : `An \`[allow cherry-pick]\` override was left by a user whose write access could not be verified, so the override was not honoured. The missing cherry-pick marker was left unchecked rather than reported as a failure.`;
           formalityOutputText += `  ⚠️ ${scanWarning}\n`;
           allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n- ⚠️ ${scanWarning}`);
         } else {

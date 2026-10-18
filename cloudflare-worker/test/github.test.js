@@ -305,6 +305,8 @@ describe('graphqlFetchRepoSetup', { concurrency: 1 }, () => {
     const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml');
     assert.strictEqual(setup.configText, null);
     assert.strictEqual(setup.labelerText, null);
+    assert.strictEqual(setup.configFailed, false, 'a null text with no error beside it is a file that is not there');
+    assert.strictEqual(setup.labelerFailed, false);
     assert.strictEqual(setup.labels.size, 0);
   });
 
@@ -356,6 +358,117 @@ describe('graphqlFetchRepoSetup', { concurrency: 1 }, () => {
     } finally {
       console.warn = originalWarn;
     }
+  });
+
+
+  // An HTTP 200 with a populated data.repository and a partial error that
+  // emptied one field: the null text it leaves is byte for byte the null text
+  // a repository without the file leaves. Read as the second, the audit runs
+  // on DEFAULT_CONFIG and still reports itself complete, which answers for
+  // rules the repository may have written differently - or switched off.
+  const setupResponseWithErrors = (repository, errors) =>
+    new Response(JSON.stringify({ data: { repository }, errors }), { status: 200 });
+
+  const quietWarnings = async (fn) => {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (msg) => { warnings.push(String(msg)); };
+    try {
+      return { result: await fn(), warnings };
+    } finally {
+      console.warn = originalWarn;
+    }
+  };
+
+  test('reports a config lost to a partial error as unread rather than absent', async () => {
+    let requestCount = 0;
+    let onCallCount = 0;
+    fetchMock = () => {
+      requestCount++;
+      return setupResponseWithErrors({
+        labels: { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: false, endCursor: null } },
+        cfg: null,
+        labeler: { text: 'docs:\n  - "docs/**"\n' }
+      }, [{ message: 'Something went wrong while executing your query.', path: ['repository', 'cfg'] }]);
+    };
+
+    const { result: setup, warnings } = await quietWarnings(() => graphqlFetchRepoSetup(
+      'token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml',
+      () => { onCallCount++; }
+    ));
+
+    assert.strictEqual(requestCount, 1, 'the whole setup is still one HTTP attempt');
+    assert.strictEqual(onCallCount, 1, 'and one charged subrequest');
+    assert.strictEqual(setup.configText, null);
+    assert.strictEqual(setup.configFailed, true, 'the field was emptied by an error, so it says nothing about the file');
+    assert.strictEqual(setup.labelerText, 'docs:\n  - "docs/**"\n');
+    assert.strictEqual(setup.labelerFailed, false, 'the error named cfg alone');
+    assert.ok(
+      warnings.some(w => w.includes('.github/formalities.json') && !w.includes('.github/labeler.yml')),
+      'the lost file is named once, in a warning of its own'
+    );
+  });
+
+  test('reports labeler rules lost to a partial error as unread rather than absent', async () => {
+    fetchMock = () => setupResponseWithErrors({
+      labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+      cfg: { text: '{"check_branch": false}' },
+      labeler: null
+    }, [{ message: 'Something went wrong while executing your query.', path: ['repository', 'labeler'] }]);
+
+    const { result: setup } = await quietWarnings(() => graphqlFetchRepoSetup(
+      'token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml'
+    ));
+
+    assert.strictEqual(setup.labelerText, null);
+    assert.strictEqual(setup.labelerFailed, true, 'a file that exists but could not be read is not "no labeler"');
+    assert.strictEqual(setup.configText, '{"check_branch": false}');
+    assert.strictEqual(setup.configFailed, false);
+  });
+
+  test('marks no file when the partial error happened somewhere else entirely', async () => {
+    fetchMock = () => setupResponseWithErrors({
+      labels: { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: false, endCursor: null } },
+      cfg: null,
+      labeler: null
+    }, [{ message: 'Something went wrong while executing your query.', path: ['repository', 'labels', 'nodes', 3] }]);
+
+    const { result: setup } = await quietWarnings(() => graphqlFetchRepoSetup(
+      'token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml'
+    ));
+
+    assert.strictEqual(setup.configFailed, false, 'an error under labels says nothing about the two files');
+    assert.strictEqual(setup.labelerFailed, false);
+  });
+
+  test('keeps a field the error named but GitHub served anyway', async () => {
+    fetchMock = () => setupResponseWithErrors({
+      labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+      cfg: { text: '{}' },
+      labeler: null
+    }, [{ message: 'Something went wrong while executing your query.', path: ['repository', 'cfg'] }]);
+
+    const { result: setup } = await quietWarnings(() => graphqlFetchRepoSetup(
+      'token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml'
+    ));
+
+    assert.strictEqual(setup.configText, '{}', 'text that arrived is text that arrived');
+    assert.strictEqual(setup.configFailed, false, 'only an empty field can have been lost');
+  });
+
+  test('marks both files unread when the partial error names no path at all', async () => {
+    fetchMock = () => setupResponseWithErrors({
+      labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+      cfg: null,
+      labeler: null
+    }, [{ message: 'Something went wrong while executing your query.' }]);
+
+    const { result: setup } = await quietWarnings(() => graphqlFetchRepoSetup(
+      'token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml'
+    ));
+
+    assert.strictEqual(setup.configFailed, true, 'an unlocated error could be the one that emptied either field');
+    assert.strictEqual(setup.labelerFailed, true);
   });
 
   test('throws when the setup query itself fails', async () => {
@@ -1102,13 +1215,33 @@ describe('subrequest accounting in paged and probe queries', { concurrency: 1 },
   });
 });
 
-// A probe the caller declined asked GitHub nothing. Reading it as "nothing
-// exists" would label an issue from an answer that never came.
-describe('graphqlCheckExistence when the attempt is not made', { concurrency: 1 }, () => {
+// Only an answer may be reported. A probe the caller declined, and one GitHub
+// failed to answer, both asked nothing: reading either as "nothing exists"
+// would label an issue from an answer that never came. GitHub saying it cannot
+// resolve the repository is an answer and still marks the probes absent.
+describe('graphqlCheckExistence when nothing was answered', { concurrency: 1 }, () => {
   let originalFetch;
 
   before(() => { originalFetch = globalThis.fetch; });
   after(() => { globalThis.fetch = originalFetch; });
+
+  // Silences the warn/error lines a failing query logs, so the run stays
+  // readable, and hands back what the probes resolved to.
+  const probeQuietly = async (onCall = () => true, probes = [
+    { key: 'tag', type: 'tag', value: 'v24.10.0' },
+    { key: 'path', type: 'path', value: 'package/utils/foo' }
+  ]) => {
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    console.warn = () => {};
+    console.error = () => {};
+    try {
+      return await graphqlCheckExistence('token', 'openwrt/openwrt', 'HEAD', probes, onCall);
+    } finally {
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+  };
 
   test('raises instead of reporting every probe false when the attempt is declined', async () => {
     let served = 0;
@@ -1127,25 +1260,113 @@ describe('graphqlCheckExistence when the attempt is not made', { concurrency: 1 
     assert.strictEqual(served, 0, 'nothing was asked, so nothing may be answered');
   });
 
-  test('still reports every probe false when GitHub itself fails', async () => {
+  test('raises when GitHub itself fails, rather than calling an existing tag absent', async () => {
     let served = 0;
     globalThis.fetch = async () => { served++; return new Response('upstream hiccup', { status: 500 }); };
 
-    const originalWarn = console.warn;
-    const originalError = console.error;
-    console.warn = () => {};
-    console.error = () => {};
-    let results;
-    try {
-      results = await graphqlCheckExistence('token', 'openwrt/openwrt', 'HEAD', [
-        { key: 'tag', type: 'tag', value: 'v24.10.0' },
-        { key: 'path', type: 'path', value: 'package/utils/foo' }
-      ], () => true);
-    } finally {
-      console.warn = originalWarn;
-      console.error = originalError;
-    }
+    await assert.rejects(
+      () => probeQuietly(),
+      /existence probe for openwrt\/openwrt was not answered \(HTTP 500: upstream hiccup\)/
+    );
     assert.strictEqual(served, 3, 'a real failure is retried to exhaustion');
+  });
+
+  test('raises when the query never reached GitHub at all', async () => {
+    globalThis.fetch = async () => { throw new Error('connection reset'); };
+
+    await assert.rejects(
+      () => probeQuietly(),
+      /existence probe for openwrt\/openwrt was not answered \(HTTP 599: connection reset\)/
+    );
+  });
+
+  test('raises on a null repository that comes with no reason at all', async () => {
+    // GitHub names a NOT_FOUND when a repository is really gone, so a null
+    // repository on its own states nothing: counting it as "every probe
+    // absent" would rest on an empty error list being vacuously all misses.
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: { repository: null } }), { status: 200 });
+
+    await assert.rejects(() => probeQuietly(), /was not answered \(HTTP 200/);
+  });
+
+  test('raises on a 200 whose errors say the query could not be executed', async () => {
+    // GitHub reports its own timeouts inside a 200: no `data`, just an error
+    // that says nothing about any tag.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      errors: [{ message: 'Something went wrong while executing your query.' }]
+    }), { status: 200 });
+
+    await assert.rejects(() => probeQuietly(), /was not answered \(HTTP 200/);
+  });
+
+  test('raises on a rate limit, which answers no question about existence', async () => {
+    globalThis.fetch = async () => new Response('API rate limit exceeded', { status: 403 });
+
+    await assert.rejects(() => probeQuietly(), /was not answered \(HTTP 403/);
+  });
+
+  test('marks every probe absent when GitHub cannot resolve the repository', async () => {
+    // A 200 carrying `data` with a null repository and a NOT_FOUND error is
+    // GitHub's answer for a repository that is not there - the tag and the
+    // path are genuinely absent.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      data: { repository: null },
+      errors: [{ type: 'NOT_FOUND', path: ['repository'], message: "Could not resolve to a Repository with the name 'openwrt/openwrt'." }]
+    }), { status: 200 });
+
+    const results = await probeQuietly();
     assert.deepStrictEqual([...results.entries()], [['tag', false], ['path', false]]);
+  });
+
+  test('marks every probe absent on a 404', async () => {
+    globalThis.fetch = async () => new Response('Not Found', { status: 404 });
+
+    const results = await probeQuietly();
+    assert.deepStrictEqual([...results.entries()], [['tag', false], ['path', false]]);
+  });
+
+  test('raises when a partial error emptied one probe field', async () => {
+    // The repository resolved and so did the tag; only the path lookup was
+    // lost. Reporting it absent invents the one answer that was missing.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      data: { repository: { p0: { name: 'v24.10.0' }, p1: null } },
+      errors: [{ message: 'Something went wrong while executing your query.', path: ['repository', 'p1'] }]
+    }), { status: 200 });
+
+    await assert.rejects(() => probeQuietly(), /probe path for openwrt\/openwrt was lost to a partial GraphQL error/);
+  });
+
+  test('marks a probe absent when the partial error on it is a lookup miss', async () => {
+    // A NOT_FOUND on the field itself is still GitHub answering the probe, so
+    // it must not be read as a lost answer - the same line the guard above
+    // draws for the repository.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      data: { repository: { p0: { name: 'v24.10.0' }, p1: null } },
+      errors: [{ type: 'NOT_FOUND', path: ['repository', 'p1'], message: 'Could not resolve to a Tree with the path.' }]
+    }), { status: 200 });
+
+    const results = await probeQuietly();
+    assert.deepStrictEqual([...results.entries()], [['tag', true], ['path', false]]);
+  });
+
+  test('reports a probe the partial error left alone', async () => {
+    // The error names a field that resolved anyway, so no probe lost its
+    // answer and the run carries on.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      data: { repository: { p0: { name: 'v24.10.0' }, p1: null } },
+      errors: [{ message: 'Something went wrong while executing your query.', path: ['repository', 'p0'] }]
+    }), { status: 200 });
+
+    const results = await probeQuietly();
+    assert.deepStrictEqual([...results.entries()], [['tag', true], ['path', false]]);
+  });
+
+  test('still reports a tag that resolves and a path that does not', async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      data: { repository: { p0: { name: 'v24.10.0' }, p1: null } }
+    }), { status: 200 });
+
+    const results = await probeQuietly();
+    assert.deepStrictEqual([...results.entries()], [['tag', true], ['path', false]]);
   });
 });

@@ -373,9 +373,15 @@ describe('issue labeller subrequest budget', () => {
   // Answers everything an issues event asks GitHub and records what really
   // went out. `configFailures` makes the first answers to the config query a
   // 500, so githubApiCall retries it; `commentPages` is the thread.
-  function stubIssuesApi({ labellerYml = INVALID_FORMAT_YML, commentPages = [[]], repoLabels = ['invalid'], configFailures = 0 } = {}) {
+  // `existenceFailures` does the same for the existence query. `lostField`
+  // ('f0' for formalities.json, 'f1' for issue-labeller.yml) drops one config
+  // blob the way a partial GraphQL error does: HTTP 200, the other field
+  // served, and an error naming the lost one. A null `labellerYml` is a
+  // repository that genuinely ships no rules file.
+  function stubIssuesApi({ labellerYml = INVALID_FORMAT_YML, commentPages = [[]], repoLabels = ['invalid'], configFailures = 0, existenceFailures = 0, lostField = null } = {}) {
     const requests = [];
     let configCalls = 0;
+    let existenceCalls = 0;
     globalThis.fetch = async (url, options = {}) => {
       const method = options.method || 'GET';
       requests.push({ url, method, body: options.body ? JSON.parse(options.body) : null });
@@ -388,15 +394,19 @@ describe('issue labeller subrequest budget', () => {
         if (body.variables.o0 !== undefined) {
           configCalls++;
           if (configCalls <= configFailures) return new Response('upstream hiccup', { status: 500 });
+          const repo0 = {
+            f0: { oid: 'cfg', text: '{"enable_issue_labeller": true}', isBinary: false },
+            f1: labellerYml === null ? null : { oid: 'yml', text: labellerYml, isBinary: false }
+          };
+          if (!lostField) return json({ data: { repo0 } });
+          delete repo0[lostField];
           return json({
-            data: {
-              repo0: {
-                f0: { oid: 'cfg', text: '{"enable_issue_labeller": true}', isBinary: false },
-                f1: { oid: 'yml', text: labellerYml, isBinary: false }
-              }
-            }
+            data: { repo0 },
+            errors: [{ message: 'Something went wrong while executing your query.', path: ['repo0', lostField] }]
           });
         }
+        existenceCalls++;
+        if (existenceCalls <= existenceFailures) return new Response('upstream hiccup', { status: 500 });
         // Existence probes: nothing the config asks about resolves.
         const aliases = Object.keys(body.variables).filter(k => k.startsWith('expr'));
         return json({ data: { repository: Object.fromEntries(aliases.map((_, i) => [`p${i}`, null])) } });
@@ -536,5 +546,79 @@ describe('issue labeller subrequest budget', () => {
 
     assert.strictEqual(commentListings(requests).length, 1);
     assert.strictEqual(commentPosts(requests).length, 0);
+  });
+
+  // Everything the run writes to the issue: the labels it adds, the ones it
+  // removes and the comment it leaves.
+  const issueWrites = (requests) => requests.filter(r => r.method !== 'GET' && r.url.includes('/issues/7'));
+
+  // A read that failed is not an answer. Taken for one, the labeller works
+  // from an empty repository or from rules the repository never wrote, and
+  // every one of those verdicts is a write on somebody's issue.
+  describe('a read the issue labeller never got an answer to', () => {
+    test('a failed existence query leaves the issue alone instead of calling it invalid', async (t) => {
+      const realFetch = globalThis.fetch;
+      const realWarn = console.warn;
+      const realError = console.error;
+      t.after(() => { globalThis.fetch = realFetch; console.warn = realWarn; console.error = realError; });
+      const requests = stubIssuesApi({ labellerYml: EXISTS_YML, existenceFailures: 3 });
+      console.warn = () => {};
+      console.error = () => {};
+
+      // The rule's probe asks whether target/linux/mediatek is there and
+      // GitHub answers 500 to all three attempts. Reading that as "it is not"
+      // would add `invalid`, drop the trigger label and tell the reporter a
+      // correct value is wrong. The run fails the delivery instead.
+      const res = await runIssuesEvent({});
+
+      assert.strictEqual(res.status, 502);
+      assert.match(await res.text(), /existence is unknown/);
+      assert.strictEqual(requests.filter(r => r.url.includes('/graphql')).length, 4, 'the config query plus three existence attempts');
+      assert.deepStrictEqual(issueWrites(requests), [], 'nothing may be written off an answer that never came');
+    });
+
+    test('a formalities.json lost in transit is not read as "labeller disabled"', async (t) => {
+      const realFetch = globalThis.fetch;
+      const realWarn = console.warn;
+      t.after(() => { globalThis.fetch = realFetch; console.warn = realWarn; });
+      const requests = stubIssuesApi({ lostField: 'f0' });
+      console.warn = () => {};
+
+      // An empty config field falls back to the defaults, where
+      // enable_issue_labeller is false - so the issue would be answered 200
+      // "disabled" and silently skipped although the repository enabled it.
+      await assert.rejects(() => runIssuesEvent({}), /formalities\.json in openwrt\/openwrt was lost to a partial GraphQL error/);
+      assert.deepStrictEqual(issueWrites(requests), []);
+    });
+
+    test('an issue-labeller.yml lost in transit does not fall back to the shipped rules', async (t) => {
+      const realFetch = globalThis.fetch;
+      const realWarn = console.warn;
+      t.after(() => { globalThis.fetch = realFetch; console.warn = realWarn; });
+      const requests = stubIssuesApi({ lostField: 'f1' });
+      console.warn = () => {};
+
+      // Falling back here applies openwrt/openwrt's own release/target rules
+      // to a repository that configured different ones, and labels an issue
+      // invalid by them.
+      await assert.rejects(() => runIssuesEvent({}), /issue-labeller\.yml in openwrt\/openwrt were lost to a partial GraphQL error/);
+      assert.deepStrictEqual(issueWrites(requests), []);
+    });
+
+    test('a repository that ships no rules file still gets the shipped ones', async (t) => {
+      const realFetch = globalThis.fetch;
+      const realWarn = console.warn;
+      t.after(() => { globalThis.fetch = realFetch; console.warn = realWarn; });
+      const requests = stubIssuesApi({ labellerYml: null, repoLabels: ['invalid'] });
+      console.warn = () => {};
+
+      // An unmarked empty field is the answer "the file is not there", and
+      // the defaults are what that repository asked for: the run has to go
+      // all the way through, or the two cases are not told apart at all.
+      const res = await runIssuesEvent({});
+
+      assert.strictEqual(res.status, 200);
+      assert.ok(issueWrites(requests).length > 0, 'the default rules still reach a verdict');
+    });
   });
 });

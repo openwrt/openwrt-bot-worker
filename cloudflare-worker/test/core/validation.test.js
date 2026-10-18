@@ -1275,3 +1275,218 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
       assert.strictEqual(res.makefileReportedFinding, true, res.makefileOutputText);
     });
   });
+
+describe('an input the run could not read', () => {
+  const silentLoader = {
+    fetchFileContentCached: async () => null,
+    isFileMissing: () => false,
+    getRefSource: () => undefined,
+    hasRefSource: () => false,
+    setRefSource: () => {},
+    getBudgetSkipCount: () => 0,
+    getFetchFailureCount: () => 0,
+    getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+  };
+
+  const COMMIT_MESSAGE = [
+    'dropbear: tidy up the default config',
+    '',
+    'Make the shipped configuration readable before the port option is added.',
+    '',
+    'Signed-off-by: Jane Doe <jane@example.com>'
+  ].join('\n');
+
+  const cleanScan = (over = {}) => ({
+    hasBranchBypassComment: false,
+    hasCherryPickBypassComment: false,
+    existingCommentId: null,
+    incomplete: false,
+    branchOverrideUnverified: false,
+    cherryPickOverrideUnverified: false,
+    ...over
+  });
+
+  const patchesResult = {
+    usePrWidePatch: false,
+    prPatch: null,
+    patchUnavailable: false,
+    upstreamComparisonSkips: 0,
+    upstreamFetchFailures: 0,
+    commitDetailsIncomplete: false,
+    packageStateKnown: true,
+    packageState: { isNewPackage: false, isDroppedPackage: false },
+    commitDetails: [{
+      sha: 'a'.repeat(40),
+      html_url: 'https://github.com/openwrt/openwrt/commit/' + 'a'.repeat(40),
+      fullCommit: {
+        sha: 'a'.repeat(40),
+        author: { login: 'janedoe' },
+        committer: { login: 'janedoe' },
+        parents: [{ sha: 'b'.repeat(40) }],
+        commit: {
+          message: COMMIT_MESSAGE,
+          author: { name: 'Jane Doe', email: 'jane@example.com' },
+          committer: { name: 'Jane Doe', email: 'jane@example.com' },
+          verification: { verified: true, key_id: 'GPGKEYID' }
+        }
+      },
+      commitPatch: [
+        'diff --git a/docs/dropbear.md b/docs/dropbear.md',
+        '--- a/docs/dropbear.md',
+        '+++ b/docs/dropbear.md',
+        '@@ -1,2 +1,3 @@',
+        ' dropbear',
+        '+a line',
+        ''
+      ].join('\n'),
+      isVerbatim: false
+    }]
+  };
+
+  const ctxFor = (over = {}) => ({
+    prNumber: 42,
+    prTitle: 'dropbear: tidy up the default config',
+    baseBranch: 'main',
+    headSha: 'head123',
+    baseSha: 'base123',
+    isBackportPr: false,
+    repoFullname: 'openwrt/openwrt',
+    config: { ...DEFAULT_CONFIG },
+    configError: null,
+    configPartial: false,
+    configUnread: false,
+    labelerUnread: false,
+    commitScanCapped: false,
+    commitsPagingCapped: false,
+    commitsCount: 1,
+    commits: [],
+    fileBatchLoader: silentLoader,
+    getCommentsScanWithRetry: async () => cleanScan(),
+    isMaintainerUser: async () => false,
+    isAuthorMaintainer: async () => false,
+    bodyRequestsCherryPickBypass: false,
+    branchCheckError: null,
+    branchCheckWarning: null,
+    branchCheckOutputText: '',
+    client: { budget: { limit: 45, reserve: 15, used: 3 } },
+    ...over
+  });
+
+  // The repository may have set a check to a warning, or switched it off. The
+  // defaults that stood in for its config cannot carry a verdict, so all three
+  // check-runs report what could be verified instead of a pass.
+  test('a config the setup query could not read leaves all three audits incomplete', async () => {
+    const ctx = ctxFor({ configUnread: true });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.strictEqual(outcome.allFormalityErrors.length, 0, 'nothing is actually wrong with this pull request');
+    assert.strictEqual(outcome.formalityChecksIncomplete, true);
+    assert.strictEqual(outcome.makefileChecksIncomplete, true);
+    assert.strictEqual(outcome.patchChecksIncomplete, true);
+    assert.ok(
+      outcome.allPrWarnings.some(w => w.includes('.github/formalities.json') && w.includes('could not be read')),
+      'and the pull request comment says which input was missing'
+    );
+
+    const report = aggregateReport(ctx, patchesResult, outcome);
+    assert.strictEqual(report.formalityConclusion, 'neutral');
+    assert.strictEqual(report.makefileConclusion, 'neutral');
+    assert.strictEqual(report.patchesConclusion, 'neutral');
+    // A check reporting neutral with nothing in its details saying why sends
+    // the reader looking for a reason that is not there, so each of the three
+    // bodies names the input that was missing.
+    assert.match(report.formalityOutputText, /`\.github\/formalities\.json` in this repository could not be read/);
+    assert.match(report.makefileOutputText, /`\.github\/formalities\.json` in this repository could not be read/);
+    assert.match(report.patchesOutputText, /`\.github\/formalities\.json` in this repository could not be read/);
+  });
+
+  test('a config that is simply absent still concludes success', async () => {
+    const ctx = ctxFor();
+    const outcome = await runValidations(ctx, patchesResult);
+    const report = aggregateReport(ctx, patchesResult, outcome);
+
+    assert.strictEqual(report.formalityConclusion, 'success');
+    assert.strictEqual(report.makefileConclusion, 'success');
+    assert.strictEqual(report.patchesConclusion, 'success');
+  });
+
+  test('unreadable labeler rules are reported without moving any conclusion', async () => {
+    const ctx = ctxFor({ labelerUnread: true, config: { ...DEFAULT_CONFIG, enable_labeler_yml: true } });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.ok(outcome.allPrWarnings.some(w => w.includes('.github/labeler.yml')));
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'success');
+  });
+
+  // enable_labeler_yml defaults to false, so the noisy case is a repository
+  // that switched the labeler off: no label was derived from the file either
+  // way, and the file being unreadable changed nothing for it.
+  test('a repository with the labeler switched off is not told its labeler file was unreadable', async () => {
+    const ctx = ctxFor({ labelerUnread: true });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.strictEqual(ctx.config.enable_labeler_yml, false, 'the default this case is about');
+    assert.ok(!outcome.allPrWarnings.some(w => w.includes('.github/labeler.yml')));
+  });
+
+  test('it is reported when whether the labeler is on is itself unreadable', async () => {
+    const ctx = ctxFor({ labelerUnread: true, configUnread: true });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.ok(outcome.allPrWarnings.some(w => w.includes('.github/labeler.yml')));
+  });
+
+  // The cherry-pick rule, waived by `[allow cherry-pick]`, needs the same
+  // answer the targeting rule gets in context.ts.
+  test('an [allow cherry-pick] override from an unverifiable author leaves the marker unchecked', async () => {
+    const ctx = ctxFor({
+      isBackportPr: true,
+      baseBranch: 'openwrt-24.10',
+      getCommentsScanWithRetry: async () => cleanScan({ cherryPickOverrideUnverified: true })
+    });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.strictEqual(outcome.allFormalityErrors.length, 0, 'the missing marker must not be reported as a failure');
+    assert.strictEqual(outcome.formalityChecksIncomplete, true);
+    assert.ok(outcome.allPrWarnings.some(w => w.includes('write access could not be verified')));
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'neutral');
+  });
+
+  // The same question asked of the pull request description rather than a
+  // comment: the resolver answers null, and null is not "no".
+  test('an [allow cherry-pick] in the description from an unresolvable author leaves the marker unchecked', async () => {
+    const ctx = ctxFor({
+      isBackportPr: true,
+      baseBranch: 'openwrt-24.10',
+      bodyRequestsCherryPickBypass: true,
+      isAuthorMaintainer: async () => null
+    });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.strictEqual(outcome.allFormalityErrors.length, 0);
+    assert.strictEqual(outcome.formalityChecksIncomplete, true);
+    assert.ok(outcome.allPrWarnings.some(w => w.includes('write access could not be verified')));
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'neutral');
+  });
+
+  test('a backport with no override at all still fails the cherry-pick rule', async () => {
+    const ctx = ctxFor({ isBackportPr: true, baseBranch: 'openwrt-24.10' });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.ok(outcome.allFormalityErrors.some(e => e.includes('cherry picked from commit')));
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'failure');
+  });
+
+  test('an [allow cherry-pick] override whose author is confirmed is honoured', async () => {
+    const ctx = ctxFor({
+      isBackportPr: true,
+      baseBranch: 'openwrt-24.10',
+      getCommentsScanWithRetry: async () => cleanScan({ hasCherryPickBypassComment: true })
+    });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.strictEqual(outcome.allFormalityErrors.length, 0);
+    assert.strictEqual(outcome.formalityChecksIncomplete, false);
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'success');
+  });
+});

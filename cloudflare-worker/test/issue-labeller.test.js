@@ -330,6 +330,25 @@ describe('handleIssueLabeller', () => {
     assert.ok(result.comments[0].includes('`24.10.99`'));
   });
 
+  test('reaches no verdict at all when the tag lookup goes unanswered', async (t) => {
+    const realFetch = globalThis.fetch;
+    const realWarn = console.warn;
+    const realError = console.error;
+    t.after(() => { globalThis.fetch = realFetch; console.warn = realWarn; console.error = realError; });
+    globalThis.fetch = async () => new Response('upstream hiccup', { status: 500 });
+    console.warn = () => {};
+    console.error = () => {};
+
+    // Same release as the test above, except that GitHub never says whether
+    // v24.10.0 is there. A verdict built on that silence calls a shipped
+    // release invalid, so there must be no verdict.
+    const data = makeIssueData(['to-triage', 'bug', 'bug-report'], '### OpenWrt Release\n\n24.10.0');
+    await assert.rejects(
+      () => handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt'),
+      /existence is unknown/
+    );
+  });
+
   test('labels stable-branch snapshot without tag existence check', async (t) => {
     const realFetch = globalThis.fetch;
     t.after(() => { globalThis.fetch = realFetch; });

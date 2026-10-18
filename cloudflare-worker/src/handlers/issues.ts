@@ -51,6 +51,16 @@ export async function handleIssuesEvent(
   if (configRes?.error) {
     throw new Error(`Failed to fetch repository config for issue labeller: ${configRes.error.message}`);
   }
+  // A field a partial GraphQL error emptied is not an absent file. Taken for
+  // one, the defaults apply and `enable_issue_labeller` reads false, so a
+  // repository that enabled the labeller is answered "disabled" and its issue
+  // is never looked at. The pull request path parks that uncertainty on a
+  // neutral check run; an issues event has no check run to carry it, so the
+  // delivery fails instead, which leaves the issue untouched and the reason
+  // in the delivery log for a redelivery.
+  if (configRes?.failed) {
+    throw new Error(`Repository config .github/formalities.json in ${repoFullname} was lost to a partial GraphQL error, so the issue labeller cannot tell whether it is enabled`);
+  }
 
   const { config: issueConfig, error: configError } = parseAndValidateConfig(configRes?.content ?? null);
   if (configError) {
@@ -62,6 +72,14 @@ export async function handleIssuesEvent(
   }
 
   const labellerFile = configFiles.get('labeller');
+  // The fallback rules are openwrt/openwrt's own, which is the right answer
+  // for a repository that ships no .github/issue-labeller.yml and the wrong
+  // one for a repository whose file was merely lost in transit: it would be
+  // labelled, and told it is invalid, by rules it never wrote. Only an
+  // unmarked empty result says the file is not there.
+  if (labellerFile?.failed) {
+    throw new Error(`Issue labeller rules .github/issue-labeller.yml in ${repoFullname} were lost to a partial GraphQL error, so this issue cannot be labelled from them`);
+  }
   const labellerConfig = (labellerFile && !labellerFile.error && labellerFile.content)
     ? (parseIssueLabellerYaml(labellerFile.content) || DEFAULT_ISSUE_LABELLER_CONFIG)
     : DEFAULT_ISSUE_LABELLER_CONFIG;
@@ -69,8 +87,8 @@ export async function handleIssuesEvent(
   // Labelling is this handler's own job, so the read that decides the labels
   // shares the fate of the writes that apply them: 502, the code this worker
   // answers a GitHub-side failure with, rather than the 500 the entrypoint
-  // gives an unexpected one. Nothing in the read throws today; the scope is
-  // what keeps a future lookup failure from reading as a worker bug.
+  // gives an unexpected one. An existence query GitHub left unanswered throws
+  // through here, which is what keeps it from being read as a worker bug.
   try {
     const labelling = await handleIssueLabeller(payload, token, labellerConfig, repoFullname, countAttempt);
     const currentIssueLabels = new Set((payload.issue.labels || []).map(l => (typeof l === "string" ? l : l.name).toLowerCase()));

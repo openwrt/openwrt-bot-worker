@@ -13,10 +13,30 @@ export interface CommentScanResult {
   // answer: reading the second as the first fails a pull request a maintainer
   // already waved through.
   incomplete: boolean;
+  // Set when an override command was found but GitHub would not say whether
+  // its author has write access. Access is never assumed, so the override is
+  // not honoured - and the rule it waives cannot be called violated either,
+  // because the evidence that would waive it is exactly what is missing. Each
+  // rule carries its own flag, so an unverifiable `[allow branch]` leaves the
+  // cherry-pick rule alone. Kept off `incomplete`: the thread itself was read
+  // in full, and re-reading it would spend the reserve on the same answer.
+  branchOverrideUnverified: boolean;
+  cherryPickOverrideUnverified: boolean;
+}
+
+export function emptyCommentScan(): CommentScanResult {
+  return {
+    hasCherryPickBypassComment: false,
+    hasBranchBypassComment: false,
+    existingCommentId: null,
+    incomplete: false,
+    branchOverrideUnverified: false,
+    cherryPickOverrideUnverified: false
+  };
 }
 
 export function incompleteCommentScan(): CommentScanResult {
-  return { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null, incomplete: true };
+  return { ...emptyCommentScan(), incomplete: true };
 }
 
 // Reads one list of issue comments for the three facts a run needs: the id
@@ -25,9 +45,9 @@ export function incompleteCommentScan(): CommentScanResult {
 // the paged REST listing below.
 export async function scanCommentList(
   comments: Array<any>,
-  isMaintainerUser: (user: GitHubUser | null | undefined, association: string | null | undefined) => Promise<boolean>,
+  isMaintainerUser: (user: GitHubUser | null | undefined, association: string | null | undefined) => Promise<boolean | null>,
   appId: number | null,
-  scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null, incomplete: false }
+  scan: CommentScanResult = emptyCommentScan()
 ): Promise<CommentScanResult> {
   for (const c of comments) {
     if ((c.viewer_did_author === true || isOwnAppComment(c, appId)) && c.body?.startsWith('## Formality Check:')) {
@@ -37,9 +57,15 @@ export async function scanCommentList(
     const hasCherryPickPattern = ALLOW_CHERRY_PICK_PATTERN.test(body);
     const hasBranchPattern = ALLOW_BRANCH_PATTERN.test(body);
 
-    if ((hasCherryPickPattern || hasBranchPattern) && await isMaintainerUser(c.user, c.author_association)) {
-      if (hasCherryPickPattern) scan.hasCherryPickBypassComment = true;
-      if (hasBranchPattern) scan.hasBranchBypassComment = true;
+    if (hasCherryPickPattern || hasBranchPattern) {
+      const isMaintainer = await isMaintainerUser(c.user, c.author_association);
+      if (isMaintainer === true) {
+        if (hasCherryPickPattern) scan.hasCherryPickBypassComment = true;
+        if (hasBranchPattern) scan.hasBranchBypassComment = true;
+      } else if (isMaintainer === null) {
+        if (hasCherryPickPattern) scan.cherryPickOverrideUnverified = true;
+        if (hasBranchPattern) scan.branchOverrideUnverified = true;
+      }
     }
   }
   return scan;
@@ -57,12 +83,12 @@ export async function scanPrComments(
   prNumber: number,
   token: string,
   onCall: (attempt: number) => boolean,
-  isMaintainerUser: (user: GitHubUser | null | undefined, association: string | null | undefined) => Promise<boolean>,
+  isMaintainerUser: (user: GitHubUser | null | undefined, association: string | null | undefined) => Promise<boolean | null>,
   appId: number | null,
   hasHeadroom: () => boolean = () => true
 ): Promise<CommentScanResult> {
   let page = 1;
-  const scan: CommentScanResult = { hasCherryPickBypassComment: false, hasBranchBypassComment: false, existingCommentId: null, incomplete: false };
+  const scan: CommentScanResult = emptyCommentScan();
 
   while (true) {
     const url = `https://api.github.com/repos/${repoFullname}/issues/${prNumber}/comments?per_page=100&page=${page}`;
