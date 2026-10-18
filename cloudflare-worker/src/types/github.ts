@@ -44,7 +44,7 @@ export interface PullRequestData {
   commits?: number;
   author_association?: string;
   user?: GitHubUser;
-  base: { ref: string; sha: string; [key: string]: unknown };
+  base: { ref: string; sha: string; repo?: { full_name?: string; default_branch?: string }; [key: string]: unknown };
   head: { ref: string; sha: string; repo?: { full_name?: string }; [key: string]: unknown };
   labels?: Array<string | { name: string }>;
   [key: string]: unknown;

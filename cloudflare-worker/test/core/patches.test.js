@@ -469,3 +469,63 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
     });
   });
 });
+
+// The release-branch check reads the package Makefiles the patches add and
+// remove from here, and must get the same paths whichever way the pull
+// request was read.
+describe('the package Makefiles a pull request adds and removes', () => {
+  const shaOf = (i) => String(i + 1).padStart(40, 'b');
+  const add = (path, eol = '\n') => [`diff --git a/${path} b/${path}`, 'new file mode 100644', '--- /dev/null', `+++ b/${path}`, '@@ -0,0 +1 @@', '+PKG_NAME:=x', ''].join(eol);
+  const remove = (path) => [`diff --git a/${path} b/${path}`, 'deleted file mode 100644', `--- a/${path}`, '+++ /dev/null', '@@ -1 +0,0 @@', '-PKG_NAME:=x', ''].join('\n');
+  const part = (i, diff) => `From ${shaOf(i)} Mon Sep 17 00:00:00 2001\nFrom: Dev <dev@example.com>\nSubject: [PATCH] change ${i}\n\n---\n${diff}`;
+
+  const contextFor = (diffs, changedFiles) => {
+    const commits = diffs.map((_, i) => ({
+      sha: shaOf(i),
+      html_url: `https://github.com/openwrt/packages/commit/${shaOf(i)}`,
+      parents: [{ sha: 'p' }],
+      changed_files: changedFiles,
+      commit: { message: `change ${i}` }
+    }));
+    const raw = diffs.map((d, i) => part(i, d)).join('');
+    return {
+      commits,
+      client: {
+        budget: { limit: 45, used: 5, reserve: 15 },
+        hasHeadroom: () => true,
+        trackedApiCall: async () => ({ code: 404, raw: '' }),
+        optionalApiCall: async () => ({ code: 404, raw: '' })
+      },
+      fileBatchLoader: { getRefSource: () => undefined, hasRefSource: () => false, setRefSource: () => {} },
+      isBackportPr: false,
+      repoFullname: 'openwrt/packages',
+      prData: { url: 'https://api.github.com/repos/openwrt/packages/pulls/1' },
+      startPrPatchFetch: async () => ({ code: 200, raw, data: null, headers: { get: () => null } })
+    };
+  };
+
+  // python-libpass replaced python-passlib, in two commits, and a rebase
+  // left the addition in twice.
+  const diffs = [
+    add('lang/python/python-libpass/Makefile'),
+    remove('lang/python/python-passlib/Makefile'),
+    add('lang/python/python-libpass/Makefile')
+  ];
+
+  test('collects the same sets commit by commit and from the whole diff', async () => {
+    const perCommit = await resolvePatchesAndCommits(contextFor(diffs, 1));
+    assert.strictEqual(perCommit.usePrWidePatch, false);
+    const padded = [...diffs, ...Array.from({ length: 17 }, (_, i) => `diff --git a/net/x/files/f${i} b/net/x/files/f${i}\n--- a/net/x/files/f${i}\n+++ b/net/x/files/f${i}\n`)];
+    const prWide = await resolvePatchesAndCommits(contextFor(padded, 2));
+    assert.strictEqual(prWide.usePrWidePatch, true);
+    for (const result of [perCommit, prWide]) {
+      assert.deepStrictEqual([...result.addedPackageMakefiles], ['lang/python/python-libpass/Makefile']);
+      assert.deepStrictEqual([...result.removedPackageMakefiles], ['lang/python/python-passlib/Makefile']);
+    }
+  });
+
+  test('keeps no line end in a path from a CRLF patch', async () => {
+    const result = await resolvePatchesAndCommits(contextFor([add('net/foo/Makefile', '\r\n'), add('net/bar/Makefile')], null));
+    assert.deepStrictEqual([...result.addedPackageMakefiles].sort(), ['net/bar/Makefile', 'net/foo/Makefile']);
+  });
+});

@@ -7,6 +7,7 @@ import {
   validatePkgHashes,
   validatePkgSourcePins,
   validateDeviceTrees,
+  validateNewPackageOnStable,
   validateUciConfigs,
   groupReleaseErrors,
   getFastPkgRoot,
@@ -22,6 +23,7 @@ import {
   MBOX_ENVELOPE_PATTERN
 } from '../../core/patch-utils.ts';
 import { CHERRY_PICK_MARKER } from '../../core/policy.ts';
+import { graphqlPathHistoryCounts } from '../../github.js';
 import type { PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult, CommitDetail } from './patches.ts';
 
@@ -413,6 +415,33 @@ export async function runValidations(
       };
     });
 
+  // A pull request's own question, answered once for all of its commits. The
+  // reads it needs go out with the batch above; the history query is the one
+  // request of its own, and only once a release branch and an added package
+  // root call for it.
+  const newPackagePromise = validateNewPackageOnStable(
+    { added: patchesResult.addedPackageMakefiles || [], removed: patchesResult.removedPackageMakefiles || [] },
+    { base: baseBranch, default: ctx.prData?.base?.repo?.default_branch || null },
+    config,
+    fetchFileContentAtHead,
+    {
+      hasHeadroom: () => typeof ctx.client?.hasHeadroom === 'function' && ctx.client.hasHeadroom(),
+      probe: (paths: string[]) => graphqlPathHistoryCounts(ctx.token, repoFullname, paths, ctx.client.countOptionalAttempt)
+    }
+  ).catch((e: any) => {
+    console.error(`Failed to check for new packages on a release branch: ${e.message}`);
+    return {
+      successes: [] as string[],
+      errors: [] as string[],
+      notices: [`Could not check whether this pull request adds a package the default branch does not carry: ${e.message}. The release-branch rule was left unchecked rather than reported as a failure.`],
+      summary: null as string | null,
+      incomplete: true
+    };
+  });
+  // Reported with the pull request's other targeting rule, above the commit
+  // blocks a long series pushes past the cut.
+  const newPackageAt = formalityOutputText.length;
+
   for (const [commitIndex, item] of commitDetails.entries()) {
     const { sha, html_url, fullCommit } = item;
     const commitMsgLines = (fullCommit?.commit?.message || '').split("\n");
@@ -588,6 +617,30 @@ export async function runValidations(
         }
         patchesOutputText += "\n";
       }
+    }
+  }
+
+  const reportNewPackage = await newPackagePromise;
+  if (reportNewPackage.incomplete) formalityChecksIncomplete = true;
+  if (reportNewPackage.successes.length > 0 || reportNewPackage.errors.length > 0 || reportNewPackage.notices.length > 0) {
+    // Graded like the release audit: 'warning' reports, `true`/'error' fails.
+    const isWarning = config.check_new_package_on_stable === 'warning';
+    let section = `#### New Package on a Release Branch:\n`;
+    reportNewPackage.successes.forEach(s => { section += `  ${s}\n`; });
+    reportNewPackage.notices.forEach(n => { section += `  ⚠️ ${n}\n`; });
+    if (reportNewPackage.summary) {
+      section += `${isWarning ? '  ⚠️ Warning: ' : '  ❌ '}${reportNewPackage.summary}\n`;
+    }
+    section += '\n';
+    formalityOutputText = formalityOutputText.slice(0, newPackageAt) + section + formalityOutputText.slice(newPackageAt);
+    // One entry per pull request: what could not be checked, then the finding
+    // when it only warns.
+    const warned = [...reportNewPackage.notices, ...(isWarning ? reportNewPackage.errors : [])];
+    if (warned.length > 0) {
+      allPrWarnings.push(`**New Package on a Release Branch**:\n` + warned.map(w => `- ⚠️ ${w}`).join('\n'));
+    }
+    if (!isWarning && reportNewPackage.errors.length > 0) {
+      allFormalityErrors.push(`**New Package on a Release Branch**:\n` + reportNewPackage.errors.map(e => `- ${e}`).join('\n'));
     }
   }
 

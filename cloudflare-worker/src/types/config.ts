@@ -55,6 +55,9 @@ export interface FormalitiesConfig {
   // Package Source Pin Check features
   check_pkg_source_pin?: false | 'warning' | 'error' | 'disabled';
 
+  // New Package on a Release Branch Check features
+  check_new_package_on_stable?: boolean | 'warning' | 'error' | 'disabled';
+
   // Identity / Account linking Check features
   require_linked_github_account?: boolean | 'warning' | 'error' | 'disabled';
 
@@ -119,7 +122,8 @@ const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_patch_refresh: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_release: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_hash: new Set([false, 'warning', 'error', 'disabled']),
-  check_pkg_source_pin: new Set([false, 'warning', 'error', 'disabled'])
+  check_pkg_source_pin: new Set([false, 'warning', 'error', 'disabled']),
+  check_new_package_on_stable: new Set([true, false, 'warning', 'error', 'disabled'])
 };
 
 const STRING_ARRAY_FIELDS = new Set([

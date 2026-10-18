@@ -37,6 +37,10 @@ export interface ResolvedPatchesResult {
   commitDetailsIncomplete: boolean;
   packageState: { isNewPackage: boolean; isDroppedPackage: boolean };
   packageStateKnown: boolean;
+  // Package Makefiles the scanned patches add or remove (see
+  // collectPackageMakefiles), trimmed and deduplicated.
+  addedPackageMakefiles: Set<string>;
+  removedPackageMakefiles: Set<string>;
   splitCommitPatches?: Map<string, string>;
 }
 
@@ -283,13 +287,21 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     : commitDetails.map(item => item.commitPatch);
   let packageStateKnown = false;
   const packageState = { isNewPackage: false, isDroppedPackage: false };
+  // Unions over whichever patches were scanned, so one pull request gives the
+  // same paths audited commit by commit and as one diff.
+  const addedPackageMakefiles = new Set<string>();
+  const removedPackageMakefiles = new Set<string>();
   for (const patch of scannedPatches) {
     if (!patch) continue;
     packageStateKnown = true;
-    if (collectPackageMakefiles(patch, 'added').length > 0) {
+    const added = collectPackageMakefiles(patch, 'added');
+    const removed = collectPackageMakefiles(patch, 'removed');
+    for (const path of added) addedPackageMakefiles.add(path);
+    for (const path of removed) removedPackageMakefiles.add(path);
+    if (added.length > 0) {
       packageState.isNewPackage = true;
     }
-    if (collectPackageMakefiles(patch, 'removed').length > 0) {
+    if (removed.length > 0) {
       packageState.isDroppedPackage = true;
     }
   }
@@ -304,6 +316,8 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     commitDetailsIncomplete,
     packageState,
     packageStateKnown,
+    addedPackageMakefiles,
+    removedPackageMakefiles,
     splitCommitPatches
   };
 }

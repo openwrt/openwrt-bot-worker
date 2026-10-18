@@ -1,6 +1,6 @@
 import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, graphqlFetchRepoLabels, graphqlCheckExistence, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, wasAttemptDeclined, MAX_ATTEMPTS, GRAPHQL_URL } from '../src/github.js';
+import { githubApiCall, graphqlBatchFetchFiles, graphqlFetchRepoSetup, graphqlFetchRepoLabels, graphqlCheckExistence, graphqlPathHistoryCounts, fetchUserRepoPermission, restCommitFromGraphql, restCommentFromGraphql, wasAttemptDeclined, MAX_ATTEMPTS, GRAPHQL_URL } from '../src/github.js';
 
 describe('graphqlBatchFetchFiles', { concurrency: 1 }, () => {
   let originalFetch;
@@ -1458,5 +1458,79 @@ describe('MAX_ATTEMPTS', { concurrency: 1 }, () => {
     assert.strictEqual(res.code, 500);
     assert.strictEqual(served, MAX_ATTEMPTS);
     assert.strictEqual(charged, served, 'and every one of them is charged');
+  });
+});
+
+// The one question the release-branch check asks: how often the default
+// branch's history touched each path. A zero there is a finding, so nothing
+// that is not GitHub's answer may come back as one.
+describe('graphqlPathHistoryCounts', { concurrency: 1 }, () => {
+  let originalFetch;
+  before(() => { originalFetch = globalThis.fetch; });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  const quietly = async (fn) => {
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    console.warn = () => {};
+    console.error = () => {};
+    try { return await fn(); } finally { console.warn = originalWarn; console.error = originalError; }
+  };
+  const answer = (commit, branch = 'master') => new Response(JSON.stringify({ data: { repository: { defaultBranchRef: { name: branch }, object: commit } } }), { status: 200 });
+
+  test('asks every path in one aliased query against HEAD and returns the counts', async () => {
+    const requests = [];
+    globalThis.fetch = async (url, options) => {
+      requests.push({ url, body: JSON.parse(options.body) });
+      return answer({ c0: { totalCount: 0 }, c1: { totalCount: 3 } }, 'main');
+    };
+    const res = await graphqlPathHistoryCounts('token', 'openwrt/packages', ['net/51ddns-agent/Makefile', 'lang/perl-future/Makefile'], () => true);
+    assert.strictEqual(requests.length, 1);
+    assert.strictEqual(requests[0].url, GRAPHQL_URL);
+    const { query, variables } = requests[0].body;
+    assert.deepStrictEqual(variables, { o: 'openwrt', n: 'packages', p0: 'net/51ddns-agent/Makefile', p1: 'lang/perl-future/Makefile' });
+    assert.match(query, /defaultBranchRef \{ name \}/);
+    assert.match(query, /object\(expression: "HEAD"\)/);
+    assert.match(query, /c0: history\(path: \$p0, first: 1\) \{ totalCount \}/);
+    assert.match(query, /c1: history\(path: \$p1, first: 1\) \{ totalCount \}/);
+    assert.strictEqual(res.defaultBranch, 'main');
+    assert.deepStrictEqual([...res.counts], [['net/51ddns-agent/Makefile', 0], ['lang/perl-future/Makefile', 3]]);
+  });
+
+  test('sends nothing for no paths', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return answer({}); };
+    const res = await graphqlPathHistoryCounts('token', 'openwrt/packages', [], () => true);
+    assert.strictEqual(served, 0);
+    assert.strictEqual(res.counts.size, 0);
+  });
+
+  test('raises on an HTTP failure GitHub kept answering after the retries', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return new Response('bad gateway', { status: 502 }); };
+    await assert.rejects(quietly(() => graphqlPathHistoryCounts('token', 'openwrt/packages', ['net/foo/Makefile'], () => true)),
+      /GraphQL path history query for openwrt\/packages was not answered \(HTTP 502: bad gateway\)/);
+    assert.strictEqual(served, MAX_ATTEMPTS);
+  });
+
+  test('raises when an alias is missing from the answer, rather than reading it as zero', async () => {
+    globalThis.fetch = async () => answer({ c0: { totalCount: 4 } });
+    await assert.rejects(quietly(() => graphqlPathHistoryCounts('token', 'openwrt/packages', ['net/a/Makefile', 'net/b/Makefile'], () => true)),
+      /returned no count for 'net\/b\/Makefile'/);
+  });
+
+  test('raises when a partial error took the answer away', async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: { repository: null }, errors: [{ message: 'timeout' }] }), { status: 200 });
+    await assert.rejects(quietly(() => graphqlPathHistoryCounts('token', 'openwrt/packages', ['net/a/Makefile'], () => true)), /was not answered \(HTTP 200/);
+    globalThis.fetch = async () => answer(null);
+    await assert.rejects(quietly(() => graphqlPathHistoryCounts('token', 'openwrt/packages', ['net/a/Makefile'], () => true)), /was not answered/);
+  });
+
+  test('raises, naming the budget, when the attempt is declined', async () => {
+    let served = 0;
+    globalThis.fetch = async () => { served++; return answer({ c0: { totalCount: 0 } }); };
+    await assert.rejects(quietly(() => graphqlPathHistoryCounts('token', 'openwrt/packages', ['net/a/Makefile'], () => false)),
+      /was not sent \(no request budget left\)/);
+    assert.strictEqual(served, 0);
   });
 });

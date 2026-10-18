@@ -19,6 +19,8 @@ Focuses on Git history hygiene, developer metadata constraints, and layout stand
 > [!TIP]
 > Maintainers can bypass this check by posting a pull request comment containing `[allow cherry-pick]` (or `[allow-cherry-pick]`). Alternatively, if the PR author is a maintainer, they can also include `[allow cherry-pick]` in the PR description. See [Who counts as a maintainer](#who-counts-as-a-maintainer).
 
+*   **New Package on a Release Branch (`check_new_package_on_stable`):** On a pull request whose base is a release branch (`openwrt-XX.YY`, `lede-17.01`, `for-XX.YY`), resolves every package Makefile it adds to its package root and asks the default branch, in one GraphQL lookup, whether that path has ever existed in its history. The roots that never did are reported: release branches carry security and bug-fix backports only, and a new package lands on the default branch first. A package the default branch has ever carried, including one it later moved or dropped, is never reported, and neither is a Makefile below a package root. The lookup covers the first 12 added roots and says so when there are more. The default-branch pull request may still be open beside this one, which the lookup cannot see, so this is a **warning by default** — set `"check_new_package_on_stable": "error"` to enforce it.
+
 *   **Merge Commit Elimination:** Rejects merge commits inside the PR tracking chain to preserve a clean linear history.
 *   **Identity Integrity:** Validates author and committer name formats and strictly blocks generic GitHub `noreply.github.com` email addresses.
 *   **Linked GitHub Account:** Verifies that the commit author email address is registered and verified on a GitHub account, linking the commit to a valid GitHub username. Can be downgraded to a non-blocking warning or disabled entirely, see `require_linked_github_account` below.
@@ -155,6 +157,7 @@ Some configuration keys offer advanced options:
 *   `check_binary_files`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable. Rejects a file git carries as binary, in any encoding, since such a file reaches none of the content checks and cannot be reviewed in a diff. Deleting one is always allowed.
 *   `check_pkg_release`: Can be `"warning"`, `"error"`, or `false` to disable.
 *   `check_pkg_hash`: `"warning"` (default) reports checksum findings without blocking, `"error"` enforces them, `false` disables the check. While it is enabled, a checksum value the build cannot use is an error at either level.
+*   `check_new_package_on_stable`: Can be `"warning"` (default, non-blocking), `"error"`/`true` (hard error), or `false`/`"disabled"` to disable. Only applies to pull requests whose base branch is a release branch; a backport of a package the default branch already carries is never reported.
 *   `check_pkg_source_pin`: `"warning"` (default) reports `PKG_SOURCE_DATE`/`PKG_SOURCE_VERSION` shape findings without blocking, `"error"` enforces them, `false` disables the check.
 *   `check_dts_checklist`: `"warning"` (default) reports DTS checklist findings without blocking, `"error"` enforces them, `false` disables the check. Only device trees the pull request adds are checked.
 *   `require_linked_github_account`: Can be `true` (default, hard error), `"warning"` (non-blocking), or `false`/`"disabled"` to disable.
@@ -218,6 +221,7 @@ Here is a comprehensive example containing all available toggle options:
   "check_pkg_release": "warning",
   "check_pkg_hash": "warning",
   "check_pkg_source_pin": "warning",
+  "check_new_package_on_stable": "warning",
   "require_linked_github_account": true,
   "check_openwrt_spelling": true,
   "enable_stale_bot": false,

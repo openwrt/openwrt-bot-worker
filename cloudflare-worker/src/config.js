@@ -63,6 +63,11 @@ export const DEFAULT_CONFIG = {
   // system accepts every value this check reports.
   check_pkg_source_pin: 'warning',
 
+  // New package on a release branch. 'warning' by default: openwrt/packages'
+  // ban is overruled in practice (12 new packages merged into openwrt-24.10
+  // as backports), and openwrt/openwrt has no such rule in the repository.
+  check_new_package_on_stable: 'warning',
+
   // Identity / Account linking Check features
   require_linked_github_account: true,
 

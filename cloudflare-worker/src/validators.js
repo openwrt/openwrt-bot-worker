@@ -1,5 +1,6 @@
 import { SPDX_LICENSE_IDS, SPDX_EXCEPTION_IDS, SPDX_DEPRECATED } from './spdx-licenses.js';
 import { getChangedFilesFromPatch as parseChangedFiles, getPresentFilesFromPatch as parsePresentFiles, splitMboxPatch } from './core/patch-utils.ts';
+import { isStableBaseBranch } from './core/policy.ts';
 export { splitMboxPatch };
 
 // The grammar of a commit subject prefix: a package name (`bash`, `lua5.4`),
@@ -3249,30 +3250,40 @@ export function isHiddenOrSpecial(filePath) {
   return filePath.split('/').some(part => part.startsWith('.'));
 }
 
-export function getFastPkgRoot(filePath) {
-  const skipDirs = new Set(['patches', 'files', 'src', 'images', '.github', '.git',
-    'root', 'htdocs', 'luasrc', 'ucode', 'po']);
-  const isSkippableDir = (name) =>
-    skipDirs.has(name) ||
+// getFastPkgRoot's tables, built once: the release-branch check runs it for
+// every package Makefile a pull request adds, and building them per call was
+// most of what a call cost.
+const FAST_ROOT_SKIP_DIRS = new Set(['patches', 'files', 'src', 'images', '.github', '.git',
+  'root', 'htdocs', 'luasrc', 'ucode', 'po']);
+const FAST_ROOT_CATEGORIES = new Set([
+  'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
+  'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
+]);
+const FAST_ROOT_NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua', 'golang']);
+
+function fastRootSkippableDir(name) {
+  return FAST_ROOT_SKIP_DIRS.has(name) ||
     name.startsWith('.') ||
     name.startsWith('patches-') ||
     name.startsWith('files-');
-  const CATEGORIES = new Set([
-    'utils', 'net', 'libs', 'lang', 'kernel', 'firmware', 'devel', 'boot',
-    'system', 'multimedia', 'mail', 'sound', 'network', 'frameworks', 'games'
-  ]);
-  const NESTED_LANGS = new Set(['python', 'perl', 'php', 'ruby', 'lua', 'golang']);
+}
 
-  const isCategoryLevel = (parts) => {
-    if (parts.length === 0) return true;
-    if (parts.length === 1 && CATEGORIES.has(parts[0])) return true;
-    if (parts[0] === 'package' && parts.length === 2 && CATEGORIES.has(parts[1])) return true;
-    if (parts.length === 2 && CATEGORIES.has(parts[1])) return true;
-    return false;
-  };
+function fastRootCategoryLevel(parts) {
+  if (parts.length === 0) return true;
+  if (parts.length === 1 && FAST_ROOT_CATEGORIES.has(parts[0])) return true;
+  if (parts[0] === 'package' && parts.length === 2 && FAST_ROOT_CATEGORIES.has(parts[1])) return true;
+  if (parts.length === 2 && FAST_ROOT_CATEGORIES.has(parts[1])) return true;
+  return false;
+}
 
-  const isPayloadDir = (dirParts) =>
-    isSkippableDir(dirParts[dirParts.length - 1]) && !isCategoryLevel(dirParts.slice(0, -1));
+function fastRootPayloadDir(dirParts) {
+  return fastRootSkippableDir(dirParts[dirParts.length - 1]) && !fastRootCategoryLevel(dirParts.slice(0, -1));
+}
+
+export function getFastPkgRoot(filePath) {
+  const CATEGORIES = FAST_ROOT_CATEGORIES;
+  const NESTED_LANGS = FAST_ROOT_NESTED_LANGS;
+  const isPayloadDir = fastRootPayloadDir;
 
   let parts = filePath.split('/');
   if (parts.length > 0) {
@@ -5248,6 +5259,181 @@ export async function validateDeviceTrees(commitDetails, CONFIG, fetchFileConten
   }
 
   return { errors, warnings, notices, successes, notes, incomplete };
+}
+
+// How many package roots one run asks the default branch about. A path the
+// branch never had walks its whole history, and that is the slow answer: 12
+// such paths took GitHub 2.2 s on openwrt/openwrt, 25 took 3.8 s.
+export const NEW_PACKAGE_PROBE_CAP = 12;
+// The largest package Makefile in the OpenWrt trees is about 61 KB. Twice
+// that is the most one added Makefile is read for: findPkgRoot's scan is
+// linear but not free, and twelve contributor-sized files of anything must
+// not cost more CPU than the whole invocation has.
+export const NEW_PACKAGE_HEAD_CHARS = 128 * 1024;
+
+// No OpenWrt layout keeps a package root more than four directories deep
+// (package/network/services/hostapd); six leaves room. A deeper Makefile is a
+// sub-Makefile, and the root helpers walk a path's segments once per segment,
+// which on a path a pull request can make kilobytes long is the whole budget.
+const NEW_PACKAGE_ROOT_MAX_DEPTH = 6;
+function tooDeepForPackageRoot(path) {
+  let at = -1;
+  for (let depth = 0; depth <= NEW_PACKAGE_ROOT_MAX_DEPTH; depth++) {
+    at = path.indexOf('/', at + 1);
+    if (at === -1) return false;
+  }
+  return true;
+}
+
+// The rule is openwrt/packages' CONTRIBUTING.md, quoted, and the wiki's order
+// (https://openwrt.org/submitting-patches#patch_backports): default branch
+// first, then the backport. Worded as "not there yet", because the one
+// legitimate shape this check cannot see is the default-branch pull request
+// still open beside this one.
+function newPackageFinding(roots, branch) {
+  const one = roots.length === 1;
+  const head = one
+    ? `This pull request adds a package that has never existed on \`${branch}\`: \`${roots[0]}\`. `
+    : `This pull request adds packages that have never existed on \`${branch}\`:\n${roots.map(r => `  - \`${r}\``).join('\n')}\n\n  `;
+  return `${head}Release branches carry backports only — openwrt/packages' \`CONTRIBUTING.md\` asks contributors to "ONLY cherry-pick or commit security and bug-fixes to these branches" and to "NOT add new packages" here, and the documented order is to land the change on \`${branch}\` first and then propose it for the release branch (\`git cherry-pick --signoff -x <commit>\`). If the \`${branch}\` pull request for ${one ? 'this package' : 'these packages'} is already open, link it here and treat this as a note rather than a finding: this check only asks whether the path exists in \`${branch}\`'s history yet.`;
+}
+
+// A package the pull request adds to a release branch that the default branch
+// has never carried. `added`/`removed` are the package Makefiles the patches
+// add and remove (collectPackageMakefiles). `lookup.probe(paths)` answers
+// { defaultBranch, counts } for the default branch's history and raises when
+// it could not; `lookup.hasHeadroom()` says whether the budget allows it.
+// Returns ungraded findings in `errors` (the caller grades them by
+// check_new_package_on_stable), the one-line form of them in `summary`, and
+// the gaps in `notices`.
+export async function validateNewPackageOnStable(makefiles, branches, CONFIG, fetchFileContentAtHead, lookup) {
+  const successes = [];
+  const errors = [];
+  const notices = [];
+  let summary = null;
+  let incomplete = false;
+  const result = () => ({ successes, errors, notices, summary, incomplete });
+
+  const level = CONFIG.check_new_package_on_stable;
+  if (!level || level === 'disabled') return result();
+  const baseBranch = branches?.base || '';
+  if (!isStableBaseBranch(baseBranch)) return result();
+  // A fork whose default branch is the release branch has nowhere else to
+  // land a package first.
+  if (branches?.default && branches.default === baseBranch) return result();
+
+  // Added and removed again, or removed and added again, is no addition: the
+  // pull request's whole diff would show neither, and in per-commit mode the
+  // two halves arrive in different commits.
+  const removed = new Set(makefiles?.removed || []);
+  const dirs = new Set();
+  const unknownLayout = new Set();
+  for (const path of makefiles?.added || []) {
+    if (removed.has(path) || tooDeepForPackageRoot(path)) continue;
+    const dir = path.slice(0, -'/Makefile'.length);
+    const fast = getFastPkgRoot(path);
+    // null is a hidden or build-infrastructure path; a root that is not the
+    // Makefile's own directory makes it a sub-Makefile (net/foo/src/Makefile).
+    if (fast === null || (typeof fast === 'string' && fast !== dir)) continue;
+    dirs.add(dir);
+    if (fast === undefined) unknownLayout.add(dir);
+  }
+  if (dirs.size === 0) return result();
+
+  const sorted = [...dirs].sort();
+  const checked = sorted.slice(0, NEW_PACKAGE_PROBE_CAP);
+  const defaultLabel = branches?.default ? `'${branches.default}'` : 'the default branch';
+  if (sorted.length > checked.length) {
+    notices.push(`This pull request adds ${sorted.length} package Makefiles; only the first ${checked.length} were checked against ${defaultLabel}, so the rest were left unchecked.`);
+    incomplete = true;
+  }
+
+  // findPkgRoot settles the layouts the path alone does not (luci's
+  // applications/<name>, the routing feed's top-level <name>/) by reading
+  // Makefiles. Only the added Makefile itself is served to it: its answer is
+  // the Makefile's own directory exactly when that Makefile marks a package,
+  // and the parents it would probe next cannot change that. A read that came
+  // back empty leaves the path unresolved - the file is at the head, so empty
+  // is a read that failed, not a Makefile without a package in it.
+  const resolved = await Promise.all(checked.map(async (dir) => {
+    if (!unknownLayout.has(dir)) return { dir, root: true };
+    const own = `${dir}/Makefile`;
+    let unread = false;
+    const fetchOwn = async (path) => {
+      if (path !== own) return null;
+      // Asked in the same tick the other audits ask theirs, so the batching
+      // loader folds this read into their request instead of one of its own.
+      let pending;
+      try {
+        pending = Promise.resolve(fetchFileContentAtHead(path));
+      } catch {
+        pending = Promise.resolve(null);
+      }
+      const content = await pending.catch(() => null);
+      if (typeof content !== 'string') unread = true;
+      // Too large to be a package Makefile anyone writes: not read, so the
+      // rule is left unchecked here rather than judged on a partial scan.
+      if (typeof content === 'string' && content.length > NEW_PACKAGE_HEAD_CHARS) {
+        oversized = true;
+        return null;
+      }
+      return content;
+    };
+    let oversized = false;
+    const root = await findPkgRoot(own, fetchOwn, Object.create(null));
+    if (root === dir) return { dir, root: true };
+    return { dir, root: false, unread: unread || oversized, oversized };
+  }));
+
+  const roots = [];
+  for (const r of resolved) {
+    if (r.root) {
+      roots.push(r.dir);
+    } else if (r.unread) {
+      const why = r.oversized
+        ? `its package Makefile is larger than this check reads (${NEW_PACKAGE_HEAD_CHARS / 1024} KiB)`
+        : 'its package Makefile could not be read';
+      notices.push(`Could not check whether '${r.dir}' exists on ${defaultLabel}: ${why}, so the release-branch rule was left unchecked rather than reported as a failure.`);
+      incomplete = true;
+    }
+  }
+  if (roots.length === 0) return result();
+
+  if (!lookup?.hasHeadroom?.()) {
+    notices.push(`Could not ask GitHub which packages ${defaultLabel} carries (no request budget left outside the reserve kept for the closing writes), so the release-branch rule was left unchecked rather than reported as a failure.`);
+    incomplete = true;
+    return result();
+  }
+
+  let answer;
+  try {
+    answer = await lookup.probe(roots.map(r => `${r}/Makefile`));
+  } catch (err) {
+    notices.push(`Could not ask GitHub which packages ${defaultLabel} carries (${err?.message || err}), so the release-branch rule was left unchecked rather than reported as a failure.`);
+    incomplete = true;
+    return result();
+  }
+  const branch = answer.defaultBranch;
+  if (branch === baseBranch) return { successes: [], errors: [], notices: [], summary: null, incomplete: false };
+
+  const missing = [];
+  for (const r of roots) {
+    const count = answer.counts.get(`${r}/Makefile`);
+    if (count === 0) {
+      missing.push(r);
+    } else if (!Number.isInteger(count) || count < 0) {
+      // Not an answer, so neither a finding nor a pass.
+      notices.push(`Could not check whether '${r}' exists on '${branch}': GitHub returned no history for it, so the release-branch rule was left unchecked rather than reported as a failure.`);
+      incomplete = true;
+    }
+  }
+  if (missing.length > 0) {
+    errors.push(newPackageFinding(missing, branch));
+    summary = `Adds ${missing.length} package${missing.length === 1 ? '' : 's'} not present in '${branch}' history: ${missing.join(', ')}`;
+  } else if (!incomplete) {
+    successes.push(`✅ Packages added by this pull request already exist on '${branch}'`);
+  }
+  return result();
 }
 
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {

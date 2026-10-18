@@ -780,6 +780,50 @@ export async function graphqlCheckExistence(token, repoFullname, ref, probes, on
   return results;
 }
 
+// --- GRAPHQL DEFAULT-BRANCH PATH HISTORY ---
+// Asks the repository's default branch, in one query, how many commits ever
+// touched each path. History rather than presence: a package the default
+// branch later moved or dropped is gone from its tree but not from its log.
+// `HEAD` resolves the default branch, whose name comes back with the counts.
+// Returns { defaultBranch, counts: Map<path, number> }, or raises when any
+// path went unanswered: as with graphqlCheckExistence there is no count that
+// means "unknown", and a zero that only stands for a failed query is a
+// package reported as never having existed.
+export async function graphqlPathHistoryCounts(token, repoFullname, paths, onCall) {
+  const counts = new Map();
+  if (!paths || paths.length === 0) return { defaultBranch: null, counts };
+
+  const slashIndex = repoFullname.indexOf('/');
+  const variables = { o: repoFullname.slice(0, slashIndex), n: repoFullname.slice(slashIndex + 1) };
+  const varDefs = ['$o: String!', '$n: String!'];
+  const fieldParts = [];
+  paths.forEach((path, i) => {
+    varDefs.push(`$p${i}: String!`);
+    variables[`p${i}`] = path;
+    fieldParts.push(`c${i}: history(path: $p${i}, first: 1) { totalCount }`);
+  });
+  const query = `query(${varDefs.join(', ')}) {\n  repository(owner: $o, name: $n) {\n    defaultBranchRef { name }\n    object(expression: "HEAD") {\n      ... on Commit {\n        ${fieldParts.join('\n        ')}\n      }\n    }\n  }\n}`;
+
+  const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables }, 'application/vnd.github+json', { onAttempt: onCall });
+  const repo = res.code === 200 ? res.data?.data?.repository : null;
+  const commit = repo?.object;
+  const defaultBranch = repo?.defaultBranchRef?.name;
+  if (!commit || typeof defaultBranch !== 'string' || defaultBranch === '') {
+    const unanswered = wasAttemptDeclined(res)
+      ? 'was not sent (no request budget left)'
+      : `was not answered (HTTP ${res.code}: ${(res.raw || '').trim().slice(0, 200)})`;
+    throw new Error(`GraphQL path history query for ${repoFullname} ${unanswered}`);
+  }
+  paths.forEach((path, i) => {
+    const count = commit[`c${i}`]?.totalCount;
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error(`GraphQL path history query for ${repoFullname} returned no count for '${path}'`);
+    }
+    counts.set(path, count);
+  });
+  return { defaultBranch, counts };
+}
+
 // Fallback for responses without the `user.permissions` object. The flat
 // `permission` field only ever reports admin/write/read/none — a `maintain` or
 // custom role that grants push is already folded into `write` there, so those

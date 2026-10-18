@@ -17,3 +17,11 @@ export function isProtectedHeadBranch(branch: string): boolean {
 export const ALLOW_BRANCH_PATTERN = /\[allow[ -]branch\]/i;
 export const ALLOW_CHERRY_PICK_PATTERN = /\[allow[ -]cherry[ -]pick\]/i;
 export const CHERRY_PICK_MARKER = /cherry[ -]picked from commit ([0-9a-fA-F]{7,40})/i;
+
+// The release branches openwrt/packages' CONTRIBUTING.md names: `for-XX.YY`
+// before the LEDE split, `lede-17.01` during it, `openwrt-XX.YY` since. A base
+// branch, unlike isProtectedHeadBranch, and unlike isBackportPr in context.ts,
+// which a pull request to master titled `[24.10] ...` also sets.
+export function isStableBaseBranch(branch: string): boolean {
+  return /^(?:openwrt|lede|for)-\d{2}\.\d{2}$/.test(branch);
+}

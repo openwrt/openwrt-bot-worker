@@ -96,6 +96,17 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(resPin.config.check_pkg_hash, 'error');
     }
 
+    // check_new_package_on_stable takes check_pkg_release's five values, and
+    // an invalid one keeps the default 'warning' without discarding the rest.
+    assert.strictEqual(parseAndValidateConfig(null).config.check_new_package_on_stable, 'warning');
+    for (const val of ['strict', 'on', 1, ['warning']]) {
+      const resNew = parseAndValidateConfig(JSON.stringify({ check_new_package_on_stable: val, check_pkg_hash: 'error' }));
+      assert.match(resNew.error, /field "check_new_package_on_stable" must be one of \[true, false, "warning", "error", "disabled"\]/);
+      assert.strictEqual(resNew.partial, true);
+      assert.strictEqual(resNew.config.check_new_package_on_stable, 'warning');
+      assert.strictEqual(resNew.config.check_pkg_hash, 'error');
+    }
+
     // check_dts_checklist takes the same four values; `true` would not say
     // which level it means, and an invalid one keeps the default 'warning'.
     for (const val of ['strict', true, 'on']) {
@@ -260,6 +271,9 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_patch_headers: val })).error, null);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_patch_refresh: val })).config.check_patch_refresh, val);
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_release: val })).error, null);
+      const newPkg = parseAndValidateConfig(JSON.stringify({ check_new_package_on_stable: val }));
+      assert.strictEqual(newPkg.error, null);
+      assert.strictEqual(newPkg.config.check_new_package_on_stable, val);
     }
 
     // 8. check_pkg_hash and check_pkg_source_pin modes (warning, error, false, disabled)

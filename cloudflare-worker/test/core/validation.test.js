@@ -4,6 +4,8 @@ import { runValidations } from '../../src/handlers/pull-request/validation.ts';
 import { aggregateReport } from '../../src/handlers/pull-request/report.ts';
 import { buildCheckRunPayloads } from '../../src/handlers/pull-request/check-run-report.ts';
 import { DEFAULT_CONFIG } from '../../src/config.js';
+import { collectPackageMakefiles } from '../../src/validators.js';
+import { resolvePatchesAndCommits } from '../../src/handlers/pull-request/patches.ts';
 
 describe('runValidations error containment', () => {
   test('gracefully handles file fetching failures in UCI or patch validation without crashing with HTTP 500', async () => {
@@ -1984,5 +1986,291 @@ index 1111111..2222222 100644
       assert.doesNotMatch(blocks[0], /- ⚠️ - /, 'one dash per line');
       assert.strictEqual(checkRunOf(ctx, patchesResult, outcome).output.title, 'Code Patches: Passed with warnings');
     });
+  });
+});
+
+// The release-branch rule asks the default branch's history about every
+// package root the pull request adds. GitHub is reached through fetch here so
+// the helper's own contract is what the tests run against: one POST whose
+// query carries `history(`, answered or failed as each test needs.
+describe('a new package on a release branch', { concurrency: 1 }, () => {
+  const SHA = 'c'.repeat(40);
+  const TRAILER = `(cherry picked from commit ${'d'.repeat(40)})`;
+  const addMakefile = (path) => [
+    `diff --git a/${path} b/${path}`,
+    'new file mode 100644',
+    'index 0000000..1111111',
+    '--- /dev/null',
+    `+++ b/${path}`,
+    '@@ -0,0 +1,3 @@',
+    '+include $(TOPDIR)/rules.mk',
+    '+PKG_NAME:=foo',
+    '+PKG_RELEASE:=1',
+    ''
+  ].join('\n');
+
+  const loader = {
+    fetchFileContentCached: async () => null,
+    isFileMissing: () => false,
+    getRefSource: () => undefined,
+    hasRefSource: () => false,
+    setRefSource: () => {},
+    getBudgetSkipCount: () => 0,
+    getFetchFailureCount: () => 0,
+    getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+  };
+
+  const ctxFor = (config = {}, over = {}) => {
+    const budget = { limit: 45, reserve: 15, used: over.used ?? 5 };
+    const baseBranch = over.baseBranch ?? 'openwrt-24.10';
+    return {
+      prNumber: 30345,
+      prTitle: over.prTitle ?? '51ddns-agent: add package',
+      prBody: '',
+      baseBranch,
+      headSha: 'head123',
+      baseSha: 'base123',
+      isBackportPr: over.isBackportPr ?? true,
+      repoFullname: 'openwrt/packages',
+      token: 'token',
+      config: { ...DEFAULT_CONFIG, ...config },
+      configError: null,
+      configPartial: false,
+      configUnread: false,
+      labelerUnread: false,
+      commitScanCapped: false,
+      commitsPagingCapped: false,
+      commitsCount: 1,
+      commits: over.commits ?? [],
+      fileBatchLoader: loader,
+      getCommentsScanWithRetry: async () => ({ hasBranchBypassComment: false, hasCherryPickBypassComment: false, existingCommentId: null, incomplete: false, branchOverrideUnverified: false, cherryPickOverrideUnverified: false }),
+      isMaintainerUser: async () => false,
+      isAuthorMaintainer: async () => false,
+      bodyRequestsCherryPickBypass: false,
+      branchCheckError: null,
+      branchCheckWarning: null,
+      branchCheckOutputText: '',
+      client: {
+        budget,
+        hasHeadroom: () => budget.limit - budget.reserve - budget.used > 0,
+        countOptionalAttempt: () => { if (budget.limit - budget.reserve - budget.used <= 0) return false; budget.used++; return true; }
+      },
+      prData: { base: { ref: baseBranch, sha: 'base123', repo: { default_branch: over.defaultBranch ?? 'master' } } }
+    };
+  };
+
+  const perCommit = (patch, message = `51ddns-agent: add package\n\nAdd the 51ddns agent.\n\nSigned-off-by: Jane Doe <jane@example.com>\n${TRAILER}`) => ({
+    usePrWidePatch: false,
+    prPatch: null,
+    commitDetails: [{
+      sha: SHA,
+      html_url: `https://github.com/openwrt/packages/commit/${SHA}`,
+      fullCommit: {
+        sha: SHA,
+        author: { login: 'janedoe' },
+        committer: { login: 'janedoe' },
+        parents: [{ sha: 'p' }],
+        commit: {
+          message,
+          author: { name: 'Jane Doe', email: 'jane@example.com' },
+          committer: { name: 'Jane Doe', email: 'jane@example.com' },
+          verification: { verified: true, key_id: 'GPGKEYID' }
+        }
+      },
+      commitPatch: patch,
+      isVerbatim: false,
+      upstreamPatch: null,
+      upstreamSha: null,
+      upstreamFetchError: null
+    }],
+    packageState: { isNewPackage: true, isDroppedPackage: false },
+    addedPackageMakefiles: new Set(collectPackageMakefiles(patch, 'added')),
+    removedPackageMakefiles: new Set(collectPackageMakefiles(patch, 'removed'))
+  });
+
+  // respond(body) -> { status, json | raw } for the history query; any other
+  // request fetch is asked for fails the test.
+  const withGitHub = async (respond, fn) => {
+    const originalFetch = globalThis.fetch;
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    const queries = [];
+    globalThis.fetch = async (url, options) => {
+      const body = JSON.parse(options?.body || '{}');
+      if (!String(url).endsWith('/graphql') || !String(body.query || '').includes('history(')) {
+        throw new Error(`unexpected request ${url}`);
+      }
+      queries.push(body);
+      const { status, json, raw } = respond(body);
+      return new Response(raw ?? JSON.stringify(json), { status });
+    };
+    console.warn = () => {};
+    console.error = () => {};
+    try {
+      return { result: await fn(), queries };
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+  };
+  // Every path asked about answered with `count(path)`.
+  const history = (count, branch = 'master') => (body) => {
+    const commit = {};
+    for (const [k, v] of Object.entries(body.variables)) {
+      if (/^p\d+$/.test(k)) commit[`c${k.slice(1)}`] = { totalCount: count(v) };
+    }
+    return { status: 200, json: { data: { repository: { defaultBranchRef: { name: branch }, object: commit } } } };
+  };
+  const SECTION = /#### New Package on a Release Branch:\n((?:  .*\n)*)/;
+  const ownWarnings = (outcome) => outcome.allPrWarnings.filter(w => w.startsWith('**New Package on a Release Branch**'));
+
+  test('warns, by default, about a package master has never carried', async () => {
+    const { result: outcome, queries } = await withGitHub(history(() => 0),
+      () => runValidations(ctxFor(), perCommit(addMakefile('net/51ddns-agent/Makefile'))));
+    assert.strictEqual(queries.length, 1);
+    assert.deepStrictEqual(queries[0].variables, { o: 'openwrt', n: 'packages', p0: 'net/51ddns-agent/Makefile' });
+    const warnings = ownWarnings(outcome);
+    assert.strictEqual(warnings.length, 1);
+    assert.ok(warnings[0].startsWith('**New Package on a Release Branch**:\n- ⚠️ This pull request adds a package that has never existed on `master`: `net/51ddns-agent`.'), warnings[0]);
+    assert.match(outcome.formalityOutputText, /#### New Package on a Release Branch:\n  ⚠️ Warning: Adds 1 package not present in 'master' history: net\/51ddns-agent\n/);
+    assert.ok(!outcome.allFormalityErrors.some(e => e.includes('New Package')), outcome.allFormalityErrors.join('\n'));
+    assert.strictEqual(outcome.formalityChecksIncomplete, false);
+    // Above the commit blocks, with the pull request's other targeting rule.
+    assert.ok(outcome.formalityOutputText.indexOf('#### New Package') < outcome.formalityOutputText.indexOf('#### Commit ['), outcome.formalityOutputText);
+  });
+
+  test('fails the pull request at "error" and at true', async () => {
+    for (const level of ['error', true]) {
+      const { result: outcome } = await withGitHub(history(() => 0),
+        () => runValidations(ctxFor({ check_new_package_on_stable: level }), perCommit(addMakefile('net/51ddns-agent/Makefile'))));
+      const errors = outcome.allFormalityErrors.filter(e => e.startsWith('**New Package on a Release Branch**'));
+      assert.strictEqual(errors.length, 1, String(level));
+      assert.ok(errors[0].startsWith('**New Package on a Release Branch**:\n- This pull request adds a package'), errors[0]);
+      assert.match(outcome.formalityOutputText, /  ❌ Adds 1 package not present in 'master' history: net\/51ddns-agent\n/);
+      assert.deepStrictEqual(ownWarnings(outcome), [], String(level));
+    }
+  });
+
+  test('sends no query and says nothing when switched off', async () => {
+    for (const level of [false, 'disabled']) {
+      const { result: outcome, queries } = await withGitHub(history(() => 0),
+        () => runValidations(ctxFor({ check_new_package_on_stable: level }), perCommit(addMakefile('net/51ddns-agent/Makefile'))));
+      assert.strictEqual(queries.length, 0, String(level));
+      assert.ok(!outcome.formalityOutputText.includes('New Package'), String(level));
+      assert.deepStrictEqual(ownWarnings(outcome), []);
+    }
+    // Control: the default level asks.
+    const { queries } = await withGitHub(history(() => 0), () => runValidations(ctxFor(), perCommit(addMakefile('net/51ddns-agent/Makefile'))));
+    assert.strictEqual(queries.length, 1);
+  });
+
+  test('leaves a pull request to master titled as a backport alone', async () => {
+    const { result: outcome, queries } = await withGitHub(history(() => 0),
+      () => runValidations(ctxFor({}, { baseBranch: 'master', prTitle: '[24.10] foo: add new package', isBackportPr: true }), perCommit(addMakefile('net/foo/Makefile'))));
+    assert.strictEqual(queries.length, 0);
+    assert.ok(!outcome.formalityOutputText.includes('New Package'));
+    assert.deepStrictEqual(ownWarnings(outcome), []);
+    // Control: the same pull request based on the release branch is asked about.
+    const control = await withGitHub(history(() => 0),
+      () => runValidations(ctxFor({}, { prTitle: '[24.10] foo: add new package' }), perCommit(addMakefile('net/foo/Makefile'))));
+    assert.strictEqual(control.queries.length, 1);
+  });
+
+  test('passes a backport of a package master already carries', async () => {
+    const { result: outcome } = await withGitHub(history(() => 3, 'main'),
+      () => runValidations(ctxFor({}, { defaultBranch: 'main' }), perCommit(addMakefile('lang/perl-future/Makefile'))));
+    assert.match(outcome.formalityOutputText, /#### New Package on a Release Branch:\n  ✅ Packages added by this pull request already exist on 'main'\n/);
+    assert.deepStrictEqual(ownWarnings(outcome), []);
+    assert.strictEqual(outcome.formalityChecksIncomplete, false);
+  });
+
+  describe('a history query that came back without an answer', () => {
+    const cases = [
+      ['HTTP 502', () => ({ status: 502, raw: 'bad gateway' })],
+      ['a missing alias', () => ({ status: 200, json: { data: { repository: { defaultBranchRef: { name: 'master' }, object: {} } } } })]
+    ];
+    for (const [name, respond] of cases) {
+      test(`${name} leaves the rule unchecked and the check neutral, never "not on master"`, async () => {
+        const ctx = ctxFor();
+        const patches = perCommit(addMakefile('net/51ddns-agent/Makefile'));
+        const { result: outcome } = await withGitHub(respond, () => runValidations(ctx, patches));
+        const warnings = ownWarnings(outcome);
+        assert.strictEqual(warnings.length, 1);
+        assert.match(warnings[0], /^\*\*New Package on a Release Branch\*\*:\n- ⚠️ Could not ask GitHub which packages 'master' carries \(GraphQL path history query/);
+        assert.ok(!warnings[0].includes('never existed'), warnings[0]);
+        assert.ok(!outcome.formalityOutputText.includes('not present in'), outcome.formalityOutputText);
+        assert.ok(!outcome.allFormalityErrors.some(e => e.includes('New Package')));
+        assert.strictEqual(outcome.formalityChecksIncomplete, true);
+        assert.strictEqual(aggregateReport(ctx, patches, outcome).formalityConclusion, 'neutral');
+      });
+    }
+  });
+
+  test('sends no query once only the reserve is left', async () => {
+    const { result: outcome, queries } = await withGitHub(history(() => 0),
+      () => runValidations(ctxFor({}, { used: 30 }), perCommit(addMakefile('net/51ddns-agent/Makefile'))));
+    assert.strictEqual(queries.length, 0);
+    assert.match(outcome.formalityOutputText, /  ⚠️ Could not ask GitHub which packages 'master' carries \(no request budget left outside the reserve kept for the closing writes\)/);
+    assert.strictEqual(outcome.formalityChecksIncomplete, true);
+  });
+
+  test('stands beside the cherry-pick rule without restating it', async () => {
+    const ctx = ctxFor();
+    const patches = perCommit(addMakefile('net/51ddns-agent/Makefile'), '51ddns-agent: add package\n\nAdd the 51ddns agent.\n\nSigned-off-by: Jane Doe <jane@example.com>');
+    const { result: outcome } = await withGitHub(history(() => 0), () => runValidations(ctx, patches));
+    assert.ok(outcome.allFormalityErrors.some(e => e.includes("must contain the context line: '(cherry picked from commit ...)'")), outcome.allFormalityErrors.join('\n'));
+    const warnings = ownWarnings(outcome);
+    assert.strictEqual(warnings.length, 1);
+    assert.ok(warnings[0].includes('never existed on `master`'));
+    assert.ok(!warnings[0].includes('cherry picked from commit'), warnings[0]);
+    assert.strictEqual(aggregateReport(ctx, patches, outcome).formalityConclusion, 'failure');
+  });
+
+  // The same pull request, audited as one diff (more than 15 commits, and a
+  // split that matched no commit, so none has a patch of its own) and commit
+  // by commit, reports the same thing after asking once.
+  test('reports the same in PR-wide and in per-commit mode', async () => {
+    const shaOf = (i) => String(i + 1).padStart(40, 'a');
+    const commitPart = (i, diff) => `From ${shaOf(i)} Mon Sep 17 00:00:00 2001\nFrom: Dev <dev@example.com>\nDate: Mon, 1 Sep 2026 10:00:00 +0200\nSubject: [PATCH] change ${i}\n\nSigned-off-by: Dev <dev@example.com>\n---\n${diff}`;
+    const touch = (i) => `diff --git a/net/other/files/f${i} b/net/other/files/f${i}\n--- a/net/other/files/f${i}\n+++ b/net/other/files/f${i}\n@@ -1 +1 @@\n-a\n+b\n`;
+    const series = (n, changedFiles) => {
+      const commits = Array.from({ length: n }, (_, i) => ({
+        sha: shaOf(i),
+        html_url: `https://github.com/openwrt/packages/commit/${shaOf(i)}`,
+        parents: [{ sha: 'p' }],
+        changed_files: changedFiles,
+        commit: { message: `change ${i}\n\nSigned-off-by: Dev <dev@example.com>` }
+      }));
+      const raw = commits.map((c, i) => commitPart(i, i === 1 ? addMakefile('net/51ddns-agent/Makefile') : touch(i))).join('');
+      return { commits, raw };
+    };
+    const runSeries = async (n, changedFiles) => {
+      const { commits, raw } = series(n, changedFiles);
+      const ctx = ctxFor({}, { commits, isBackportPr: false });
+      ctx.commitsCount = n;
+      ctx.client.trackedApiCall = async () => ({ code: 404, raw: '' });
+      ctx.client.optionalApiCall = async () => ({ code: 404, raw: '' });
+      ctx.startPrPatchFetch = async () => ({ code: 200, raw, data: null, headers: { get: () => null } });
+      ctx.prData.url = 'https://api.github.com/repos/openwrt/packages/pulls/30345';
+      const patches = await resolvePatchesAndCommits(ctx);
+      const { result, queries } = await withGitHub(history(() => 0), () => runValidations(ctx, patches));
+      return { patches, outcome: result, queries };
+    };
+
+    const prWide = await runSeries(20, 2);
+    assert.strictEqual(prWide.patches.usePrWidePatch, true);
+    assert.ok(prWide.patches.commitDetails.every(c => c.commitPatch === null));
+    const split = await runSeries(3, 1);
+    assert.strictEqual(split.patches.usePrWidePatch, false);
+    assert.ok(split.patches.commitDetails.every(c => typeof c.commitPatch === 'string'));
+
+    for (const run of [prWide, split]) {
+      assert.strictEqual(run.queries.length, 1);
+      assert.deepStrictEqual(run.queries[0].variables, { o: 'openwrt', n: 'packages', p0: 'net/51ddns-agent/Makefile' });
+      assert.strictEqual(ownWarnings(run.outcome).length, 1);
+    }
+    assert.deepStrictEqual(ownWarnings(prWide.outcome), ownWarnings(split.outcome));
+    assert.strictEqual(prWide.outcome.formalityOutputText.match(SECTION)[0], split.outcome.formalityOutputText.match(SECTION)[0]);
   });
 });
