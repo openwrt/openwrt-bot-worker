@@ -50,6 +50,9 @@ export interface FormalitiesConfig {
   // Package Hash Check features
   check_pkg_hash?: false | 'warning' | 'error' | 'disabled';
 
+  // Package Source Pin Check features
+  check_pkg_source_pin?: false | 'warning' | 'error' | 'disabled';
+
   // Identity / Account linking Check features
   require_linked_github_account?: boolean | 'warning' | 'error' | 'disabled';
 
@@ -111,7 +114,8 @@ const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_buildbot_default: new Set([true, false, 'warning', 'error', 'disabled']),
   check_patch_headers: new Set([true, false, 'warning', 'error', 'disabled']),
   check_pkg_release: new Set([true, false, 'warning', 'error', 'disabled']),
-  check_pkg_hash: new Set([false, 'warning', 'error', 'disabled'])
+  check_pkg_hash: new Set([false, 'warning', 'error', 'disabled']),
+  check_pkg_source_pin: new Set([false, 'warning', 'error', 'disabled'])
 };
 
 const STRING_ARRAY_FIELDS = new Set([

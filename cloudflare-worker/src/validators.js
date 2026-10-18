@@ -4228,6 +4228,381 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
   return { errors, warnings, notices, findings, successes };
 }
 
+// PKG_SOURCE_DATE and PKG_SOURCE_VERSION pin a repository checkout. The
+// package policies ask for the date as YYYY-MM-DD and for the revision
+// identifier itself, but the build takes any string: include/download.mk only
+// dots the date and rules.mk cuts the revision to eight characters. So nothing
+// here breaks a build, every finding rides on check_pkg_source_pin, and only
+// the lines a pull request writes are judged. PKG_RELEASE and the checksums
+// stay with the two audits above.
+const SOURCE_PIN_LINE_BUDGET = 6000;
+// How much head-file text one audit may scan. A contributor's new Makefile can
+// be megabytes, and every head scan costs about 4 ms per MB on the worst
+// shapes; the largest real package Makefile is about 61 KB.
+export const SOURCE_PIN_HEAD_CHARS = 256 * 1024;
+// The names the audit reads share a prefix and differ in the character after
+// it, so a line is compared against one name at most. Each comparison reads
+// characters out of a slice of the whole patch, which is what dominates the
+// cost of the scan.
+const SOURCE_PIN_PREFIX = 'PKG_SOURCE_';
+const SOURCE_PIN_NAME_BY_CHAR = new Map([
+  [68 /* D */, { name: 'PKG_SOURCE_DATE', tail: 'DATE' }],
+  [86 /* V */, { name: 'PKG_SOURCE_VERSION', tail: 'VERSION' }],
+  [80 /* P */, { name: 'PKG_SOURCE_PROTO', tail: 'PROTO' }]
+]);
+// Compared whole and lowercased: a tag such as `release-0.1` or
+// `lf-6.18.2-1.0.0` must never match by prefix.
+const MOVING_REFS = new Set(['master', 'main', 'head', 'trunk', 'dev', 'devel', 'develop', 'development', 'next', 'stable', 'latest']);
+const MOVING_REF_PREFIXES = ['refs/heads/', 'refs/remotes/', 'origin/'];
+const EARLIEST_SOURCE_YEAR = 1991;
+// Timezones and a pull request that waited a few days.
+const FUTURE_SLACK_MS = 7 * 86400000;
+const SOURCE_DATE_FORM = /^\d{4}-\d{2}-\d{2}$/;
+// Bounded so a line padded with megabytes of blanks costs no more than any
+// other: past 64 the next character is a blank, not an operator, and the line
+// is not read as an assignment.
+const SOURCE_PIN_MAX_BLANKS = 64;
+
+// The PKG_SOURCE_* name a line starts with at column 0, where make reads an
+// assignment, or null.
+function sourcePinName(line) {
+  if (line.charCodeAt(0) !== 80 /* P */ || !line.startsWith(SOURCE_PIN_PREFIX)) return null;
+  const candidate = SOURCE_PIN_NAME_BY_CHAR.get(line.charCodeAt(SOURCE_PIN_PREFIX.length));
+  return candidate !== undefined && line.startsWith(candidate.tail, SOURCE_PIN_PREFIX.length) ? candidate.name : null;
+}
+
+// The right-hand side of a column-0 assignment of `name`, unquoted and without
+// its comment, or null.
+function sourcePinAssignment(line, name) {
+  if (line.charCodeAt(0) !== 80 /* P */ || !line.startsWith(name)) return null;
+  return assignedValueAfter(line, name.length);
+}
+
+// The value assigned after a name that ends at `end`: `=`, `:=`, `::=`, `+=`
+// or `?=`, after optional blanks. No backtracking regex: it runs on every
+// added Makefile line, and `PKG_SOURCE_DATE_EPOCH = ...` must not read as the
+// date.
+function assignedValueAfter(line, end) {
+  // `PKG_SOURCE_DATE_EPOCH`, `PKG_SOURCE_DATEX`: a longer name, not this one.
+  const next = line.charCodeAt(end);
+  if (next !== 32 && next !== 9 && next !== 61 && next !== 58 && next !== 43 && next !== 63) return null;
+  let i = end;
+  const blanksEnd = Math.min(line.length, end + SOURCE_PIN_MAX_BLANKS);
+  while (i < blanksEnd && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  const c = line.charCodeAt(i);
+  if (c === 61) i += 1; // =
+  else if ((c === 58 || c === 43 || c === 63) && line.charCodeAt(i + 1) === 61) i += 2; // := += ?=
+  else if (c === 58 && line.charCodeAt(i + 1) === 58 && line.charCodeAt(i + 2) === 61) i += 3; // ::=
+  else return null;
+  const hash = line.indexOf('#', i);
+  return line.slice(i, hash === -1 ? line.length : hash).replace(/["']/g, '').trim();
+}
+
+// Whether `content` assigns `name` anywhere, indented or under a condition
+// included. It settles an absence, so any doubt counts as assigned.
+function assignsAnywhere(content, name) {
+  for (let at = content.indexOf(name); at !== -1; at = content.indexOf(name, at + 1)) {
+    let i = at + name.length;
+    while (content.charCodeAt(i) === 32 || content.charCodeAt(i) === 9) i++;
+    const c = content.charCodeAt(i);
+    if (c === 61 || ((c === 58 || c === 43 || c === 63) && (content.charCodeAt(i + 1) === 61 || content.charCodeAt(i + 1) === 58))) return true;
+  }
+  return false;
+}
+
+// Whether every include of `content` points into the build system itself. No
+// include/*.mk assigns PKG_VERSION, but a feed helper such as luci.mk does.
+function includesOnlyBuildSystem(content) {
+  for (const raw of content.split('\n')) {
+    const line = raw.trimStart();
+    const keyword = line.startsWith('include') ? 7 : (line.startsWith('-include') || line.startsWith('sinclude')) ? 8 : 0;
+    if (keyword === 0 || (line.charCodeAt(keyword) !== 32 && line.charCodeAt(keyword) !== 9)) continue;
+    const hash = line.indexOf('#');
+    for (const target of line.slice(keyword, hash === -1 ? line.length : hash).split(/[ \t]/)) {
+      const t = target.trim();
+      if (t === '') continue;
+      if (!(t.startsWith('$(INCLUDE_DIR)/') || t.startsWith('$(TOPDIR)/')) || t.includes('..') || t.includes('/feeds/')) return false;
+    }
+  }
+  return true;
+}
+
+// The first column-0 assignment of `name` in a whole Makefile, the line
+// parseMakefileVar reads too.
+function firstSourcePinAssignment(content, name) {
+  for (const line of content.split('\n')) {
+    const value = sourcePinAssignment(line, name);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+// The version include/download.mk builds when PKG_VERSION is unset:
+// `$(subst -,.,$(PKG_SOURCE_DATE))` (or `0` without a date), `~`, and the
+// revision cut by rules.mk's version_abbrev (`printf '%.8s'`).
+export function sourcePinVersion(date, revision) {
+  return `${date ? date.replace(/-/g, '.') : '0'}~${revision.slice(0, 8)}`;
+}
+
+// null for a usable PKG_SOURCE_DATE, else what is wrong with it.
+function sourceDateProblem(value, nowMs) {
+  if (!SOURCE_DATE_FORM.test(value)) return 'form';
+  const [y, m, d] = value.split('-').map(Number);
+  const date = new Date(0);
+  date.setUTCFullYear(y, m - 1, d);
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== m - 1 || date.getUTCDate() !== d) return 'unreal';
+  if (y < EARLIEST_SOURCE_YEAR) return 'early';
+  if (date.getTime() > nowMs + FUTURE_SLACK_MS) return 'future';
+  return null;
+}
+
+// The YYYY-MM-DD spelling of a date written another unambiguous way
+// (`2025.10.06`, `20241017`, `2026-2-3`), or null.
+function dashedSourceDate(value) {
+  const parts = /^(\d{4})(\d{2})(\d{2})$/.exec(value) || /^(\d{4})([./_-])(\d{1,2})\2(\d{1,2})$/.exec(value);
+  if (!parts) return null;
+  const [y, m, d] = parts.length === 4 ? parts.slice(1) : [parts[1], parts[3], parts[4]];
+  const dashed = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+  const problem = sourceDateProblem(dashed, Infinity);
+  return problem === null || problem === 'early' ? dashed : null;
+}
+
+// A contributor-written value as a finding quotes it.
+const quotePinValue = (value) => (value.length > 64 ? `${value.slice(0, 64)}…` : value);
+
+export async function validatePkgSourcePins(commitDetails, CONFIG, fetchFileContentAtHead, now = Date.now) {
+  // `errors` stays empty: the build accepts every value judged here, so all of
+  // it is in `findings`, at the level the repository configured.
+  const errors = [];
+  const warnings = [];
+  const findings = [];
+  const notices = [];
+  const successes = [];
+  let incomplete = false;
+
+  if (CONFIG.check_pkg_source_pin === false || CONFIG.check_pkg_source_pin === 'disabled') {
+    return { errors, warnings, notices, findings, successes };
+  }
+
+  let effectiveCommitDetails = commitDetails;
+  if (Array.isArray(commitDetails) && commitDetails.length === 1 && commitDetails[0]?.commitPatch) {
+    const splitResult = splitMboxPatch(commitDetails[0].commitPatch);
+    if (splitResult === false) {
+      return {
+        errors: [],
+        successes: [],
+        warnings: [],
+        notices: ["Could not safely verify commit boundaries in PR-wide patch series"],
+        findings: [],
+        incomplete: true
+      };
+    }
+    if (splitResult) {
+      effectiveCommitDetails = splitResult;
+    }
+  }
+
+  const addedFiles = new Set();
+  const deletedFiles = new Set();
+  // Deleted and then added again in the same series; see the release audit.
+  const readdedFiles = new Set();
+  const makefiles = new Set();
+  // A revert restores whatever was there before, a dotted date included, so a
+  // Makefile only reverts touch is not the contributor's choice.
+  const nonRevertedFiles = new Set();
+  // Per Makefile, the added/deleted lines of each commit that changed it, in
+  // series order: the latest commit to write a name is the one whose value
+  // the head holds, so a fixup that corrects a date is not reported.
+  const commitChanges = Object.create(null);
+
+  for (const item of effectiveCommitDetails) {
+    if (!item.commitPatch) continue;
+    const isRevertCommit = CONFIG.allow_revert !== false &&
+      parseRevertCommit(item.fullCommit?.commit?.message || '') !== null;
+    const states = parseDiffFileStates(item.commitPatch);
+    states.addedFiles.forEach(f => {
+      if (deletedFiles.has(f)) readdedFiles.add(f);
+      addedFiles.add(f);
+      deletedFiles.delete(f);
+    });
+    states.deletedFiles.forEach(f => {
+      deletedFiles.add(f);
+      addedFiles.delete(f);
+      readdedFiles.delete(f);
+    });
+    for (const file of getChangedFilesFromPatch(item.commitPatch)) {
+      if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
+      if (isHiddenOrSpecial(file)) continue;
+      makefiles.add(file);
+      if (!isRevertCommit) nonRevertedFiles.add(file);
+    }
+    for (const [file, change] of Object.entries(collectFileLineChanges(item.commitPatch))) {
+      if (!makefiles.has(file)) continue;
+      if (!commitChanges[file]) commitChanges[file] = [];
+      commitChanges[file].push(change);
+    }
+  }
+
+  const paths = [...makefiles].filter(f => !deletedFiles.has(f) || addedFiles.has(f));
+  if (paths.length > 15) {
+    notices.push(`Package source pin audit skipped: PR modifies ${paths.length} Makefiles. Batch updates of >15 Makefiles are not automatically audited to prevent hitting API rate/subrequest limits.`);
+    return { errors, warnings, notices, findings, successes, incomplete: true };
+  }
+
+  // One budget for the whole audit, spent in path order before any read: a
+  // diff of thousands of `PKG_SOURCE_DATE_EPOCH` lines never completes both
+  // names, so without it the scan is as long as the patch.
+  let lineBudget = SOURCE_PIN_LINE_BUDGET;
+  let budgetSpent = false;
+
+  // Per name: undefined when the series does not write it, null when it
+  // removes it, else the value it leaves.
+  const scanPins = (changes) => {
+    const pins = { PKG_SOURCE_DATE: undefined, PKG_SOURCE_VERSION: undefined, PKG_SOURCE_PROTO: undefined };
+    const decided = () => pins.PKG_SOURCE_DATE !== undefined && pins.PKG_SOURCE_VERSION !== undefined;
+    for (let c = changes.length - 1; c >= 0 && !decided(); c--) {
+      for (const line of changes[c].added) {
+        if (--lineBudget < 0) return { pins, truncated: true };
+        const name = sourcePinName(line);
+        if (name === null || pins[name] !== undefined) continue;
+        const value = assignedValueAfter(line, name.length);
+        if (value === null) continue;
+        pins[name] = value;
+        if (decided()) break;
+      }
+      if (decided()) break;
+      // An assignment this commit deletes without writing a new one is gone
+      // from the head, whatever an earlier commit wrote.
+      for (const line of changes[c].deleted) {
+        if (--lineBudget < 0) return { pins, truncated: true };
+        const name = sourcePinName(line);
+        if (name !== null && pins[name] === undefined && assignedValueAfter(line, name.length) !== null) pins[name] = null;
+      }
+    }
+    return { pins, truncated: false };
+  };
+
+  const scanned = [];
+  for (const path of paths) {
+    if (!nonRevertedFiles.has(path)) continue;
+    const { pins, truncated } = scanPins(commitChanges[path] || []);
+    if (truncated && !budgetSpent) {
+      budgetSpent = true;
+      incomplete = true;
+      notices.push(`Package source pin audit stopped after ${SOURCE_PIN_LINE_BUDGET} changed Makefile lines, so the remaining Makefiles in this pull request were not checked.`);
+    }
+    if (pins.PKG_SOURCE_DATE !== undefined || pins.PKG_SOURCE_VERSION !== undefined) {
+      scanned.push({ path, pins, truncated });
+    }
+  }
+
+  const isLiteral = (value) => typeof value === 'string' && value !== '' && !value.includes('$');
+
+  // What the patch settles, and whether the head must be read for the rest.
+  // The head is read only for what the patch cannot settle; with the hash
+  // audit on, it already asked for this very file.
+  function plan({ path, pins, truncated }) {
+    const date = isLiteral(pins.PKG_SOURCE_DATE) ? pins.PKG_SOURCE_DATE : null;
+    const revision = isLiteral(pins.PKG_SOURCE_VERSION) ? pins.PKG_SOURCE_VERSION : null;
+    const dateProblem = date === null ? null : sourceDateProblem(date, now());
+    const abbreviated = revision !== null && /^[0-9a-f]{7,39}$/i.test(revision) && !/^\d+$/.test(revision);
+    const isNew = addedFiles.has(path) && !readdedFiles.has(path);
+    const needsProto = abbreviated && pins.PKG_SOURCE_PROTO === undefined;
+    const needsAbsence = isNew && revision !== null && (pins.PKG_SOURCE_DATE === undefined || pins.PKG_SOURCE_DATE === null);
+    const readsHead = needsProto || needsAbsence || dateProblem === 'form';
+    return { path, pins, truncated, date, revision, dateProblem, abbreviated, needsProto, needsAbsence, readsHead };
+  }
+
+  function judge({ path, pins, truncated, date, revision, dateProblem, abbreviated, needsProto, needsAbsence }, headContent, overBudget) {
+    const out = { findings: [], notices: [], successes: [], incomplete: false };
+    if (headContent === null && (needsProto || needsAbsence)) {
+      out.notices.push(overBudget
+        ? `'${path}' at the head commit is larger than what this audit has left to read, so its PKG_SOURCE_DATE and PKG_SOURCE_VERSION were not fully checked.`
+        : `Could not read '${path}' at the head commit, so its PKG_SOURCE_DATE and PKG_SOURCE_VERSION were not fully checked.`);
+      out.incomplete = true;
+    }
+
+    if (dateProblem === 'form') {
+      const dashed = dashedSourceDate(date);
+      // Quoting the version is only right where download.mk builds it.
+      const pinnedRevision = revision ?? (headContent === null ? null : firstSourcePinAssignment(headContent, 'PKG_SOURCE_VERSION'));
+      const builtVersion = dashed !== null && isLiteral(pinnedRevision) && headContent !== null && !assignsAnywhere(headContent, 'PKG_VERSION')
+        ? sourcePinVersion(dashed, pinnedRevision)
+        : null;
+      const advice = dashed === null
+        ? 'Write it in that form, so a reader can tell it is a date.'
+        : builtVersion === null
+          ? `Write it as '${dashed}', so a reader can tell it is a date.`
+          : `Write it as '${dashed}' — the build system turns it into the package version '${builtVersion}', so the dashes are what tell a reader it is a date.`;
+      out.findings.push(`- PKG_SOURCE_DATE in '${path}' is '${quotePinValue(date)}', which is not the YYYY-MM-DD form the package policies ask for: the value "must correspond to the modification date in the format YYYY-MM-DD of the source repository revision being packaged". ${advice}`);
+    } else if (dateProblem !== null) {
+      const why = { unreal: 'not a real date', early: 'too early to be the date of a source revision', future: 'in the future' }[dateProblem];
+      out.findings.push(`- PKG_SOURCE_DATE in '${path}' is '${date}', which is ${why}. Use the day of the revision PKG_SOURCE_VERSION pins, in YYYY-MM-DD form.`);
+    }
+
+    if (revision !== null) {
+      const ref = revision.toLowerCase();
+      if (MOVING_REFS.has(ref) || MOVING_REF_PREFIXES.some(prefix => ref.startsWith(prefix))) {
+        out.findings.push(`- PKG_SOURCE_VERSION in '${path}' is '${quotePinValue(revision)}', which names a branch instead of a revision. A branch head moves, so every build can fetch different sources — "using the head of a branch will create unpredictable results which can be different each build" (openwrt/packages CONTRIBUTING.md). Pin the commit hash of the revision you tested, and set PKG_SOURCE_DATE to that revision's date.`);
+      } else if (abbreviated) {
+        const proto = pins.PKG_SOURCE_PROTO !== undefined
+          ? pins.PKG_SOURCE_PROTO
+          : (headContent === null ? null : firstSourcePinAssignment(headContent, 'PKG_SOURCE_PROTO'));
+        if (proto === 'git') {
+          out.findings.push(`- PKG_SOURCE_VERSION in '${path}' is the abbreviated hash '${revision}'. The policies ask for the revision identifier itself — the full 40-character commit hash — which stays unambiguous as upstream grows; the build system shortens it to eight characters for the version string by itself.`);
+        }
+      }
+    }
+
+    // A new Makefile whose version download.mk would build from nothing but
+    // the revision. Settled on the whole head file, never on the first
+    // column-0 assignment: an indented or conditional PKG_SOURCE_DATE, or a
+    // helper that sets PKG_VERSION, is not an absence.
+    if (needsAbsence && headContent !== null &&
+      !headContent.includes('PKG_SOURCE_DATE') &&
+      !assignsAnywhere(headContent, 'PKG_VERSION') &&
+      includesOnlyBuildSystem(headContent)) {
+      out.findings.push(`- New package Makefile '${path}' pins the revision '${quotePinValue(revision)}' but sets neither PKG_SOURCE_DATE nor PKG_VERSION, so the build system has no date to build a version from and this package becomes version '${sourcePinVersion(null, revision)}'. Add PKG_SOURCE_DATE with the date of that revision (YYYY-MM-DD).`);
+    }
+
+    // Only the halves that were literal, and so actually checked. The bot
+    // never knows whether the date matches the revision, so it never says so.
+    if (out.findings.length === 0 && !out.incomplete && !truncated) {
+      const halves = [];
+      if (revision !== null) halves.push(`PKG_SOURCE_VERSION '${revision.length > 12 ? `${revision.slice(0, 12)}…` : revision}'`);
+      if (date !== null) halves.push(`PKG_SOURCE_DATE '${date}'`);
+      if (halves.length > 0) out.successes.push(`✅ Package Makefile '${path}' pins its source with ${halves.join(' and ')}`);
+    }
+    return out;
+  }
+
+  // Every head read fires together so the batching loader merges them, and
+  // shares them with the hash and release audits' reads of the same files.
+  const plans = scanned.map(plan);
+  const heads = await Promise.all(plans.map(p => (p.readsHead ? fetchFileContentAtHead(p.path) : null)));
+  // Every scan of a head costs its length, and the line budget above counts
+  // only patch lines. Charged in path order, so the same pull request always
+  // stops at the same file; a head past what is left is treated as unread.
+  let headChars = SOURCE_PIN_HEAD_CHARS;
+  const results = plans.map((p, i) => {
+    let head = typeof heads[i] === 'string' ? heads[i] : null;
+    const overBudget = head !== null && head.length > headChars;
+    if (overBudget) head = null;
+    else if (head !== null) headChars -= head.length;
+    return judge(p, head, overBudget);
+  });
+  for (const result of results) {
+    findings.push(...result.findings);
+    notices.push(...result.notices);
+    successes.push(...result.successes);
+    if (result.incomplete) incomplete = true;
+  }
+
+  return incomplete
+    ? { errors, warnings, notices, findings, successes, incomplete: true }
+    : { errors, warnings, notices, findings, successes };
+}
+
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {
   const errors = [];
   const successes = [];

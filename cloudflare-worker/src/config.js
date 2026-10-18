@@ -52,6 +52,11 @@ export const DEFAULT_CONFIG = {
   // all is reported as an error at either level while the audit is on.
   check_pkg_hash: 'warning',
 
+  // Package Source Pin Check features. 'warning' by default: the date and
+  // revision shapes come from the package policies alone, and the build
+  // system accepts every value this check reports.
+  check_pkg_source_pin: 'warning',
+
   // Identity / Account linking Check features
   require_linked_github_account: true,
 

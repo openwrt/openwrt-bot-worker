@@ -5,6 +5,7 @@ import {
   collectAddedPatchFiles,
   validatePkgReleaseBumps,
   validatePkgHashes,
+  validatePkgSourcePins,
   validateUciConfigs,
   groupReleaseErrors,
   getFastPkgRoot,
@@ -361,6 +362,19 @@ export async function runValidations(
       };
     });
 
+  const sourcePinsPromise = validatePkgSourcePins(releaseDetails, config, fetchFileContentAtHead)
+    .catch((e: any) => {
+      console.error(`Failed to audit package source pins: ${e.message}`);
+      return {
+        successes: [] as string[],
+        errors: [] as string[],
+        warnings: [] as string[],
+        notices: [`Could not complete package source pin audit because of an error fetching file content: ${e.message}`],
+        findings: [] as string[],
+        incomplete: true
+      };
+    });
+
   for (const [commitIndex, item] of commitDetails.entries()) {
     const { sha, html_url, fullCommit } = item;
     const commitMsgLines = (fullCommit?.commit?.message || '').split("\n");
@@ -700,6 +714,32 @@ export async function runValidations(
     if (hashErrors.length > 0) {
       allMakefileErrors.push(`**Package Hash Audit**:\n` + hashErrors.join("\n"));
       hashErrors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+    }
+    makefileOutputText += "\n";
+  }
+
+  // Graded like the hash audit's findings; the build accepts every value this
+  // audit judges, so it has no errors of its own.
+  const reportPins = await sourcePinsPromise;
+  if ((reportPins as any).incomplete) makefileChecksIncomplete = true;
+  const pinErrors = [...reportPins.errors, ...(config.check_pkg_source_pin === 'error' ? reportPins.findings : [])];
+  const pinWarnings = [
+    ...(reportPins.notices || []).map(n => `- ${n}`),
+    ...reportPins.warnings.map(w => `- ${w}`),
+    ...(config.check_pkg_source_pin === 'error' ? [] : reportPins.findings)
+  ];
+  if (pinErrors.length > 0 || (reportPins.findings || []).length > 0 ||
+    findingInWarnings(reportPins as any)) makefileReportedFinding = true;
+  if (reportPins.successes.length > 0 || pinErrors.length > 0 || pinWarnings.length > 0) {
+    makefileOutputText += `#### Package Source Pin Audit:\n`;
+    reportPins.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    if (pinWarnings.length > 0) {
+      allPrWarnings.push(`**Package Source Pin Audit**:\n` + pinWarnings.map(w => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+      pinWarnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    }
+    if (pinErrors.length > 0) {
+      allMakefileErrors.push(`**Package Source Pin Audit**:\n` + pinErrors.join("\n"));
+      pinErrors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     makefileOutputText += "\n";
   }

@@ -336,6 +336,8 @@ diff --git a/package/utils/foo/patches/010-fix.patch b/package/utils/foo/patches
       result.makefileOutputText);
     assert.match(result.makefileOutputText, /⚠️ Warning: Could not complete package hash audit because of an error fetching file content/,
       result.makefileOutputText);
+    assert.match(result.makefileOutputText, /⚠️ Warning: Could not complete package source pin audit because of an error fetching file content/,
+      result.makefileOutputText);
     assert.strictEqual(result.makefileReportedFinding, false);
   });
 
@@ -1273,6 +1275,60 @@ diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
       assert.match(res.makefileOutputText, /#### Package Hash Audit:/);
       assert.match(res.makefileOutputText, /⚠️ Warning: PKG_HASH in 'package\/utils\/foo\/Makefile' is set to 'skip'/);
       assert.strictEqual(res.makefileReportedFinding, true, res.makefileOutputText);
+    });
+
+    // The source pin audit has no errors of its own: every finding is graded
+    // by check_pkg_source_pin, the way the hash audit grades its findings.
+    describe('the package source pin audit', () => {
+      const dottedDate = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -8,1 +8,1 @@
+-PKG_SOURCE_DATE:=2025-10-06
++PKG_SOURCE_DATE:=2025.10.06
+`;
+      const abbreviated = `
+diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile
+--- a/package/utils/foo/Makefile
++++ b/package/utils/foo/Makefile
+@@ -8,1 +8,1 @@
++PKG_SOURCE_VERSION:=a1b2c3d
+`;
+      const quiet = { check_pkg_release: false, check_pkg_hash: false };
+
+      test('reports a finding as a warning by default', async () => {
+        const res = await runValidations(ctxFor(quiet), perCommit(dottedDate));
+        assert.match(res.makefileOutputText, /#### Package Source Pin Audit:\n  ⚠️ Warning: PKG_SOURCE_DATE in 'package\/utils\/foo\/Makefile' is '2025\.10\.06'/, res.makefileOutputText);
+        assert.ok(res.allPrWarnings.some(w => w.startsWith('**Package Source Pin Audit**:\n- ⚠️ PKG_SOURCE_DATE')), res.allPrWarnings.join('\n'));
+        assert.deepStrictEqual(res.allMakefileErrors, []);
+        assert.strictEqual(res.makefileReportedFinding, true);
+        // The date stands on the patch alone; the unread head only drops the
+        // version example from the wording.
+        assert.ok(!res.makefileOutputText.includes('were not fully checked'), res.makefileOutputText);
+      });
+
+      test('reports a finding as an error when the repository asks for it', async () => {
+        const res = await runValidations(ctxFor({ ...quiet, check_pkg_source_pin: 'error' }), perCommit(dottedDate));
+        assert.ok(res.allMakefileErrors.some(e => e.startsWith('**Package Source Pin Audit**:\n- PKG_SOURCE_DATE')), res.allMakefileErrors.join('\n'));
+        assert.match(res.makefileOutputText, /  ❌ PKG_SOURCE_DATE in 'package\/utils\/foo\/Makefile'/);
+        assert.ok(!res.allPrWarnings.some(w => w.includes('Package Source Pin Audit')), res.allPrWarnings.join('\n'));
+        assert.strictEqual(res.makefileReportedFinding, true);
+      });
+
+      test('reports an unread head as a gap, not as a finding', async () => {
+        const res = await runValidations(ctxFor(quiet), perCommit(abbreviated));
+        assert.match(res.makefileOutputText, /⚠️ Warning: Could not read 'package\/utils\/foo\/Makefile' at the head commit/, res.makefileOutputText);
+        assert.strictEqual(res.makefileChecksIncomplete, true);
+        assert.strictEqual(res.makefileReportedFinding, false);
+      });
+
+      test('reports a head read that throws as a gap', async () => {
+        const res = await runValidations(ctxFor(quiet, async () => { throw new Error('loader exploded'); }), perCommit(abbreviated));
+        assert.match(res.makefileOutputText, /⚠️ Warning: Could not complete package source pin audit because of an error fetching file content: loader exploded/, res.makefileOutputText);
+        assert.strictEqual(res.makefileChecksIncomplete, true);
+        assert.ok(!/Package Source Pin Audit:\n(  .*\n)*  ⚠️ Warning: PKG_SOURCE/.test(res.makefileOutputText), res.makefileOutputText);
+      });
     });
   });
 

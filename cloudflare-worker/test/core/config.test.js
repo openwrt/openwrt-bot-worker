@@ -86,6 +86,16 @@ describe('parseAndValidateConfig', () => {
     const resHashTrue = parseAndValidateConfig(JSON.stringify({ check_pkg_hash: true }));
     assert.match(resHashTrue.error, /field "check_pkg_hash" must be one of/);
 
+    // check_pkg_source_pin takes the same four values, and an invalid one
+    // falls back to the default 'warning' without discarding the rest.
+    for (const val of ['strict', true]) {
+      const resPin = parseAndValidateConfig(JSON.stringify({ check_pkg_source_pin: val, check_pkg_hash: 'error' }));
+      assert.match(resPin.error, /field "check_pkg_source_pin" must be one of \[false, "warning", "error", "disabled"\]/);
+      assert.strictEqual(resPin.partial, true);
+      assert.strictEqual(resPin.config.check_pkg_source_pin, 'warning');
+      assert.strictEqual(resPin.config.check_pkg_hash, 'error');
+    }
+
     const resInvalidBinary = parseAndValidateConfig(JSON.stringify({ check_binary_files: 'warnning' }));
     assert.match(resInvalidBinary.error, /field "check_binary_files" must be one of/);
 
@@ -230,9 +240,10 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_release: val })).error, null);
     }
 
-    // 8. check_pkg_hash modes (warning, error, false, disabled)
+    // 8. check_pkg_hash and check_pkg_source_pin modes (warning, error, false, disabled)
     for (const val of [false, 'warning', 'error', 'disabled']) {
       assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_hash: val })).error, null);
+      assert.strictEqual(parseAndValidateConfig(JSON.stringify({ check_pkg_source_pin: val })).error, null);
     }
   });
 });
