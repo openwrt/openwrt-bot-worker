@@ -524,6 +524,18 @@ describe('the package Makefiles a pull request adds and removes', () => {
     }
   });
 
+  // packageState is what the add and drop package labels are set from.
+  test('reads no package added or dropped from kbuild Makefiles alone', async () => {
+    const src = 'package/kernel/foo/src/Makefile';
+    const result = await resolvePatchesAndCommits(contextFor([
+      [`diff --git a/${src} b/${src}`, 'new file mode 100644', '--- /dev/null', `+++ b/${src}`, '@@ -0,0 +1 @@', '+obj-m := foo.o', ''].join('\n'),
+      [`diff --git a/${src} b/${src}`, 'deleted file mode 100644', `--- a/${src}`, '+++ /dev/null', '@@ -1 +0,0 @@', '-obj-m := foo.o', ''].join('\n')
+    ], 1));
+    assert.strictEqual(result.packageStateKnown, true);
+    assert.deepStrictEqual(result.packageState, { isNewPackage: false, isDroppedPackage: false });
+    assert.deepStrictEqual([...result.addedPackageMakefiles, ...result.removedPackageMakefiles], []);
+  });
+
   test('keeps no line end in a path from a CRLF patch', async () => {
     const result = await resolvePatchesAndCommits(contextFor([add('net/foo/Makefile', '\r\n'), add('net/bar/Makefile')], null));
     assert.deepStrictEqual([...result.addedPackageMakefiles].sort(), ['net/bar/Makefile', 'net/foo/Makefile']);
