@@ -1,9 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { Worker } from 'node:worker_threads';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 import { findPkgRoot } from '../../src/validators.js';
+import { cpuRatio } from './helpers.js';
 
 describe('findPkgRoot', () => {
   test('ignores category-level Makefiles and non-package paths but parses package paths correctly', async () => {
@@ -282,34 +280,9 @@ describe('findPkgRoot on the package helper include', () => {
     assert.ok(accepted > 4000 && accepted < 36000, `${accepted} of ${awkward.length + generated.length} accepted`);
   });
 
-  // Pinned without a clock: each shape against a Makefile of the same size
-  // whose lines are not blank, measured alternately in a worker thread, so a
-  // busy machine slows both arms at once. The regex cost hundreds of times
-  // more on each of these; the worker turns a hang into a failure.
-  const WORKER = `
-    import { findPkgRoot } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const { shapes, plain } = workerData;
-    const cost = async (text, reps) => {
-      const started = performance.now();
-      for (let i = 0; i < reps; i++) await findPkgRoot('foo/bar/x.c', async () => text, {});
-      return performance.now() - started;
-    };
-    await cost(plain, 3);
-    const ratios = {};
-    for (const [name, text] of Object.entries(shapes)) {
-      await cost(text, 1);
-      const rounds = [];
-      for (let round = 0; round < 5; round++) {
-        const base = await cost(plain, 10);
-        const measured = await cost(text, 10);
-        rounds.push(measured / Math.max(base, 0.001));
-      }
-      ratios[name] = rounds.sort((a, b) => a - b)[2];
-    }
-    parentPort.postMessage(ratios);
-  `;
-
+  // Each shape against a Makefile of the same size whose lines are not blank,
+  // as a ratio of thread CPU time (see cpuRatio). The regex cost hundreds of
+  // times more on each of these.
   test('costs what a Makefile of the same size costs, whatever its whitespace', async () => {
     const size = 8000;
     const shapes = {
@@ -319,22 +292,11 @@ describe('findPkgRoot on the package helper include', () => {
       'include and a run of spaces': `include${' '.repeat(size)}x\n`,
       'include and a run of blank lines': `include${'\n'.repeat(size)}x\n`
     };
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
-      eval: true,
-      workerData: { shapes, plain: 'x = 1\n'.repeat(size / 6) }
-    });
-    let ratios;
-    try {
-      ratios = await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('findPkgRoot did not settle the whitespace shapes within 30 s')), 30000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
-    for (const [name, ratio] of Object.entries(ratios)) {
+    for (const [name, text] of Object.entries(shapes)) {
+      const { ratio } = await cpuRatio(({ validators: { findPkgRoot }, data: { text, plain } }) => ({
+        base: () => findPkgRoot('foo/bar/x.c', async () => plain, {}),
+        measured: () => findPkgRoot('foo/bar/x.c', async () => text, {})
+      }), { text, plain: 'x = 1\n'.repeat(size / 6) }, { what: `findPkgRoot on ${name}` });
       assert.ok(ratio < 20, `${name} cost ${ratio.toFixed(1)}x a Makefile of the same size`);
     }
   });

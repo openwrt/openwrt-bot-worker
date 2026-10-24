@@ -1,11 +1,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { Worker } from 'node:worker_threads';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 import { validateSubjectScope, createSubjectScopeBudget, findPkgRoot } from '../../src/validators.js';
 import { DEFAULT_CONFIG } from '../../src/config.js';
-import { CONFIG } from './helpers.js';
+import { CONFIG, cpuRatio } from './helpers.js';
 
 const SCOPE = {
   ...CONFIG,
@@ -433,111 +430,40 @@ describe('validateSubjectScope bounds', () => {
   });
 
   // The cost is pinned without a clock: segments scanned is a counter, and the
-  // prefix's own length is a ratio of two arms measured alternately in a
-  // worker thread, so a busy machine slows both at once. The token spellings
-  // are built once per commit and each path segment costs a few lookups; the
-  // shape that rebuilt them per segment, or walked every token per segment,
-  // grows with the prefix and costs over 9 ms at 400 files. The worker is
-  // there so a regression that blocks the thread fails instead of hanging.
-  const WORKER = `
-    import { validateSubjectScope, createSubjectScopeBudget } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const { config, patch, long, short, overCap } = workerData;
-    const commit = (subject) => ({ commit: { message: subject + '\\n\\nBody.' } });
-    const run = async (subject, p, reps) => {
-      const budget = createSubjectScopeBudget();
-      let last = null;
-      const started = performance.now();
-      for (let i = 0; i < reps; i++) {
-        budget.segments = 1e9;
-        last = await validateSubjectScope(commit(subject), p, config, 'openwrt/packages', async () => null, { isMissing: () => true, budget });
-      }
-      return { elapsed: performance.now() - started, scanned: budget.segmentsScanned / reps, last };
-    };
-    await run(short, patch, 3);
-    const ratios = [];
-    let longRun = null;
-    for (let round = 0; round < 5; round++) {
-      const a = await run(short, patch, 10);
-      longRun = await run(long, patch, 10);
-      ratios.push(longRun.elapsed / Math.max(a.elapsed, 0.001));
-    }
-    const over = await run(long, overCap, 1);
-    parentPort.postMessage({
-      ratio: ratios.sort((x, y) => x - y)[2],
-      scanned: longRun.scanned,
-      notices: longRun.last.notices,
-      overScanned: over.scanned,
-      over: over.last
-    });
-  `;
-
+  // prefix's own length is a ratio of thread CPU time (see cpuRatio). The
+  // token spellings are built once per commit and each path segment costs a
+  // few lookups; the shape that rebuilt them per segment, or walked every
+  // token per segment, grows with the prefix and costs over 9 ms at 400 files.
   test('costs the same for a long chained prefix as for a short one, and nothing over the cap', async () => {
     const files = Array.from({ length: 120 }, (_, f) => Array.from({ length: 10 }, (_, s) => `dir${f}-seg${s}-x`).join('/'));
     const long = 'aaaa: bbbb: cccc: dddd: eeee: ffff: gggg: hhhh: iiii: jjjj: kkkk: llll: mmmm: n';
     assert.ok(long.length <= SCOPE.max_subject_len_hard);
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
-      eval: true,
-      workerData: {
-        config: SCOPE,
-        patch: patchOf(...files),
-        long,
-        short: 'aaaa: fix it',
-        overCap: patchOf(...Array.from({ length: 2000 }, (_, i) => `net/pkg${i}/Makefile`))
-      }
-    });
-    let measured;
-    try {
-      measured = await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('the scope check did not settle 120 deep paths within 20 s')), 20000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
+    const { ratio, measured } = await cpuRatio(({ validators: { validateSubjectScope, createSubjectScopeBudget }, data: { config, patch, long, short } }) => {
+      const run = async (subject) => {
+        const budget = createSubjectScopeBudget();
+        const res = await validateSubjectScope({ commit: { message: `${subject}\n\nBody.` } }, patch, config, 'openwrt/packages', async () => null, { isMissing: () => true, budget });
+        return { scanned: budget.segmentsScanned, notices: res.notices };
+      };
+      return { base: () => run(short), measured: () => run(long) };
+    }, { config: SCOPE, patch: patchOf(...files), long, short: 'aaaa: fix it' }, { what: 'the scope check on a 12-part prefix' });
     // Every segment is unique and none matches, so all 1200 are scanned once.
     assert.strictEqual(measured.scanned, 1200);
     // No package root to read: left unchecked for the directory cap, not reported.
     assert.match(measured.notices[0], /more than 8 directories looked up/);
-    assert.ok(measured.ratio < 4, `a 12-part prefix cost ${measured.ratio.toFixed(1)}x a one-part prefix on the same files`);
-    assert.strictEqual(measured.overScanned, 0);
-    assert.deepStrictEqual(measured.over.successes, []);
-    assert.deepStrictEqual(measured.over.warnings, []);
+    assert.ok(ratio < 4, `a 12-part prefix cost ${ratio.toFixed(1)}x a one-part prefix on the same files`);
+
+    const budget = createSubjectScopeBudget();
+    const overCap = patchOf(...Array.from({ length: 2000 }, (_, i) => `net/pkg${i}/Makefile`));
+    const over = await validateSubjectScope({ commit: { message: `${long}\n\nBody.` } }, overCap, SCOPE, 'openwrt/packages', async () => null, { isMissing: () => true, budget });
+    assert.strictEqual(budget.segmentsScanned, 0);
+    assert.deepStrictEqual(over.successes, []);
+    assert.deepStrictEqual(over.warnings, []);
   });
 
   // A contributor's Makefile whose package names each sit on a different link
   // of a 300-variable chain: resolving them all cost 12 ms for 8 KB. Pinned as
-  // a ratio against a Makefile of the same size with literal names, measured
-  // alternately in a worker thread.
-  const NAMES_WORKER = `
-    import { validateSubjectScope, createSubjectScopeBudget } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const { config, chained, literal } = workerData;
-    const patch = 'diff --git a/net/foo/Makefile b/net/foo/Makefile\\n--- a/net/foo/Makefile\\n+++ b/net/foo/Makefile\\n@@ -1 +1 @@\\n-o\\n+n\\n';
-    const commit = { commit: { message: 'hostapd: fix WPS\\n\\nBody.' } };
-    const run = async (text, reps) => {
-      let last = null;
-      const started = performance.now();
-      for (let i = 0; i < reps; i++) {
-        last = await validateSubjectScope(commit, patch, config, 'openwrt/packages', async () => text,
-          { isMissing: () => false, budget: createSubjectScopeBudget() });
-      }
-      return { elapsed: performance.now() - started, last };
-    };
-    await run(literal, 3);
-    await run(chained, 1);
-    const ratios = [];
-    let chainedRun = null;
-    for (let round = 0; round < 5; round++) {
-      const a = await run(literal, 5);
-      chainedRun = await run(chained, 5);
-      ratios.push(chainedRun.elapsed / Math.max(a.elapsed, 0.001));
-    }
-    parentPort.postMessage({ ratio: ratios.sort((x, y) => x - y)[2], last: chainedRun.last });
-  `;
-
+  // a ratio of thread CPU time against a Makefile of the same size with
+  // literal names (see cpuRatio).
   test('costs about what literal names cost for names built from a chain of variables', async () => {
     const size = 8 * 1024;
     let chained = 'PKG_NAME:=$(V0)\n';
@@ -545,24 +471,15 @@ describe('validateSubjectScope bounds', () => {
     for (let i = 0; chained.length < size; i++) chained += `define Package/$(V${i % 300})-${i}\nendef\n`;
     let literal = 'PKG_NAME:=foo\n';
     for (let i = 0; literal.length < size; i++) literal += `define Package/foo-${i}\nendef\n`;
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(NAMES_WORKER.replace('VALIDATORS', validators), {
-      eval: true,
-      workerData: { config: SCOPE, chained: chained.slice(0, size), literal: literal.slice(0, size) }
-    });
-    let measured;
-    try {
-      measured = await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('the scope check did not settle a chained Makefile within 20 s')), 20000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
-    assert.ok(measured.ratio < 8, `names from a chain of variables cost ${measured.ratio.toFixed(1)}x literal ones`);
+    const { ratio, measured } = await cpuRatio(({ validators: { validateSubjectScope, createSubjectScopeBudget }, data: { config, chained, literal } }) => {
+      const patch = 'diff --git a/net/foo/Makefile b/net/foo/Makefile\n--- a/net/foo/Makefile\n+++ b/net/foo/Makefile\n@@ -1 +1 @@\n-o\n+n\n';
+      const run = (text) => validateSubjectScope({ commit: { message: 'hostapd: fix WPS\n\nBody.' } }, patch, config, 'openwrt/packages', async () => text,
+        { isMissing: () => false, budget: createSubjectScopeBudget() });
+      return { base: () => run(literal), measured: () => run(chained) };
+    }, { config: SCOPE, chained: chained.slice(0, size), literal: literal.slice(0, size) }, { what: 'the scope check on names from a chain of variables' });
+    assert.ok(ratio < 8, `names from a chain of variables cost ${ratio.toFixed(1)}x literal ones`);
     // And it says less, never more: templated names leave the prefix unchecked.
-    assert.match(leftUnchecked(measured.last, { gap: false }), /builds package names from make expansions/);
+    assert.match(leftUnchecked(measured, { gap: false }), /builds package names from make expansions/);
   });
 });
 
@@ -570,45 +487,15 @@ describe('validateSubjectScope bounds', () => {
 // findPkgRoot. Its `include ... luci.mk` test once let `^\s*` cross lines, so
 // every line start of a Makefile of blank lines rescanned all the rest: 20,000
 // of them cost over a second, and the 5,000 here hundreds of times what a
-// Makefile of ordinary lines does. Pinned as a ratio against one of the same
-// size whose lines are not blank, measured alternately in a worker thread.
+// Makefile of ordinary lines does. Pinned as a ratio of thread CPU time
+// against one of the same size whose lines are not blank (see cpuRatio).
 describe('findPkgRoot on a Makefile of blank lines', () => {
-  const WORKER = `
-    import { findPkgRoot } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const { blank, plain } = workerData;
-    const cost = async (text, reps) => {
-      const started = performance.now();
-      for (let i = 0; i < reps; i++) await findPkgRoot('foo/bar/baz/x.c', async () => text, {});
-      return performance.now() - started;
-    };
-    await cost(plain, 2);
-    const ratios = [];
-    for (let round = 0; round < 5; round++) {
-      const base = await cost(plain, 5);
-      const measured = await cost(blank, 5);
-      ratios.push(measured / Math.max(base, 0.001));
-    }
-    parentPort.postMessage(ratios.sort((a, b) => a - b)[2]);
-  `;
-
   test('costs what a Makefile of the same size costs', async () => {
     const lines = 2500;
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
-      eval: true,
-      workerData: { blank: '\n'.repeat(lines * 2), plain: 'x\n'.repeat(lines) }
-    });
-    let ratio;
-    try {
-      ratio = await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('findPkgRoot did not settle a Makefile of blank lines within 20 s')), 20000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
+    const { ratio } = await cpuRatio(({ validators: { findPkgRoot }, data: { blank, plain } }) => ({
+      base: () => findPkgRoot('foo/bar/baz/x.c', async () => plain, {}),
+      measured: () => findPkgRoot('foo/bar/baz/x.c', async () => blank, {})
+    }), { blank: '\n'.repeat(lines * 2), plain: 'x\n'.repeat(lines) }, { what: 'findPkgRoot on a Makefile of blank lines' });
     assert.ok(ratio < 20, `a Makefile of blank lines cost ${ratio.toFixed(1)}x one of the same size`);
   });
 

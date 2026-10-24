@@ -4,7 +4,7 @@ import { validateConffilesCoverage, validateMakefileContext } from '../../src/va
 import {
   CONFIG, makeCommit, existingPackage, newPackage, diff, gitModified,
   assertNoneIncludes,
-  assertSomeIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes
+  assertSomeIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes, cpuRatio
 } from './helpers.js';
 
 const FOO = 'package/utils/foo/Makefile';
@@ -915,27 +915,37 @@ endef
     `+\t$(INSTALL_CONF) ./files/x $(1)/etc/config/${installedDir}/x`,
     '+endef'
   );
+  // The verdict on these entries is unchanged, so what is pinned is the cost:
+  // as a ratio of thread CPU time against the same Makefile with an entry the
+  // matcher settles in one pass (see cpuRatio), and under a ceiling of 5 ms
+  // of CPU per call, over twenty times the most any of them took on loaded
+  // macOS or Linux (0.23 ms), which a slowdown of both arms alike still
+  // breaks.
+  const entryCost = (odd, plain, what) => cpuRatio(({ validators: { validateMakefileContext }, helpers: { CONFIG, makeCommit, newPackage }, data: { odd, plain } }) => ({
+    base: () => validateMakefileContext(makeCommit('foo: add new package'), plain, CONFIG, newPackage()),
+    measured: () => validateMakefileContext(makeCommit('foo: add new package'), odd, CONFIG, newPackage())
+  }), { odd, plain }, { what });
 
   // Ten expansions side by side against a 35-character segment: ~3.5 s
-  // unfixed, which is why the length is 35 and not more. The verdict is
-  // unchanged, so what is pinned here is the time.
-  test('judges adjacent unresolved expansions without enumerating the segment', () => {
+  // unfixed, which is why the length is 35 and not more. Pinned against a
+  // literal entry of the same length.
+  test('judges adjacent unresolved expansions without enumerating the segment', async () => {
     const entry = '/etc/config/' + Array.from({ length: 10 }, (_, i) => `$(A${i})`).join('');
-    const started = Date.now();
-    const res = validate('foo: add new package', unresolvedEntryPatch(entry, 'a'.repeat(35)), newPackage());
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed < 500, `judging one conffiles entry took ${elapsed} ms`);
+    const { ratio, measuredMs, measured: res } = await entryCost(unresolvedEntryPatch(entry, 'a'.repeat(35)),
+      unresolvedEntryPatch(`/etc/config/${'b'.repeat(50)}`, 'a'.repeat(35)), 'ten adjacent unresolved expansions');
+    assert.ok(ratio < 5, `ten adjacent expansions cost ${ratio.toFixed(1)}x a literal entry`);
+    assert.ok(measuredMs < 5, `ten adjacent expansions took ${measuredMs.toFixed(1)} ms of CPU per call`);
     assertErrorIncludes(res, 'does not list it');
   });
 
   // Collapsing the adjacent ones is not the whole story: three expansions kept
   // apart by literal text survive it, and against a long segment that is 1.2 s
   // unfixed. A path segment's length is bounded by nothing in a patch.
-  test('judges unresolved expansions separated by literals against a long path', () => {
-    const started = Date.now();
-    const res = validate('foo: add new package', unresolvedEntryPatch('/etc/config/$(A)x$(B)x$(C)', 'x'.repeat(2000)), newPackage());
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed < 500, `judging one conffiles entry took ${elapsed} ms`);
+  test('judges unresolved expansions separated by literals against a long path', async () => {
+    const { ratio, measuredMs, measured: res } = await entryCost(unresolvedEntryPatch('/etc/config/$(A)x$(B)x$(C)', 'x'.repeat(2000)),
+      unresolvedEntryPatch(`/etc/config/${'y'.repeat(16)}`, 'x'.repeat(2000)), 'three expansions apart against a long path');
+    assert.ok(ratio < 5, `three expansions kept apart cost ${ratio.toFixed(1)}x a literal entry`);
+    assert.ok(measuredMs < 5, `three expansions kept apart took ${measuredMs.toFixed(1)} ms of CPU per call`);
     assertErrorIncludes(res, 'does not list it');
   });
 
@@ -1011,18 +1021,20 @@ endef
   // path carries one segment more than the entry, so the segment counts settle
   // it first. Here the counts are equal and the matcher really walks a
   // 2000-character segment, which the backtracking pattern spent ~1.4 s on.
-  test('walks a long path segment against the literals between expansions', () => {
-    const started = Date.now();
-    const res = validate('foo: add new package', newFooMakefile(
+  // Pinned against one expansion walking the same segment.
+  test('walks a long path segment against the literals between expansions', async () => {
+    const entryPatch = (entry) => newFooMakefile(
       '+define Package/foo/conffiles',
-      '+/etc/config/$(A)x$(B)x$(C)q',
+      `+${entry}`,
       '+endef',
       '+define Package/foo/install',
       `+\t$(INSTALL_CONF) ./files/x $(1)/etc/config/${'x'.repeat(2000)}`,
       '+endef'
-    ), newPackage());
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed < 500, `judging one conffiles entry took ${elapsed} ms`);
+    );
+    const { ratio, measuredMs, measured: res } = await entryCost(entryPatch('/etc/config/$(A)x$(B)x$(C)q'), entryPatch('/etc/config/$(A)q'),
+      'three expansions walking a long segment');
+    assert.ok(ratio < 5, `three expansions walking the segment cost ${ratio.toFixed(1)}x one`);
+    assert.ok(measuredMs < 5, `three expansions walking the segment took ${measuredMs.toFixed(1)} ms of CPU per call`);
     assertErrorIncludes(res, 'does not list it');
   });
 
@@ -1051,31 +1063,22 @@ describe('validateConffilesCoverage', () => {
   // install line. Reading it depends on nothing but the entry, so it happens
   // once per entry now.
   //
-  // Pinned as a ratio rather than a bound in milliseconds: the same entries are
-  // judged against one install line and against a hundred, and reading them
-  // once makes the two cost about the same, while reading them per pair makes
-  // the second a hundred times the first. A ratio survives a loaded machine,
-  // where an absolute bound close enough to the unfixed cost to discriminate
+  // Pinned as a ratio of thread CPU time rather than a bound in milliseconds
+  // (see cpuRatio): the same entries are judged against one install line and
+  // against a hundred, and reading them once makes the two cost about the
+  // same, while reading them per pair makes the second a hundred times the
+  // first. An absolute bound close enough to the unfixed cost to discriminate
   // (3 ms fixed against 26 ms unfixed) is a flake.
-  const judge = (entries, installed) => {
-    const errors = [];
-    validateConffilesCoverage(new Map([['foo', entries]]), installed, 'foo', errors, [], new Set(['foo']), true, []);
-    return errors;
-  };
-  // Best of three: the first call also pays for compiling these functions,
-  // which is several times what the pairing costs.
-  const costOf = (entries, installed) => {
-    let best = Infinity;
-    let errors = [];
-    for (let run = 0; run < 3; run++) {
-      const started = performance.now();
-      errors = judge(entries, installed);
-      best = Math.min(best, performance.now() - started);
-    }
-    return { best, errors };
-  };
+  const coverageCost = (base, measured, what) => cpuRatio(({ validators: { validateConffilesCoverage }, data }) => {
+    const judge = ({ entries, installed }) => {
+      const errors = [];
+      validateConffilesCoverage(new Map([['foo', entries]]), installed, 'foo', errors, [], new Set(['foo']), true, []);
+      return errors;
+    };
+    return { base: () => judge(data.base), measured: () => judge(data.measured) };
+  }, { base, measured }, { what });
 
-  test('reads a conffiles entry once, not once per install line', () => {
+  test('reads a conffiles entry once, not once per install line', async () => {
     const entries = new Set();
     for (let i = 0; i < 20; i++) {
       entries.add(`/etc/config/pre${i}${'z'.repeat(32000)}$(A)q${'z'.repeat(32000)}`);
@@ -1084,14 +1087,13 @@ describe('validateConffilesCoverage', () => {
     const hundred = [];
     for (let i = 0; i < 100; i++) hundred.push({ pkg: 'foo', path: `/etc/config/other${i}` });
 
-    const single = costOf(entries, one);
-    const many = costOf(entries, hundred);
+    const { ratio, base: single, measured: many } = await coverageCost({ entries, installed: one }, { entries, installed: hundred },
+      'the same entries against 100 install lines');
 
     // No entry covers any of the paths, so every pair really is judged.
-    assert.strictEqual(single.errors.length, 1);
-    assert.strictEqual(many.errors.length, 100);
-    assert.ok(many.best < single.best * 10 + 5,
-      `100 install lines cost ${many.best.toFixed(1)} ms against ${single.best.toFixed(1)} ms for one: the entries are being read per pair`);
+    assert.strictEqual(single.length, 1);
+    assert.strictEqual(many.length, 100);
+    assert.ok(ratio < 10, `100 install lines cost ${ratio.toFixed(1)}x one: the entries are being read per pair`);
   });
 
   // A conffiles entry that is a literal path, and an install destination that
@@ -1132,10 +1134,8 @@ describe('validateConffilesCoverage', () => {
   // Pinned as a ratio, like the case above and for the same reason: the same
   // 600 install lines are judged against one entry and against 600 of its
   // shape, and collapsing them to one shape makes the two cost about the same,
-  // while a shape per entry makes the second 600 times the first. Both arms
-  // inflate together on a loaded machine, which is what an absolute bound in
-  // milliseconds cannot do - that bound went red in most contended runs.
-  test('matches one shape for entries that differ only in the variable named', () => {
+  // while a shape per entry makes the second 600 times the first.
+  test('matches one shape for entries that differ only in the variable named', async () => {
     const sameShape = (count) => {
       const entries = new Set();
       for (let i = 0; i < count; i++) entries.add(`/etc/config/$(UNSET${i})x`);
@@ -1144,14 +1144,13 @@ describe('validateConffilesCoverage', () => {
     const installed = [];
     for (let i = 0; i < 600; i++) installed.push({ pkg: 'foo', path: `/etc/config/other${i}` });
 
-    const single = costOf(sameShape(1), installed);
-    const many = costOf(sameShape(600), installed);
+    const { ratio, base: single, measured: many } = await coverageCost({ entries: sameShape(1), installed }, { entries: sameShape(600), installed },
+      '600 entries of one shape');
 
     // No entry covers any of the paths, so every pair really is judged.
-    assert.strictEqual(single.errors.length, 600);
-    assert.strictEqual(many.errors.length, 600);
-    assert.ok(many.best < single.best * 10 + 5,
-      `600 entries of one shape cost ${many.best.toFixed(1)} ms against ${single.best.toFixed(1)} ms for one: each entry is its own matcher shape`);
+    assert.strictEqual(single.length, 600);
+    assert.strictEqual(many.length, 600);
+    assert.ok(ratio < 10, `600 entries of one shape cost ${ratio.toFixed(1)}x one: each entry is its own matcher shape`);
   });
 
   // Passes before the lookup above as well: it is the guard that replacing

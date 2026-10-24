@@ -1,12 +1,9 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { Worker } from 'node:worker_threads';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 import { isValidName, parseRevertSubject, parseRevertCommit, validateFormalities, extractSubjectEntity } from '../../src/validators.js';
 import {
   CONFIG, JOHN, makeCommit, commitBy,
-  assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes
+  assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes, cpuRatio
 } from './helpers.js';
 
 const JANE = Object.freeze({ name: 'Jane Smith', email: 'jane@smith.com' });
@@ -635,12 +632,22 @@ describe('Signed-off-by parsing', () => {
 
   test('answers promptly on a long line that is not a URL', async () => {
     // 48 000 letters cost the old pattern about 5.5 seconds: it retried the
-    // whole run at every starting position looking for a scheme.
-    const message = 'pkg: update\n\n' + 'x'.repeat(48000) + '\n\nSigned-off-by: Jane Doe <jane@doe.com>';
-    const started = process.hrtime.bigint();
-    await validateFormalities(commitWith(message), SIGNOFF_CONFIG);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
+    // whole run at every starting position looking for a scheme. Pinned
+    // against the same letters wrapped at the width limit, and under 20 ms of
+    // CPU per call, over twenty times the most it took on loaded macOS
+    // (0.7 ms) or Linux (0.8 ms).
+    const letters = 'x'.repeat(48000);
+    const message = (body) => `pkg: update\n\n${body}\n\nSigned-off-by: Jane Doe <jane@doe.com>`;
+    const { ratio, measuredMs } = await cpuRatio(({ validators: { validateFormalities }, data: { long, wrapped, config } }) => ({
+      base: () => validateFormalities(wrapped, config),
+      measured: () => validateFormalities(long, config)
+    }), {
+      long: commitWith(message(letters)),
+      wrapped: commitWith(message(letters.match(/.{1,100}/g).join('\n'))),
+      config: SIGNOFF_CONFIG
+    }, { what: 'a 48 000-letter line' });
+    assert.ok(ratio < 5, `a 48 000-letter line cost ${ratio.toFixed(1)}x the same letters wrapped`);
+    assert.ok(measuredMs < 20, `a 48 000-letter line took ${measuredMs.toFixed(1)} ms of CPU per call`);
   });
 
   test('reads the name and address whatever spacing the trailer uses', async () => {
@@ -659,15 +666,17 @@ describe('Signed-off-by parsing', () => {
     // A commit message anyone can write. The pattern used to let the space
     // matcher and the name matcher compete for every space: 3000 of them cost
     // about six seconds of CPU, past what any Worker invocation gets, so the
-    // run was killed and the pull request got no checks at all.
-    const message = 'pkg: update\n\nSigned-off-by:' + ' '.repeat(3000);
-    const started = process.hrtime.bigint();
-    const res = await validateFormalities(commitWith(message), SIGNOFF_CONFIG);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    // The bound is far above what the fixed pattern needs (hundredths of a
-    // millisecond) and far below what the old one did (about 6 500 ms), so a
-    // slow or loaded machine cannot turn this into a false alarm.
-    assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
+    // run was killed and the pull request got no checks at all. Pinned
+    // against a trailer of as many letters, which has no spaces to split, and
+    // under 2 ms of CPU per call, over thirty times the most it took on loaded
+    // macOS or Linux (0.06 ms).
+    const trailer = (after) => commitWith(`pkg: update\n\nSigned-off-by:${after}`);
+    const { ratio, measuredMs, measured: res } = await cpuRatio(({ validators: { validateFormalities }, data: { spaces, letters, config } }) => ({
+      base: () => validateFormalities(letters, config),
+      measured: () => validateFormalities(spaces, config)
+    }), { spaces: trailer(' '.repeat(3000)), letters: trailer('x'.repeat(3000)), config: SIGNOFF_CONFIG }, { what: 'a trailer of 3000 spaces' });
+    assert.ok(ratio < 5, `a trailer of 3000 spaces cost ${ratio.toFixed(1)}x one of 3000 letters`);
+    assert.ok(measuredMs < 2, `a trailer of 3000 spaces took ${measuredMs.toFixed(2)} ms of CPU per call`);
     assertErrorIncludes(res, 'Signed-off-by');
   });
 });
@@ -718,81 +727,27 @@ describe('subject prefix grammar cost', () => {
   const BENIGN_OVER_LIMIT = `netifd: ${'x'.repeat(OVER_LIMIT.length - 8)}`;
   const commitFor = (subject) => signedOff(`${subject}\n\nSome body text.\nhttps://example.com/`, JANE);
 
-  // All of this runs in a worker thread, and that is the point. What the
-  // unambiguous grammar bought is that a dotted subject costs what any other
-  // subject of its length costs; the ambiguous one ran this one for tens of
-  // seconds. A regression that bad blocks the thread it runs on, so neither a
-  // test timeout nor an assertion after it would ever run - measured in
-  // process, the suite hangs instead of failing. A worker can be terminated
-  // from here, which turns "it never came back" into a failure with a message.
-  //
-  // The cost itself is pinned as a ratio against the plain subject of the same
-  // length, measured alternately so a loaded machine inflates both arms at
-  // once: an absolute bound tight enough to catch the old grammar is a flake
-  // on a busy CPU.
-  const WORKER = `
-    import { validateFormalities } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const { config, pairs } = workerData;
-    const cost = async (commit, reps) => {
-      const started = performance.now();
-      let last = null;
-      for (let i = 0; i < reps; i++) last = await validateFormalities(commit, config);
-      return { elapsed: performance.now() - started, errors: last.errors };
-    };
-    const out = {};
-    for (const [name, odd, plain] of pairs) {
-      await cost(plain, 1);
-      const ratios = [];
-      let errors = [];
-      for (let round = 0; round < 5; round++) {
-        const base = await cost(plain, 20);
-        const measured = await cost(odd, 20);
-        errors = measured.errors;
-        ratios.push(measured.elapsed / Math.max(base.elapsed, 0.001));
-      }
-      out[name] = { ratio: ratios.sort((a, b) => a - b)[2], errors };
-    }
-    parentPort.postMessage(out);
-  `;
-
-  const measureOutOfThread = async () => {
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
-      eval: true,
-      workerData: {
-        config: CONFIG,
-        pairs: [
-          ['withinLimit', commitFor(PATHOLOGICAL), commitFor(BENIGN)],
-          ['overLimit', commitFor(OVER_LIMIT), commitFor(BENIGN_OVER_LIMIT)]
-        ]
-      }
-    });
-    try {
-      return await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('the grammar did not settle a 70-character dotted subject within 20 s')), 20000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
-  };
+  // What the unambiguous grammar bought is that a dotted subject costs what
+  // any other subject of its length costs; the ambiguous one ran this one for
+  // tens of seconds, which is why it is measured in a worker thread that can
+  // be cut off (see cpuRatio), as a ratio against the plain subject.
+  const measure = (odd, plain, what) => cpuRatio(({ validators: { validateFormalities }, data: { odd, plain, config } }) => ({
+    base: () => validateFormalities(plain, config),
+    measured: () => validateFormalities(odd, config)
+  }), { odd: commitFor(odd), plain: commitFor(plain), config: CONFIG }, { what });
 
   test('settles a dotted subject as fast as a plain one of its length, over the limit too', async () => {
     assert.ok(PATHOLOGICAL.length <= CONFIG.max_subject_len_hard);
     assert.strictEqual(BENIGN.length, PATHOLOGICAL.length);
     assert.ok(OVER_LIMIT.length > CONFIG.max_subject_len_hard);
 
-    const measured = await measureOutOfThread();
-
-    assert.ok(measured.withinLimit.ratio < 20,
-      `the dotted subject cost ${measured.withinLimit.ratio.toFixed(1)}x a plain one of the same length`);
-    assert.ok(measured.overLimit.ratio < 20,
-      `the over-limit dotted subject cost ${measured.overLimit.ratio.toFixed(1)}x a plain one of the same length`);
+    const withinLimit = await measure(PATHOLOGICAL, BENIGN, 'the grammar on a 70-character dotted subject');
+    assert.ok(withinLimit.ratio < 20, `the dotted subject cost ${withinLimit.ratio.toFixed(1)}x a plain one of the same length`);
+    const overLimit = await measure(OVER_LIMIT, BENIGN_OVER_LIMIT, 'the grammar on an over-limit dotted subject');
+    assert.ok(overLimit.ratio < 20, `the over-limit dotted subject cost ${overLimit.ratio.toFixed(1)}x a plain one of the same length`);
     // The grammar still runs on a subject cut to the hard limit, so the
     // missing `<prefix>: ` is reported in the same round as the length.
-    const overLimitErrors = measured.overLimit.errors.join('\n');
+    const overLimitErrors = overLimit.measured.errors.join('\n');
     assert.match(overLimitErrors, /exceeds hard limit/);
     assert.match(overLimitErrors, /must start with/);
   });
