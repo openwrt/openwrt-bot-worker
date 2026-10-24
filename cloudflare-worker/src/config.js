@@ -84,16 +84,39 @@ export const DEFAULT_CONFIG = {
   enable_labeler_yml: false,
   enable_issue_labeller: false,
 
-  // Stale PR cleanup. Read by the scheduled scan (see stale.js), which checks
-  // the repository config directly, but listed here so this object stays the
-  // full set of keys a repository can set.
-  enable_stale_bot: false,
-
-  // Stale bot: machine accounts whose comments and reviews must not reset the
-  // stale countdown. GitHub Apps and *[bot] accounts are always ignored by
-  // shape; automation running on a plain User account (an AI reviewer such as
-  // openwrt-ai) is indistinguishable from a person and has to be named here.
-  stale_ignored_users: ['openwrt-ai'],
+  // Stale cleanup, read by the scheduled scan (see stale.js). One rule per
+  // kind: an open item carrying one of `labels` and idle for
+  // `days_until_stale` days is marked `stale` with a comment, and closed
+  // `days_until_close` days later unless someone acts and `close` is set.
+  // `dry_run` only logs what the scan would do. An issue is asked once, and
+  // at most `max_per_run` issues are marked per scan, so turning it on does
+  // not post on a whole backlog at once. `ignored_users` names machine
+  // accounts whose comments and reviews never reset the countdown: GitHub
+  // Apps and *[bot] accounts are ignored by shape, but automation running on
+  // a plain User account (an AI reviewer such as openwrt-ai) is
+  // indistinguishable from a person and has to be named here. The older
+  // `enable_stale_bot` and `stale_ignored_users` keys still apply when the
+  // block leaves `pull_requests.enabled` and `ignored_users` out.
+  stale_bot: {
+    ignored_users: ['openwrt-ai'],
+    pull_requests: {
+      enabled: false,
+      labels: ['not following guidelines'],
+      days_until_stale: 14,
+      days_until_close: 14,
+      close: true,
+      dry_run: false
+    },
+    issues: {
+      enabled: false,
+      labels: [],
+      days_until_stale: 14,
+      days_until_close: 14,
+      close: false,
+      dry_run: false,
+      max_per_run: 10
+    }
+  },
 };
 
 export const LABEL_GUIDELINES = 'not following guidelines';
