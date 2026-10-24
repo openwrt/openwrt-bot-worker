@@ -1399,21 +1399,75 @@ export function isPackageMakefilePath(filePath) {
   return true;
 }
 
-// Collect the Makefiles a patch adds (`--- /dev/null`) or removes
-// (`+++ /dev/null`), dropping the build-infrastructure paths rejected by
-// isPackageMakefilePath(). Everything else counts as a package Makefile, so
-// unlisted infrastructure trees are still reported as new/dropped packages.
+// Every package recipe in the OpenWrt trees includes $(TOPDIR)/rules.mk, and
+// none of the kbuild or source-tree Makefiles kept beside them does.
+const RULES_MK_INCLUDE = {
+  added: /^\+[ \t]*-?include[ \t]+\$(?:\(TOPDIR\)|\{TOPDIR\})\/rules\.mk[ \t]*(?:#.*)?\r?$/m,
+  removed: /^-[ \t]*-?include[ \t]+\$(?:\(TOPDIR\)|\{TOPDIR\})\/rules\.mk[ \t]*(?:#.*)?\r?$/m
+};
+
+// 'added' or 'removed' when the diff's header says the patch adds or deletes
+// the whole file, else null. Only the header is read: a content line can
+// spell '--- /dev/null' too.
+function wholeFileSide(fileDiff) {
+  for (let start = 0; start < fileDiff.length;) {
+    let end = fileDiff.indexOf('\n', start);
+    if (end === -1) end = fileDiff.length;
+    const line = fileDiff.slice(start, end);
+    if (line.startsWith('@@')) break;
+    if (/^---[ \t]+\/dev\/null\r?$/.test(line)) return 'added';
+    if (/^\+\+\+[ \t]+\/dev\/null\r?$/.test(line)) return 'removed';
+    start = end + 1;
+  }
+  return null;
+}
+
+// Whether a Makefile sits inside a package rather than at a package root: a
+// kbuild file or a source tree's own Makefile, which follows its project's
+// conventions, not a recipe's. `fileDiff` is the file's part of the patch;
+// `side` says whether it adds or removes the whole file, and is read from its
+// header when not given. Build infrastructure, the top-level Makefile and
+// hidden paths never are: the rules.mk test below holds for package trees
+// only, and toolchain/ recipes reach rules.mk through a common.mk.
+export function isNestedMakefile(filePath, fileDiff, side) {
+  if (!isPackageMakefilePath(filePath)) return false;
+  const path = filePath.trim().replace(/^\.\//, '');
+  if (!tooDeepForPackageRoot(path)) {
+    const fast = getFastPkgRoot(path);
+    if (fast === null) return false;
+    // A root other than its own directory: package/kernel/foo/src/Makefile.
+    if (typeof fast === 'string') return fast !== path.slice(0, -'/Makefile'.length);
+  }
+  // The path does not tell. An added or removed file is all in the patch, so
+  // its content decides; a changed one is only partly there, so it is not
+  // left out on a guess.
+  const whole = side === undefined ? wholeFileSide(fileDiff || '') : side;
+  if (whole !== 'added' && whole !== 'removed') return false;
+  return !RULES_MK_INCLUDE[whole].test(fileDiff || '');
+}
+
+// Whether a Makefile is an OpenWrt package recipe, the one kind with PKG_*
+// metadata and package blocks: neither build infrastructure nor nested.
+export function isPackageRecipeMakefile(filePath, fileDiff, side) {
+  return isPackageMakefilePath(filePath) && !isNestedMakefile(filePath, fileDiff, side);
+}
+
+// Collect the package recipes a patch adds (`--- /dev/null`) or removes
+// (`+++ /dev/null`), as isPackageRecipeMakefile() tells them apart from
+// build infrastructure and from the Makefiles nested inside a package.
 export function collectPackageMakefiles(commitPatch, direction) {
   const regex = direction === 'added'
     ? /^---\s+\/dev\/null\r?\n\+\+\+\s+b\/(.*)\r?$/gm
     : /^---\s+a\/(.*)\r?\n\+\+\+\s+\/dev\/null\r?$/gm;
 
   const paths = [];
-  let match;
-  while ((match = regex.exec(commitPatch)) !== null) {
-    const filePath = match[1].trim();
-    if (isPackageMakefilePath(filePath)) {
-      paths.push(filePath);
+  for (const fileDiff of commitPatch.split(/^diff --git /m)) {
+    let match;
+    while ((match = regex.exec(fileDiff)) !== null) {
+      const filePath = match[1].trim();
+      if (isPackageRecipeMakefile(filePath, fileDiff, direction)) {
+        paths.push(filePath);
+      }
     }
   }
   return paths;
@@ -2063,7 +2117,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
   // Every Makefile check below wants the same thing: the patch split per file,
   // narrowed to Makefiles, split into lines. Compute it once (lazily, so
   // configurations with all Makefile checks off pay nothing) instead of
-  // re-scanning the whole patch once per enabled check.
+  // re-scanning the whole patch once per enabled check. A kbuild file or a
+  // package's src/Makefile follows its own project's style, not OpenWrt's.
   let cachedMakefileChunks = null;
   const getMakefileChunks = () => {
     if (cachedMakefileChunks !== null) return cachedMakefileChunks;
@@ -2073,6 +2128,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
       if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
+      if (isNestedMakefile(filePath, fileDiff)) continue;
       cachedMakefileChunks.push({ filePath, lines: fileDiff.split('\n'), rawChunk: fileDiff });
     }
     return cachedMakefileChunks;
@@ -2752,7 +2808,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
       if (!fileMatch) continue;
       const filePath = fileMatch[1].trim();
-      if (!isPackageMakefilePath(filePath)) continue;
+      if (!isPackageRecipeMakefile(filePath, fileDiff)) continue;
       deadVarCheckRun = true;
 
       const isLuci = fileDiff.includes('luci.mk') || /^[+ ]LUCI_[A-Z]/m.test(fileDiff);
