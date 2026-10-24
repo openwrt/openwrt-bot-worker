@@ -1,25 +1,12 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { extractConffilesMap, extractDefinedPackages, resolveMakefileVar } from '../../src/validators.js';
+import { cpuRatio } from './helpers.js';
 
-// What one reading of a text costs, as the fastest of five runs: the first
-// also pays for compiling the code under it, which is several times what the
-// reading costs, and taking the fastest is what keeps one descheduled run from
-// deciding the answer. Used below to pin a cost as a RATIO between two sizes
-// of one dimension rather than as a bound in milliseconds. A bound close
-// enough to the unfixed cost to discriminate is missed by 4-40x whenever the
-// test runner puts another file's process on the same core, which turned the
-// suite red in most contended runs; a ratio inflates on both arms at once.
-const costOf = (read) => {
-  let best = Infinity;
-  let out;
-  for (let run = 0; run < 5; run++) {
-    const started = performance.now();
-    out = read();
-    best = Math.min(best, performance.now() - started);
-  }
-  return { best, out };
-};
+// The costs below are pinned as a RATIO between two sizes of one dimension,
+// in thread CPU time (see cpuRatio), rather than as a bound in milliseconds:
+// one close enough to the unfixed cost to discriminate is missed whenever the
+// test runner puts another file's process on the same core.
 
 describe('resolveMakefileVar', () => {
   test('resolves a chain, a cycle and an unset variable', () => {
@@ -33,18 +20,27 @@ describe('resolveMakefileVar', () => {
   // own `seen`, so without the budget this chain expands both $(V) on each
   // line in full: 2^18 calls building a 262144-character PKG_RELEASE, which
   // alone is far past the Worker CPU limit. Depth 18 is bounded on purpose -
-  // it costs ~0.4 s unfixed instead of the minutes a deeper chain would.
-  test('bounds a doubling variable chain instead of expanding it 2^n times', () => {
-    const lines = ['PKG_NAME:=demo', 'PKG_VERSION:=1.0', 'PKG_RELEASE:=$(V0)'];
-    for (let i = 0; i < 18; i++) lines.push(`V${i}:=$(V${i + 1})$(V${i + 1})`);
-    lines.push('V18:=1');
+  // it costs ~0.4 s unfixed instead of the minutes a deeper chain would. The
+  // cost is pinned against depth 8, whose 2^9 expansions are about what the
+  // budget allows: bounded, the two cost the same; unbounded, a thousandfold.
+  // One call also stays under 10 ms of CPU, over twenty times the most it took
+  // on loaded macOS or Linux (0.43 ms), which a slowdown of both depths alike
+  // still breaks.
+  test('bounds a doubling variable chain instead of expanding it 2^n times', async () => {
+    const chain = (depth) => {
+      const lines = ['PKG_NAME:=demo', 'PKG_VERSION:=1.0', 'PKG_RELEASE:=$(V0)'];
+      for (let i = 0; i < depth; i++) lines.push(`V${i}:=$(V${i + 1})$(V${i + 1})`);
+      lines.push(`V${depth}:=1`);
+      return lines.join('\n');
+    };
+    const { ratio, measuredMs, measured: value } = await cpuRatio(({ validators: { resolveMakefileVar }, data: { deep, shallow } }) => ({
+      base: () => resolveMakefileVar(shallow, 'PKG_RELEASE'),
+      measured: () => resolveMakefileVar(deep, 'PKG_RELEASE')
+    }), { deep: chain(18), shallow: chain(8) }, { what: 'a doubling variable chain' });
 
-    const started = Date.now();
-    const value = resolveMakefileVar(lines.join('\n'), 'PKG_RELEASE');
-    const elapsed = Date.now() - started;
-
+    assert.ok(ratio < 4, `a doubling chain 18 deep cost ${ratio.toFixed(1)}x one 8 deep`);
+    assert.ok(measuredMs < 10, `a doubling chain 18 deep took ${measuredMs.toFixed(1)} ms of CPU per call`);
     assert.ok(value.length < 1024, `PKG_RELEASE grew to ${value.length} characters`);
-    assert.ok(elapsed < 200, `resolving a ${lines.join('\n').length}-byte Makefile took ${elapsed} ms`);
   });
 
   // The same chain with a long literal on every line: counting expansions
@@ -104,7 +100,7 @@ describe('extractConffilesMap', () => {
   // name the variable, so the same block is read with one entry and with 500:
   // resolving once makes the two cost about the same, resolving per line makes
   // the second hundreds of times the first.
-  test('resolves each variable once for a whole conffiles block', () => {
+  test('resolves each variable once for a whole conffiles block', async () => {
     const block = (entries) => {
       const lines = ['PKG_NAME:=foo'];
       for (let i = 0; i < 40; i++) lines.push(`V${i}:=$(V${i + 1})$(V${i + 1})`);
@@ -117,17 +113,18 @@ describe('extractConffilesMap', () => {
     const one = block(1);
     const content = block(500);
 
-    const single = costOf(() => extractConffilesMap(one));
-    const many = costOf(() => extractConffilesMap(content));
+    const { ratio, base: single, measured: many } = await cpuRatio(({ validators: { extractConffilesMap }, data: { one, content } }) => ({
+      base: () => extractConffilesMap(one),
+      measured: () => extractConffilesMap(content)
+    }), { one, content }, { what: '500 conffiles entries naming one variable' });
 
-    assert.ok(many.best < single.best * 10 + 5,
-      `500 entries naming one variable cost ${many.best.toFixed(1)} ms against ${single.best.toFixed(1)} ms for one: the variable is resolved per line`);
+    assert.ok(ratio < 10, `500 entries naming one variable cost ${ratio.toFixed(1)}x one: the variable is resolved per line`);
     // Resolving once must give what resolving per line gave: the guard that
     // this is a saving and not a change of answer.
     const value = resolveMakefileVar(content, 'V0');
-    assert.strictEqual(single.out.get('foo').size, 1);
-    assert.strictEqual(many.out.get('foo').size, 500);
-    assert.deepStrictEqual([...many.out.get('foo')].slice(0, 3), [0, 1, 2].map(i => `/etc/config/e${i}${value}`));
+    assert.strictEqual(single.get('foo').size, 1);
+    assert.strictEqual(many.get('foo').size, 500);
+    assert.deepStrictEqual([...many.get('foo')].slice(0, 3), [0, 1, 2].map(i => `/etc/config/e${i}${value}`));
   });
 
   // Which assignment a name has is a pure function of the text, so reading it
@@ -143,7 +140,7 @@ describe('extractConffilesMap', () => {
   // some forty times the first. 40 names and not more because the walk itself
   // is linear in the names even when the read is shared, and enough of them
   // make that linear part alone an order of magnitude.
-  test('reads an assignment once per Makefile, not once per name leading to it', () => {
+  test('reads an assignment once per Makefile, not once per name leading to it', async () => {
     const makefile = (names) => {
       const lines = ['PKG_NAME:=foo'];
       for (let i = 0; i < 1200; i++) lines.push('# ' + 'a'.repeat(78));
@@ -157,15 +154,16 @@ describe('extractConffilesMap', () => {
     const one = makefile(1);
     const forty = makefile(40);
 
-    const single = costOf(() => extractConffilesMap(one));
-    const many = costOf(() => extractConffilesMap(forty));
+    const { ratio, base: single, measured: many } = await cpuRatio(({ validators: { extractConffilesMap }, data: { one, forty } }) => ({
+      base: () => extractConffilesMap(one),
+      measured: () => extractConffilesMap(forty)
+    }), { one, forty }, { what: '40 names leading into one chain' });
 
-    assert.ok(many.best < single.best * 10 + 5,
-      `40 names leading into the chain cost ${many.best.toFixed(1)} ms against ${single.best.toFixed(1)} ms for one: the Makefile is read per name`);
+    assert.ok(ratio < 10, `40 names leading into the chain cost ${ratio.toFixed(1)}x one: the Makefile is read per name`);
     // Sharing the read must give what reading per name gave.
-    assert.strictEqual(single.out.get('foo').size, 1);
-    assert.strictEqual(many.out.get('foo').size, 40);
-    assert.deepStrictEqual([...many.out.get('foo')].slice(0, 3), [0, 1, 2].map(i => `/etc/config/cz${i}`));
+    assert.strictEqual(single.get('foo').size, 1);
+    assert.strictEqual(many.get('foo').size, 40);
+    assert.deepStrictEqual([...many.get('foo')].slice(0, 3), [0, 1, 2].map(i => `/etc/config/cz${i}`));
   });
 });
 
@@ -181,7 +179,7 @@ describe('extractDefinedPackages', () => {
   // for it, so the same padding is read with one block and with 400: stripping
   // once keeps the padding's own cost the whole cost, while stripping per
   // block makes the second hundreds of times the first.
-  test('strips the patch markers once per Makefile, not once per package block', () => {
+  test('strips the patch markers once per Makefile, not once per package block', async () => {
     const chunkOf = (blocks) => {
       const lines = ['+PKG_NAME:=mypkg', '+PKG_VERSION:=1.0'];
       for (let i = 0; i < 1300; i++) lines.push('+# ' + 'a'.repeat(78));
@@ -191,13 +189,14 @@ describe('extractDefinedPackages', () => {
     const one = chunkOf(1);
     const chunk = chunkOf(400);
 
-    const single = costOf(() => extractDefinedPackages(one));
-    const many = costOf(() => extractDefinedPackages(chunk));
+    const { ratio, base: single, measured: many } = await cpuRatio(({ validators: { extractDefinedPackages }, data: { one, chunk } }) => ({
+      base: () => extractDefinedPackages(one),
+      measured: () => extractDefinedPackages(chunk)
+    }), { one, chunk }, { what: '400 package blocks' });
 
-    assert.ok(many.best < single.best * 10 + 5,
-      `400 package blocks cost ${many.best.toFixed(1)} ms against ${single.best.toFixed(1)} ms for one: the markers are stripped per block`);
-    assert.strictEqual(single.out.size, 1);
-    assert.strictEqual(many.out.size, 400);
-    assert.ok(many.out.has('mypkg-sub0') && many.out.has('mypkg-sub399'), `names: ${[...many.out].slice(0, 3)}`);
+    assert.ok(ratio < 10, `400 package blocks cost ${ratio.toFixed(1)}x one: the markers are stripped per block`);
+    assert.strictEqual(single.size, 1);
+    assert.strictEqual(many.size, 400);
+    assert.ok(many.has('mypkg-sub0') && many.has('mypkg-sub399'), `names: ${[...many].slice(0, 3)}`);
   });
 });

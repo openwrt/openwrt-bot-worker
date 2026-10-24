@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { validateMakefileContext, validatePkgReleaseBumps, findPkgRoot, isPackageMakefilePath } from '../../src/validators.js';
 import {
   CONFIG, makeCommit, existingPackage, newPackage, diff, modified, added, removed, gitModified, gitAdded,
-  assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes
+  assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes, cpuRatio
 } from './helpers.js';
 
 // One commit through validateMakefileContext, in a pull request that has not
@@ -1459,12 +1459,17 @@ describe('PKG_MAINTAINER parsing', () => {
 
   test('answers promptly on a maintainer line full of angle brackets', async () => {
     // 80 000 of them cost the old pattern about 5.5 seconds, from one added
-    // Makefile line - well inside what a pull request can carry.
-    const patch = settingMaintainer('<'.repeat(80000));
-    const started = process.hrtime.bigint();
-    const res = validate('mypkg: set maintainer', patch, options);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.ok(ms < 2500, `parsing took ${ms.toFixed(0)} ms, which no invocation can afford`);
+    // Makefile line - well inside what a pull request can carry. Pinned
+    // against a value of as many letters, which has no bracket to rescan from,
+    // and under 25 ms of CPU per call, over eighteen times the most it took on
+    // loaded macOS (1.0 ms) or Linux (1.3 ms), so a slowdown of both arms
+    // alike fails too.
+    const { ratio, measuredMs, measured: res } = await cpuRatio(({ validators: { validateMakefileContext }, helpers: { makeCommit, existingPackage }, data }) => ({
+      base: () => validateMakefileContext(makeCommit('mypkg: set maintainer'), data.letters, data.config, existingPackage(), data.repo),
+      measured: () => validateMakefileContext(makeCommit('mypkg: set maintainer'), data.brackets, data.config, existingPackage(), data.repo)
+    }), { brackets: settingMaintainer('<'.repeat(80000)), letters: settingMaintainer('x'.repeat(80000)), ...options }, { what: 'a maintainer line of 80 000 angle brackets' });
+    assert.ok(ratio < 5, `80 000 angle brackets cost ${ratio.toFixed(1)}x as many letters`);
+    assert.ok(measuredMs < 25, `80 000 angle brackets took ${measuredMs.toFixed(1)} ms of CPU per call`);
     // The malformed value is still reported.
     assertErrorIncludes(res, 'PKG_MAINTAINER');
   });

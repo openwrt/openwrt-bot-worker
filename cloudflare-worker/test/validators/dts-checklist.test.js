@@ -1,10 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { validateDeviceTrees } from '../../src/validators.js';
-import { Worker } from 'node:worker_threads';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
-import { CONFIG, makeCommit, readFixture } from './helpers.js';
+import { CONFIG, makeCommit, readFixture, cpuRatio } from './helpers.js';
 
 const DTS_CONFIG = { ...CONFIG, check_dts_checklist: 'warning' };
 
@@ -534,41 +531,10 @@ describe('validateDeviceTrees: configuration', () => {
 // each with a default-state was 4.5 million steps; each node now takes its
 // owner from its parent when it opens.
 //
-// Pinned as a ratio against as many lines of sibling nodes, measured
-// alternately and in a worker thread so a regression that hangs fails with a
-// message (see 'subject prefix grammar cost' in formalities.test.js). A
-// preemption can multiply a round of a few milliseconds, so the ratio
-// compares the best of 25 short rounds of each arm: load only ever adds time.
-// Measured with twelve CPU-bound processes and six copies of this suite
-// running beside it: 1.3-1.6x fixed, 16-27x with the walk. The patch text is
-// reused, so the shared parsers answer from their cache and only this check
-// is measured.
+// Pinned as a ratio of thread CPU time against as many lines of sibling
+// nodes (see cpuRatio). The patch text is reused, so the shared parsers
+// answer from their cache and only this check is measured.
 describe('device tree nesting cost', () => {
-  const WORKER = `
-    import { validateDeviceTrees } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const { deep, flat } = workerData;
-    const config = { check_dts_checklist: 'warning' };
-    const cost = async (patch, reps) => {
-      const commits = [{ commitPatch: patch }];
-      const started = performance.now();
-      let last = null;
-      for (let i = 0; i < reps; i++) last = await validateDeviceTrees(commits, config, async () => null, false);
-      return { elapsed: performance.now() - started, warnings: last.warnings, notices: last.notices };
-    };
-    await cost(flat, 2);
-    await cost(deep, 2);
-    let flatBest = Infinity;
-    let deepBest = Infinity;
-    let result = null;
-    for (let round = 0; round < 25; round++) {
-      flatBest = Math.min(flatBest, (await cost(flat, 4)).elapsed);
-      result = await cost(deep, 4);
-      deepBest = Math.min(deepBest, result.elapsed);
-    }
-    parentPort.postMessage({ ratio: deepBest / Math.max(flatBest, 0.001), warnings: result.warnings, notices: result.notices });
-  `;
-
   test('settles a node 3,000 levels deep as fast as one of 3,000 siblings', async () => {
     const depth = 2998;
     const deepLines = [SPDX, '\tleds {', '\t\tcompatible = "gpio-leds";'];
@@ -582,23 +548,18 @@ describe('device tree nesting cost', () => {
     const deep = addition(DTS, deepLines);
     const flat = addition(DTS, flatLines.slice(0, deepLines.length));
 
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(WORKER.replace('VALIDATORS', validators), { eval: true, workerData: { deep, flat } });
-    let measured;
-    try {
-      measured = await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('3,000 nested device-tree nodes did not settle within 20 s')), 20000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
+    const { ratio, measured } = await cpuRatio(({ validators: { validateDeviceTrees }, data: { deep, flat } }) => {
+      const config = { check_dts_checklist: 'warning' };
+      return {
+        base: () => validateDeviceTrees([{ commitPatch: flat }], config, async () => null, false),
+        measured: () => validateDeviceTrees([{ commitPatch: deep }], config, async () => null, false)
+      };
+    }, { deep, flat }, { what: '3,000 nested device-tree nodes' });
 
     // Every nested LED really is judged: one finding naming all of them.
     assert.deepStrictEqual(measured.notices, []);
     assert.strictEqual(measured.warnings.length, 1);
     assert.ok(measured.warnings[0].includes(`on ${depth} LED nodes`), measured.warnings[0]);
-    assert.ok(measured.ratio < 5, `3,000 nested nodes cost ${measured.ratio.toFixed(1)}x as many siblings`);
+    assert.ok(ratio < 5, `3,000 nested nodes cost ${ratio.toFixed(1)}x as many siblings`);
   });
 });

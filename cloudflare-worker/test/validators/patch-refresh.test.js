@@ -1,10 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { Worker } from 'node:worker_threads';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 import { validateEmbeddedPatches } from '../../src/validators.js';
-import { readFixture, assertSomeIncludes, assertNoneIncludes, assertNoErrors } from './helpers.js';
+import { readFixture, assertSomeIncludes, assertNoneIncludes, assertNoErrors, cpuRatio } from './helpers.js';
 
 // The header rule is off in most of these, so only the refresh rule speaks.
 const REFRESH = { check_patch_headers: false, check_patch_refresh: true };
@@ -430,44 +427,16 @@ describe('validateEmbeddedPatches: diffs the refresh target did not write', () =
 // pull request diff in a sample of 400 merged ones (openwrt PR 25945: 39 patch
 // files, 26 129 lines, about a megabyte), rebuilt here in its shape, and on a
 // file whose every line is a header pair - the most work a contributor can
-// hand it per byte. Run in a worker thread, so a regression that blocks the
-// thread fails here instead of hanging the suite, and pinned as a ratio of
-// that thread's CPU time against the header rule on the same input, measured
-// alternately, so a loaded machine inflates both arms at once.
+// hand it per byte. Pinned as a ratio of thread CPU time against the header
+// rule alone on the same input (see cpuRatio).
 describe('refresh rule cost', () => {
-  const WORKER = `
-    import { validateEmbeddedPatches } from VALIDATORS;
-    import { parentPort, workerData } from 'node:worker_threads';
-    const lookup = async () => 'From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\\nFrom: a\\nDate: b\\nSubject: c\\n';
-    const both = { check_patch_headers: true, check_patch_refresh: 'warning' };
-    const headersOnly = { check_patch_headers: true, check_patch_refresh: false };
-    // This thread's CPU time where Node has it, so time the thread spent
-    // descheduled on a loaded machine counts in neither arm.
-    const now = process.threadCpuUsage
-      ? () => { const { user, system } = process.threadCpuUsage(); return (user + system) / 1000; }
-      : () => performance.now();
-    const cost = async (patch, config, reps) => {
-      const started = now();
-      let last = null;
-      for (let i = 0; i < reps; i++) last = await validateEmbeddedPatches(patch, config, lookup);
-      return { elapsed: now() - started, last };
+  const measure = (patch, what) => cpuRatio(({ validators: { validateEmbeddedPatches }, data: { patch } }) => {
+    const lookup = async () => 'From 0123456789012345678901234567890123456789 Mon Sep 17 00:00:00 2001\nFrom: a\nDate: b\nSubject: c\n';
+    return {
+      base: () => validateEmbeddedPatches(patch, { check_patch_headers: true, check_patch_refresh: false }, lookup),
+      measured: () => validateEmbeddedPatches(patch, { check_patch_headers: true, check_patch_refresh: 'warning' }, lookup)
     };
-    const out = {};
-    for (const [name, patch] of Object.entries(workerData)) {
-      await cost(patch, both, 2);
-      await cost(patch, headersOnly, 2);
-      const ratios = [];
-      let last = null;
-      for (let round = 0; round < 5; round++) {
-        const base = await cost(patch, headersOnly, 5);
-        const measured = await cost(patch, both, 5);
-        last = measured.last;
-        ratios.push(measured.elapsed / Math.max(base.elapsed, 0.001));
-      }
-      out[name] = { ratio: ratios.sort((a, b) => a - b)[2], warnings: last.warnings, successes: last.successes };
-    }
-    parentPort.postMessage(out);
-  `;
+  }, { patch }, { what });
 
   // 39 added patch files of 660 lines each, in the form the refresh target
   // writes: a header, then hunks over many source files.
@@ -492,36 +461,17 @@ describe('refresh rule cost', () => {
     return added(P, lines);
   };
 
-  const measureOutOfThread = async () => {
-    const validators = JSON.stringify(pathToFileURL(resolve(import.meta.dirname, '../../src/validators.js')).href);
-    const worker = new Worker(WORKER.replace('VALIDATORS', validators), {
-      eval: true,
-      workerData: { largestPullRequest: largestPullRequest(), headerPairs: headerPairs() }
-    });
-    try {
-      return await new Promise((settle, fail) => {
-        const cutOff = setTimeout(() => fail(new Error('the refresh rule did not settle within 20 s')), 20000);
-        worker.on('message', (value) => { clearTimeout(cutOff); settle(value); });
-        worker.on('error', (err) => { clearTimeout(cutOff); fail(err); });
-      });
-    } finally {
-      await worker.terminate();
-    }
-  };
-
   test('costs a small multiple of the header rule on the largest diffs it is handed', async () => {
-    const measured = await measureOutOfThread();
+    // About 3x and 9x today; each bound is four times that.
+    // Searching past a line's end for its tab, once per pair, costs seconds.
+    const largest = await measure(largestPullRequest(), 'the refresh rule on the largest pull request');
+    assert.deepStrictEqual(largest.measured.warnings, []);
+    assert.ok(largest.measured.successes.includes(ALL_REFRESHED), JSON.stringify(largest.measured.successes));
+    assert.ok(largest.ratio < 12, `the largest pull request cost ${largest.ratio.toFixed(1)}x the header rule alone`);
 
-    assert.deepStrictEqual(measured.largestPullRequest.warnings, []);
-    assert.ok(measured.largestPullRequest.successes.includes(ALL_REFRESHED), JSON.stringify(measured.largestPullRequest.successes));
-    assert.strictEqual(measured.headerPairs.warnings.length, 1);
-    assert.ok(measured.headerPairs.warnings[0].includes('do not use the `a/` and `b/` prefixes'), measured.headerPairs.warnings[0]);
-
-    // About 3x and 10x today; each bound is four times that. Searching past
-    // a line's end for its tab, once per pair, costs seconds.
-    assert.ok(measured.largestPullRequest.ratio < 12,
-      `the largest pull request cost ${measured.largestPullRequest.ratio.toFixed(1)}x the header rule alone`);
-    assert.ok(measured.headerPairs.ratio < 40,
-      `a file of header pairs cost ${measured.headerPairs.ratio.toFixed(1)}x the header rule alone`);
+    const pairs = await measure(headerPairs(), 'the refresh rule on a file of header pairs');
+    assert.strictEqual(pairs.measured.warnings.length, 1);
+    assert.ok(pairs.measured.warnings[0].includes('do not use the `a/` and `b/` prefixes'), pairs.measured.warnings[0]);
+    assert.ok(pairs.ratio < 40, `a file of header pairs cost ${pairs.ratio.toFixed(1)}x the header rule alone`);
   });
 });
