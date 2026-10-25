@@ -21,6 +21,7 @@ What each rule reports is in [checks](checks.md).
 | Key | Values | Default | Controls |
 |---|---|---|---|
 | `check_branch` | boolean | `true` | Source branch |
+| `check_cherry_pick` | level | `true` | Cherry-pick marker |
 | `check_merge_commits` | boolean | `true` | Merge commits |
 | `check_noreply_email` | boolean | `true` | `noreply.github.com` addresses |
 | `check_signoff` | boolean | `true` | Sign-off |

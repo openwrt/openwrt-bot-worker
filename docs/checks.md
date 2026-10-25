@@ -5,7 +5,7 @@ Each rule reports into one of the three check runs. A finding is an error, which
 ## Git & Commits
 
 *   **Source branch** (`check_branch`): a pull request opened from `main`, `master` or a release branch.
-*   **Cherry-pick marker**: a commit on a release branch without the `(cherry picked from commit ...)` line.
+*   **Cherry-pick marker** (`check_cherry_pick`): a commit on a release branch without the `(cherry picked from commit ...)` line. A commit that has it is compared with its upstream commit at every level.
 *   **New package on a release branch** (`check_new_package_on_stable`, warning): an added package the default branch has never carried. New packages land on the default branch first.
 *   **Merge commits** (`check_merge_commits`): a merge commit in the pull request.
 *   **Identity**: an author or committer name that is not a full name, and an author or committer address at `noreply.github.com` (`check_noreply_email`).

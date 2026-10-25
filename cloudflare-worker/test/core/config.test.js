@@ -107,6 +107,21 @@ describe('parseAndValidateConfig', () => {
       assert.strictEqual(resNew.config.check_pkg_hash, 'error');
     }
 
+    // check_cherry_pick takes the five levels, and an invalid one keeps the default.
+    assert.strictEqual(parseAndValidateConfig(null).config.check_cherry_pick, true);
+    for (const val of [true, false, 'warning', 'error', 'disabled']) {
+      const resPick = parseAndValidateConfig(JSON.stringify({ check_cherry_pick: val }));
+      assert.strictEqual(resPick.error, null);
+      assert.strictEqual(resPick.config.check_cherry_pick, val);
+    }
+    for (const val of ['warn', 'on', 1, ['warning']]) {
+      const resPick = parseAndValidateConfig(JSON.stringify({ check_cherry_pick: val, check_pkg_hash: 'error' }));
+      assert.match(resPick.error, /field "check_cherry_pick" must be one of \[true, false, "warning", "error", "disabled"\]/);
+      assert.strictEqual(resPick.partial, true);
+      assert.strictEqual(resPick.config.check_cherry_pick, true);
+      assert.strictEqual(resPick.config.check_pkg_hash, 'error');
+    }
+
     // check_subject_scope takes check_pkg_release's five values, and an
     // invalid one keeps the default 'warning' without discarding the rest.
     // Its allowlist is an array of strings like stale_ignored_users.
