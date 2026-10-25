@@ -31,9 +31,21 @@ const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^(?:${SUBJECT_PREFIX_SOURCE})+\\s*`)
 // four of its merged commits spell it `tree-wide: `.
 const TREEWIDE_SUBJECT_ENTITIES = new Set(['treewide', 'tree-wide']);
 
+// A full name is two or more words, or one Han, Hangul or Kana word of two or
+// more characters. Words may be separated by commas or be quoted nicknames, and
+// one parenthesised group may close the name. Each part starts on a character
+// no other part can, so the match stays linear in the name's length.
+const NAME_WORD = `(?:[\\p{L}'.-]+|"[\\p{L}\\d._-]+"|'[\\p{L}._-]*\\d[\\p{L}\\d._-]*')`;
+const NAME_CJK = '[\\p{sc=Han}\\p{sc=Hangul}\\p{sc=Hiragana}\\p{sc=Katakana}\\u30FC]{2,}';
+const NAME_GROUP = " \\([\\p{L}\\d'.,-]+(?: [\\p{L}\\d'.,-]+)*\\)";
+const NAME_RE = new RegExp(`^(?<words>${NAME_WORD}(?:,? ${NAME_WORD})+|${NAME_CJK})(?:${NAME_GROUP})?$`, 'u');
+const NAME_PLAIN_WORD_RE = /^[\p{L}'.-]+$/u;
+const NAME_LETTER_RE = /[\p{Lu}\p{Ll}\p{Lt}\p{Lo}]/u;
+
 export function isValidName(name) {
-  const nameRegex = /^[\p{L}'.-]+(?: [\p{L}'.-]+)+$/u;
-  return nameRegex.test(name);
+  const words = NAME_RE.exec(name)?.groups?.words;
+  return words !== undefined &&
+    words.split(/,? /).some(word => NAME_PLAIN_WORD_RE.test(word) && NAME_LETTER_RE.test(word));
 }
 
 export function isNoreplyEmail(email) {
