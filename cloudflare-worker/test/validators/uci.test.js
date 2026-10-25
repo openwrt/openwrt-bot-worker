@@ -174,6 +174,33 @@ endef
         `,
         'package/utils/foo/files/foo.conf': 'raw_config_key: raw_value\n'
       }
+    },
+    // zabbix: a description says which UCI file the package reads, and the
+    // file of that name goes elsewhere through a template no line names.
+    {
+      name: 'does not read a destination out of a package description',
+      patch: fileDiff('admin/zabbix/files/usr/share/zabbix_agentd.openwrt-params.d/network', []),
+      files: {
+        'admin/zabbix/Makefile': `
+PKG_NAME:=zabbix
+
+define Package/zabbix/install/zabbix.conf.d
+	$(INSTALL_DIR) $(1)/usr/share/zabbix_agentd.openwrt-params.d
+	$(INSTALL_DATA) ./files/usr/share/zabbix_agentd.openwrt-params.d/$(2) $(1)/usr/share/zabbix_agentd.openwrt-params.d/$(2)
+endef
+
+define Package/zabbix-extra-network/description
+An extra package for zabbix-agentd that adds a discovery rule for openwrt network interfaces.
+The idea here is to discover only interfaces listed in /etc/config/network (discover br-lan and not eth0.1 and wlan0)
+endef
+
+# reads /etc/config/network at runtime
+define Package/zabbix-extra-network/install
+	$(call Package/zabbix/install/zabbix.conf.d,$(1),network)
+endef
+        `,
+        'admin/zabbix/files/usr/share/zabbix_agentd.openwrt-params.d/network': 'UserParameter=openwrt.discovery,lua -l ubus\n'
+      }
     }
   ];
 
