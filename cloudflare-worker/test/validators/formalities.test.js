@@ -39,7 +39,19 @@ describe('isValidName', () => {
     ['rejects names with underscores', false, ['john_doe']],
     ['rejects double spaces', false, ['John  Doe']],
     ['rejects leading/trailing whitespace', false, [' John Doe', 'John Doe ']],
-    ['rejects invalid characters (slashes, etc.)', false, ['John/Doe']]
+    ['rejects invalid characters (slashes, etc.)', false, ['John/Doe']],
+    // Shapes of names on merged commits.
+    ['accepts a trailing affiliation or romanisation in parentheses', true,
+      ['Jane Doe (Example Corp)', 'John Smith (jsmith2k)', '张三 (ZHANG San)', '李四 (Li, Si)']],
+    ['accepts quoted nicknames, digits included', true, ["Jan 'jd42' Novak", 'Petr "Ace" Svoboda']],
+    ['accepts comma-separated parts', true, ['Min Ha, Lee', 'Jane Doe, PhD, MSc']],
+    ['accepts a Han, Hangul or Kana name written as one word', true, ['张三', '김철수', 'やまだ', 'ナカムラ', 'ハーマン']],
+    ['rejects a single Latin word even with a group', false, ['Jane (Example Corp)', 'dependabot[bot]', 'Weblate (bot)']],
+    ['rejects a single Han character', false, ['张', '张 (Zhang)']],
+    ['rejects malformed groups, nicknames and commas', false,
+      ['John Doe ()', 'John Doe (Foo', 'John (Foo) Doe', 'John Doe (Foo) (Bar)', 'John "" Doe', 'John , Doe', 'John Doe,', 'John,Doe']],
+    ['rejects nicknames alone', false, ['"John" "Doe"', "'ab1' 'cd2'", '"John" "Doe" (Example Corp)']],
+    ['rejects marks, placeholders and punctuation without a letter', false, ['々々', '〇〇', 'ーー', '々ー (Foo)', '-- --', ". '"]]
   ];
 
   for (const [title, valid, names] of cases) {
@@ -49,6 +61,20 @@ describe('isValidName', () => {
       }
     });
   }
+
+  // A grammar in which a quoted word could be a word or a nickname backtracks
+  // exponentially, and the name is whatever the contributor configured.
+  test('grades a long run of quoted words as fast as a plain name of its length', async () => {
+    const odd = `Jane ${"'ab' ".repeat(40)}!`;
+    const plain = `Jane ${'x'.repeat(odd.length - 6)}!`;
+    assert.strictEqual(plain.length, odd.length);
+    const { ratio, measured } = await cpuRatio(({ validators: { isValidName }, data: { odd, plain } }) => ({
+      base: () => isValidName(plain),
+      measured: () => isValidName(odd)
+    }), { odd, plain }, { what: 'a name of 40 quoted words' });
+    assert.strictEqual(measured, false);
+    assert.ok(ratio < 20, `the quoted-word name cost ${ratio.toFixed(1)}x a plain one of the same length`);
+  });
 });
 
 describe('validateFormalities', () => {
