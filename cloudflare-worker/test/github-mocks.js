@@ -1,5 +1,8 @@
 // Webhook signatures and GitHub API answers shared by the handler tests.
 
+// GitHub's limit, not imported: the mock stands for GitHub.
+const GITHUB_PR_COMMIT_LIMIT = 250;
+
 export async function calculateHmac(secret, payload) {
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -135,12 +138,13 @@ export function graphqlLabelsHandler(url, options, labelNames = []) {
       // The listings are re-entered with `_setup=1` so a test counting real
       // REST requests can tell these apart from ones the worker makes itself.
       const commits = await restPages(`https://api.github.com/repos/${owner}/${name}/pulls/${pr}/commits`);
+      const served = commits.slice(0, GITHUB_PR_COMMIT_LIMIT);
       const commentsPage1 = await restListJson(`https://api.github.com/repos/${owner}/${name}/issues/${pr}/comments?per_page=100&page=1&_setup=1`);
       repository.pullRequest = {
         commits: {
           totalCount: commits.length,
-          pageInfo: { hasNextPage: commits.length > 100, endCursor: commits.length > 100 ? 'page2' : null },
-          nodes: commits.slice(0, 100).map(c => ({ commit: graphqlCommitFromRest(c, owner, name) }))
+          pageInfo: { hasNextPage: served.length > 100, endCursor: served.length > 100 ? 'page2' : null },
+          nodes: served.slice(0, 100).map(c => ({ commit: graphqlCommitFromRest(c, owner, name) }))
         },
         comments: {
           totalCount: commentsPage1.length,
@@ -173,7 +177,7 @@ export async function restPages(baseUrl) {
 }
 
 // The worker pages commits past the first hundred with a cursor query; answer
-// it from the same REST listing.
+// it from the same REST listing, cut at the first 250 as GitHub cuts it.
 export function graphqlCommitPageHandler(url, options) {
   if (!url.includes('/graphql') || !options?.body) return null;
   const body = JSON.parse(options.body);
@@ -181,7 +185,7 @@ export function graphqlCommitPageHandler(url, options) {
   return (async () => {
     const { owner, name, pr, after } = body.variables;
     const pageNumber = Number(String(after).replace('page', ''));
-    const all = await restPages(`https://api.github.com/repos/${owner}/${name}/pulls/${pr}/commits`);
+    const all = (await restPages(`https://api.github.com/repos/${owner}/${name}/pulls/${pr}/commits`)).slice(0, GITHUB_PR_COMMIT_LIMIT);
     const start = (pageNumber - 1) * 100;
     const nodes = all.slice(start, start + 100).map(c => ({ commit: graphqlCommitFromRest(c, owner, name) }));
     const hasNextPage = all.length > start + 100;
