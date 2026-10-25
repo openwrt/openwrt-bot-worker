@@ -528,8 +528,11 @@ export async function runValidations(
       reportFormality.errors.forEach((err: string) => { formalityOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
 
-    if (isBackportPr) {
-      if (!CHERRY_PICK_MARKER.test(fullCommit?.commit?.message || '')) {
+    // A marker that is there is compared with upstream whatever the level.
+    const hasCherryPickMarker = CHERRY_PICK_MARKER.test(fullCommit?.commit?.message || '');
+    const cherryPickLevel = config.check_cherry_pick;
+    if (isBackportPr && (hasCherryPickMarker || (cherryPickLevel && cherryPickLevel !== 'disabled'))) {
+      if (!hasCherryPickMarker) {
         const isMaintainer = await ctx.isAuthorMaintainer(ctx.bodyRequestsCherryPickBypass);
         const scanResult = await getCommentsScanWithRetry();
         const bypassCherryPickCheck = scanResult.hasCherryPickBypassComment || (ctx.bodyRequestsCherryPickBypass && isMaintainer === true);
@@ -540,6 +543,11 @@ export async function runValidations(
 
         if (bypassCherryPickCheck) {
           formalityOutputText += "  ⚠️ Commit to stable branch bypasses cherry-pick requirement via override command\n";
+        } else if (cherryPickLevel === 'warning') {
+          // Nothing fails at this level, so an unread or unverified override changes nothing.
+          const cherryPickWarning = `Backports targeting stable branch (${baseBranch}) should contain the context line: '(cherry picked from commit ...)'`;
+          formalityOutputText += `  ⚠️ Warning: ${cherryPickWarning}\n`;
+          allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n- ⚠️ ${cherryPickWarning}`);
         } else if (scanResult.incomplete || overrideUnverified) {
           // Same as the branch rule above: the comment that waves this commit
           // through may be sitting in the part of the thread that could not be

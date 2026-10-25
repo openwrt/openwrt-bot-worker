@@ -1745,6 +1745,60 @@ describe('an input the run could not read', () => {
     assert.strictEqual(outcome.formalityChecksIncomplete, false);
     assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion, 'success');
   });
+
+  // check_cherry_pick grades a missing marker: every level against every
+  // answer the comment thread can give, and a commit that has the marker.
+  describe('check_cherry_pick', () => {
+    const scans = {
+      'no override': cleanScan(),
+      'an unread thread': cleanScan({ incomplete: true }),
+      'an unverified override': cleanScan({ cherryPickOverrideUnverified: true }),
+      'a confirmed override': cleanScan({ hasCherryPickBypassComment: true })
+    };
+    const marked = structuredClone(patchesResult);
+    marked.commitDetails[0].fullCommit.commit.message =
+      COMMIT_MESSAGE.replace('\n\nSigned-off-by', `\n\n(cherry picked from commit ${'c'.repeat(40)})\nSigned-off-by`);
+    const markerErrors = (outcome) => outcome.allFormalityErrors.filter(e => e.includes('cherry picked from commit'));
+    const markerWarnings = (outcome) => outcome.allPrWarnings.filter(w => w.includes("should contain the context line: '(cherry picked from commit ...)'"));
+
+    for (const level of [true, 'error', 'warning', false, 'disabled']) {
+      const on = level !== false && level !== 'disabled';
+      for (const [scanName, scan] of Object.entries(scans)) {
+        const expected = !on ? 'nothing'
+          : scanName === 'a confirmed override' ? 'the override'
+          : level === 'warning' ? 'a warning'
+          : scanName === 'no override' ? 'an error' : 'partially checked';
+        test(`${JSON.stringify(level)} with ${scanName}: ${expected}`, async () => {
+          let lookups = 0;
+          const ctx = ctxFor({
+            isBackportPr: true,
+            baseBranch: 'openwrt-24.10',
+            config: { ...DEFAULT_CONFIG, check_cherry_pick: level },
+            getCommentsScanWithRetry: async () => { lookups++; return scan; },
+            isAuthorMaintainer: async () => { lookups++; return false; }
+          });
+          const outcome = await runValidations(ctx, patchesResult);
+
+          assert.strictEqual(markerErrors(outcome).length, expected === 'an error' ? 1 : 0);
+          assert.strictEqual(markerWarnings(outcome).length, expected === 'a warning' ? 1 : 0);
+          assert.strictEqual(outcome.formalityChecksIncomplete, expected === 'partially checked');
+          assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).formalityConclusion,
+            { 'an error': 'failure', 'partially checked': 'neutral' }[expected] || 'success');
+          if (expected === 'the override') assert.match(outcome.formalityOutputText, /bypasses cherry-pick requirement/);
+          if (expected === 'nothing') assert.strictEqual(lookups, 0);
+        });
+      }
+
+      test(`${JSON.stringify(level)} with the marker: compared with upstream`, async () => {
+        const ctx = ctxFor({ isBackportPr: true, baseBranch: 'openwrt-24.10', config: { ...DEFAULT_CONFIG, check_cherry_pick: level } });
+        const outcome = await runValidations(ctx, marked);
+
+        assert.deepStrictEqual(markerErrors(outcome), []);
+        assert.deepStrictEqual(markerWarnings(outcome), []);
+        assert.match(outcome.formalityOutputText, /✅ Commit explicitly specifies cherry-pick origin context/);
+      });
+    }
+  });
 });
 
 // The refresh rule grades its findings by check_patch_refresh, apart from the

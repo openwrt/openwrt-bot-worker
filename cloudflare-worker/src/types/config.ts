@@ -2,6 +2,7 @@ import { DEFAULT_CONFIG } from '../config.js';
 
 export interface FormalitiesConfig {
   check_branch?: boolean;
+  check_cherry_pick?: boolean | 'warning' | 'error' | 'disabled';
   check_merge_commits?: boolean;
   check_noreply_email?: boolean;
   check_signoff?: boolean;
@@ -115,6 +116,7 @@ const NUMBER_FIELDS = new Set([
 
 const ALLOWED_VALUES_BY_FIELD: Record<string, Set<unknown>> = {
   check_binary_files: new Set([true, false, 'warning', 'error', 'disabled']),
+  check_cherry_pick: new Set([true, false, 'warning', 'error', 'disabled']),
   check_trailing_newline: new Set([true, false, 'warning', 'error', 'disabled']),
   require_linked_github_account: new Set([true, false, 'warning', 'error', 'disabled']),
   check_uci_config: new Set([true, false, 'disabled']),

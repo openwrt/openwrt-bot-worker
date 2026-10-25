@@ -1,6 +1,7 @@
 // Default fallback configuration if .github/formalities.json is missing in the repository
 export const DEFAULT_CONFIG = {
   check_branch: true,
+  check_cherry_pick: true,
   check_merge_commits: true,
   check_noreply_email: true,
   check_signoff: true,
