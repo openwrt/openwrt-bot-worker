@@ -554,6 +554,57 @@ describe('parseRevertCommit', () => {
     const res = parseRevertCommit(`fixup! Revert "mypkg: update to 1.2.3"\n\nThis reverts commit ${REVERTED_SHA}.`);
     assert.strictEqual(res.original, 'mypkg: update to 1.2.3');
   });
+
+  test('finds the reference on any line of the body, indented or after CRLF', () => {
+    const subject = 'Revert "mypkg: update to 1.2.3"';
+    for (const body of [
+      `It broke the build.\n\n  This reverts commit ${REVERTED_SHA}.`,
+      `It broke the build.\r\n\r\n\tthis Reverts Commit ${REVERTED_SHA.slice(0, 7)}\r\n`,
+      'Reverts openwrt/packages#12345  \r\n\r\nSigned-off-by: Jane Doe <jane@doe.com>',
+      `${'\n'.repeat(4000)}This reverts commit ${REVERTED_SHA}.`
+    ]) {
+      assert.ok(parseRevertCommit(`${subject}\n${body}`), JSON.stringify(body.slice(0, 40)));
+    }
+    for (const body of [
+      `It broke the build. This reverts commit ${REVERTED_SHA}.`,
+      'Reverts openwrt/packages#12345 because it broke the build',
+      'Reverts openwrt/packages'
+    ]) {
+      assert.strictEqual(parseRevertCommit(`${subject}\n\n${body}`), null, body);
+    }
+  });
+
+  test('reads only whole lines of the first 8 KB of the body', () => {
+    const subject = 'Revert "mypkg: update to 1.2.3"';
+    const endingAtCut = (line, rest) => `${'x'.repeat(8192 - line.length - 1)}\n${line}${rest}`;
+    const github = 'Reverts openwrt/packages#123';
+    const git = `This reverts commit ${REVERTED_SHA.slice(0, 7)}`;
+    for (const line of [github, git]) {
+      assert.ok(parseRevertCommit(`${subject}\n${endingAtCut(line, '\nmore text')}`), `${line}, a whole line just inside the cut`);
+    }
+    assert.strictEqual(parseRevertCommit(`${subject}\n${endingAtCut(github, ' trailing words')}`), null);
+    assert.strictEqual(parseRevertCommit(`${subject}\n${endingAtCut(git, 'zz')}`), null);
+    assert.strictEqual(parseRevertCommit(`${subject}\n${'x'.repeat(9000)}\n${github}`), null);
+  });
+
+  // Every commit's body is read here several times per run.
+  test('reads a body of blank lines as fast as a body of text of its size', async () => {
+    const size = 4000;
+    const subject = 'Revert "mypkg: update to 1.2.3"';
+    const shapes = {
+      'blank lines under a revert subject': `${subject}\n${'\n'.repeat(size)}`,
+      'blank lines under any subject': `mypkg: update to 1.2.3\n${'\n'.repeat(size)}`,
+      'blank CRLF lines': `${subject}\n${' \r\n'.repeat(size / 3)}`,
+      'tab-indented blank lines': `${subject}\n${'\t\n'.repeat(size / 2)}`
+    };
+    for (const [name, text] of Object.entries(shapes)) {
+      const { ratio } = await cpuRatio(({ validators: { parseRevertCommit }, data: { text, plain } }) => ({
+        base: () => parseRevertCommit(plain),
+        measured: () => parseRevertCommit(text)
+      }), { text, plain: `${subject}\n${'x\n'.repeat(size / 2)}` }, { what: `parseRevertCommit on ${name}` });
+      assert.ok(ratio < 20, `${name} cost ${ratio.toFixed(1)}x a body of text of the same size`);
+    }
+  });
 });
 
 describe('validateFormalities revert subjects', () => {
