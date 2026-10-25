@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { validateMakefileContext, validatePkgReleaseBumps, findPkgRoot, isPackageMakefilePath } from '../../src/validators.js';
+import { validateMakefileContext, validatePkgReleaseBumps, findPkgRoot, isPackageMakefilePath, PACKAGE_HELPER_MKS } from '../../src/validators.js';
 import {
   CONFIG, makeCommit, existingPackage, newPackage, diff, modified, added, removed, gitModified, gitAdded,
   assertSomeIncludes, assertNoneIncludes, assertNoErrors, assertErrorIncludes, assertNoErrorIncludes, cpuRatio
@@ -620,6 +620,76 @@ PKG_NAME:=golang
     assertNoErrorIncludes(res, 'PKG_LICENSE_FILES');
     // PKG_MAINTAINER is still required, and this Makefile sets it
     assertNoErrorIncludes(res, 'PKG_MAINTAINER');
+  });
+
+  // The Makefile of openwrt/openwrt c93e7700d40 "optee-os-stm32: add OP-TEE
+  // for stm32 boards", cut down: include/optee-os.mk sets both license fields.
+  test('skips PKG_LICENSE/PKG_LICENSE_FILES when package includes optee-os.mk', () => {
+    const state = existingPackage();
+    const res = validate('optee-os-stm32: add OP-TEE for stm32 boards', diff(
+      gitAdded('package/boot/optee-os-stm32/Makefile'),
+      '@@ -0,0 +1,12 @@',
+      '+include $(TOPDIR)/rules.mk',
+      '+',
+      '+PKG_VERSION:=4.3.0',
+      '+PKG_RELEASE:=1',
+      '+PKG_MAINTAINER:=Thomas Richard <thomas.richard@bootlin.com>',
+      '+',
+      '+include $(INCLUDE_DIR)/kernel.mk',
+      '+include $(INCLUDE_DIR)/optee-os.mk',
+      '+include $(INCLUDE_DIR)/package.mk',
+      '+',
+      '+$(eval $(call BuildPackage/Optee-os))'
+    ), { state });
+    assert.strictEqual(state.isNewPackage, true);
+    for (const field of ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES']) assertNoErrorIncludes(res, field);
+  });
+
+  test('waives for each package helper exactly the metadata it provides', () => {
+    for (const helper of PACKAGE_HELPER_MKS) {
+      const res = validate('foo: add package', diff(
+        gitAdded('package/utils/foo/Makefile'),
+        '@@ -0,0 +1,3 @@',
+        '+PKG_NAME:=foo',
+        `+include $(INCLUDE_DIR)/${helper.mk}`
+      ), { state: existingPackage() });
+      for (const field of ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES']) {
+        const asked = res.errors.some(err => err.includes(`mandatory parameter: '${field}'`));
+        assert.strictEqual(asked, !helper.provides.includes(field), `${helper.mk} and ${field}: ${res.errors.join(', ')}`);
+      }
+    }
+  });
+
+  const askedOfNewPackage = (lines) => {
+    const res = validate('foo: add package', diff(
+      gitAdded('package/boot/uboot-foo/Makefile'),
+      `@@ -0,0 +1,${lines.length + 1} @@`,
+      '+PKG_NAME:=uboot-foo',
+      ...lines.map(line => `+${line}`)
+    ), { state: existingPackage() });
+    return ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'].filter(field => res.errors.some(err => err.includes(`mandatory parameter: '${field}'`)));
+  };
+
+  test('waives what an include line lists, whatever else is on the line', () => {
+    for (const line of [
+      'include $(INCLUDE_DIR)/u-boot.mk # helper', 'include $(INCLUDE_DIR)/u-boot.mk $(INCLUDE_DIR)/package.mk',
+      'include $(INCLUDE_DIR)/package.mk $(INCLUDE_DIR)/u-boot.mk', '-include $(INCLUDE_DIR)/u-boot.mk',
+      'sinclude $(INCLUDE_DIR)/u-boot.mk', '\tinclude\t$(INCLUDE_DIR)/u-boot.mk', 'include $(INCLUDE_DIR)/u-boot.mk\r', 'include u-boot.mk'
+    ]) {
+      assert.deepStrictEqual(askedOfNewPackage([line]), ['PKG_MAINTAINER'], JSON.stringify(line));
+    }
+    assert.deepStrictEqual(askedOfNewPackage(['include ../../luci.mk # LuCI']), ['PKG_LICENSE']);
+  });
+
+  test('waives nothing for a helper that is only mentioned, not included', () => {
+    for (const lines of [
+      ['# include $(INCLUDE_DIR)/u-boot.mk'], ['# based on include/u-boot.mk'], ['include $(INCLUDE_DIR)/package.mk # not u-boot.mk'],
+      ['include $(INCLUDE_DIR)/u-boot.mk.orig'], ['include $(INCLUDE_DIR)/xu-boot.mk'], ['include $(INCLUDE_DIR)/my-u-boot.mk'],
+      ['include', '# see u-boot.mk'], ['include', '$(INCLUDE_DIR)/optee-os.mk'],
+      ['FOO_INCLUDE:=$(TOPDIR)/u-boot.mk'], ['includes $(INCLUDE_DIR)/u-boot.mk']
+    ]) {
+      assert.deepStrictEqual(askedOfNewPackage(lines), ['PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES'], JSON.stringify(lines));
+    }
   });
 
   test('evaluates metadata per file when one commit adds two new packages', () => {
@@ -1676,5 +1746,55 @@ diff --git a/package/kernel/nat46/patches/001-fix.patch b/package/kernel/nat46/p
 +changed
 `, 'package/kernel/nat46/Makefile', 'include $(INCLUDE_DIR)/kernel.mk\n\nPKG_NAME:=nat46\nPKG_SOURCE_DATE:=2022-09-19\nPKG_SOURCE_VERSION:=4c5beee236841724219598fabb1edc93d4f08ce5\n');
     assertErrorIncludes(res, 'without a PKG_RELEASE or version bump');
+  });
+});
+
+// The metadata and release checks used to find helpers with backtracking
+// regexes, 30 to 120 ms for 8 KB.
+describe('package helper include cost', () => {
+  const size = 8000;
+  const head = 'PKG_NAME:=foo\nPKG_VERSION:=1\nX:=1\n';
+
+  test('costs what a new Makefile of the same size costs, whatever its includes and whitespace', async () => {
+    const shapes = {
+      'an added include and a run of spaces': `include${' '.repeat(size)}`,
+      'an added line of includes': 'include '.repeat(size / 4)
+    };
+    for (const [name, text] of Object.entries(shapes)) {
+      const { ratio } = await cpuRatio(({ validators: { validateMakefileContext }, data: { text, plain, config } }) => {
+        const newPackage = (body) => '\ndiff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile\n' +
+          'new file mode 100644\n--- /dev/null\n+++ b/package/utils/foo/Makefile\n@@ -0,0 +1,3 @@\n+PKG_NAME:=foo\n' +
+          body.split('\n').map(line => `+${line}`).join('\n') + '\n';
+        const [measuredPatch, basePatch] = [newPackage(text), newPackage(plain)];
+        const run = (patch) => validateMakefileContext({ commit: { message: 'foo: add package' } }, patch, config,
+          { isNewPackage: false, isDroppedPackage: false }, 'openwrt/packages');
+        return { base: () => run(basePatch), measured: () => run(measuredPatch) };
+      }, {
+        text,
+        // As large as the largest shape.
+        plain: 'x = 1\n'.repeat(size / 3),
+        config: { ...CONFIG, check_conffiles: false, check_crlf: false, check_pkg_version: false, check_trailing_newline: false }
+      }, { what: `the metadata check on ${name}` });
+      assert.ok(ratio < 20, `${name} cost ${ratio.toFixed(1)}x a Makefile of the same size`);
+    }
+  });
+
+  test('costs what a head Makefile of the same size costs, whatever its includes and whitespace', async () => {
+    const shapes = {
+      'a head Makefile of blank lines': `${head}${'\n'.repeat(size / 2)}`,
+      'a head include and a run of blank lines': `${head}include${'\n'.repeat(size / 2)}x\n`
+    };
+    for (const [name, text] of Object.entries(shapes)) {
+      const { ratio } = await cpuRatio(({ validators: { validatePkgReleaseBumps }, data: { text, plain, config } }) => {
+        const changed = '\ndiff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile\n' +
+          '--- a/package/utils/foo/Makefile\n+++ b/package/utils/foo/Makefile\n+X:=1\n';
+        const at = (content) => async (path) => (path === 'package/utils/foo/Makefile' ? content : null);
+        const base = at('PKG_NAME:=foo\nPKG_VERSION:=1\n');
+        const run = (head) => validatePkgReleaseBumps([{ commitPatch: changed }], config, at(head), base);
+        return { base: () => run(plain), measured: () => run(text) };
+      }, { text, plain: `${head}${'x = 1\n'.repeat(size / 12)}`, config: { ...CONFIG, check_pkg_release: 'warning' } },
+      { what: `the release audit on ${name}` });
+      assert.ok(ratio < 20, `${name} cost ${ratio.toFixed(1)}x a Makefile of the same size`);
+    }
   });
 });

@@ -227,13 +227,18 @@ describe('findPkgRoot for feeds without category directories', () => {
 // trusted-firmware-a.mk or optee-os.mk. That was decided by
 // /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m,
 // whose `\s` ran across line breaks: quadratic on blank lines, and findPkgRoot
-// reads Makefiles a pull request writes. Its replacement must answer exactly
-// what the regex answered, so the regex stays here as the reference.
+// reads Makefiles a pull request writes. The scan that replaced it must answer
+// what this plain reading of each line answers.
 describe('findPkgRoot on the package helper include', () => {
-  const REFERENCE = /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m;
+  const HELPERS = ['luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk'];
+  const includesHelper = (content) => content.split('\n').some(line => {
+    const [directive, ...files] = line.split('#')[0].split(/[ \t\v\f\r]+/).filter(Boolean);
+    return ['include', '-include', 'sinclude'].includes(directive) &&
+      files.some(file => HELPERS.some(mk => file === mk || file.endsWith(`/${mk}`)));
+  });
   const resolves = async (content) => (await findPkgRoot('foo/bar/x.c', async () => content, {})) === 'foo/bar';
 
-  test('accepts exactly the Makefiles the regex accepted, the awkward ones included', async () => {
+  test('accepts exactly the Makefiles make reads as including a helper, the awkward ones included', async () => {
     const awkward = [
       'include ../../luci.mk', 'include ../../luci.mk\n', 'include ../../luci.mk  \n\n\n', 'include ../../luci.mk\t\r\n',
       '  include $(INCLUDE_DIR)/u-boot.mk', '\tinclude\t$(INCLUDE_DIR)/trusted-firmware-a.mk\r', 'include ../optee-os.mk\u00a0',
@@ -245,7 +250,11 @@ describe('findPkgRoot on the package helper include', () => {
       'include ../../luci.mk\\\n', 'include \\\n\t../../luci.mk', 'include ../../luci.MK', 'INCLUDE luci.mk', 'include\v\fluci.mk\v',
       'include\ninclude luci.mk', 'include x\ninclude luci.mk', '\n\n\n  \t\ninclude luci.mk\n\n', 'include luci.mk\u2028x', 'include luci.mk\u3000\ufeff',
       'include ../../luci.mk\n# x\n', 'PKG_X:=1\ninclude $(TOPDIR)/feeds/luci/luci.mk\n', 'include u-boot.mk trusted-firmware-a.mk', 'include optee-os.mk\r\r\r',
-      '\ufeffinclude luci.mk', 'include\u00a0luci.mk', 'include\u200bluci.mk', '', '\n', ' ', 'luci.mk', 'include .mk', 'include -luci.mk'
+      '\ufeffinclude luci.mk', 'include\u00a0luci.mk', 'include\u200bluci.mk', '', '\n', ' ', 'luci.mk', 'include .mk', 'include -luci.mk',
+      'include ../../luci.mk # x', 'include a.mk ../../luci.mk', 'include ../../luci.mk a.mk', '-include x/luci.mk', 'sinclude\tx/u-boot.mk',
+      'include\t#luci.mk', 'include x#/luci.mk', 'include x/luci.mk#', 'include /luci.mk', 'include x//luci.mk', 'include x/luci.mk/',
+      'include\r\n../../luci.mk', ' -include luci.mk', '- include luci.mk', 's include luci.mk', 'xsinclude luci.mk', '--include luci.mk',
+      'include include luci.mk', 'x include luci.mk\ninclude u-boot.mk', 'include\fluci.mk'
     ];
     const pieces = ['include', 'include ', ' ', '\t', '\n', '\r\n', '\r', '\v', '\u00a0', '\u2028', '#', '-', 'x', '_', '/', '../', '$(TOPDIR)/',
       'luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk', 'xluci.mk', 'luci', '.mk', 'mk', 'a.mk', 'define Package/x\n', 'endef', '\\'];
@@ -255,15 +264,18 @@ describe('findPkgRoot on the package helper include', () => {
     const some = (list, most) => Array.from({ length: random(most + 1) }, () => pick(list)).join('');
     // Free-form strings, and lines shaped like an include with every part
     // varied: what comes before the keyword, the keyword, the whitespace
-    // after it, the text, the helper, what follows it and the line end.
-    const blanks = [' ', '\t', '\v', '\f', '\u00a0', '\u3000', '\ufeff', '\u200b'];
-    const breaks = ['\n', '\r\n', '\r', '\u2028', '\u2029'];
-    const line = () => some([...blanks, '#', 'x'], 2) +
-      pick(['include', 'include', 'include', 'includes', '-include', 'sinclude', 'INCLUDE', 'define Package/x\ninclude']) +
-      some([...blanks, ...blanks, ...breaks], 3) +
-      some(['../', '$(TOPDIR)/', 'x', '-', '_', '.', '#', ' ', 'a.mk ', 'include ', '\\'], 3) +
-      pick(['luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk', 'luci', 'luci.MK', 'a.mk', '.mk', '']) +
-      some([...blanks, ...blanks, 'x', '#', '\\', ...breaks], 2) +
+    // after it, the files before the helper, the directory it is in, the
+    // helper, what follows it and the line end.
+    const blanks = [' ', '\t', '\v', '\f', '\r'];
+    const otherBlanks = ['\u00a0', '\u3000', '\ufeff', '\u200b'];
+    const breaks = ['\n', '\r\n', '\u2028', '\u2029'];
+    const line = () => some([...blanks, ...blanks, '#', 'x', '-', 's'], 1) +
+      pick(['include', 'include', 'include', 'include', 'includes', '-include', 'sinclude', 'INCLUDE', 'define Package/x\ninclude']) +
+      pick([...blanks, ...blanks, ...blanks, ...blanks, ...otherBlanks, ...breaks, '#']) + some([...blanks, ...blanks, ...otherBlanks, ...breaks], 1) +
+      some(['a.mk ', 'include ', '# ', '\\ ', 'x', ' ', '\t'], 1) +
+      pick(['', '', '../', '../', '$(TOPDIR)/', 'x/', 'x', '-', '/', '//', '#/']) +
+      pick([...HELPERS, ...HELPERS, ...HELPERS, 'luci', 'luci.MK', 'a.mk', '.mk', '']) +
+      some([...blanks, ...blanks, ...otherBlanks, 'x', '#', '\\', '/', ' a.mk', ...breaks], 1) +
       pick(['', ...breaks, '\n\n', '\nendef\n']);
     const generated = [
       ...Array.from({ length: 10000 }, () => Array.from({ length: 1 + random(10) }, () => pick(pieces)).join('')),
@@ -271,9 +283,9 @@ describe('findPkgRoot on the package helper include', () => {
     ];
     let accepted = 0;
     for (const content of [...awkward, ...generated]) {
-      const expected = REFERENCE.test(content);
+      const expected = includesHelper(content);
       if (expected) accepted++;
-      // An empty Makefile is no Makefile to findPkgRoot, whatever the regex says.
+      // An empty Makefile is no Makefile to findPkgRoot, whatever the reference says.
       assert.strictEqual(await resolves(content), expected && content !== '', JSON.stringify(content));
     }
     // Both answers are well represented, so the comparison means something.

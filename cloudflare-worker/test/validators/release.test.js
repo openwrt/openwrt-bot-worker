@@ -141,6 +141,19 @@ diff --git a/package/boot/uboot-testboard/Makefile b/package/boot/uboot-testboar
       success: 'shared build helper'
     },
     {
+      name: 'passes when optee-os.mk based package Makefile changes non-cosmetically without PKG_RELEASE',
+      root: 'package/boot/optee-os-testboard',
+      patch: `
+diff --git a/package/boot/optee-os-testboard/Makefile b/package/boot/optee-os-testboard/Makefile
+--- a/package/boot/optee-os-testboard/Makefile
++++ b/package/boot/optee-os-testboard/Makefile
++  PLAT_FLAVOR:=testboard
+`,
+      head: 'PKG_VERSION:=4.9.0\ninclude $(INCLUDE_DIR)/optee-os.mk\n\ndefine Optee-os/Default\n  PLAT_FLAVOR:=testboard\nendef\n',
+      base: 'PKG_VERSION:=4.9.0\ninclude $(INCLUDE_DIR)/optee-os.mk\n\ndefine Optee-os/Default\nendef\n',
+      success: 'shared build helper'
+    },
+    {
       name: 'still fails for non-u-boot package with no PKG_RELEASE and non-cosmetic changes',
       root: 'package/utils/bash',
       patch: `
@@ -417,6 +430,32 @@ diff --git a/utils/prometheus-node-exporter-ucode/Makefile b/utils/prometheus-no
       }
     });
   }
+
+  test('exempts a package whose include line lists a helper, and only then', async () => {
+    const root = 'package/boot/uboot-foo';
+    const patch = `
+diff --git a/${root}/Makefile b/${root}/Makefile
+--- a/${root}/Makefile
++++ b/${root}/Makefile
++X:=1
+`;
+    const audit = (include) => validatePkgReleaseBumps([{ commitPatch: patch }], defaultConf,
+      makefileAt(root, `PKG_NAME:=uboot-foo\nPKG_VERSION:=2026.01\n${include}\nX:=1\n`),
+      makefileAt(root, `PKG_NAME:=uboot-foo\nPKG_VERSION:=2026.01\n${include}\n`));
+    for (const include of [
+      'include $(INCLUDE_DIR)/u-boot.mk # x', 'include $(INCLUDE_DIR)/u-boot.mk $(INCLUDE_DIR)/package.mk',
+      '-include $(INCLUDE_DIR)/u-boot.mk', 'sinclude $(INCLUDE_DIR)/u-boot.mk', 'include $(INCLUDE_DIR)/optee-os.mk'
+    ]) {
+      const res = await audit(include);
+      assertNoErrors(res);
+      assertSuccessIncludes(res, 'shared build helper');
+    }
+    for (const include of [
+      '# include $(INCLUDE_DIR)/u-boot.mk', 'include $(INCLUDE_DIR)/u-boot.mk.orig', 'include $(INCLUDE_DIR)/xu-boot.mk', 'include\n# u-boot.mk'
+    ]) {
+      assertErrorIncludes(await audit(include), 'content changed without a PKG_RELEASE or version bump');
+    }
+  });
 
   test('skips checks when only test.sh or test-version.sh are modified', async () => {
     const commitDetails = [{
