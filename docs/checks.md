@@ -31,7 +31,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 *   **Conffiles** (`check_conffiles`): a file installed into `/etc` with `INSTALL_CONF`, or into `/etc/config`, that the package's conffiles list leaves out, and a malformed conffiles entry.
 *   **UCI files** (`check_uci_config`): a file installed into `/etc/config` that is not valid UCI.
 *   **Line endings** (`check_crlf`): CRLF line endings.
-*   **Trailing newline** (`check_trailing_newline`): a file that does not end with a newline.
+*   **Trailing newline** (`check_trailing_newline`): a file that does not end with a newline. Symlinks are exempt.
 *   **Binary files** (`check_binary_files`): a file git treats as binary. Deleting one is always allowed.
 *   **PKG_RELEASE** (`check_pkg_release`, warning): a new package whose `PKG_RELEASE` is not 1, a version update that does not reset it to 1 and a package change with neither a version nor a release bump. Packages built on `u-boot.mk`, `trusted-firmware-a.mk`, `optee-os.mk` or `luci.mk` never use `PKG_RELEASE` and are not asked for one.
 *   **PKG_HASH** (`check_pkg_hash`, warning): a version change that keeps the old checksum, and a new package without one. A checksum the build cannot use is always an error.
