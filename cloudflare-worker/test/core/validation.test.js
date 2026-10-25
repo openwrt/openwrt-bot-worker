@@ -1052,15 +1052,24 @@ describe('runValidations on a commit listing shorter than the count', () => {
     packageState: { isNewPackage: false, isDroppedPackage: false }
   };
 
-  test('names the paging cap when pages were left unfetched', async () => {
+  test('names GitHub\'s limit when pages were left unfetched', async () => {
     const res = await runValidations(ctxFor(412, true, [commit('a1')]), patchesResult);
-    assert.match(res.formalityOutputText, /capped at 300 commits for API safety/);
-    assert.ok(res.allPrWarnings.some(w => w.includes('capped at 300 commits')), res.allPrWarnings.join('\n'));
+    assert.match(res.formalityOutputText, /GitHub serves at most 250 commits of a pull request, and this one has 412/);
+    assert.ok(res.allPrWarnings.some(w => w.includes('wrong base branch')), res.allPrWarnings.join('\n'));
   });
 
-  test('reports withheld records instead of the cap when every page was read', async () => {
+  // openwrt/openwrt#26017: 5324 commits against openwrt-25.12.
+  test('names GitHub\'s limit and the base branch past 250 commits, not a re-run', async () => {
+    const served = Array.from({ length: 250 }, (_, i) => commit(`c${i}`));
+    const res = await runValidations(ctxFor(5324, false, served), patchesResult);
+    assert.match(res.formalityOutputText, /GitHub serves at most 250 commits of a pull request, and this one has 5324, so only 250 of their messages were audited/);
+    assert.match(res.formalityOutputText, /opened against the wrong base branch/);
+    assert.doesNotMatch(res.formalityOutputText, /Re-running/);
+  });
+
+  test('reports withheld records instead of the limit when every page was read', async () => {
     const res = await runValidations(ctxFor(2, false, [commit('a1')]), patchesResult);
-    assert.doesNotMatch(res.formalityOutputText, /capped at 300 commits/);
+    assert.doesNotMatch(res.formalityOutputText, /at most 250 commits/);
     assert.match(res.formalityOutputText, /counted 2 commits for this pull request but served the records of 1, so 1 commit message\(s\) were not audited/);
   });
 });

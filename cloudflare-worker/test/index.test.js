@@ -584,7 +584,7 @@ index 123456..789012 100644
     }
   });
 
-  test('adds warning when PR has more than 300 commits and commit audit is capped', async () => {
+  test('adds a warning naming GitHub\'s limit when a PR has more commits than GitHub serves', async () => {
     const commitsList = Array.from({ length: 350 }, (_, i) => ({
       sha: `sha300${i}`,
       html_url: `https://github.com/commit/sha300${i}`,
@@ -685,8 +685,9 @@ index 123456..789012 100644
 
       const formalityCheck = checkRunsPosted.find(cr => cr.name === 'FormalityCheck / Git & Commits');
       assert.ok(formalityCheck);
-      assert.match(formalityCheck.output.text, /Commit scan is capped at 300 commits/);
-      assert.match(formalityCheck.output.text, /This PR has 350 commits/);
+      assert.match(formalityCheck.output.text, /GitHub serves at most 250 commits of a pull request, and this one has 350, so only 250 of their messages were audited/);
+      assert.match(formalityCheck.output.text, /wrong base branch/);
+      assert.doesNotMatch(formalityCheck.output.text, /Re-running/);
     } finally {
       crypto.subtle.importKey = originalImportKey;
       crypto.subtle.sign = originalSign;

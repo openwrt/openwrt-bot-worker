@@ -25,7 +25,7 @@ import {
   MBOX_ENVELOPE_PATTERN
 } from '../../core/patch-utils.ts';
 import { CHERRY_PICK_MARKER } from '../../core/policy.ts';
-import { graphqlPathHistoryCounts } from '../../github.js';
+import { graphqlPathHistoryCounts, GITHUB_PR_COMMIT_LIMIT } from '../../github.js';
 import type { PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult, CommitDetail } from './patches.ts';
 
@@ -100,12 +100,11 @@ export async function runValidations(
   }
 
   if (commitScanCapped) {
-    // The same shortfall, two causes: pages this run did not ask for, or
-    // commit records GitHub counted and then would not serve. Naming the cap
-    // for the second one tells a two-commit pull request it has over 300.
+    // Past GitHub's limit no run reads the rest, and the base branch is the
+    // likely mistake. Below it GitHub withheld records a re-run may get.
     const scanned = ctx.commits.length;
-    const cappedWarning = commitsPagingCapped
-      ? `Commit scan is capped at 300 commits for API safety. This PR has ${commitsCount} commits, so only the first 300 commit messages were audited.`
+    const cappedWarning = commitsPagingCapped || commitsCount > GITHUB_PR_COMMIT_LIMIT
+      ? `GitHub serves at most ${GITHUB_PR_COMMIT_LIMIT} commits of a pull request, and this one has ${commitsCount}, so only ${scanned} of their messages were audited. A pull request this large has usually been opened against the wrong base branch: check that it targets the branch its commits were made on.`
       : `GitHub counted ${commitsCount} commits for this pull request but served the records of ${scanned}, so ${commitsCount - scanned} commit message(s) were not audited. Re-running the checks may well succeed.`;
     formalityOutputText += `⚠️ Warning: ${cappedWarning}\n\n`;
     allPrWarnings.push(`**Commit Audit Scope**:\n- ⚠️ ${cappedWarning}`);

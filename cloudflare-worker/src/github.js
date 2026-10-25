@@ -436,6 +436,9 @@ function pushGraphqlCommits(nodes, commits, where) {
   return list.length;
 }
 
+// GitHub serves at most 250 commits of a pull request, through GraphQL and REST.
+export const GITHUB_PR_COMMIT_LIMIT = 250;
+
 /** @param {string} token @param {string} repoFullname @param {string} ref @param {string} configPath @param {string} labelerPath @param {any} onCall @param {number|null} [prNumber] @param {number} [maxCommitPages] */
 export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath, labelerPath, onCall, prNumber = null, maxCommitPages = 3) {
   const slashIndex = repoFullname.indexOf('/');
