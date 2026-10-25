@@ -6043,6 +6043,29 @@ export async function validateNewPackageOnStable(makefiles, branches, CONFIG, fe
   return result();
 }
 
+// The lines that can install a file: an install block, a tab-indented recipe
+// line, or an install or copy command.
+function recipeLineFlags(lines) {
+  const flags = new Array(lines.length).fill(false);
+  let inInstall = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    const define = trimmed.match(/^define\s+(\S+)/);
+    if (define) {
+      inInstall = /\/install$/.test(define[1]);
+      continue;
+    }
+    if (/^endef\b/.test(trimmed)) {
+      inInstall = false;
+      continue;
+    }
+    flags[i] = inInstall || line.startsWith('\t') ||
+      /^(?:\$\((?:INSTALL_[A-Z]+|CP|LN)\)|cp|install|ln)\s/.test(trimmed);
+  }
+  return flags;
+}
+
 export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) {
   const errors = [];
   const successes = [];
@@ -6117,18 +6140,21 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
       // itself may the base-name matching below speak — without this guard,
       // every such sibling matched the /etc/config/uhttpd conffiles entry
       // through the shared stem and was rejected as invalid UCI.
-      const namingLines = makefileContent.split('\n')
-        .filter(l => !l.trim().startsWith('#') && l.includes(filename));
+      // Only a recipe line installs anything, not a package description.
+      const lines = makefileContent.split('\n');
+      const isRecipe = recipeLineFlags(lines);
+      const namingLines = lines
+        .filter((l, i) => isRecipe[i] && !l.trim().startsWith('#') && l.includes(filename));
 
       if (namingLines.length > 0 && !namingLines.some(l => l.includes('etc/config'))) {
         return empty;
       }
 
       const nameWithoutExt = filename.includes('.') ? filename.substring(0, filename.lastIndexOf('.')) : filename;
-      const lines = makefileContent.split('\n');
       let inConffiles = false;
 
-      for (const line of lines) {
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+        const line = lines[lineIndex];
         const trimmed = line.trim();
         if (trimmed.startsWith('#')) continue;
 
@@ -6162,7 +6188,7 @@ export async function validateUciConfigs(commitPatch, CONFIG, fetchFileContent) 
               break;
             }
           }
-        } else {
+        } else if (isRecipe[lineIndex]) {
           // Look for install/cp commands
           const filesIndex = file.indexOf('/files/');
           const relativePath = filesIndex !== -1 ? file.substring(filesIndex + 7) : '';
