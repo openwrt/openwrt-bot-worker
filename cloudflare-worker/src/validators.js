@@ -181,11 +181,20 @@ export function parseRevertSubject(subject) {
 // as `This reverts commit <sha>.`; the revert button on GitHub references the
 // reverted pull request instead. Requiring one of the two ties the relaxed
 // revert rules to a commit that really is a revert, rather than to any subject
-// that happens to be shaped like one.
+// that happens to be shaped like one. Read line by line, as a multiline `^\s*`
+// over the whole body was quadratic on blank lines, and only as far as the
+// reference can be.
+const REVERT_BODY_CHARS = 8192;
+
 export function hasRevertReference(body) {
   if (typeof body !== 'string') return false;
-  return /^\s*this reverts commit\s+[0-9a-f]{7,40}\b/im.test(body) ||
-    /^\s*reverts\s+[\w.-]+\/[\w.-]+#\d+\s*$/im.test(body);
+  // A line cut short by the limit could end where a reference would.
+  const head = body.length > REVERT_BODY_CHARS ? body.slice(0, body.lastIndexOf('\n', REVERT_BODY_CHARS) + 1) : body;
+  for (const line of head.split('\n')) {
+    if (/^\s*this reverts commit\s+[0-9a-f]{7,40}\b/i.test(line) ||
+        /^\s*reverts\s+[\w.-]+\/[\w.-]+#\d+\s*$/i.test(line)) return true;
+  }
+  return false;
 }
 
 // Returns { prefix, original, depth } when a full commit message is a revert -
@@ -193,10 +202,10 @@ export function hasRevertReference(body) {
 export function parseRevertCommit(message) {
   if (typeof message !== 'string') return null;
 
-  const lines = message.split('\n');
-  if (!hasRevertReference(lines.slice(1).join('\n'))) return null;
+  const nl = message.indexOf('\n');
+  if (nl < 0 || !hasRevertReference(message.slice(nl + 1))) return null;
 
-  return parseRevertSubject(lines[0].trim().replace(/^(fixup!|squash!)\s+/, ''));
+  return parseRevertSubject(message.slice(0, nl).trim().replace(/^(fixup!|squash!)\s+/, ''));
 }
 
 async function getSshKeyFingerprint(sigText) {
@@ -713,10 +722,6 @@ const SUBJECT_SCOPE_NAME_CAP = 512;
 // past it is never rewritten or looked up, so a path of long segments costs
 // what one of short segments does.
 const SUBJECT_SCOPE_SEGMENT_CHARS = 64;
-// Where `git revert` and GitHub put the reference, with room to spare. Read
-// no further: a revert-shaped subject over megabytes of body must not pay
-// for all of it.
-const SUBJECT_SCOPE_REVERT_BODY_CHARS = 8192;
 
 // One per run, shared by every commit in it: the path segments the exact pass
 // may still scan (about 3 ms of CPU), the commits that may still read their
@@ -901,18 +906,6 @@ function scopeFuzzyMatch(name, tokenComps) {
   return undefined;
 }
 
-// hasRevertReference's two patterns, one line at a time, over the start of
-// the body. Its multiline `^\s*` lets every line start rescan all the
-// whitespace after it - a body of blank lines costs it quadratic time - and
-// anchored to one line each the same lines match.
-function hasRevertReferenceByLine(body) {
-  for (const line of body.slice(0, SUBJECT_SCOPE_REVERT_BODY_CHARS).split('\n')) {
-    if (/^\s*this reverts commit\s+[0-9a-f]{7,40}\b/i.test(line) ||
-        /^\s*reverts\s+[\w.-]+\/[\w.-]+#\d+\s*$/i.test(line)) return true;
-  }
-  return false;
-}
-
 function scopePrefixChain(text) {
   const match = text.match(SUBJECT_PREFIX_STRIP_RE);
   if (!match) return null;
@@ -936,7 +929,7 @@ function subjectScopePrefix(message, CONFIG) {
   let graded = subject;
   let outer = null;
   const revert = parseRevertSubject(subject);
-  if (revert && hasRevertReferenceByLine(nl < 0 ? '' : message.slice(nl + 1))) {
+  if (revert && hasRevertReference(nl < 0 ? '' : message.slice(nl + 1))) {
     graded = revert.original;
     outer = revert.prefix ? scopePrefixChain(revert.prefix) : null;
   }
