@@ -501,6 +501,38 @@ describe('validateFormalities', () => {
       }
     });
   }
+
+  // Shapes of merged subjects.
+  test('accepts an acronym or an identifier after the prefix', async () => {
+    const subjects = [
+      'kernel: net: phy: realtek: USXGMII bring-up work-around',
+      'hostapd: ACS scans for all links of an AP MLD with one request',
+      'ath79: DTS update for RFKILL switch',
+      'luci-mod-network: DHCP; make MAC validation work',
+      'luci-mod-status: ES6 treatment',
+      'asterisk: VM_MESSAGEFILE',
+      'rockchip: DevBoard R1 use dedicated uboot'
+    ];
+    for (const subject of subjects) {
+      const res = await validateFormalities(signedOff(`${subject}\n\nSome body text.`, JANE), CONFIG);
+      assertNoErrorIncludes(res, 'lower-case word after the prefix');
+    }
+  });
+
+  test('rejects a capitalised verb after the prefix', async () => {
+    const subjects = [
+      'CI: Add build test for riscv64_riscv64',
+      'luci-mod-network: Correctly assign dnsmasq instance: name not number',
+      'gcc: Update README: tested on arm (imx233-olinuxino) board',
+      'ddns-scripts: Incremented PKG_RELEASE: fix in files/services',
+      // The quoted subject of a revert that does not say what it reverts.
+      'libcap: Revert "libcap: update to 2.77"'
+    ];
+    for (const subject of subjects) {
+      const res = await validateFormalities(signedOff(`${subject}\n\nSome body text.`, JANE), CONFIG);
+      assertErrorIncludes(res, 'lower-case word after the prefix');
+    }
+  });
 });
 
 const REVERTED_SHA = '9fceb02d0ae598e95dc970b74767f19372d61af8';

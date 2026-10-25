@@ -10,7 +10,7 @@ Each rule reports into one of the three check runs. A finding is an error, which
 *   **Merge commits** (`check_merge_commits`): a merge commit in the pull request.
 *   **Identity**: an author or committer name that is not a full name, and an author or committer address at `noreply.github.com` (`check_noreply_email`).
 *   **Linked account** (`require_linked_github_account`): an author address that belongs to no GitHub account.
-*   **Subject**: a missing `<package>: ` prefix, a capital letter after it, a trailing period or a missing blank line before the body.
+*   **Subject**: a missing `<package>: ` prefix, a capitalised word after it other than an acronym or identifier, a trailing period or a missing blank line before the body.
 *   **Subject scope** (`check_subject_scope`, warning): a prefix that names nothing the commit changes, such as `hostapd:` on a commit that only touches dropbear.
 *   **Length** (`max_subject_len_soft`, `max_subject_len_hard`, `max_body_line_len`): a subject over the soft limit is a warning, over the hard limit an error. A body line over the limit is an error, unless it is a URL, quoted output or a word that cannot be broken.
 *   **Sign-off** (`check_signoff`): a missing `Signed-off-by:` line, or one that does not match the author.

@@ -31,6 +31,13 @@ const SUBJECT_PREFIX_STRIP_RE = new RegExp(`^(?:${SUBJECT_PREFIX_SOURCE})+\\s*`)
 // four of its merged commits spell it `tree-wide: `.
 const TREEWIDE_SUBJECT_ENTITIES = new Set(['treewide', 'tree-wide']);
 
+// The word after the prefix is a verb and starts in lower case, but a name
+// keeps its spelling: a word with a second capital, a digit or `_` (`USXGMII`,
+// `DTS`, `ES6`, `OpenWrt`, `VM_MESSAGEFILE`) is not a capitalised verb.
+function startsWithCapitalisedVerb(text) {
+  return /^[A-Z][^A-Z\d_]*$/.test(text.match(/^\S*/)[0]);
+}
+
 // A full name is two or more words, or one Han, Hangul or Kana word of two or
 // more characters. Words may be separated by commas or be quoted nicknames, and
 // one parenthesised group may close the name. Each part starts on a character
@@ -392,7 +399,7 @@ export async function validateFormalities(fullCommit, CONFIG) {
         subjectErrors.push("Commit subject must start with `<package name or prefix>: `");
       } else {
         const afterPrefix = gradedSubject.replace(SUBJECT_PREFIX_STRIP_RE, '');
-        if (afterPrefix.length > 0 && afterPrefix[0] === afterPrefix[0].toUpperCase() && /[a-zA-Z]/.test(afterPrefix[0])) {
+        if (startsWithCapitalisedVerb(afterPrefix)) {
           subjectErrors.push("Commit subject must start with a lower-case word after the prefix");
         }
         if (subject.endsWith('.')) {
