@@ -28,7 +28,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 *   **Metadata** (`check_openwrt_meta`): a new package without `PKG_MAINTAINER`, `PKG_LICENSE` or `PKG_LICENSE_FILES`. A LuCI package needs only `PKG_LICENSE`. A package built on `u-boot.mk`, `trusted-firmware-a.mk` or `optee-os.mk` needs only `PKG_MAINTAINER`.
 *   **SPDX license** (`check_spdx_license`, warning): a `PKG_LICENSE` that is not an SPDX identifier, with the identifier to use where one exists.
 *   **Init scripts** (`check_init_scripts`, warning): a new init script without `#!/bin/sh /etc/rc.common` or a `START=` priority.
-*   **Conffiles** (`check_conffiles`): configuration installed with `INSTALL_CONF` or into `/etc/config` that the package's conffiles list leaves out, and a malformed conffiles entry.
+*   **Conffiles** (`check_conffiles`): a file installed into `/etc` with `INSTALL_CONF`, or into `/etc/config`, that the package's conffiles list leaves out, and a malformed conffiles entry.
 *   **UCI files** (`check_uci_config`): a file installed into `/etc/config` that is not valid UCI.
 *   **Line endings** (`check_crlf`): CRLF line endings.
 *   **Trailing newline** (`check_trailing_newline`): a file that does not end with a newline.

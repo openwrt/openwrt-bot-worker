@@ -1056,6 +1056,98 @@ endef
   });
 });
 
+describe('validateMakefileContext conffiles by assignment', () => {
+  const NEW_FOO = ['diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile', 'new file mode 100644', '--- /dev/null', '+++ b/package/utils/foo/Makefile'];
+  const validateNew = (...lines) =>
+    validateMakefileContext(makeCommit('foo: add new package'), diff(NEW_FOO, lines), CONFIG, newPackage());
+
+  // weechat, avahi and zabbix give their variants one shared list by assigning
+  // it, before or after the block it names, as a variable or through call.
+  const variants = (shared) => [
+    '+Package/foo-tiny/conffiles = $(call Package/foo/conffiles)',
+    '+',
+    '+define Package/foo/conffiles',
+    ...shared.map(path => `+${path}`),
+    '+endef',
+    '+',
+    '+Package/foo-full/conffiles=$(Package/foo/conffiles)',
+    '+',
+    '+define Package/foo-tiny/install',
+    '+\t$(INSTALL_DIR) $(1)/etc/config',
+    '+\t$(INSTALL_CONF) ./files/foo.config $(1)/etc/config/foo',
+    '+endef',
+    '+',
+    '+define Package/foo-full/install',
+    '+\t$(INSTALL_DIR) $(1)/etc/config',
+    '+\t$(INSTALL_CONF) ./files/foo.config $(1)/etc/config/foo',
+    '+endef'
+  ];
+
+  test('reads a conffiles list a variant assigns from another package', () => {
+    const res = validateNew(...variants(['/etc/config/foo']));
+    assertNoErrorIncludes(res, 'conffiles');
+    assertSomeIncludes(res.successes, 'conffiles macro properly registers INSTALL_CONF');
+  });
+
+  test('holds an assigned conffiles list to the paths it really lists', () => {
+    const res = validateNew(...variants(['/etc/config/bar']));
+    assertErrorIncludes(res, "Makefile installs '/etc/config/foo', but 'define Package/foo-tiny/conffiles' does not list it");
+    assertErrorIncludes(res, "Makefile installs '/etc/config/foo', but 'define Package/foo-full/conffiles' does not list it");
+    assertNoErrorIncludes(res, "missing the required 'conffiles' section");
+  });
+});
+
+// How the conffiles rule reads an install line: a finding (the new package has
+// no conffiles section), nothing to ask for, or undetermined.
+describe('validateMakefileContext install destinations', () => {
+  const NEW_FOO = ['diff --git a/package/utils/foo/Makefile b/package/utils/foo/Makefile', 'new file mode 100644', '--- /dev/null', '+++ b/package/utils/foo/Makefile'];
+  const MISSING = "missing the required 'conffiles' section";
+  const NOTICE = 'Could not safely determine installed configuration path';
+
+  for (const [shape, lines, expected] of [
+    ['a file into /etc', ['\t$(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf'], 'a finding'],
+    ['a source under PKG_INSTALL_DIR into /etc/', ['\t$(INSTALL_CONF) $(PKG_INSTALL_DIR)/etc/foo.conf $(1)/etc/'], 'a finding'],
+    ['a source under $(1)', ['\t$(INSTALL_CONF) $(1)/usr/share/foo.conf $(1)/etc/foo.conf'], 'a finding'],
+    ['a template into a directory', ['\t$$(INSTALL_CONF) ./files/common.conf $$(1)/etc/foo/'], 'a finding'],
+    ['a file into /usr/share', ['\t$(INSTALL_CONF) ./files/fw.conf $(1)/usr/share/fw3/foo.conf'], 'nothing'],
+    ['-t /usr/share and the sources on the next line', ['\t$(INSTALL_CONF) -t $(1)/usr/share/foo \\', '\t\t./files/foo.conf'], 'nothing'],
+    ['a template source named after $(1)', ['\t$$(INSTALL_CONF) ./files/$(1).conf $$(1)/etc/foo/'], 'undetermined'],
+    ['a destination that is not absolute', ['\t$(INSTALL_CONF) ./files/foo.conf $(1)$(FOO_DIR)/foo.conf'], 'undetermined'],
+    ['the destination on the next line', ['\t$(INSTALL_CONF) $(1)/usr/share/foo/defaults.conf \\', '\t\t$(1)/etc/foo.conf'], 'undetermined'],
+    ['two commands', ['\t$(INSTALL_DIR) $(1)/etc/config && $(INSTALL_CONF) ./files/foo.config $(1)/etc/config/foo'], 'undetermined'],
+    ['a test before the command', ['\t[ -f $(1)/etc/foo.conf ] || $(INSTALL_CONF) ./files/foo.conf $(1)/etc/foo.conf'], 'undetermined'],
+    ['a foreach', ['\t$(foreach f,a.conf b.conf,$(INSTALL_CONF) ./files/$(f) $(1)/etc/foo/;)'], 'undetermined']
+  ]) {
+    test(`${shape}: ${expected}`, async () => {
+      const res = await validateMakefileContext(makeCommit('foo: add new package'), diff(
+        NEW_FOO, '+define Package/foo/install', ...lines.map(line => `+${line}`), '+endef'
+      ), CONFIG, newPackage());
+      assert.strictEqual(res.errors.some(e => e.includes(MISSING)), expected === 'a finding', res.errors.join('\n'));
+      assert.strictEqual(res.incomplete, expected === 'undetermined');
+      assert.strictEqual(res.notices.some(n => n.includes(NOTICE)), expected === 'undetermined');
+    });
+  }
+
+  // A modified Makefile is read in full at the head.
+  test('a modified Makefile installing into /usr/share: nothing', async () => {
+    const patch = diff(gitModified(FOO), '@@ -20,2 +20,3 @@ define Package/foo/install', '+\t$(INSTALL_CONF) ./files/fw.conf $(1)/usr/share/fw3/foo.conf');
+    const head = 'define Package/foo/install\n\t$(INSTALL_DIR) $(1)/usr/share/fw3\n\t$(INSTALL_CONF) ./files/fw.conf $(1)/usr/share/fw3/foo.conf\nendef\n';
+    const res = await validateMakefileContext(makeCommit('foo: install fw.conf'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => head);
+    assertNoErrorIncludes(res, 'conffiles');
+    assert.strictEqual(res.incomplete, false);
+  });
+
+  // telephony's net/yate/Makefile.
+  test('a modified Makefile with yate\'s template line: undetermined', async () => {
+    const line = '\t\t$$(INSTALL_CONF) $$(PKG_INSTALL_DIR)/etc/yate/$(1).conf $$(1)/etc/yate/ ;\\';
+    const patch = diff(gitModified(FOO), '@@ -200,4 +200,5 @@ define BuildPlugin', `+${line}`);
+    const head = `define BuildPlugin\n  define Package/foo-mod-$(1)/install\n${line}\n  endef\n  $$(eval $$(call BuildPackage,foo-mod-$(1)))\nendef\n`;
+    const res = await validateMakefileContext(makeCommit('foo: install plugin configs'), patch, CONFIG, existingPackage(), 'openwrt/packages', async () => head);
+    assert.strictEqual(res.incomplete, true);
+    assertSomeIncludes(res.notices, NOTICE, 'notices');
+  });
+});
+
 describe('validateConffilesCoverage', () => {
   // Every install line is paired with every conffiles entry, and reading an
   // entry - tokenising it and cutting it into segments - was redone for each
