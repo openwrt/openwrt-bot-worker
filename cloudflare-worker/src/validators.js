@@ -1617,18 +1617,35 @@ function makefilePkgNameResolver(makefileText) {
   };
 }
 
+// `Package/<x>/conffiles = <value>`, with or without the diff marker.
+const CONFFILES_ASSIGNMENT = /^[ \t+]*Package\/([^\/\s]+)\/conffiles[ \t]*[:?+]?=(.*)$/;
+
 export function extractConffilesMap(makefileText) {
   const map = new Map();
   if (!makefileText) return map;
 
   // Extract all define blocks for potential macro calls like $(call Package/foo/Default/conffiles)
   const defineBlocks = new Map();
+  // A variant can take another package's list by assignment (weechat, zabbix).
+  // Kept apart, so that it never shadows a define of that name.
+  const assignedBlocks = new Map();
   const rawLines = makefileText.split('\n');
   let currentMacro = null;
   let currentLines = [];
 
   for (const rawLine of rawLines) {
     if (currentMacro === null) {
+      if (rawLine.startsWith('-')) continue;
+      const assignMatch = rawLine.match(CONFFILES_ASSIGNMENT);
+      if (assignMatch) {
+        const value = assignMatch[2].trim();
+        if (value) {
+          const name = `Package/${assignMatch[1]}/conffiles`;
+          if (!assignedBlocks.has(name)) assignedBlocks.set(name, []);
+          assignedBlocks.get(name).push(value);
+        }
+        continue;
+      }
       // A define name runs to the first whitespace, parentheses included:
       // `define Package/$(PKG_NAME)/conffiles` is the ordinary spelling across
       // the feeds, and stopping at `(` captured `Package/$` instead, so the
@@ -1664,16 +1681,20 @@ export function extractConffilesMap(makefileText) {
   // stripped, which is a different text, so it gets a resolver of its own.
   const resolvePkgName = makefilePkgNameResolver(makefileText);
 
+  const blockLines = (name) => defineBlocks.get(name) || assignedBlocks.get(name);
+
   function expandLines(lines, seenMacros = new Set()) {
     const result = [];
     for (const line of lines) {
       const callMatch = line.match(/^\$\(call\s+([^\)\s]+)\)/);
-      if (callMatch) {
-        const macroName = callMatch[1];
-        if (defineBlocks.has(macroName) && !seenMacros.has(macroName)) {
+      // A block can also be referenced as a variable, `$(Package/foo/conffiles)`.
+      const refMatch = callMatch ? null : line.match(/^\$\(([^\)\s]+)\)$/);
+      if (callMatch || (refMatch && blockLines(refMatch[1]))) {
+        const macroName = (callMatch || refMatch)[1];
+        if (blockLines(macroName) && !seenMacros.has(macroName)) {
           const nextSeen = new Set(seenMacros);
           nextSeen.add(macroName);
-          result.push(...expandLines(defineBlocks.get(macroName), nextSeen));
+          result.push(...expandLines(blockLines(macroName), nextSeen));
         }
       } else {
         // Expand known variables
@@ -1694,7 +1715,7 @@ export function extractConffilesMap(makefileText) {
     return result;
   }
 
-  for (const [name, lines] of defineBlocks.entries()) {
+  for (const [name, lines] of [...defineBlocks.entries(), ...assignedBlocks.entries()]) {
     const conffilesMatch = name.match(/^Package\/([^\/\s]+)\/conffiles$/);
     if (conffilesMatch) {
       const pkg = resolvePkgName(conffilesMatch[1]);
@@ -1767,9 +1788,25 @@ export function extractInstallLinePackages(makefileText) {
 // function of the text and the name, so a resolver belonging to one text
 // answers exactly as a fresh resolution would. Omit it and every line builds
 // its own.
+//
+// Only a single command is read. Its destination is the word after `-t`, or
+// else its last word, and has to start with `$(1)`. A line that chains
+// commands, or that continues without `-t`, is left undetermined.
 export function extractInstalledConfigPath(contentLine, makefileText, resolveVar = null) {
-  const match = contentLine.match(/^(.*?)\$(?:\(1\)|\{1\})([^\s;&|]+)/);
-  if (!match) return { paths: [], unresolvable: true };
+  if (/;|&&|\|/.test(contentLine)) return { paths: [], unresolvable: true };
+  const continued = /\\\s*$/.test(contentLine);
+  const words = contentLine.replace(/\\\s*$/, '').trim().split(/\s+/).filter(Boolean);
+  const t = words.findIndex(word => word === '-t' || word === '--target-directory');
+  let last;
+  if (t !== -1 && t + 1 < words.length) {
+    last = words.splice(t, 2)[1];
+  } else if (continued && words.length > 1) {
+    return { paths: [], unresolvable: true };
+  } else {
+    last = words.pop() || '';
+  }
+  const destination = last.replace(/['"]/g, '').match(/^\$\$?(?:\(1\)|\{1\})(.*)$/);
+  if (!destination) return { paths: [], unresolvable: true };
 
   // Everything between the install macro and the destination is a source. The
   // leading word is the macro or command - `$(INSTALL_CONF)`, `$(CP)`, `ln` -
@@ -1777,7 +1814,6 @@ export function extractInstalledConfigPath(contentLine, makefileText, resolveVar
   // source either, and only `install`'s mode, owner and group take a value of
   // their own; `cp -r` does not, so a flag must not swallow the file after it.
   const TAKES_A_VALUE = /^(?:-[mog]|--mode|--owner|--group)$/;
-  const words = match[1].trim().split(/\s+/).filter(Boolean);
   if (words.length > 0 && !words[0].includes('/')) words.shift();
   const rawSources = [];
   for (let i = 0; i < words.length; i++) {
@@ -1787,7 +1823,7 @@ export function extractInstalledConfigPath(contentLine, makefileText, resolveVar
     }
     rawSources.push(words[i].replace(/['"]/g, ''));
   }
-  let target = match[2];
+  let target = destination[1];
 
   let resolve = resolveVar;
   const expandVars = (str) => {
@@ -1806,7 +1842,7 @@ export function extractInstalledConfigPath(contentLine, makefileText, resolveVar
 
   target = expandVars(target).replace(/['"]/g, '').replace(/\/+/g, '/');
 
-  if (/\$[({]/.test(target)) {
+  if (/\$[({]/.test(target) || !target.startsWith('/')) {
     return { paths: [], unresolvable: true };
   }
 
@@ -2705,7 +2741,9 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             for (const resolvedPath of resolvedPaths) {
               files.push({ pkg, pkgCertain, path: resolvedPath });
             }
-          } else if (unresolvable || item.contentLine.includes('INSTALL_CONF')) {
+          } else if (unresolvable) {
+            // An INSTALL_CONF outside /etc installs no conffile. Only a
+            // destination that could not be read leaves the check open.
             undetermined = true;
           }
         }
@@ -2714,7 +2752,7 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
       if (MakefileInstallsConfig) {
         const { files: installedConfigFiles, undetermined: hasUndeterminedConfigPath } = resolveConfigEntries(rawChunk);
-        if (hasUndeterminedConfigPath || installedConfigFiles.length === 0) {
+        if (hasUndeterminedConfigPath) {
           if (isAddedMakefile || typeof fetchFileContent !== 'function') {
             notices.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
             isValidationIncomplete = true;
@@ -2727,10 +2765,11 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
                   return { incomplete: true };
                 }
                 const resolvedFromHead = resolveConfigEntries(headText);
-                if (resolvedFromHead.undetermined || resolvedFromHead.files.length === 0) {
+                if (resolvedFromHead.undetermined) {
                   notices.push(`Could not safely determine installed configuration path(s) under /etc/ to verify conffiles coverage.`);
                   return { incomplete: true };
                 }
+                if (resolvedFromHead.files.length === 0) return { incomplete: false };
                 const headMap = extractConffilesMap(headText);
                 const headDefinedPkgs = extractDefinedPackages(headText);
                 const res = validateConffilesCoverage(headMap, resolvedFromHead.files, defaultPkgName, errors, successes, headDefinedPkgs, isAddedMakefile, notices);
@@ -2741,6 +2780,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
               }
             });
           }
+        } else if (installedConfigFiles.length === 0) {
+          // Every install line resolved, and none of them under /etc.
         } else if (isAddedMakefile) {
           const diffMap = extractConffilesMap(rawChunk);
           const res = validateConffilesCoverage(diffMap, installedConfigFiles, defaultPkgName, errors, successes, definedPackages, isAddedMakefile, notices);
