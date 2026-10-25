@@ -3274,11 +3274,18 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
     const missingNewlineFiles = [];
     const changedFiles = new Set();
 
+    // Git stores a symlink's target without a newline. The mode is in the header.
+    let nextIsSymlink = false;
     const patchLines = commitPatch.split('\n');
     for (const line of patchLines) {
-      if (line.startsWith('+++ b/')) {
-        currentFile = line.slice(6).trim().replace(/\r$/, '');
-        if (currentFile !== '/dev/null') {
+      if (line.startsWith('diff --git ')) {
+        nextIsSymlink = false;
+      } else if (/^(?:new file mode|new mode) 120000\r?$/.test(line) || /^index [0-9a-f]+\.\.[0-9a-f]+ 120000\r?$/.test(line)) {
+        nextIsSymlink = true;
+      } else if (line.startsWith('+++ b/')) {
+        currentFile = nextIsSymlink ? null : line.slice(6).trim().replace(/\r$/, '');
+        nextIsSymlink = false;
+        if (currentFile !== null && currentFile !== '/dev/null') {
           changedFiles.add(currentFile);
         }
       } else if (line.startsWith('+++ /dev/null')) {

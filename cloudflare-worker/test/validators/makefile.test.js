@@ -841,6 +841,26 @@ endef
     assert.deepStrictEqual(res.warnings, []);
   });
 
+  // luci-theme-material adds its dark and light variants as symlinks.
+  test('does not ask a symlink for a trailing newline', () => {
+    const link = (path, mode) => [
+      `diff --git a/${path} b/${path}`,
+      ...mode,
+      ...(mode[0].startsWith('new file') ? ['--- /dev/null'] : [`--- a/${path}`]),
+      `+++ b/${path}`,
+      '@@ -0,0 +1 @@',
+      '+material',
+      '\\ No newline at end of file'
+    ];
+    const res = validate('luci-theme-material: add variants', diff(
+      link('themes/luci-theme-material/htdocs/luci-static/material-dark', ['new file mode 120000', 'index 0000000000..20800454f3']),
+      link('themes/luci-theme-material/htdocs/luci-static/material-light', ['index 1111111111..20800454f3 120000']),
+      link('themes/luci-theme-material/htdocs/luci-static/material-old', ['old mode 100644', 'new mode 120000']),
+      link('themes/luci-theme-material/htdocs/luci-static/material.txt', ['new file mode 100644', 'index 0000000000..20800454f3'])
+    ), { config: focused({ check_trailing_newline: true }) });
+    assertErrorsInOrder(res, ["File 'themes/luci-theme-material/htdocs/luci-static/material.txt' is missing a trailing newline"]);
+  });
+
   for (const { title, checks, lines, errors, note } of [
     {
       title: 'flags spaces immediately after the := operator in Makefiles',
