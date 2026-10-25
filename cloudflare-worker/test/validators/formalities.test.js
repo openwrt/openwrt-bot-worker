@@ -215,7 +215,9 @@ describe('validateFormalities', () => {
       '[   21.058106] Unable to handle kernel access to user memory outside uaccess routines at virtual address 00000000000000b8',
       'make[2]: *** [modules/video.mk:620: a very long target path that keeps going far past the configured width limit] Error 1',
       '$ ./scripts/kconfig.pl + target/linux/generic/config-6.6 /dev/null > target/linux/generic/config-6.6-new and more output',
-      'Fixes: af0546da3440dba24217949527e503820350ff05 ("layerscape: armv8_64b: add Traverse Ten64 NAND variant with a longer tail")'
+      'Fixes: af0546da3440dba24217949527e503820350ff05 ("layerscape: armv8_64b: add Traverse Ten64 NAND variant with a longer tail")',
+      // diffoscope output, quoted in openwrt/luci#8714
+      "│ │ │ -export const revision = '26.133.20346~e9ebca7', branch = 'LuCI (HEAD detached at e9ebca7) branch';"
     ];
     for (const vline of verbatimLines) {
       assert.ok(vline.length > 100, `fixture must exceed the limit: ${vline.slice(0, 40)}`);
@@ -228,6 +230,14 @@ describe('validateFormalities', () => {
     const bullet = ' - This is only working if the first partition is active because recovery images are always flashed to the active partition';
     assert.ok(bullet.length > 100);
     assertErrorIncludes(await validateFormalities(fixBuild(bullet), CONFIG), 'exceeds max width');
+
+    // Only a line that starts with a box-drawing character is verbatim.
+    const prose = 'The tree output draws its branches with │ and ├── characters, which is fine as long as this line wraps';
+    const changelog = '* Fix a buffer overread in mbedtls_ssl_parse_server_hello() when the server sends an empty extension list';
+    for (const line of [prose, changelog]) {
+      assert.ok(line.length > 100);
+      assertErrorIncludes(await validateFormalities(fixBuild(line), CONFIG), 'exceeds max width');
+    }
   });
 
   test('rejects commit with only Signed-off-by and no description', async () => {

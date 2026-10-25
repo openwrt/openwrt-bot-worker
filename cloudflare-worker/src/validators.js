@@ -264,7 +264,8 @@ const VERBATIM_LINE_PATTERNS = [
   /^\[ *\d+\.\d+\] /,         // kernel log timestamp: [   10.933640] ...
   /^make(?:\[\d+\])?: /,      // make output: make[3]: *** ...
   /^[$#] /,                   // shell prompt / git bisect transcript
-  /^Fixes: [0-9a-f]{7,40}\b/  // Fixes: <sha> ("...") — never wrapped, per git convention
+  /^Fixes: [0-9a-f]{7,40}\b/, // Fixes: <sha> ("...") — never wrapped, per git convention
+  /^[─-╿]/          // box-drawing tool output: diffoscope, tree (│ │ ├── ...)
 ];
 
 // --- ENGINE CHECKS ---
