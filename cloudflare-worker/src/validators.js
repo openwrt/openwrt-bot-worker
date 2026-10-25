@@ -1542,6 +1542,25 @@ function hasStrayWhitespace(text, spans = makeExpansionSpans(text)) {
   return false;
 }
 
+const PKG_NAME_REF = /\$(?:\(PKG_NAME\)|{PKG_NAME})/;
+
+// Whether $(PKG_NAME) is passed to a `call` or `eval`, at any depth. The name
+// beside one, as in PKG_SOURCE's `$(call version_abbrev,...)`, does not count.
+// A `foreach` is judged whole, and a line make cannot parse keeps the old word
+// match.
+function pkgNameInCallOrEval(text) {
+  const spans = makeExpansionSpans(text);
+  if (spans === null) return /\b(?:call|eval)\b/.test(text);
+  for (const [start, end] of spans) {
+    const inner = text.slice(start + 2, end - 1);
+    const passes = /^(?:call|eval)[ \t]/.test(inner) ||
+      (/^foreach[ \t]/.test(inner) && /\$[({](?:call|eval)[ \t]/.test(inner));
+    if (passes && PKG_NAME_REF.test(inner)) return true;
+    if (pkgNameInCallOrEval(inner)) return true;
+  }
+  return false;
+}
+
 const NON_VERSION_MAKEFILE_VARS = new Set([
   'PKG_NAME', 'PKG_RELEASE', 'PKG_HASH', 'PKG_MIRROR_HASH',
   'PKG_MAINTAINER', 'PKG_LICENSE', 'PKG_LICENSE_FILES',
@@ -2982,7 +3001,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
             const trimmed = contentLine.trim();
             const isEmpty = trimmed === '';
             const isComment = trimmed.startsWith('#');
-            const isConditional = /^(ifeq|ifneq|else|endif)\b/.test(trimmed);
+            // Inside a define, make reads a conditional at column 0. With a tab the shell would run it.
+            const isConditional = /^(ifeq|ifneq|ifdef|ifndef|else|endif)\b/.test(trimmed);
 
             if (!isEmpty && !isComment && !isContinuation && !isConditional) {
               if (inBlock === 'metadata') {
@@ -3147,11 +3167,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           if (contentLine.trim().startsWith('#')) {
             continue;
           }
-          if (/\$(?:\(PKG_NAME\)|{PKG_NAME})/.test(contentLine)) {
-            const hasDefine = /\bdefine\b/.test(contentLine);
-            const hasCall = /\bcall\b/.test(contentLine);
-            const hasEval = /\beval\b/.test(contentLine);
-            if (hasDefine || hasCall || hasEval) {
+          if (PKG_NAME_REF.test(contentLine)) {
+            if (/^\s*(?:(?:override|export)\s+)*define\s/.test(contentLine) || pkgNameInCallOrEval(contentLine)) {
               pkgNameCheckErrors++;
               errors.push(`- Makefile line '${contentLine.trim()}' reuses PKG_NAME in a call, define, or eval. Use the literal package name instead.`);
             }
