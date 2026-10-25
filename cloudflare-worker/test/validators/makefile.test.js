@@ -1016,6 +1016,22 @@ endef
       errors: []
     },
     {
+      // video's sdl2 packages.
+      title: 'accepts ifdef and ifndef at column 0 inside a recipe',
+      lines: [
+        '+define Build/InstallDev',
+        '+\t$(call Build/InstallDev/cmake,$(1))',
+        '+ifdef CONFIG_DEBUG',
+        '+\t$(LN) libSDL2_imaged.so $(1)/usr/lib/libSDL2_image.so',
+        '+endif',
+        '+ifndef CONFIG_USE_MUSL',
+        '+\t$(CP) $(PKG_INSTALL_DIR)/usr/lib/libfoo.so* $(1)/usr/lib/',
+        '+endif',
+        '+endef'
+      ],
+      errors: []
+    },
+    {
       title: 'respects check_makefile_indentation: false configuration option',
       enabled: false,
       lines: ['+define Package/foo', '+ SECTION:=utils', '+endef'],
@@ -1318,9 +1334,22 @@ endef
       '+define Package/$(PKG_NAME)',
       '+$(eval $(call BuildPackage,$(PKG_NAME)))',
       '+define Package/${PKG_NAME}/description',
-      '+$(call BuildPackage,${PKG_NAME})'
+      '+$(call BuildPackage,${PKG_NAME})',
+      '+  define Package/$(PKG_NAME)-plugin-$(1)',
+      '+  $$(eval $$(call BuildPackage,$(PKG_NAME)-plugin-$(1)))',
+      '+$(call Package/$(PKG_NAME)/install/plugin,$$(1),$(1))'
     ));
-    assertErrorsInOrder(res, [REUSE, REUSE, REUSE, REUSE]);
+    assertErrorsInOrder(res, [REUSE, REUSE, REUSE, REUSE, REUSE, REUSE, REUSE]);
+  });
+
+  test('rejects PKG_NAME in a prefixed define or a foreach that feeds eval', () => {
+    const res = validate('foo: test', diff(
+      reuseHeader,
+      '+override define Package/$(PKG_NAME)/conffiles',
+      '+export define Package/$(PKG_NAME)/description',
+      '+$(foreach p,$(PKG_NAME) $(PKG_NAME)-extra,$(eval $(call BuildPackage,$(p))))'
+    ));
+    assertErrorsInOrder(res, [REUSE, REUSE, REUSE]);
   });
 
   for (const { title, lines, note } of [
@@ -1332,6 +1361,18 @@ endef
     {
       title: 'allows PKG_NAME outside of call, define, and eval lines',
       lines: ['+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)', '+PKG_SOURCE_URL:=https://github.com/foo/$(PKG_NAME)']
+    },
+    {
+      // pulseaudio's PKG_SOURCE and crun's generated config.h.
+      title: 'allows PKG_NAME on a line that only mentions call or define elsewhere',
+      lines: [
+        '+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(PKG_SOURCE_DATE)-$(call version_abbrev,$(PKG_SOURCE_VERSION)).tar.zst',
+        '+\techo "#define PACKAGE_STRING \\"$(PKG_NAME) $(PKG_VERSION)\\"" >> $(PKG_BUILD_DIR)/config.h'
+      ]
+    },
+    {
+      title: 'allows PKG_NAME in a foreach that feeds no call or eval',
+      lines: ['+CONF_FILES:=$(foreach f,$(PKG_NAME) $(PKG_NAME)-extra,$(f).conf)']
     },
     {
       title: 'ignores comments containing PKG_NAME inside eval/call/define patterns',
