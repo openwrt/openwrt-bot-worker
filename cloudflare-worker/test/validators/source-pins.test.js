@@ -407,6 +407,13 @@ describe('validatePkgSourcePins: series and limits', () => {
     assert.strictEqual(fifteen.res.incomplete, undefined);
   });
 
+  test('reads no Makefile nested inside a package and gives it no place among the fifteen', async () => {
+    const many = Array.from({ length: 15 }, (_, i) => change(`net/pkg${i}/Makefile`, ['+PKG_SOURCE_DATE:=2025.10.06'])).join('');
+    const { res, reads } = await audit([many + change('net/pkg0/src/Makefile', ['+CFLAGS += -Wall'])]);
+    assert.strictEqual(res.findings.length, 15);
+    assert.ok(!reads.includes('net/pkg0/src/Makefile'), reads.join(', '));
+  });
+
   // The CPU guard, pinned as a count rather than a clock: lines shaped like
   // the date that never complete it defeat the early exit, so the scan stops
   // after exactly 6000 of them.

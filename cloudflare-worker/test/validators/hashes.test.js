@@ -37,6 +37,19 @@ diff --git a/package/utils/newpkg/Makefile b/package/utils/newpkg/Makefile
   // A bash Makefile at a version, followed by the given lines.
   const bash = (version, ...rest) => ['PKG_NAME:=bash', `PKG_VERSION:=${version}`, ...rest];
 
+  // The audit read a kernel package's kbuild Makefile, which took one of the
+  // fifteen places.
+  test('reads no Makefile nested inside a package and gives it no place among the fifteen', async () => {
+    const recipe = (i) => `diff --git a/package/utils/p${i}/Makefile b/package/utils/p${i}/Makefile\n--- a/package/utils/p${i}/Makefile\n+++ b/package/utils/p${i}/Makefile\n+PKG_VERSION:=1.${i}\n`;
+    const nested = 'diff --git a/package/kernel/foo-leds/src/Makefile b/package/kernel/foo-leds/src/Makefile\n--- a/package/kernel/foo-leds/src/Makefile\n+++ b/package/kernel/foo-leds/src/Makefile\n+obj-m := ledbar.o\n';
+    const reads = [];
+    const read = async (path) => { reads.push(path); return makefile(['PKG_NAME:=p', 'PKG_VERSION:=1.0', pinned, sourceUrl]); };
+    const patch = Array.from({ length: 15 }, (_, i) => recipe(i)).join('') + nested;
+    const res = await validatePkgHashes([{ commitPatch: patch }], HASH_CONFIG, read, read);
+    assertNoneIncludes(res.notices, 'audit skipped', 'notices');
+    assert.ok(reads.length > 0 && !reads.includes('package/kernel/foo-leds/src/Makefile'), reads.join(', '));
+  });
+
   const generateDiff = (head, base) => {
     const headLines = head || [];
     const baseLines = base || [];

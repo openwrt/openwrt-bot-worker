@@ -2232,11 +2232,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
       }
     };
 
-    for (const fileDiff of commitPatch.split(/^diff --git /m)) {
-      const fileMatch = fileDiff.match(/^\+\+\+\s+b\/(.*)$/m);
-      if (!fileMatch) continue;
-      const filePath = fileMatch[1].trim();
-      if (!filePath.endsWith('/Makefile') && filePath !== 'Makefile') continue;
+    // A nested Makefile's PKG_VERSION, if it has one, is its project's own.
+    for (const { filePath, rawChunk: fileDiff } of getMakefileChunks()) {
       // A brand-new Makefile is a package addition, not a version bump: its
       // subject says what is added and carries no old-to-new version context.
       if (/^---\s+\/dev\/null/m.test(fileDiff)) continue;
@@ -4928,7 +4925,8 @@ export async function validatePkgHashes(commitDetails, CONFIG, fetchFileContentA
     });
     for (const file of getChangedFilesFromPatch(item.commitPatch)) {
       if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
-      if (isHiddenOrSpecial(file)) continue;
+      // A Makefile nested inside a package has no PKG_HASH to audit.
+      if (isHiddenOrSpecial(file) || isNestedMakefile(file)) continue;
       makefiles.add(file);
     }
 
@@ -5278,7 +5276,8 @@ export async function validatePkgSourcePins(commitDetails, CONFIG, fetchFileCont
     });
     for (const file of getChangedFilesFromPatch(item.commitPatch)) {
       if (file !== 'Makefile' && !file.endsWith('/Makefile')) continue;
-      if (isHiddenOrSpecial(file)) continue;
+      // A Makefile nested inside a package pins no package source.
+      if (isHiddenOrSpecial(file) || isNestedMakefile(file)) continue;
       makefiles.add(file);
       if (!isRevertCommit) nonRevertedFiles.add(file);
     }
