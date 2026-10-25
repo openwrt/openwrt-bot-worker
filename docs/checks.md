@@ -25,7 +25,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 ## OpenWrt Makefiles
 
 *   **Version in subject** (`check_pkg_version`): a new `PKG_VERSION` that the commit subject does not mention.
-*   **Metadata** (`check_openwrt_meta`): a new package without `PKG_MAINTAINER`, `PKG_LICENSE` or `PKG_LICENSE_FILES`. A LuCI package needs only `PKG_LICENSE`. A package built on `u-boot.mk` or `trusted-firmware-a.mk` needs only `PKG_MAINTAINER`.
+*   **Metadata** (`check_openwrt_meta`): a new package without `PKG_MAINTAINER`, `PKG_LICENSE` or `PKG_LICENSE_FILES`. A LuCI package needs only `PKG_LICENSE`. A package built on `u-boot.mk`, `trusted-firmware-a.mk` or `optee-os.mk` needs only `PKG_MAINTAINER`.
 *   **SPDX license** (`check_spdx_license`, warning): a `PKG_LICENSE` that is not an SPDX identifier, with the identifier to use where one exists.
 *   **Init scripts** (`check_init_scripts`, warning): a new init script without `#!/bin/sh /etc/rc.common` or a `START=` priority.
 *   **Conffiles** (`check_conffiles`): configuration installed with `INSTALL_CONF` or into `/etc/config` that the package's conffiles list leaves out, and a malformed conffiles entry.
@@ -33,7 +33,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 *   **Line endings** (`check_crlf`): CRLF line endings.
 *   **Trailing newline** (`check_trailing_newline`): a file that does not end with a newline.
 *   **Binary files** (`check_binary_files`): a file git treats as binary. Deleting one is always allowed.
-*   **PKG_RELEASE** (`check_pkg_release`, warning): a new package whose `PKG_RELEASE` is not 1, a version update that does not reset it to 1 and a package change with neither a version nor a release bump. Packages built on `u-boot.mk`, `trusted-firmware-a.mk` or `luci.mk` never use `PKG_RELEASE` and are not asked for one.
+*   **PKG_RELEASE** (`check_pkg_release`, warning): a new package whose `PKG_RELEASE` is not 1, a version update that does not reset it to 1 and a package change with neither a version nor a release bump. Packages built on `u-boot.mk`, `trusted-firmware-a.mk`, `optee-os.mk` or `luci.mk` never use `PKG_RELEASE` and are not asked for one.
 *   **PKG_HASH** (`check_pkg_hash`, warning): a version change that keeps the old checksum, and a new package without one. A checksum the build cannot use is always an error.
 *   **Source pin** (`check_pkg_source_pin`, warning): a `PKG_SOURCE_DATE` that is not a `YYYY-MM-DD` date, and a `PKG_SOURCE_VERSION` that is a branch name or an abbreviated hash.
 *   **DTS checklist** (`check_dts_checklist`, warning): an added device tree without an SPDX header, with a redundant `default-state = "off"` on a GPIO LED or with the old `label = "color:function"` LED naming.

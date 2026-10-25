@@ -2319,17 +2319,8 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
           requiredMeta = [...CONFIG.check_openwrt_meta];
         }
 
-        const knownLicenseIncludeFiles = ['trusted-firmware-a.mk', 'u-boot.mk'];
-        const hasLicenseInclude = knownLicenseIncludeFiles.some(mkFile =>
-          new RegExp(`^\\+.*include.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(chunk.rawChunk)
-        );
-        if (hasLicenseInclude) {
-          requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_LICENSE' && meta !== 'PKG_LICENSE_FILES');
-        }
-
-        if (/^\+\s*include\s+.*\bluci\.mk/m.test(chunk.rawChunk)) {
-          requiredMeta = requiredMeta.filter(meta => meta !== 'PKG_MAINTAINER' && meta !== 'PKG_LICENSE_FILES');
-        }
+        const provided = new Set(includedPackageHelpers(addedDiffText(chunk.lines)).flatMap(helper => helper.provides));
+        requiredMeta = requiredMeta.filter(meta => !provided.has(meta));
 
         requiredMeta.forEach(meta => {
           const escapedMeta = meta.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -3997,7 +3988,7 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = Object.cre
     const content = await fetchFileContent(makefilePath);
     const ok = !!(content && (
       /^PKG_(?:NAME|DISTNAME)\s*(?::=|=)/m.test(content) ||
-      includesPackageHelperMk(content)
+      includedPackageHelpers(content, true).length > 0
     ));
     cache[dir] = ok;
     return ok;
@@ -4031,61 +4022,38 @@ export async function findPkgRoot(filePath, fetchFileContent, cache = Object.cre
   return null;
 }
 
-// Whether a Makefile includes one of the helpers that make a directory a
-// package without a PKG_NAME. It answers exactly what
-// /^\s*include\s+.*\b(?:luci|u-boot|trusted-firmware-a|optee-os)\.mk\s*$/m
-// answers, without its backtracking: with the m flag that `\s*` ran across
-// line breaks, so every line start of a Makefile of blank lines rescanned the
-// rest - a quarter of a second for 20 KB, which any pull request can write.
-// Read the way the regex reads it: lines end at \n, \r, U+2028 and U+2029,
-// whitespace is JavaScript's \s, the whitespace after `include` may span
-// lines, and the helper must end the line it is on, after a word boundary.
-const PACKAGE_HELPER_MKS = ['luci.mk', 'u-boot.mk', 'trusted-firmware-a.mk', 'optee-os.mk'];
-const PACKAGE_HELPER_BY_LAST_LETTER = new Map(PACKAGE_HELPER_MKS.map(mk => [mk.charCodeAt(mk.length - 4), mk]));
-// What the regex made of each UTF-16 unit: a blank is \s less the line
-// breaks, a word character is \w. A table, because the scan reads every
-// character of the lines it looks at.
-const CHAR_BLANK = 1;
-const CHAR_BREAK = 2;
-const CHAR_WORD = 4;
-const CHAR_CLASS = new Uint8Array(65536);
-for (const c of [9, 11, 12, 32, 0xa0, 0x1680, 0x202f, 0x205f, 0x3000, 0xfeff]) CHAR_CLASS[c] = CHAR_BLANK;
-for (let c = 0x2000; c <= 0x200a; c++) CHAR_CLASS[c] = CHAR_BLANK;
-for (const c of [10, 13, 0x2028, 0x2029]) CHAR_CLASS[c] = CHAR_BREAK;
-for (const [from, to] of [[48, 57], [65, 90], [97, 122], [95, 95]]) {
-  for (let c = from; c <= to; c++) CHAR_CLASS[c] = CHAR_WORD;
+// Helpers that make the including Makefile a package without a PKG_NAME.
+// `provides` is the metadata a new package on one need not write, and
+// `exemptFromRelease` marks the helpers whose packages never use PKG_RELEASE.
+export const PACKAGE_HELPER_MKS = Object.freeze([
+  { mk: 'luci.mk', provides: ['PKG_MAINTAINER', 'PKG_LICENSE_FILES'], exemptFromRelease: true },
+  { mk: 'u-boot.mk', provides: ['PKG_LICENSE', 'PKG_LICENSE_FILES'], exemptFromRelease: true },
+  { mk: 'trusted-firmware-a.mk', provides: ['PKG_LICENSE', 'PKG_LICENSE_FILES'], exemptFromRelease: true },
+  { mk: 'optee-os.mk', provides: ['PKG_LICENSE', 'PKG_LICENSE_FILES'], exemptFromRelease: true }
+].map(helper => Object.freeze({ ...helper, provides: Object.freeze(helper.provides) })));
+
+// The helpers a Makefile includes, in order. A line whose first word is
+// `include`, `-include` or `sinclude` names them, as a file name or a path
+// ending in `/<name>`, before any `#`. Line by line, so the scan stays linear.
+function includedPackageHelpers(content, firstOnly = false) {
+  const found = [];
+  for (const line of content.split('\n')) {
+    const files = /^[ \t\v\f\r]*(?:-|s)?include[ \t\v\f\r]+([^#]*)/.exec(line)?.[1];
+    if (!files) continue;
+    for (const file of files.split(/[ \t\v\f\r]+/)) {
+      const helper = PACKAGE_HELPER_MKS.find(h => file === h.mk || file.endsWith(`/${h.mk}`));
+      if (helper && !found.includes(helper)) {
+        found.push(helper);
+        if (firstOnly) return found;
+      }
+    }
+  }
+  return found;
 }
 
-function includesPackageHelperMk(content) {
-  const n = content.length;
-  // Each walk below covers the blanks in front of one `include`, the
-  // whitespace after it or the line that ends, so no character is walked
-  // more than twice.
-  for (let at = content.indexOf('include'); at !== -1; at = content.indexOf('include', at + 7)) {
-    // `^\s*`: only blanks between the line start and the keyword. Blank
-    // lines before it are the same match from a later line start.
-    let lineStart = at;
-    while (lineStart > 0 && CHAR_CLASS[content.charCodeAt(lineStart - 1)] === CHAR_BLANK) lineStart--;
-    if (lineStart > 0 && CHAR_CLASS[content.charCodeAt(lineStart - 1)] !== CHAR_BREAK) continue;
-    // `\s+`: at least one, line breaks included. The text it stops at is on
-    // the line the helper has to end.
-    let textStart = at + 7;
-    while (textStart < n && (CHAR_CLASS[content.charCodeAt(textStart)] & (CHAR_BLANK | CHAR_BREAK)) !== 0) textStart++;
-    if (textStart === at + 7 || textStart === n) continue;
-    let end = textStart;
-    while (end < n && CHAR_CLASS[content.charCodeAt(end)] !== CHAR_BREAK) end++;
-    // `\.mk\s*$`: nothing but blanks after the helper.
-    while (end > textStart && CHAR_CLASS[content.charCodeAt(end - 1)] === CHAR_BLANK) end--;
-    // The letter before `.mk` tells the four helpers apart.
-    if (content.charCodeAt(end - 1) !== 107 || content.charCodeAt(end - 2) !== 109 || content.charCodeAt(end - 3) !== 46) continue;
-    const mk = PACKAGE_HELPER_BY_LAST_LETTER.get(content.charCodeAt(end - 4));
-    if (mk === undefined) continue;
-    const from = end - mk.length;
-    // `.*\b`: anywhere in that text, after a character that is no word
-    // character. At textStart that is the whitespace before it.
-    if (from >= textStart && content.startsWith(mk, from) && CHAR_CLASS[content.charCodeAt(from - 1)] !== CHAR_WORD) return true;
-  }
-  return false;
+// The lines a diff of one file adds, as the text a helper include is read in.
+function addedDiffText(lines) {
+  return lines.filter(line => line.startsWith('+') && !line.startsWith('+++')).map(line => line.slice(1)).join('\n');
 }
 
 // `cache`, when given, holds what this same content already yielded for a
@@ -4491,12 +4459,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
     // when the tool itself has adopted PKG_RELEASE (e.g. tools/squashfs4).
     const isHostToolRoot = pkgRoot.startsWith('tools/') || pkgRoot.startsWith('toolchain/');
 
-    // Some package families never adopt PKG_RELEASE: u-boot and ARM Trusted
-    // Firmware track the upstream revision via PKG_VERSION/PKG_SOURCE_VERSION,
-    // and LuCI packages derive their version from git history inside luci.mk.
-    // Don't demand a release convention these Makefiles never had.
-    const RELEASE_EXEMPT_INCLUDES = ['u-boot.mk', 'trusted-firmware-a.mk', 'luci.mk'];
-
+    // A package on a helper that never uses PKG_RELEASE is not asked for one.
     // Nor demand one where there is nothing at all to bump. A Makefile with no
     // PKG_RELEASE and no version anyone could move cannot carry a release:
     // package/kernel/linux is the kernel itself (PKG_NAME, PKG_FLAGS and
@@ -4513,9 +4476,7 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
     const isReleaseExemptMakefile = (content, release) =>
       release === null && !!content &&
-      (RELEASE_EXEMPT_INCLUDES.some(mkFile =>
-        new RegExp(`^\\s*include\\s+.*${mkFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(content))
-        || hasNothingToBump(content));
+      (includedPackageHelpers(content).some(helper => helper.exemptFromRelease) || hasNothingToBump(content));
 
     // `PKG_RELEASE:=$(AUTORELEASE)` leaves the number to the buildsystem,
     // which is the supported way to carry none: there is nothing for a
