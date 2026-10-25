@@ -464,6 +464,24 @@ PKG_NAME:=golang
     assert.ok(resGood.successes.some(s => s.includes('PKG_VERSION bump matches context information inside subject line (1.22.2)')));
   });
 
+  // 24bf94ecb72: a kbuild Makefile's assignments sent the check to read it at
+  // the head for a PKG_VERSION it cannot have.
+  test('reads no nested Makefile for an indirect PKG_VERSION', async () => {
+    const patch = `
+diff --git a/package/kernel/button-hotplug/src/Makefile b/package/kernel/button-hotplug/src/Makefile
+--- a/package/kernel/button-hotplug/src/Makefile
++++ b/package/kernel/button-hotplug/src/Makefile
+@@ -1,1 +1,1 @@
+-obj-m := button-hotplug.o
++obj-m := button-hotplug.o gpio-hotplug.o
+`;
+    const reads = [];
+    const res = await validateMakefileContext(makeCommit('button-hotplug: add gpio-hotplug'), patch, CONFIG, existingPackage(), 'openwrt/openwrt',
+      async (path) => { reads.push(path); return 'obj-m := button-hotplug.o gpio-hotplug.o\n'; });
+    assert.deepStrictEqual(reads, []);
+    assertNoErrorIncludes(res, 'PKG_VERSION');
+  });
+
   test('requires metadata fields for new packages', () => {
     const state = existingPackage();
     const res = validate('newpkg: add package', diff(
