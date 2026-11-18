@@ -66,8 +66,9 @@ const DTS = 'target/linux/ramips/dts/mt7621_vendor_board.dts';
 const SPDX_FINDING = "has no 'SPDX-License-Identifier' comment in its file header";
 const DEFAULT_STATE_FINDING = `sets 'default-state = "off"'`;
 const LABEL_FINDING = `with the deprecated 'label = "<colour>:<function>"' form`;
+const CALIBRATION_FINDING = 'sets the deprecated prefixed calibration variant';
 
-const kinds = (list) => list.map(f => (f.includes(SPDX_FINDING) ? 'spdx' : f.includes(DEFAULT_STATE_FINDING) ? 'default-state' : f.includes(LABEL_FINDING) ? 'label' : f));
+const kinds = (list) => list.map(f => (f.includes(SPDX_FINDING) ? 'spdx' : f.includes(DEFAULT_STATE_FINDING) ? 'default-state' : f.includes(LABEL_FINDING) ? 'label' : f.includes(CALIBRATION_FINDING) ? 'calibration' : f));
 
 describe('validateDeviceTrees: the three items', () => {
   test('passes a modern device tree with one success line; default-state "on" and "keep" never fire', async () => {
@@ -76,19 +77,22 @@ describe('validateDeviceTrees: the three items', () => {
       assert.deepStrictEqual(res.warnings, [], state);
       assert.deepStrictEqual(res.errors, []);
       assert.deepStrictEqual(res.notices, []);
-      assert.deepStrictEqual(res.successes, [`✅ New device tree '${DTS}' carries an SPDX header and uses no deprecated LED pattern`]);
+      assert.deepStrictEqual(res.successes, [`✅ New device tree '${DTS}' carries an SPDX header and uses no deprecated LED or calibration pattern`]);
       assert.strictEqual(res.incomplete, false);
       assert.deepStrictEqual(reads, []);
     }
   });
 
-  test('the real ipq5018-re700x.dts: one finding naming its four gpio-leds LEDs, no SPDX finding', async () => {
+  // As added, the file also carried the prefixed calibration variant twice;
+  // openwrt/openwrt b2ea590 converted it later.
+  test('the real ipq5018-re700x.dts: one finding naming its four gpio-leds LEDs, one for its calibration variant, no SPDX finding', async () => {
     const path = 'target/linux/qualcommax/dts/ipq5018-re700x.dts';
     const { res, reads } = await audit([addition(path, RE700X)]);
-    assert.deepStrictEqual(kinds(res.warnings), ['default-state']);
-    const [finding] = res.warnings;
+    assert.deepStrictEqual(kinds(res.warnings), ['default-state', 'calibration']);
+    const [finding, calibration] = res.warnings;
     assert.ok(finding.startsWith(`- New device tree '${path}' sets 'default-state = "off"' on 4 LED nodes inside a 'compatible = "gpio-leds"' block ('wps-red', 'wps-blue', 'wlan-2g', and 1 more).`), finding);
     assert.ok(finding.includes('0d23fd2'), finding);
+    assert.ok(calibration.startsWith(`- New device tree '${path}' sets the deprecated prefixed calibration variant 2 times ('qcom,ath11k-calibration-variant = "TP-Link-RE700X"', 'qcom,ath11k-calibration-variant = "TP-Link-RE700X"').`), calibration);
     assert.deepStrictEqual(res.successes, []);
     assert.deepStrictEqual(reads, [], 'a single commit carries the whole file, so nothing is read');
   });
@@ -102,7 +106,7 @@ describe('validateDeviceTrees: the three items', () => {
     const path = 'target/linux/realtek/dts/rtl9303_hasivo_s600wp-5gt-2s-plus.dts';
     const { res } = await audit([addition(path, S600WP)]);
     assert.deepStrictEqual(res.warnings, []);
-    assert.deepStrictEqual(res.successes, [`✅ New device tree '${path}' carries an SPDX header and uses no deprecated LED pattern`]);
+    assert.deepStrictEqual(res.successes, [`✅ New device tree '${path}' carries an SPDX header and uses no deprecated LED or calibration pattern`]);
   });
 
   test('the real rtl9303_hasivo_s1100wp-8xgt-se.dts: no finding for eight register-bit-led nodes', async () => {
@@ -220,6 +224,48 @@ describe('validateDeviceTrees: the three items', () => {
     assert.deepStrictEqual(kinds(res.warnings), ['spdx', 'default-state', 'label']);
     assert.ok(res.warnings[1].includes("on 1 LED node inside a 'compatible = \"gpio-leds\"' block ('power')"), res.warnings[1]);
   });
+
+  // A wifi node of a new ipq40xx board, written the way new device PRs still
+  // add it.
+  const radios = (property) => [
+    SPDX, '/ {', '};', '',
+    '&wifi0 {', '\tstatus = "okay";', `\t${property} = "Vendor-Board";`, '};', '',
+    '&wifi1 {', '\tstatus = "okay";', `\t${property} = "Vendor-Board";`, '};'
+  ];
+
+  test('reports the prefixed ath10k and ath11k calibration variants with their values', async () => {
+    for (const property of ['qcom,ath10k-calibration-variant', 'qcom,ath11k-calibration-variant']) {
+      const { res } = await audit([addition(DTS, radios(property))]);
+      assert.deepStrictEqual(kinds(res.warnings), ['calibration'], property);
+      assert.ok(res.warnings[0].includes(`variant 2 times ('${property} = "Vendor-Board"', '${property} = "Vendor-Board"').`), res.warnings[0]);
+      assert.ok(res.warnings[0].includes(`'qcom,calibration-variant = "...";' with the same value`), res.warnings[0]);
+      assert.deepStrictEqual(res.successes, []);
+    }
+  });
+
+  test('leaves the generic calibration variant and look-alike properties alone', async () => {
+    const lines = [
+      ...radios('qcom,calibration-variant'),
+      '&wifi2 {',
+      '\t// qcom,ath10k-calibration-variant = "Old-Name";',
+      '\tqcom,ath10k-calibration-variant-x = "Not-It";',
+      '\tqcom,ath12k-calibration-variant = "Never-Prefixed";',
+      '};'
+    ];
+    const { res } = await audit([addition(DTS, lines)]);
+    assert.deepStrictEqual(res.warnings, []);
+    assert.deepStrictEqual(res.successes, [`✅ New device tree '${DTS}' carries an SPDX header and uses no deprecated LED or calibration pattern`]);
+  });
+
+  test('confirms a calibration finding at the head: converted there is no finding', async () => {
+    const first = addition(DTS, radios('qcom,ath10k-calibration-variant'));
+    const fix = change(DTS, ['\tstatus = "okay";', '-\tqcom,ath10k-calibration-variant = "Vendor-Board";', '+\tqcom,calibration-variant = "Vendor-Board";']);
+    const still = await audit([first, fix], { head: `${radios('qcom,ath10k-calibration-variant').join('\n')}\n` });
+    assert.deepStrictEqual(kinds(still.res.warnings), ['calibration']);
+    const fixed = await audit([first, fix], { head: `${radios('qcom,calibration-variant').join('\n')}\n` });
+    assert.deepStrictEqual(fixed.res.warnings, []);
+    assert.deepStrictEqual(fixed.reads, [DTS]);
+  });
 });
 
 describe('validateDeviceTrees: what is in scope', () => {
@@ -231,7 +277,7 @@ describe('validateDeviceTrees: what is in scope', () => {
     const fixed = await audit([first, fix], { head: fixedHead });
     assert.deepStrictEqual(fixed.reads, [DTS]);
     assert.deepStrictEqual(fixed.res.warnings, []);
-    assert.deepStrictEqual(fixed.res.successes, [`✅ New device tree '${DTS}' carries an SPDX header and uses no deprecated LED pattern`]);
+    assert.deepStrictEqual(fixed.res.successes, [`✅ New device tree '${DTS}' carries an SPDX header and uses no deprecated LED or calibration pattern`]);
     assert.strictEqual(fixed.res.incomplete, false);
 
     const unread = await audit([first, fix], { head: null });
@@ -457,7 +503,7 @@ describe('validateDeviceTrees: bounds', () => {
     const fits = await audit([addition(first, firstLines) + addition(second, secondLines.slice(0, -1))]);
     assert.deepStrictEqual(fits.res.notices, []);
     assert.deepStrictEqual(kinds(fits.res.warnings), ['spdx']);
-    assert.deepStrictEqual(fits.res.successes, [`✅ New device tree '${second}' carries an SPDX header and uses no deprecated LED pattern`]);
+    assert.deepStrictEqual(fits.res.successes, [`✅ New device tree '${second}' carries an SPDX header and uses no deprecated LED or calibration pattern`]);
   });
 
   test('confirms at most 10 files at the head and names the rest as unchecked', async () => {
@@ -477,7 +523,7 @@ describe('validateDeviceTrees: bounds', () => {
     const first = 'target/linux/ramips/dts/first.dts';
     const second = 'target/linux/ramips/dts/second.dts';
     const { res } = await audit([addition(first, [SPDX, ...wide(299)]) + addition(second, [SPDX, ...wide(300)])]);
-    assert.deepStrictEqual(res.successes, [`✅ New device tree '${first}' carries an SPDX header and uses no deprecated LED pattern`]);
+    assert.deepStrictEqual(res.successes, [`✅ New device tree '${first}' carries an SPDX header and uses no deprecated LED or calibration pattern`]);
     assert.deepStrictEqual(res.notices, ['Device tree checklist not run on 1 of 2 added device trees: the diff is larger than this check scans in one run.']);
     assert.strictEqual(res.incomplete, true);
   });

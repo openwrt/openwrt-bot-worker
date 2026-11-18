@@ -5549,6 +5549,9 @@ const DTS_MAX_LINE_CHARS = 512;
 // labels in the tree, every one starting with one of these is an LED; `0:APPSBL`
 // partitions and the function-first `system:red` never match.
 const DTS_LED_COLOURS = new Set(['white', 'red', 'green', 'blue', 'amber', 'yellow', 'orange', 'purple', 'violet', 'cyan', 'pink', 'ir', 'rgb']);
+// The kernel bindings mark both as deprecated in favour of
+// qcom,calibration-variant; ath12k never had a prefixed form.
+const DTS_PREFIXED_CALIBRATION = ['qcom,ath10k-calibration-variant', 'qcom,ath11k-calibration-variant'];
 const DTS_EXCERPTS = 3;
 const DTS_NOTE_PATHS = 5;
 
@@ -5586,6 +5589,7 @@ function scanDeviceTree(chunks) {
   const frames = [{ name: '', compatible: null, inherited: null, pending: null }];
   const defaultOff = [];
   const labels = [];
+  const calibration = [];
   let sawSpdx = false;
   let inBlockComment = false;
 
@@ -5640,11 +5644,17 @@ function scanDeviceTree(chunks) {
         const value = deviceTreeString(line, 'label');
         const colon = value === null ? -1 : value.indexOf(':');
         if (colon > 0 && DTS_LED_COLOURS.has(value.slice(0, colon))) labels.push(value);
+      } else if (lead === 113 /* q */ && line.startsWith('qcom,ath1')) {
+        for (const name of DTS_PREFIXED_CALIBRATION) {
+          if (!line.startsWith(name)) continue;
+          const value = deviceTreeString(line, name);
+          if (value !== null) calibration.push(`${name} = "${value}"`);
+        }
       }
     }
   }
   for (const frame of frames) settle(frame);
-  return { missingSpdx: !sawSpdx, defaultOff, labels };
+  return { missingSpdx: !sawSpdx, defaultOff, labels, calibration };
 }
 
 // At most `limit` lines of `text`, or null when it has more: a head that a
@@ -5685,10 +5695,14 @@ function deviceTreeFindings(path, result) {
     const n = result.labels.length;
     out.push(`- New device tree '${path}' names ${n} LED${n === 1 ? '' : 's'} with the deprecated 'label = "<colour>:<function>"' form (${deviceTreeExcerpts(result.labels)}). openwrt/openwrt's [.github/llm-review-rules.md](https://github.com/openwrt/openwrt/blob/main/.github/llm-review-rules.md) replaces it with 'color = <LED_COLOR_ID_<COLOUR>>;' plus 'function = LED_FUNCTION_<FUNC>;' from 'include/dt-bindings/leds/common.h' — and with 'function = "<func>";' where no 'LED_FUNCTION_*' constant matches, which is the case for names like 'rssi', 'signal1', 'sfp' or 'user'. Older device trees in the tree still use the label form; new ones are asked not to.`);
   }
+  if (result.calibration.length > 0) {
+    const n = result.calibration.length;
+    out.push(`- New device tree '${path}' sets the deprecated prefixed calibration variant ${n} time${n === 1 ? '' : 's'} (${deviceTreeExcerpts(result.calibration)}). The kernel bindings mark 'qcom,ath10k-calibration-variant' and 'qcom,ath11k-calibration-variant' as deprecated, and openwrt/openwrt's [.github/llm-review-rules.md](https://github.com/openwrt/openwrt/blob/main/.github/llm-review-rules.md) asks for 'qcom,calibration-variant = "...";' with the same value instead. Older device trees in the tree may still use the prefixed form; new ones are asked not to.`);
+  }
   return out;
 }
 
-const hasDeviceTreeHit = (result) => result.missingSpdx || result.defaultOff.length > 0 || result.labels.length > 0;
+const hasDeviceTreeHit = (result) => result.missingSpdx || result.defaultOff.length > 0 || result.labels.length > 0 || result.calibration.length > 0;
 
 export async function validateDeviceTrees(commitDetails, CONFIG, fetchFileContentAtHead, isBackportPr = false) {
   const errors = [];
@@ -5852,7 +5866,8 @@ export async function validateDeviceTrees(commitDetails, CONFIG, fetchFileConten
     headResult.set(r.file, {
       missingSpdx: r.result.missingSpdx && atHead.missingSpdx,
       defaultOff: r.result.defaultOff.length > 0 ? atHead.defaultOff : [],
-      labels: r.result.labels.length > 0 ? atHead.labels : []
+      labels: r.result.labels.length > 0 ? atHead.labels : [],
+      calibration: r.result.calibration.length > 0 ? atHead.calibration : []
     });
   });
 
@@ -5862,7 +5877,7 @@ export async function validateDeviceTrees(commitDetails, CONFIG, fetchFileConten
     if (final === null) continue;
     const fileFindings = deviceTreeFindings(file, final);
     if (fileFindings.length > 0) findings.push(...fileFindings);
-    else successes.push(`✅ New device tree '${file}' carries an SPDX header and uses no deprecated LED pattern`);
+    else successes.push(`✅ New device tree '${file}' carries an SPDX header and uses no deprecated LED or calibration pattern`);
   }
 
   return { errors, warnings, notices, successes, notes, incomplete };
