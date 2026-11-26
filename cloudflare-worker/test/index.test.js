@@ -2379,6 +2379,10 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
         }), { status: 200 });
       }
       if (url.includes('/commits/a1b2c3d4e5f61111222233334444555566667777')) {
+        // An object stands for an answer other than the patch.
+        if (upstreamPatchContent && typeof upstreamPatchContent === 'object') {
+          return new Response(JSON.stringify(upstreamPatchContent.body), { status: upstreamPatchContent.status });
+        }
         if (options && options.headers && options.headers.Accept === 'application/vnd.github.patch') {
           return new Response(upstreamPatchContent, { status: 200 });
         }
@@ -2515,6 +2519,35 @@ index 123456..789012 100644
     assert.strictEqual(checkRun.conclusion, 'failure');
     assert.match(checkRun.output.text, /bar.*must not contain any spaces/);
     assert.doesNotMatch(checkRun.output.text, /foo.*must not contain any spaces/);
+  });
+
+  // routing#1210: the cherry-picked commit is in another repository.
+  test('checks a backport in full when GitHub has no such upstream commit', async () => {
+    const prPatchContent = `From: John Doe <john@doe.com>
+Subject: mypkg: update to 1.2.3
+
+diff --git a/package/utils/mypkg/Makefile b/package/utils/mypkg/Makefile
+index 123456..789012 100644
+--- a/package/utils/mypkg/Makefile
++++ b/package/utils/mypkg/Makefile
+@@ -1,5 +1,5 @@
++define Package/mypkg/conffiles
++ /etc/config/foo
++endef
+`;
+    const response = await sendBackportWebhookPR(
+      '[24.10] mypkg: update to 1.2.3',
+      'master',
+      'mypkg: update to 1.2.3\n\n(cherry picked from commit a1b2c3d4e5f61111222233334444555566667777)\n\nSigned-off-by: John Doe <john@doe.com>',
+      prPatchContent,
+      { status: 422, body: { message: 'No commit found for SHA: a1b2c3d4e5f61111222233334444555566667777' } }
+    );
+    assert.strictEqual(response.status, 200);
+    const commitCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / Git & Commits');
+    assert.notStrictEqual(commitCheck.conclusion, 'neutral', commitCheck.output.text);
+    assert.match(commitCheck.output.text, /Commit a1b2c3d from the cherry-pick line is not in test\/repo/);
+    const makefileCheck = postedCheckRuns.find(cr => cr.name === 'FormalityCheck / OpenWrt Makefiles');
+    assert.match(makefileCheck.output.text, /foo.*must not contain any spaces/);
   });
 
   test('skips the upstream comparison when the subrequest budget is exhausted', async () => {

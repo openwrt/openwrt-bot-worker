@@ -141,11 +141,74 @@ describe('resolvePatchesAndCommits lifecycle phase', () => {
       }
       return { code: 200, raw: 'diff --git a/foo b/foo\n' };
     };
-
-    const result = await resolvePatchesAndCommits(ctx);
+    const logged = [];
+    const originalError = console.error;
+    console.error = (msg) => { logged.push(String(msg)); };
+    let result;
+    try {
+      result = await resolvePatchesAndCommits(ctx);
+    } finally {
+      console.error = originalError;
+    }
+    assert.ok(logged.some(m => m.includes('Could not fetch upstream commit 0987654') && m.includes('HTTP 404')), 'the silent call does not hide a real failure');
     assert.strictEqual(result.upstreamFetchFailures, 1);
     assert.strictEqual(result.upstreamComparisonSkips, 0, 'a 404 says nothing about this PR being too large');
     assert.ok(result.commitDetails[0].upstreamFetchError.includes('HTTP 404'));
+  });
+
+  // routing#1210 cherry-picked from openwrt/packages, where the package moved.
+  // GitHub answers 422 when the repository has no such commit at all.
+  test('records a 422 as a commit the repository does not have, not as a failure', async () => {
+    const ctx = createMockContext({ commitsCount: 1 });
+    ctx.isBackportPr = true;
+    ctx.commits = [{
+      sha: '1234567890123456789012345678901234567890',
+      html_url: 'https://github.com/test/repo/commit/1234567890123456789012345678901234567890',
+      commit: { message: 'foo: backport fix\n\n(cherry picked from commit 0987654321098765432109876543210987654321)' }
+    }];
+    let upstreamOptions = null;
+    ctx.client.optionalApiCall = async (url, method, body, accept, options) => {
+      if (url.includes('/commits/0987654321098765432109876543210987654321')) {
+        upstreamOptions = options;
+        return { code: 422, raw: '{"message":"No commit found for SHA: 0987654"}', data: { message: 'No commit found for SHA: 0987654' } };
+      }
+      return { code: 200, raw: 'diff --git a/foo b/foo\n' };
+    };
+
+    const result = await resolvePatchesAndCommits(ctx);
+    assert.strictEqual(upstreamOptions?.silent, true, 'an expected 422 is not logged as an error');
+    assert.strictEqual(result.upstreamFetchFailures, 0);
+    assert.strictEqual(result.upstreamNotInRepo, 1);
+    assert.strictEqual(result.commitDetails[0].upstreamNotInRepo, '0987654321098765432109876543210987654321');
+    assert.strictEqual(result.commitDetails[0].upstreamFetchError, null);
+    assert.strictEqual(result.commitDetails[0].upstreamSha, null);
+  });
+
+  test('treats any other 422 as a failed fetch', async () => {
+    const ctx = createMockContext({ commitsCount: 1 });
+    ctx.isBackportPr = true;
+    ctx.commits = [{
+      sha: '1234567890123456789012345678901234567890',
+      html_url: 'https://github.com/test/repo/commit/1234567890123456789012345678901234567890',
+      commit: { message: 'foo: backport fix\n\n(cherry picked from commit 0987654321098765432109876543210987654321)' }
+    }];
+    ctx.client.optionalApiCall = async (url) => {
+      if (url.includes('/commits/0987654321098765432109876543210987654321')) {
+        return { code: 422, raw: '{"message":"Validation Failed"}', data: { message: 'Validation Failed' } };
+      }
+      return { code: 200, raw: 'diff --git a/foo b/foo\n' };
+    };
+    const originalError = console.error;
+    console.error = () => {};
+    let result;
+    try {
+      result = await resolvePatchesAndCommits(ctx);
+    } finally {
+      console.error = originalError;
+    }
+    assert.strictEqual(result.upstreamNotInRepo, 0);
+    assert.strictEqual(result.upstreamFetchFailures, 1);
+    assert.ok(result.commitDetails[0].upstreamFetchError.includes('HTTP 422'));
   });
 
   // In PR-wide mode no commit has a patch of its own, but the upstream diff is

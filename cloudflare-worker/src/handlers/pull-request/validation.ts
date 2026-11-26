@@ -572,6 +572,8 @@ export async function runValidations(
         formalityOutputText += "  ✅ Commit explicitly specifies cherry-pick origin context\n";
         if (item.isVerbatim) {
           formalityOutputText += "  ✅ Backport matches upstream commit verbatim. Skipping style and packaging validations.\n";
+        } else if (item.upstreamNotInRepo) {
+          formalityOutputText += `  ℹ️ Commit ${item.upstreamNotInRepo.slice(0, 7)} from the cherry-pick line is not in ${repoFullname}, so this backport was checked in full instead of against it.\n`;
         } else if (item.upstreamFetchError) {
           formalityOutputText += `  ⚠️ ${item.upstreamFetchError}\n`;
           allPrWarnings.push(`**Commit [${sha.slice(0, 7)}](${html_url})**:\n- ⚠️ ${item.upstreamFetchError}`);
