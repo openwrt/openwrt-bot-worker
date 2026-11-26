@@ -175,7 +175,13 @@ export async function loadPullRequestContext(
       return { kind: 'response', response: new Response("Missing pull request number", { status: 400 }) };
     }
 
-    if (!await isMaintainerUser(data.comment?.user, data.comment?.author_association)) {
+    // A failed lookup (null) runs the checks only for a comment with an
+    // override, which the scan then reports as unverified. Any other comment
+    // would cost a full run for as long as the lookup keeps failing.
+    const commenter = await isMaintainerUser(data.comment?.user, data.comment?.author_association);
+    const commentBody = data.comment?.body || '';
+    const carriesOverride = ALLOW_BRANCH_PATTERN.test(commentBody) || ALLOW_CHERRY_PICK_PATTERN.test(commentBody);
+    if (commenter === false || (commenter === null && !carriesOverride)) {
       return { kind: 'response', response: new Response("Ignored non-maintainer issue comment", { status: 200 }) };
     }
 
