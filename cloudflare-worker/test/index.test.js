@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import worker from '../src/index.js';
 import { handleScheduled, hasRealActivitySince } from '../src/stale.js';
 import { githubApiCall } from '../src/github.js';
-import { calculateHmac, parseGraphqlRequest, graphqlResponse, graphqlLabelsHandler } from './github-mocks.js';
+import { calculateHmac, parseGraphqlRequest, graphqlResponse, graphqlLabelsHandler, generateTestPrivateKeyPEM } from './github-mocks.js';
 
 // --- STALE SCAN GRAPHQL MOCKING HELPERS ---
 // The daily scan asks GitHub two GraphQL questions per repository: the repo
@@ -67,23 +67,6 @@ function staleGraphqlHandler(url, options, { config = null, staleLabelExists = t
     }), { status: 200 });
   }
   return null;
-}
-
-async function generateTestPrivateKeyPEM() {
-  const keyPair = await crypto.subtle.generateKey(
-    {
-      name: "RSASSA-PKCS1-v1_5",
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: "SHA-256"
-    },
-    true,
-    ["sign", "verify"]
-  );
-
-  const exported = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
-  const exportedB64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
-  return `-----BEGIN PRIVATE KEY-----\n${exportedB64}\n-----END PRIVATE KEY-----`;
 }
 
 describe('Cloudflare Worker Webhook & Error Handling', { concurrency: 1 }, () => {

@@ -3,6 +3,7 @@ import { handleScheduled } from './stale.js';
 import { isBotUser } from './core/utils.ts';
 import { handleIssuesEvent } from './handlers/issues.ts';
 import { handlePullRequestEvent } from './handlers/pull-request/index.ts';
+import { handleTesterPing, TESTER_PING_LABEL } from './handlers/tester-ping.ts';
 import { isPullRequestPayload, isIssueCommentPayload, isIssuesPayload } from './types/github.ts';
 
 // --- WEBHOOK HANDLER ---
@@ -52,7 +53,14 @@ async function handleWebhook(request, env) {
       return new Response("Invalid payload: expected pull_request event payload with pull_request object", { status: 400 });
     }
     const action = data.action || '';
-    if (!['opened', 'synchronize', 'reopened', 'edited'].includes(action)) {
+    // Only the tester ping reads a label event. The labeler sends one for
+    // every label it adds, so the rest stop before a token is minted.
+    if (action === 'labeled') {
+      if ((data.label?.name || '').toLowerCase() !== TESTER_PING_LABEL.toLowerCase() ||
+        isBotUser(data.sender) || data.pull_request.state !== 'open') {
+        return new Response("Ignored pull request label", { status: 200 });
+      }
+    } else if (!['opened', 'synchronize', 'reopened', 'edited'].includes(action)) {
       return new Response("Ignored pull request action", { status: 200 });
     }
     if (action === 'edited' && !data.changes?.base && !data.changes?.body && !data.changes?.title) {
@@ -83,6 +91,9 @@ async function handleWebhook(request, env) {
 
   if (event === "issues") {
     return await handleIssuesEvent(data, token, repoFullname, appId, env, tokenMintAttempts);
+  }
+  if (event === "pull_request" && data.action === "labeled") {
+    return await handleTesterPing(data, token, repoFullname, appId, env, tokenMintAttempts);
   }
 
   return await handlePullRequestEvent(data, event, env, token, repoFullname, appId, tokenMintAttempts);
