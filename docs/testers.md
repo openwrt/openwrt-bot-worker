@@ -1,6 +1,6 @@
 # Tester ping
 
-Adding the `RFT` label to an open pull request mentions the testers listed for the files it changes. The list lives in `CODEOWNERS` on the default branch, in comments that GitHub ignores:
+Adding the `RFT` label to an open pull request mentions the testers listed for the files it changes. The bot creates the label in a repository that does not have it yet. The list lives in `CODEOWNERS` on the default branch, in comments that GitHub ignores:
 
 ```
 # rft: /target/linux/mediatek/ @alice @bob
