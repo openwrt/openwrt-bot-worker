@@ -324,6 +324,20 @@ function interpolate(template, vars) {
   return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] !== undefined ? vars[key] : '');
 }
 
+const CODE_SPAN_MAX = 200;
+
+// A code span around text the reporter wrote, on one line because a span
+// cannot cross a blank line. Its fence is one backtick longer than any run
+// inside, so neither can end it early and let an @mention out of it.
+function codeSpan(value) {
+  const flat = String(value).replace(/\s*\n\s*/g, ' ').trim();
+  const text = flat.length > CODE_SPAN_MAX ? `${flat.slice(0, CODE_SPAN_MAX)}…` : flat;
+  const longest = Math.max(0, ...(text.match(/`+/g) || []).map(run => run.length));
+  const fence = '`'.repeat(longest + 1);
+  const pad = /^`|`$/.test(text) ? ' ' : '';
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
 // --- DEFAULT CONFIG (fallback when .github/issue-labeller.yml is absent) ---
 export const DEFAULT_ISSUE_LABELLER_CONFIG = {
   meta: {
@@ -348,7 +362,7 @@ export const DEFAULT_ISSUE_LABELLER_CONFIG = {
     },
     {
       label: 'target/{segment0}',
-      conditions: [{ field: 'target', format: '^[a-zA-Z0-9]+/[a-zA-Z0-9]+$', exists: 'path:target/linux/{segment0}/{segment1}' }]
+      conditions: [{ field: 'target', format: '^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$', exists: 'path:target/linux/{segment0}/{segment1}' }]
     },
     {
       label: 'Official Image',
@@ -550,7 +564,7 @@ export async function handleIssueLabeller(data, token, config, repoFullname, onC
 
     for (const inv of invalidFields) {
       const fieldName = inv.field || 'field';
-      const val = inv.value ? `\`${inv.value}\`` : '_empty_';
+      const val = inv.value ? codeSpan(inv.value) : '_empty_';
       const hint = inv.hint || defaultHints[fieldName.toLowerCase()] || '';
 
       if (hint) {

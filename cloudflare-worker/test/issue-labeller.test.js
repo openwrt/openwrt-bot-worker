@@ -270,6 +270,18 @@ describe('handleIssueLabeller', () => {
     assert.ok(result.comments[0].includes('Please fix these by **editing the issue description**'));
   });
 
+  test('keeps a backtick in the reported value inside its code span', async () => {
+    const data = makeIssueData(['to-triage', 'bug'], '### Release\n\nx` @someone `y');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(result.comments[0].includes('``x` @someone `y``'), result.comments[0]);
+  });
+
+  test('keeps a mention after a blank line inside the code span', async () => {
+    const data = makeIssueData(['to-triage', 'bug'], '### Release\n\nfoo\n\n@someone');
+    const result = await handleIssueLabeller(data, 'token', DEFAULT_ISSUE_LABELLER_CONFIG, 'openwrt/openwrt');
+    assert.ok(result.comments[0].includes('`foo @someone`'), result.comments[0]);
+  });
+
   test('adds contains-based labels (Official Image)', async () => {
     const body = `### Image Kind\n\nOfficial downloaded image\n\n### Device\n\nTP-Link Archer C6`;
     const data = makeIssueData(['to-triage', 'bug', 'bug-report'], body);
@@ -814,5 +826,22 @@ describe('applyIssueLabelling comment handling', () => {
 
     await applyIssueLabelling(empty, 'token', 'openwrt/openwrt', 7, new Set(), new Set(), null);
     assert.strictEqual(requests.length, 0);
+  });
+});
+
+// $DISTRIB_TARGET as the reporter copies it: some subtargets have an underscore.
+describe('the default target format', () => {
+  const format = new RegExp(DEFAULT_ISSUE_LABELLER_CONFIG.rules.find(r => r.label === 'target/{segment0}').conditions[0].format);
+
+  test('accepts subtargets with an underscore', () => {
+    for (const target of ['lantiq/xrx200_legacy', 'layerscape/armv8_64b', 'realtek/rtl930x_nand', 'ramips/mt7621', 'x86/64']) {
+      assert.ok(format.test(target), target);
+    }
+  });
+
+  test('still rejects what is not target/subtarget', () => {
+    for (const value of ['ramips', 'ramips/mt7621/nand', 'openwrt-24.10-ramips-mt7621-squashfs.bin', 'ramips mt7621']) {
+      assert.ok(!format.test(value), value);
+    }
   });
 });
