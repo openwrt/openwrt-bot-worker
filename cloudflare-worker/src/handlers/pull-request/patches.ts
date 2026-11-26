@@ -17,6 +17,8 @@ export interface CommitDetail {
   upstreamPatch: string | null;
   upstreamSha: string | null;
   upstreamFetchError: string | null;
+  // The cherry-picked commit, when GitHub says this repository has no such commit.
+  upstreamNotInRepo: string | null;
 }
 
 // Counted per pass: an abandoned per-commit pass keeps resolving after the
@@ -25,6 +27,7 @@ export interface CommitDetail {
 interface UpstreamCounts {
   comparisonSkips: number;
   fetchFailures: number;
+  notInRepo: number;
 }
 
 export interface ResolvedPatchesResult {
@@ -34,6 +37,7 @@ export interface ResolvedPatchesResult {
   commitDetails: CommitDetail[];
   upstreamComparisonSkips: number;
   upstreamFetchFailures: number;
+  upstreamNotInRepo: number;
   commitDetailsIncomplete: boolean;
   packageState: { isNewPackage: boolean; isDroppedPackage: boolean };
   packageStateKnown: boolean;
@@ -52,7 +56,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
   let patchUnavailable = false;
   // Comparisons the budget never allowed, kept apart from the ones GitHub
   // refused to serve: only the first is a matter of this PR being too large.
-  let upstreamCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0 };
+  let upstreamCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0, notInRepo: 0 };
   let commitDetailsIncomplete = false;
 
   let prWidePatchText: string | null = null;
@@ -185,6 +189,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     let upstreamPatch: string | null = null;
     let upstreamSha: string | null = null;
     let upstreamFetchError: string | null = null;
+    let upstreamNotInRepo: string | null = null;
 
     if (isBackportPr) {
       const commitMsg = commitData.commit?.message || '';
@@ -201,7 +206,9 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
         const targetSha = match[1];
         upstreamSha = targetSha;
         const upstreamUrl = `https://api.github.com/repos/${repoFullname}/commits/${targetSha}`;
-        const upstreamRes = await client.optionalApiCall(upstreamUrl, 'GET', null, 'application/vnd.github.patch');
+        // Silent, because a 422 is an expected answer here. A failure it also
+        // hides is logged below.
+        const upstreamRes = await client.optionalApiCall(upstreamUrl, 'GET', null, 'application/vnd.github.patch', { silent: true });
         if (upstreamRes && upstreamRes.code === 200) {
           if (!fileBatchLoader.hasRefSource(targetSha)) {
             fileBatchLoader.setRefSource(targetSha, 'base');
@@ -221,9 +228,17 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
           // described below as a diff that deviates from its original.
           counts.comparisonSkips++;
           upstreamSha = null;
+        } else if (upstreamRes?.code === 422 && /^No commit found for SHA/.test(upstreamRes.data?.message || '')) {
+          // GitHub's answer that this repository has no such commit. A
+          // backport can come from another repository, such as a package that
+          // moved feeds, so it is checked in full rather than left open.
+          counts.notInRepo++;
+          upstreamNotInRepo = targetSha;
+          upstreamSha = null;
         } else {
           counts.fetchFailures++;
           upstreamFetchError = `Could not fetch upstream commit ${targetSha.slice(0, 7)} from GitHub API (HTTP ${upstreamRes?.code})`;
+          if (upstreamRes?.code === 404 || upstreamRes?.code === 422) console.error(`${upstreamFetchError} for ${repoFullname}`);
         }
       }
     }
@@ -236,13 +251,14 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
       isVerbatim,
       upstreamPatch,
       upstreamSha,
-      upstreamFetchError
+      upstreamFetchError,
+      upstreamNotInRepo
     };
   };
 
   let commitDetails: CommitDetail[] = [];
   if (!usePrWidePatch) {
-    const perCommitCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0 };
+    const perCommitCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0, notInRepo: 0 };
     upstreamCounts = perCommitCounts;
     try {
       commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, true, perCommitCounts)));
@@ -268,7 +284,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     // This pass recomputes every commit from scratch, so it counts into its
     // own object: what the abandoned per-commit pass counted, before or after
     // this one took over, is not what the reported numbers are about.
-    const prWideCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0 };
+    const prWideCounts: UpstreamCounts = { comparisonSkips: 0, fetchFailures: 0, notInRepo: 0 };
     upstreamCounts = prWideCounts;
     try {
       commitDetails = await Promise.all(commits.map(commitData => mapCommitData(commitData, false, prWideCounts)));
@@ -313,6 +329,7 @@ export async function resolvePatchesAndCommits(ctx: PullRequestContext): Promise
     commitDetails,
     upstreamComparisonSkips: upstreamCounts.comparisonSkips,
     upstreamFetchFailures: upstreamCounts.fetchFailures,
+    upstreamNotInRepo: upstreamCounts.notInRepo,
     commitDetailsIncomplete,
     packageState,
     packageStateKnown,

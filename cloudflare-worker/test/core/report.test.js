@@ -19,6 +19,7 @@ describe('aggregateReport lifecycle phase', () => {
     patchUnavailable = false,
     upstreamComparisonSkips = 0,
     upstreamFetchFailures = 0,
+    upstreamNotInRepo = 0,
     commitDetailsIncomplete = false
   } = {}) => ({
     usePrWidePatch: false,
@@ -27,6 +28,7 @@ describe('aggregateReport lifecycle phase', () => {
     commitDetails: [],
     upstreamComparisonSkips,
     upstreamFetchFailures,
+    upstreamNotInRepo,
     commitDetailsIncomplete,
     packageState: { isNewPackage: false, isDroppedPackage: false },
     packageStateKnown: true
@@ -159,6 +161,23 @@ describe('aggregateReport lifecycle phase', () => {
     assert.strictEqual(report.formalityConclusion, 'neutral');
     assert.ok(!report.allPrWarnings.some(w => w.includes('too large')),
       'the commit section already names the upstream commit and its HTTP code');
+  });
+
+  // A cherry-picked commit the repository does not have leaves nothing
+  // unchecked: the backport was audited in full.
+  test('passes formality when a cherry-picked commit is not in the repository', () => {
+    const report = aggregateReport(createMockContext(), createMockPatchesResult({ upstreamNotInRepo: 1 }), createMockOutcome());
+
+    assert.strictEqual(report.formalityConclusion, 'success');
+    assert.deepStrictEqual(report.allPrWarnings, []);
+  });
+
+  test('keeps the unfiltered caveat when such a backport has Makefile findings', () => {
+    const report = aggregateReport(createMockContext(), createMockPatchesResult({ upstreamNotInRepo: 1 }),
+      createMockOutcome({ makefileErrors: ['- Makefile problem'] }));
+
+    assert.strictEqual(report.formalityConclusion, 'success');
+    assert.ok(report.allPrWarnings.some(w => w.includes('not in this repository')), report.allPrWarnings.join('\n'));
   });
 
   test('marks formality neutral when an override could not be looked up', () => {

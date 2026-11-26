@@ -35,6 +35,7 @@ export function aggregateReport(
 ): AggregatedReport {
   const { client, fileBatchLoader, commitScanCapped, commits } = ctx;
   const { patchUnavailable, upstreamComparisonSkips, upstreamFetchFailures, commitDetailsIncomplete } = patchesResult;
+  const upstreamNotInRepo = patchesResult.upstreamNotInRepo || 0;
   const {
     allFormalityErrors,
     allPrWarnings,
@@ -132,6 +133,15 @@ export function aggregateReport(
       if (makefileFinding) makefileNotes.push(unfilteredWarning);
       if (patchesFinding) patchesNotes.push(unfilteredWarning);
     }
+  }
+
+  // A cherry-picked commit this repository does not have was not compared, so
+  // inherited findings stay in. The commit itself was checked in full.
+  if (upstreamNotInRepo > 0 && (allMakefileErrors.length > 0 || makefileReportedFinding || allPatchesErrors.length > 0 || patchesReportedFinding)) {
+    const notInRepoWarning = `${upstreamNotInRepo} cherry-picked commit(s) are not in this repository, so issues this backport inherited from them were not filtered out of the findings below.`;
+    allPrWarnings.push(`**Validation Coverage**:\n- ⚠️ ${notInRepoWarning}`);
+    if (allMakefileErrors.length > 0 || makefileReportedFinding) makefileNotes.push(notInRepoWarning);
+    if (allPatchesErrors.length > 0 || patchesReportedFinding) patchesNotes.push(notInRepoWarning);
   }
 
   if (upstreamComparisonSkips > 0) {

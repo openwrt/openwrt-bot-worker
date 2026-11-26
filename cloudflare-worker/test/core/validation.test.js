@@ -1807,6 +1807,19 @@ describe('an input the run could not read', () => {
         assert.match(outcome.formalityOutputText, /✅ Commit explicitly specifies cherry-pick origin context/);
       });
     }
+
+    // routing#1210: the marker names a commit in openwrt/packages.
+    test('says plainly when the cherry-picked commit is not in the repository, without a warning', async () => {
+      const elsewhere = structuredClone(marked);
+      elsewhere.commitDetails[0].upstreamNotInRepo = 'c'.repeat(40);
+      const ctx = ctxFor({ isBackportPr: true, baseBranch: 'openwrt-24.10' });
+      const outcome = await runValidations(ctx, elsewhere);
+
+      assert.match(outcome.formalityOutputText, /ℹ️ Commit ccccccc from the cherry-pick line is not in openwrt\/openwrt, so this backport was checked in full/);
+      assert.doesNotMatch(outcome.formalityOutputText, /deviates from upstream/);
+      assert.deepStrictEqual(outcome.allPrWarnings, []);
+      assert.strictEqual(outcome.formalityChecksIncomplete, false);
+    });
   });
 });
 
