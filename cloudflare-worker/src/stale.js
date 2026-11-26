@@ -34,6 +34,10 @@ export function hasRealActivitySince(timeline, labeledAt, ignoredLogins) {
         when = item.committer?.date || item.author?.date;
         actorRequired = false;
         break;
+      case 'pushed':
+        when = item.created_at;
+        actorRequired = false;
+        break;
       case 'head_ref_force_pushed':
       case 'reopened':
         when = item.created_at;
@@ -128,7 +132,9 @@ function graphqlOutcome(res, label) {
   // is among the missing pieces would look like one with no history at all,
   // and the fallback below could close it on that - so any error at all means
   // this repository is skipped this round.
-  const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+  // A check suite only dates a push, so one GitHub would not serve leaves its
+  // pull request on its commit dates rather than the repository unread.
+  const errors = (Array.isArray(res.data?.errors) ? res.data.errors : []).filter(e => !(e?.path || []).includes('checkSuites'));
   if (res.code !== 200 || !res.data?.data?.repository || errors.length > 0) {
     const detail = errors.map(e => e.message).join('; ');
     console.error(`[Stale Bot] Failed ${label} (HTTP ${res.code}): ${detail || (res.raw || '').trim().slice(0, 200)}`);
@@ -200,6 +206,16 @@ function actorFromGraphql(actor) {
   return { login: actor.login, type: actor.__typename === 'Bot' ? 'Bot' : 'User' };
 }
 
+// A commit carries the dates it was made, not when it was pushed, so one
+// pushed days later read as old. The first check suite of the head commit
+// comes with its push, and a later one can only make it look more recent.
+function headPush(node) {
+  const suites = (node.commits?.nodes?.[0]?.commit?.checkSuites?.nodes || [])
+    .map(suite => new Date(suite?.createdAt).getTime())
+    .filter(time => !Number.isNaN(time));
+  return suites.length > 0 ? [{ event: 'pushed', created_at: new Date(Math.min(...suites)).toISOString() }] : [];
+}
+
 function timelineFromGraphql(nodes) {
   const items = [];
   for (const node of nodes || []) {
@@ -248,6 +264,7 @@ async function fetchStalePullRequests(token, repo, labelNames, onAttempt) {
         createdAt
         updatedAt
         labels(first: 50) { nodes { name } }
+        commits(last: 1) { nodes { commit { checkSuites(first: 10) { nodes { createdAt } } } } }
         timelineItems(last: ${STALE_TIMELINE_WINDOW}, itemTypes: [LABELED_EVENT, ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT, REOPENED_EVENT]) {
           totalCount
           nodes {
@@ -282,7 +299,7 @@ async function fetchStalePullRequests(token, repo, labelNames, onAttempt) {
         created_at: node.createdAt,
         updated_at: node.updatedAt,
         labels: (node.labels?.nodes || []).map(l => ({ name: l.name })),
-        timeline: timelineFromGraphql(node.timelineItems?.nodes),
+        timeline: [...timelineFromGraphql(node.timelineItems?.nodes), ...headPush(node)],
         // True when the window did not reach back far enough to hold the whole
         // history, which is what makes a missing stale-labelling event
         // inconclusive rather than proof that there was none.

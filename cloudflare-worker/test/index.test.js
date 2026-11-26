@@ -59,6 +59,7 @@ function staleGraphqlHandler(url, options, { config = null, staleLabelExists = t
               createdAt: pr.createdAt ?? pr.updatedAt,
               updatedAt: pr.updatedAt,
               labels: { nodes: (pr.labels || []).map(name => ({ name })) },
+              commits: { nodes: pr.headSuites ? [{ commit: { checkSuites: { nodes: pr.headSuites.map(createdAt => ({ createdAt })) } } }] : [] },
               timelineItems: {
                 totalCount: pr.timelineTotalCount ?? (pr.timeline || []).length,
                 nodes: staleTimelineNodes(pr.timeline)
@@ -1036,7 +1037,7 @@ index 123456..789012 100644
 
   // The stale scan against one installation: every read answered from the
   // given repositories and pull requests, every request recorded.
-  const runStaleScan = async ({ repos = ['testorg/repo1'], prs = [], env = {}, failWrite = null } = {}) => {
+  const runStaleScan = async ({ repos = ['testorg/repo1'], prs = [], env = {}, failWrite = null, errors = null } = {}) => {
     const calls = [];
     fetchMock = async (url, options) => {
       const method = options?.method || 'GET';
@@ -1044,7 +1045,7 @@ index 123456..789012 100644
       if (url.includes('/access_tokens')) return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
       if (url.includes('/app/installations')) return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
       if (url.includes('/installation/repositories')) return new Response(JSON.stringify({ repositories: repos.map(full_name => ({ full_name })) }), { status: 200 });
-      const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: true }, prs });
+      const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: true }, prs, errors });
       if (sr) return sr;
       if (failWrite && failWrite(url, method)) return new Response(JSON.stringify({ message: 'refused' }), { status: 422 });
       return new Response(JSON.stringify({}), { status: 200 });
@@ -1078,6 +1079,26 @@ index 123456..789012 100644
       timeline: [{ kind: 'labeled', label: 'not following guidelines', at: daysAgo(2) }]
     }] });
     assert.deepStrictEqual(calls.filter(c => c.method === 'POST' && c.url.includes('/labels')), []);
+  });
+
+  // The commit was made 20 days ago and pushed 3 days ago.
+  test('counts a push by its check suite, not by the date of its commit', async () => {
+    const labelled = { kind: 'labeled', label: 'not following guidelines', at: daysAgo(30) };
+    const calls = await runStaleScan({ prs: [
+      { number: 66, createdAt: daysAgo(40), updatedAt: daysAgo(3), labels: ['not following guidelines'], timeline: [labelled, { kind: 'committed', at: daysAgo(20) }], headSuites: [daysAgo(3), daysAgo(1)] },
+      { number: 67, createdAt: daysAgo(40), updatedAt: daysAgo(3), labels: ['stale', 'not following guidelines'], timeline: [labelled, { kind: 'labeled', label: 'stale', at: daysAgo(15) }, { kind: 'committed', at: daysAgo(20) }], headSuites: [daysAgo(3)] }
+    ] });
+    assert.deepStrictEqual(posted(calls, 66, 'labels'), [], 'pushed three days ago, so not stale');
+    assert.ok(!calls.some(c => c.method === 'PATCH'), 'pushed after the stale label, so not closed');
+    assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/issues/67/labels/stale')));
+  });
+
+  test('keeps scanning a repository whose check suites GitHub would not serve', async () => {
+    const calls = await runStaleScan({
+      prs: [{ number: 68, createdAt: daysAgo(40), updatedAt: daysAgo(20), labels: ['not following guidelines'], timeline: [{ kind: 'labeled', label: 'not following guidelines', at: daysAgo(20) }] }],
+      errors: [{ message: 'Resource not accessible by integration', path: ['repository', 'pullRequests', 'nodes', 0, 'commits', 'nodes', 0, 'commit', 'checkSuites'] }]
+    });
+    assert.strictEqual(posted(calls, 68, 'labels').length, 1);
   });
 
   test('does not mark a PR whose complete timeline does not say when the guidelines label came', async () => {
