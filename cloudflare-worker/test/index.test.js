@@ -2427,9 +2427,22 @@ describe('Backport Cherry-pick and Bypass Validation', () => {
     assert.strictEqual(tokenMinted, false);
   });
 
-  test('ignores a comment whose permission lookup failed, rather than trusting it', async () => {
+  test('still runs the checks for an override when the permission lookup failed', async () => {
     const { response, prFetched, permissionLookups } = await sendIssueComment(
-      { body: 'recheck please', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer', type: 'User' } },
+      { body: '[allow cherry-pick]', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer', type: 'User' } },
+      { privatemaintainer: 'admin' },
+      { privatemaintainer: 1 }
+    );
+
+    assert.strictEqual(response.status, 200);
+    assert.ok(permissionLookups.includes('privatemaintainer'));
+    assert.ok(prFetched);
+    assert.ok(postedCheckRuns.some(cr => cr.name === 'FormalityCheck / Git & Commits'));
+  });
+
+  test('ignores any other comment when the permission lookup failed', async () => {
+    const { response, prFetched, permissionLookups } = await sendIssueComment(
+      { body: 'thanks, looks good', author_association: 'CONTRIBUTOR', user: { login: 'privatemaintainer', type: 'User' } },
       { privatemaintainer: 'admin' },
       { privatemaintainer: 1 }
     );
