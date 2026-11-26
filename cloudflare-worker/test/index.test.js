@@ -36,14 +36,16 @@ function staleGraphqlHandler(url, options, { config = null, staleLabelExists = t
   if (!url.includes('/graphql') || !options?.body) return null;
   const body = JSON.parse(options.body);
   if (body.query.includes('staleLabel: label(')) {
-    return new Response(JSON.stringify({
-      data: {
-        repository: {
-          cfg: config === null ? null : { text: JSON.stringify(config) },
-          staleLabel: staleLabelExists ? { name: 'stale' } : null
-        }
-      }
-    }), { status: 200 });
+    // One alias per repository of the batch: r0, r1, ...
+    const setup = {
+      cfg: config === null ? null : { text: JSON.stringify(config) },
+      staleLabel: staleLabelExists ? { name: 'stale' } : null
+    };
+    const aliases = Object.keys(body.variables || {}).filter(k => /^o\d+$/.test(k));
+    const data = aliases.length > 0
+      ? Object.fromEntries(aliases.map(key => [`r${key.slice(1)}`, setup]))
+      : { repository: setup };
+    return new Response(JSON.stringify({ data }), { status: 200 });
   }
   if (body.query.includes('pullRequests(states: OPEN')) {
     return new Response(JSON.stringify({
@@ -54,6 +56,7 @@ function staleGraphqlHandler(url, options, { config = null, staleLabelExists = t
             pageInfo: { hasNextPage: false, endCursor: null },
             nodes: prs.map(pr => ({
               number: pr.number,
+              createdAt: pr.createdAt ?? pr.updatedAt,
               updatedAt: pr.updatedAt,
               labels: { nodes: (pr.labels || []).map(name => ({ name })) },
               timelineItems: {
@@ -824,7 +827,7 @@ index 123456..789012 100644
         const daysAgo15 = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
         const sr = staleGraphqlHandler(url, options, {
           config: { enable_stale_bot: true },
-          prs: [{ number: 55, updatedAt: daysAgo15, labels: ['not following guidelines'] }]
+          prs: [{ number: 55, updatedAt: daysAgo15, labels: ['not following guidelines'], timeline: [{ kind: 'labeled', label: 'not following guidelines', at: daysAgo15 }] }]
         });
         if (sr) return sr;
       }
@@ -1029,6 +1032,103 @@ index 123456..789012 100644
     } finally {
       fetchMock = null;
     }
+  });
+
+  // The stale scan against one installation: every read answered from the
+  // given repositories and pull requests, every request recorded.
+  const runStaleScan = async ({ repos = ['testorg/repo1'], prs = [], env = {}, failWrite = null } = {}) => {
+    const calls = [];
+    fetchMock = async (url, options) => {
+      const method = options?.method || 'GET';
+      calls.push({ url, method, body: options?.body ? JSON.parse(options.body) : null });
+      if (url.includes('/access_tokens')) return new Response(JSON.stringify({ token: 'inst-token' }), { status: 200 });
+      if (url.includes('/app/installations')) return new Response(JSON.stringify([{ id: 101, account: { login: 'testorg' } }]), { status: 200 });
+      if (url.includes('/installation/repositories')) return new Response(JSON.stringify({ repositories: repos.map(full_name => ({ full_name })) }), { status: 200 });
+      const sr = staleGraphqlHandler(url, options, { config: { enable_stale_bot: true }, prs });
+      if (sr) return sr;
+      if (failWrite && failWrite(url, method)) return new Response(JSON.stringify({ message: 'refused' }), { status: 422 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+    try {
+      await handleScheduled({ APP_ID: '12345', PRIVATE_KEY: privateKeyPEM, ...env });
+    } finally {
+      fetchMock = null;
+    }
+    return calls;
+  };
+  const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+  const posted = (calls, pr, kind) => calls.filter(c => c.method === 'POST' && c.url.endsWith(`/issues/${pr}/${kind}`));
+
+  test('marks a PR stale when only bots were active since the threshold', async () => {
+    const calls = await runStaleScan({ prs: [{
+      number: 55, createdAt: daysAgo(20), updatedAt: daysAgo(1), labels: ['not following guidelines'],
+      timeline: [
+        { kind: 'labeled', label: 'not following guidelines', at: daysAgo(20) },
+        { kind: 'commented', login: 'openwrt-ai', at: daysAgo(1) },
+        { kind: 'commented', login: 'openwrt[bot]', type: 'Bot', at: daysAgo(2) }
+      ]
+    }] });
+    assert.strictEqual(posted(calls, 55, 'labels').length, 1);
+    assert.strictEqual(posted(calls, 55, 'comments').length, 1);
+  });
+
+  test('gives a PR the full threshold after the guidelines label came', async () => {
+    const calls = await runStaleScan({ prs: [{
+      number: 61, createdAt: daysAgo(40), updatedAt: daysAgo(2), labels: ['not following guidelines'],
+      timeline: [{ kind: 'labeled', label: 'not following guidelines', at: daysAgo(2) }]
+    }] });
+    assert.deepStrictEqual(calls.filter(c => c.method === 'POST' && c.url.includes('/labels')), []);
+  });
+
+  test('does not mark a PR whose complete timeline does not say when the guidelines label came', async () => {
+    const calls = await runStaleScan({ prs: [{ number: 65, createdAt: daysAgo(40), updatedAt: daysAgo(20), labels: ['not following guidelines'], timeline: [] }] });
+    assert.deepStrictEqual(calls.filter(c => c.method === 'POST' && c.url.includes('/labels')), []);
+  });
+
+  test('does not mark a PR a person commented on, or one opened recently', async () => {
+    const calls = await runStaleScan({ prs: [
+      { number: 56, createdAt: daysAgo(20), updatedAt: daysAgo(3), labels: ['not following guidelines'], timeline: [{ kind: 'commented', login: 'jane', at: daysAgo(3) }] },
+      { number: 57, createdAt: daysAgo(3), updatedAt: daysAgo(3), labels: ['not following guidelines'], timeline: [] }
+    ] });
+    assert.deepStrictEqual(calls.filter(c => c.method === 'POST' && c.url.includes('/labels')), []);
+  });
+
+  test('leaves a PR open when the stale labelling event is missing', async () => {
+    const calls = await runStaleScan({ prs: [{ number: 58, createdAt: daysAgo(60), updatedAt: daysAgo(40), labels: ['stale', 'not following guidelines'], timeline: [] }] });
+    assert.deepStrictEqual(posted(calls, 58, 'comments'), []);
+    assert.ok(!calls.some(c => c.method === 'PATCH'));
+  });
+
+  test('finds a Stale labelling event whatever its case', async () => {
+    const calls = await runStaleScan({ prs: [{
+      number: 59, createdAt: daysAgo(40), updatedAt: daysAgo(20), labels: ['Stale', 'not following guidelines'],
+      timeline: [{ kind: 'labeled', label: 'Stale', at: daysAgo(5) }]
+    }] });
+    assert.ok(!calls.some(c => c.method === 'PATCH'), 'labelled five days ago, so not closed yet');
+  });
+
+  test('does not post the warning when the stale label could not be added', async () => {
+    const calls = await runStaleScan({
+      prs: [{ number: 60, createdAt: daysAgo(20), updatedAt: daysAgo(20), labels: ['not following guidelines'], timeline: [{ kind: 'labeled', label: 'not following guidelines', at: daysAgo(20) }] }],
+      failWrite: (url, method) => method === 'POST' && url.endsWith('/issues/60/labels')
+    });
+    assert.deepStrictEqual(posted(calls, 60, 'comments'), []);
+  });
+
+  test('asks for the setup of all repositories in one query', async () => {
+    const calls = await runStaleScan({ repos: ['testorg/a', 'testorg/b', 'testorg/c'] });
+    const setups = calls.filter(c => c.url.includes('/graphql') && c.body.query.includes('staleLabel: label('));
+    assert.strictEqual(setups.length, 1);
+  });
+
+  test('stops between pull requests when the request budget runs out', async () => {
+    const prs = [61, 62, 63, 64].map(number => ({ number, createdAt: daysAgo(20), updatedAt: daysAgo(20), labels: ['not following guidelines'], timeline: [{ kind: 'labeled', label: 'not following guidelines', at: daysAgo(20) }] }));
+    const calls = await runStaleScan({ prs, env: { SUBREQUEST_BUDGET_LIMIT: '12' } });
+    assert.ok(calls.length <= 12, `${calls.length} requests`);
+    const labelled = calls.filter(c => c.method === 'POST' && c.url.match(/\/issues\/6\d\/labels$/)).length;
+    const warned = calls.filter(c => c.method === 'POST' && c.url.match(/\/issues\/6\d\/comments$/)).length;
+    assert.ok(labelled >= 1, 'the first pull request still fits');
+    assert.strictEqual(labelled, warned, 'no pull request is labelled without its warning');
   });
 
   test('scans a repository with two requests, whatever the number of stale PRs', async () => {
