@@ -49,7 +49,7 @@ _remove_labels: ["to-triage"]
   _color: "0e7490"
   _description: "Hardware target reported"
   - field: "target"
-    format: '^[a-zA-Z0-9]+/[a-zA-Z0-9]+$'
+    format: '^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$'
     exists: "path:target/linux/{segment0}/{segment1}"
     hint: "Run `. /etc/openwrt_release && echo $DISTRIB_TARGET` on the device and paste that line, for example `ramips/mt7621`"
 
