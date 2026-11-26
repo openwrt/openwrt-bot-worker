@@ -2155,6 +2155,10 @@ export function validateConffilesCoverage(conffilesMap, installedFiles, defaultP
   return { incomplete: unverifiableCount > 0 };
 }
 
+// A version variable first, or a literal version and nothing but the archive
+// suffix: `3proxy-$(PKG_VERSION).tar.gz` starts with a digit and names a package.
+const VERSION_ONLY_SOURCE = /^v?(?:\$[({][A-Za-z0-9_]*(?:VERSION|REV)[A-Za-z0-9_]*[)}]|\d+(?:[._-]\d+)*(?:[._~+-]?(?:rc|alpha|beta|pre|post|dev|p)\d*)*(?:[._-](?:src|source))?\.(?:tar(?:\.[a-z0-9]+)?|tgz|tbz2?|txz|zip|gz|bz2|xz|zst)$)/i;
+
 export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, repoFullname, fetchFileContent) {
   const errors = [];
   const successes = [];
@@ -2916,6 +2920,28 @@ export function validateMakefileContext(fullCommit, commitPatch, CONFIG, state, 
 
     if (deadVarCheckRun && deadVarErrors === 0) {
       successes.push("✅ Makefile does not assign per-package variables at the top level");
+    }
+  }
+
+  // The archive is saved in dl/ and on the mirror under PKG_SOURCE, so a name
+  // that is only the version collides with other packages' archives.
+  {
+    let sourceNameChecked = false;
+    let sourceNameErrors = 0;
+    for (const { lines } of getMakefileChunks()) {
+      for (const line of lines) {
+        const match = line.match(/^\+\s*PKG_SOURCE\s*[:?]?=\s*(\S.*?)\s*$/);
+        if (!match) continue;
+        sourceNameChecked = true;
+        const value = match[1].replace(/\s+#.*$/, '');
+        if (!VERSION_ONLY_SOURCE.test(value)) continue;
+        sourceNameErrors++;
+        const named = `$(PKG_NAME)-${value.replace(/^v(?=[$\d])/, '')}`;
+        errors.push(`- PKG_SOURCE:=${value} names the archive after its version alone, so it can collide with another package's archive in dl/ and on the download mirror. Use PKG_SOURCE:=${named}, and set PKG_SOURCE_URL_FILE:=${value} if the download URL needs the upstream file name.`);
+      }
+    }
+    if (sourceNameChecked && sourceNameErrors === 0) {
+      successes.push("✅ PKG_SOURCE names the package, not only its version");
     }
   }
 

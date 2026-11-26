@@ -1570,6 +1570,63 @@ describe('validateMakefileContext dead package variables', () => {
   });
 });
 
+// openwrt/packages libpfring saved its archive as dl/9.4.0.tar.gz.
+describe('validateMakefileContext PKG_SOURCE name', () => {
+  const PKG = 'package/libs/libfoo/Makefile';
+  const NAMED_AFTER_VERSION = 'names the archive after its version alone';
+
+  for (const [value, suggestion] of [
+    ['$(PKG_VERSION).tar.gz', 'PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz'],
+    ['v$(PKG_VERSION).tar.gz', 'PKG_SOURCE_URL_FILE:=v$(PKG_VERSION).tar.gz'],
+    ['9.4.0.tar.gz', 'PKG_SOURCE:=$(PKG_NAME)-9.4.0.tar.gz'],
+    ['2024-01-01.tar.gz', 'PKG_SOURCE:=$(PKG_NAME)-2024-01-01.tar.gz'],
+    ['1.2.3-1.tar.gz', 'PKG_SOURCE:=$(PKG_NAME)-1.2.3-1.tar.gz'],
+    ['1.2.3.post1.tar.gz', 'PKG_SOURCE:=$(PKG_NAME)-1.2.3.post1.tar.gz'],
+    ['1.0~rc1.tar.xz', 'PKG_SOURCE:=$(PKG_NAME)-1.0~rc1.tar.xz'],
+    ['8.9p1.tar.gz', 'PKG_SOURCE:=$(PKG_NAME)-8.9p1.tar.gz'],
+    ['$(PKG_SOURCE_VERSION).tar.xz', 'PKG_SOURCE:=$(PKG_NAME)-$(PKG_SOURCE_VERSION).tar.xz']
+  ]) {
+    test(`reports PKG_SOURCE:=${value}`, () => {
+      const res = validate('libfoo: update', diff(modified(PKG), `+PKG_SOURCE:=${value}`), { config: focused() });
+      assertErrorIncludes(res, NAMED_AFTER_VERSION);
+      assertErrorIncludes(res, suggestion);
+    });
+  }
+
+  for (const value of [
+    '$(PKG_NAME)-$(PKG_VERSION).tar.gz',
+    'tzdata$(PKG_VERSION).tar.gz',
+    'go$(PKG_FILE_VERSION).src.tar.gz',
+    '$(PYPI_SOURCE_NAME)-$(PKG_VERSION).$(PYPI_SOURCE_EXT)',
+    '$(PKG_SOURCE_SUBDIR).tar.zst',
+    'v4l-utils-$(PKG_VERSION).tar.xz',
+    '3proxy-$(PKG_VERSION).tar.gz',
+    '7z2408-src.tar.xz'
+  ]) {
+    test(`accepts PKG_SOURCE:=${value}`, () => {
+      const res = validate('libfoo: update', diff(modified(PKG), `+PKG_SOURCE:=${value}`), { config: focused() });
+      assertNoErrorIncludes(res, NAMED_AFTER_VERSION);
+    });
+  }
+
+  test('keeps a trailing comment out of the suggestion', () => {
+    const res = validate('libfoo: update', diff(modified(PKG), '+PKG_SOURCE:=$(PKG_VERSION).tar.gz # upstream name'), { config: focused() });
+    assertErrorIncludes(res, 'Use PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz, and set PKG_SOURCE_URL_FILE:=$(PKG_VERSION).tar.gz if');
+  });
+
+  test('leaves a suffix appended with += alone', () => {
+    const res = validate('libfoo: update', diff(modified(PKG), '+PKG_SOURCE+=$(PKG_VERSION).tar.gz'), { config: focused() });
+    assertNoErrorIncludes(res, NAMED_AFTER_VERSION);
+  });
+
+  test('leaves an unchanged line and a nested Makefile alone', () => {
+    const context = validate('libfoo: update', diff(modified(PKG), ' PKG_SOURCE:=$(PKG_VERSION).tar.gz', '+PKG_RELEASE:=2'), { config: focused() });
+    assertNoErrorIncludes(context, NAMED_AFTER_VERSION);
+    const nested = validate('libfoo: update', diff(modified('package/libs/libfoo/src/Makefile'), '+PKG_SOURCE:=$(PKG_VERSION).tar.gz'), { config: focused() });
+    assertNoErrorIncludes(nested, NAMED_AFTER_VERSION);
+  });
+});
+
 describe('isPackageMakefilePath', () => {
   for (const { title, expected, paths } of [
     {
