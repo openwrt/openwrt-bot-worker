@@ -163,7 +163,7 @@ diff --git a/package/utils/bash/patches/001-fix.patch b/package/utils/bash/patch
 
   test('catches patches missing From/Subject headers', async () => {
     const res = await validateEmbeddedPatches(newPatchWithoutHeaders, CONFIG);
-    assertErrorIncludes(res, 'Regenerate the patch');
+    assertErrorIncludes(res, 'Add the missing lines above the diff');
   });
 
   test('names only the mbox separator when everything else is present (issue #76)', async () => {
@@ -429,7 +429,7 @@ new file mode 100644
 
   test('still judges a new patch file from the diff when it is not there', async () => {
     const res = await validateEmbeddedPatches(newPatchWithoutHeaders, CONFIG, async () => null, () => true);
-    assertErrorIncludes(res, 'Regenerate the patch');
+    assertErrorIncludes(res, 'Add the missing lines above the diff');
   });
 
   test('counts a patch file whose fetch throws, and still judges the rest', async () => {
@@ -468,7 +468,7 @@ new file mode 100644
   test('reports missing headers in modified patches as a warning, not a failure', async () => {
     const res = await validateEmbeddedPatches(modifiedPatch, CONFIG, async () => 'Some content without headers');
     assertNoErrors(res);
-    assertSomeIncludes(res.warnings, 'Regenerate the patch', 'warnings');
+    assertSomeIncludes(res.warnings, 'Add the missing lines above the diff', 'warnings');
   });
 
   // Only the two off switches change what comes back; how loudly a finding is
@@ -482,7 +482,7 @@ new file mode 100644
     test(title, async () => {
       const res = await validateEmbeddedPatches(newPatchWithoutHeaders, { ...CONFIG, check_patch_headers: level });
       if (reported) {
-        assertErrorIncludes(res, 'Regenerate the patch');
+        assertErrorIncludes(res, 'Add the missing lines above the diff');
       } else {
         assertNoErrors(res);
         assert.deepStrictEqual(res.successes, []);
