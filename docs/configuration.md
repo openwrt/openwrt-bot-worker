@@ -1,6 +1,6 @@
 # Configuration
 
-A repository changes the defaults with a `.github/formalities.json` file on its default branch. Keys it leaves out keep their defaults, and unknown keys are ignored. A key with a value the bot does not accept keeps its default, and the check runs name it.
+A repository changes the defaults with a `.github/formalities.json` file. The pull request checks read it from the branch the pull request targets, the issue labeller and the stale bot from the default branch. Keys it leaves out keep their defaults, and unknown keys are ignored. A key with a value the bot does not accept keeps its default, and the check runs name it.
 
 ```json
 {
