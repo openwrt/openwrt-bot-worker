@@ -474,6 +474,19 @@ diff --git a/package/utils/bash/test-version.sh b/package/utils/bash/test-versio
     assertNoErrors(res);
   });
 
+  test('skips checks when only pre-test.sh is modified', async () => {
+    const commitDetails = [{
+      commitPatch: `
+diff --git a/package/utils/bash/pre-test.sh b/package/utils/bash/pre-test.sh
++++ b/package/utils/bash/pre-test.sh
++apk add bash-doc
+`
+    }];
+    const makefile = makefileAt('package/utils/bash', 'PKG_NAME:=bash\nPKG_VERSION:=5.2\nPKG_RELEASE:=1\n');
+
+    assertNoErrors(await validatePkgReleaseBumps(commitDetails, defaultConf, makefile, makefile));
+  });
+
   test('states the minor-change advice once per report, not once per package', async () => {
     const pkgs = ['bash', 'dnsmasq', 'busybox'];
     const commitDetails = [{

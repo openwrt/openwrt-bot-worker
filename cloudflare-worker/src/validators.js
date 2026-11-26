@@ -3463,7 +3463,7 @@ export async function validateEmbeddedPatches(commitPatch, CONFIG, fetchFileCont
     // Only the headers that are absent are named: listing all of them
     // whatever was missing read as a false claim (issue #76).
     const names = (headers) => headers.map(h => h.name).join(', ');
-    const howToFix = "Regenerate the patch with 'git format-patch' so that 'git am' can apply it" +
+    const howToFix = "Add the missing lines above the diff as 'git format-patch' writes them, so that 'git am' can apply the patch, and keep the diff as the refresh target writes it" +
       (missing.includes(PATCH_HEADERS[0])
         ? ". Patches are also concatenated into a single mbox stream for 'git am', where the separator line is the only thing that keeps them apart"
         : '');
@@ -4422,6 +4422,9 @@ function diffTouchesVar(diff, varNames) {
 
 const isStrictInt = (v) => typeof v === 'string' && /^\d+$/.test(v.trim());
 
+// The scripts the packages CI runs, which no build installs.
+const CI_ONLY_SCRIPTS = new Set(['test.sh', 'test-version.sh', 'pre-test.sh']);
+
 export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileContentAtHead, fetchFileContentAtBase) {
   const errors = [];
   // The gaps that stopped the audit, apart from whatever it found; see
@@ -4514,9 +4517,8 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
       if (!isRevertCommit) nonRevertedFiles.add(file);
       if (isHiddenOrSpecial(file)) continue;
 
-      // Ignore test files that serve only within CI/CD (e.g. test.sh, test-version.sh)
       const filename = file.split('/').pop();
-      if (filename === 'test.sh' || filename === 'test-version.sh') {
+      if (CI_ONLY_SCRIPTS.has(filename)) {
         continue;
       }
 
@@ -4717,9 +4719,8 @@ export async function validatePkgReleaseBumps(commitDetails, CONFIG, fetchFileCo
 
       for (const file in fileChanges) {
         if (file === pkgRoot || file.startsWith(pkgRoot + '/')) {
-          // Ignore test files that serve only within CI/CD (e.g. test.sh, test-version.sh)
           const filename = file.split('/').pop();
-          if (filename === 'test.sh' || filename === 'test-version.sh') {
+          if (CI_ONLY_SCRIPTS.has(filename)) {
             continue;
           }
 
