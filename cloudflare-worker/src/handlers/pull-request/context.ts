@@ -50,8 +50,10 @@ export interface PullRequestContext {
   // this repository may well have written differently.
   configUnread: boolean;
   labelerUnread: boolean;
+  reviewRulesUnread: boolean;
   existingLabels: Set<string> | null;
   labelerText: string | null;
+  reviewRulesText: string | null;
   commits: CommitData[];
   commitsCount: number;
   commitScanCapped: boolean;
@@ -311,6 +313,7 @@ export async function loadPullRequestContext(
   // the wrong one for a config GitHub would not serve.
   const configUnread = Boolean(setup.configFailed);
   const labelerUnread = Boolean(setup.labelerFailed);
+  const reviewRulesUnread = Boolean(setup.rulesFailed);
   if (configUnread) {
     console.warn(`Repository config .github/formalities.json in ${repoFullname} could not be read, so every check below ran with its default setting: the checks that read it report themselves unchecked rather than passing or failing on settings this repository may not have.`);
   }
@@ -456,8 +459,10 @@ export async function loadPullRequestContext(
       configPartial,
       configUnread,
       labelerUnread,
+      reviewRulesUnread,
       existingLabels: setup.labels,
       labelerText: setup.labelerText,
+      reviewRulesText: setup.rulesText,
       commits,
       commitsCount,
       commitScanCapped,

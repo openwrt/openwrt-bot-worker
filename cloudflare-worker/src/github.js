@@ -1,3 +1,5 @@
+import { REVIEW_RULES_PATH } from './core/review-rules.ts';
+
 // --- GITHUB API HELPER ---
 // `options.onAttempt` is invoked immediately before every outgoing fetch,
 // retries included, with the attempt number. Cloudflare counts each of those
@@ -347,14 +349,15 @@ export async function graphqlFetchRepoLabels(token, repoFullname, onCall) {
 
 // --- GRAPHQL PR SETUP FETCH ---
 // Everything a pull_request event needs before validation starts, in one
-// round trip: the repository's labels, .github/formalities.json and
-// .github/labeler.yml, and - when a pull request number is given - that pull
-// request's commits and issue comments. The commits come back in the shape
+// round trip: the repository's labels, .github/formalities.json,
+// .github/labeler.yml and .github/llm-review-rules.md, and - when a pull
+// request number is given - that pull request's commits and issue comments.
+// The commits come back in the shape
 // the REST commits listing delivered (see restCommitFromGraphql), so the
 // checks that consume them did not have to learn a second vocabulary.
 //
 // Returns { labels, configText, configFailed, labelerText, labelerFailed,
-// commits, commitsTotal, comments }.
+// rulesText, rulesFailed, commits, commitsTotal, comments }.
 // A missing file yields null text (callers fall back to their defaults, like
 // the REST 404 used to), and `configFailed`/`labelerFailed` tell that absence
 // apart from a file a partial GraphQL error took away: only an unmarked null
@@ -446,14 +449,15 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   const name = repoFullname.slice(slashIndex + 1);
   const withPr = Number.isInteger(prNumber);
 
-  const query = `query($owner: String!, $name: String!, $cfgExpr: String!, $labExpr: String!${withPr ? ', $pr: Int!' : ''}) {
+  const query = `query($owner: String!, $name: String!, $cfgExpr: String!, $labExpr: String!, $rulesExpr: String!${withPr ? ', $pr: Int!' : ''}) {
   repository(owner: $owner, name: $name) {
     labels(first: 100) {
       nodes { name }
       pageInfo { hasNextPage endCursor }
     }
     cfg: object(expression: $cfgExpr) { ... on Blob { text } }
-    labeler: object(expression: $labExpr) { ... on Blob { text } }${withPr ? `
+    labeler: object(expression: $labExpr) { ... on Blob { text } }
+    rules: object(expression: $rulesExpr) { ... on Blob { text } }${withPr ? `
     pullRequest(number: $pr) {
       commits(first: 100) {
         totalCount
@@ -477,7 +481,7 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   }
 }`;
 
-  const variables = { owner, name, cfgExpr: `${ref}:${configPath}`, labExpr: `${ref}:${labelerPath}` };
+  const variables = { owner, name, cfgExpr: `${ref}:${configPath}`, labExpr: `${ref}:${labelerPath}`, rulesExpr: `${ref}:${REVIEW_RULES_PATH}` };
   if (withPr) variables.pr = prNumber;
   const res = await githubApiCall(GRAPHQL_URL, token, 'POST', { query, variables },
     'application/vnd.github+json', { onAttempt: onCall });
@@ -511,6 +515,7 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   const fieldLost = (alias) => failedFields.has('*') || failedFields.has('repository') || failedFields.has(`repository.${alias}`);
   const configText = typeof repo.cfg?.text === 'string' ? repo.cfg.text : null;
   const labelerText = typeof repo.labeler?.text === 'string' ? repo.labeler.text : null;
+  const rulesText = typeof repo.rules?.text === 'string' ? repo.rules.text : null;
 
   const setup = {
     labels,
@@ -518,6 +523,8 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
     configFailed: configText === null && fieldLost('cfg'),
     labelerText,
     labelerFailed: labelerText === null && fieldLost('labeler'),
+    rulesText,
+    rulesFailed: rulesText === null && fieldLost('rules'),
     commits: null,
     commitsTotal: 0,
     commitsPagingCapped: false,
@@ -525,7 +532,7 @@ export async function graphqlFetchRepoSetup(token, repoFullname, ref, configPath
   };
   // Logged here rather than with the partial errors below, because the
   // no-pull-request path returns before those are ever looked at.
-  const lost = [setup.configFailed && configPath, setup.labelerFailed && labelerPath].filter(Boolean);
+  const lost = [setup.configFailed && configPath, setup.labelerFailed && labelerPath, setup.rulesFailed && REVIEW_RULES_PATH].filter(Boolean);
   if (lost.length > 0) {
     console.warn(`GraphQL repository setup for ${repoFullname} lost ${lost.join(' and ')} to a partial error: reported as unread, not as absent`);
   }

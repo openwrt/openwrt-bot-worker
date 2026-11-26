@@ -40,6 +40,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 *   **Makefile style**: a space after `:=` (`check_space_after_assignment`), `=` where `:=` belongs (`check_missing_colon`), wrong indentation (`check_makefile_indentation`) and `$(PKG_NAME)` in a `define`, `call` or `eval` (`check_pkg_name_reuse`).
 *   **Dead package variables**: a per-package variable such as `TITLE` or `DEPENDS` set at the top level, where the build system ignores it.
 *   **Buildbot default** (`check_buildbot_default`, warning): a feed package that adds itself to buildbot images through `DEFAULT`. Not checked in openwrt/openwrt.
+*   **Repository rules**: an added line that breaks a rule the repository wrote into `.github/llm-review-rules.md` (see [repository rules](review-rules.md)).
 
 ## Code Patches
 

@@ -17,6 +17,7 @@ The bot also labels pull requests that add or drop a package or target a release
 *   [docs/checks.md](docs/checks.md) lists every rule, the labels and the maintainer overrides.
 *   [docs/configuration.md](docs/configuration.md) lists every key of `.github/formalities.json`.
 *   [docs/issue-labeller.md](docs/issue-labeller.md) describes `.github/issue-labeller.yml`.
+*   [docs/review-rules.md](docs/review-rules.md) describes the rules a repository adds to `.github/llm-review-rules.md`.
 *   [docs/deployment.md](docs/deployment.md) sets up the GitHub App, the Worker and the deployment pipeline.
 
 ## Development
