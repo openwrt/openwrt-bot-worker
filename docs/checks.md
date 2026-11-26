@@ -38,6 +38,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 *   **Source pin** (`check_pkg_source_pin`, warning): a `PKG_SOURCE_DATE` that is not a `YYYY-MM-DD` date, and a `PKG_SOURCE_VERSION` that is a branch name or an abbreviated hash.
 *   **DTS checklist** (`check_dts_checklist`, warning): an added device tree without an SPDX header, with a redundant `default-state = "off"` on a GPIO LED or with the old `label = "color:function"` LED naming.
 *   **Makefile style**: a space after `:=` (`check_space_after_assignment`), `=` where `:=` belongs (`check_missing_colon`), wrong indentation (`check_makefile_indentation`) and `$(PKG_NAME)` in a `define`, `call` or `eval` (`check_pkg_name_reuse`).
+*   **Source archive name**: a `PKG_SOURCE` that starts with the version, such as `$(PKG_VERSION).tar.gz`. The archive is saved under that name in `dl/` and on the download mirror, so it needs the package name.
 *   **Dead package variables**: a per-package variable such as `TITLE` or `DEPENDS` set at the top level, where the build system ignores it.
 *   **Buildbot default** (`check_buildbot_default`, warning): a feed package that adds itself to buildbot images through `DEFAULT`. Not checked in openwrt/openwrt.
 
