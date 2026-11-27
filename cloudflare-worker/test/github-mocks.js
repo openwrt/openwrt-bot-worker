@@ -108,7 +108,7 @@ export function graphqlLabelsHandler(url, options, labelNames = []) {
     }), { status: 200 });
   }
 
-  // Fused repo-setup query: resolve the two file expressions through the
+  // Fused repo-setup query: resolve the file expressions through the
   // surrounding fetch mock's REST branches, and - when the query asks for the
   // pull request - its commits and comments through the REST listings the
   // mocks already declare, reshaped the way GraphQL returns them (the
@@ -127,11 +127,12 @@ export function graphqlLabelsHandler(url, options, labelNames = []) {
       if (res.status !== 200) return null;
       return { text: await res.text() };
     };
-    const [cfg, labeler] = await Promise.all([
+    const [cfg, labeler, rules] = await Promise.all([
       fetchExpr(body.variables.cfgExpr),
-      fetchExpr(body.variables.labExpr)
+      fetchExpr(body.variables.labExpr),
+      body.variables.rulesExpr ? fetchExpr(body.variables.rulesExpr) : null
     ]);
-    const repository = { labels: labelsPayload, cfg, labeler };
+    const repository = { labels: labelsPayload, cfg, labeler, rules };
 
     if (body.query.includes('pullRequest(number:')) {
       const pr = body.variables.pr;

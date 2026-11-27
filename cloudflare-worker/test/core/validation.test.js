@@ -1675,6 +1675,43 @@ describe('an input the run could not read', () => {
     assert.strictEqual(report.patchesConclusion, 'success');
   });
 
+  const DOCS_RULE = '```formality-rule\nfiles: docs/**\nadded: a line\nmessage: Write a real sentence.\n```\n';
+
+  test('reports a repository rule in the makefile details and the comment, without failing', async () => {
+    const ctx = ctxFor({ reviewRulesText: DOCS_RULE });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.match(outcome.makefileOutputText, /#### Repository Rules:\n  ⚠️ Warning: Write a real sentence\. Found in \[docs\/dropbear\.md:2\]/);
+    assert.ok(outcome.allPrWarnings.some(w => w.startsWith('**Repository Rules**:\n- ⚠️ Write a real sentence.')));
+    assert.strictEqual(outcome.makefileReportedFinding, true);
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).makefileConclusion, 'success');
+  });
+
+  test('fails the makefile check on an error-level rule', async () => {
+    const ctx = ctxFor({ reviewRulesText: DOCS_RULE.replace('message:', 'level: error\nmessage:') });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.ok(outcome.allMakefileErrors.some(e => e.startsWith('**Repository Rules**:')));
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).makefileConclusion, 'failure');
+  });
+
+  test('names a broken rule in the details only', async () => {
+    const ctx = ctxFor({ reviewRulesText: '```formality-rule\nfiles: docs/**\n```\n' });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.match(outcome.makefileOutputText, /The rule at line 1 of `\.github\/llm-review-rules\.md` was not checked: it names no added text, it needs exactly one message\./);
+    assert.ok(!outcome.allPrWarnings.some(w => w.includes('Repository Rules')));
+  });
+
+  test('leaves the makefile check incomplete when the rules could not be read', async () => {
+    const ctx = ctxFor({ reviewRulesUnread: true });
+    const outcome = await runValidations(ctx, patchesResult);
+
+    assert.strictEqual(outcome.makefileChecksIncomplete, true);
+    assert.match(outcome.makefileOutputText, /`\.github\/llm-review-rules\.md` could not be read, so its rules were not checked\./);
+    assert.strictEqual(aggregateReport(ctx, patchesResult, outcome).makefileConclusion, 'neutral');
+  });
+
   test('unreadable labeler rules are reported without moving any conclusion', async () => {
     const ctx = ctxFor({ labelerUnread: true, config: { ...DEFAULT_CONFIG, enable_labeler_yml: true } });
     const outcome = await runValidations(ctx, patchesResult);
@@ -2514,5 +2551,74 @@ describe('the subject prefix against what the commit changes', () => {
     assert.ok(!none.allPrWarnings.some(w => FINDING.test(w)), none.allPrWarnings.join('\n'));
     assert.strictEqual(none.allPrWarnings.filter(w => UNSPLIT.test(w)).length, 3, none.allPrWarnings.join('\n'));
     assert.strictEqual(none.formalityChecksIncomplete, true);
+  });
+});
+
+describe('repository rules in PR-wide mode', () => {
+  const loader = {
+    fetchFileContentCached: async () => null,
+    isFileMissing: () => false,
+    getRefSource: () => undefined,
+    hasRefSource: () => false,
+    setRefSource: () => {},
+    getBudgetSkipCount: () => 0,
+    getFetchFailureCount: () => 0,
+    getStats: () => ({ budgetSkipCount: 0, missingFilesCount: 0 })
+  };
+  const sha1 = '1'.repeat(40);
+  const sha2 = '2'.repeat(40);
+  const sha3 = '3'.repeat(40);
+  const RULES = (glob) => `\`\`\`formality-rule\nfiles: ${glob}\nadded: mediatek,mtd-eeprom\nmessage: Use an nvmem cell.\n\`\`\`\n`;
+  const DTS = 'target/linux/ramips/dts/mt7621_example.dts';
+  const part = (sha, subject) => `From ${sha} Mon Sep 17 00:00:00 2001
+From: Jane Doe <jane@example.com>
+Subject: [PATCH] ${subject}
+
+---
+diff --git a/${DTS} b/${DTS}
+--- a/${DTS}
++++ b/${DTS}
+@@ -1,1 +1,2 @@
+ / {
++	mediatek,mtd-eeprom = <&factory 0x8000>;
+`;
+  const commit = (sha, message, changedFiles) => ({
+    sha, parents: [{ sha: 'p' }], changed_files: changedFiles,
+    commit: { message, author: { name: 'Jane Doe', email: 'jane@example.com' }, committer: { name: 'Jane Doe', email: 'jane@example.com' } }
+  });
+  const run = async (rules, changedFiles = 1) => {
+    const commits = [
+      commit(sha1, 'ramips: add an example device\n\nSigned-off-by: Jane Doe <jane@example.com>', changedFiles),
+      commit(sha2, 'ramips: nothing\n\nSigned-off-by: Jane Doe <jane@example.com>', 0),
+      commit(sha3, `Revert "ramips: add an example device"\n\nThis reverts commit ${sha1}.\n\nSigned-off-by: Jane Doe <jane@example.com>`, 1)
+    ];
+    const prPatch = part(sha1, 'ramips: add an example device') +
+      `From ${sha2} Mon Sep 17 00:00:00 2001\nFrom: Jane Doe <jane@example.com>\nSubject: [PATCH] ramips: nothing\n\n---\n` +
+      part(sha3, 'Revert "ramips: add an example device"');
+    const ctx = {
+      prNumber: 42, prTitle: 'ramips: add an example device', baseBranch: 'main', headSha: sha3, baseSha: 'base123',
+      isBackportPr: false, repoFullname: 'openwrt/openwrt', config: { ...DEFAULT_CONFIG }, configError: null,
+      commitScanCapped: false, commitsCount: 3, commits, fileBatchLoader: loader, reviewRulesText: rules,
+      getCommentsScanWithRetry: async () => ({ hasBranchBypassComment: false, hasCherryPickBypassComment: false, existingCommentId: null, incomplete: false }),
+      isMaintainerUser: async () => false, isAuthorMaintainer: async () => false, branchCheckError: null, branchCheckOutputText: ''
+    };
+    const commitDetails = commits.map(c => ({ sha: c.sha, html_url: `https://github.com/openwrt/openwrt/commit/${c.sha}`, fullCommit: c, commitPatch: null, isVerbatim: false, upstreamPatch: null }));
+    return runValidations(ctx, { usePrWidePatch: true, prPatch, commitDetails, packageState: { isNewPackage: false, isDroppedPackage: false } });
+  };
+
+  test('links each hit to its commit and skips an empty commit and a revert', async () => {
+    const result = await run(RULES('target/linux/**/*.dts*'));
+    const section = result.makefileOutputText.split('#### Repository Rules:')[1] || '';
+    assert.ok(section.includes(`Found in [${DTS}:2](https://github.com/openwrt/openwrt/blob/${sha1}/`), section);
+    assert.doesNotMatch(section, new RegExp(sha3));
+    assert.doesNotMatch(result.makefileOutputText, /could not be read/);
+  });
+
+  test('reports a series it could not split only where a rule would have read it', async () => {
+    const covered = await run(RULES('target/linux/**/*.dts*'), 2);
+    assert.match(covered.makefileOutputText, /The repository rules were not checked against 1 commit whose diff could not be read\./);
+    assert.strictEqual(covered.makefileChecksIncomplete, true);
+    const elsewhere = await run(RULES('package/**'), 2);
+    assert.doesNotMatch(elsewhere.makefileOutputText, /Repository Rules/);
   });
 });

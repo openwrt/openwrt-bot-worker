@@ -41,6 +41,7 @@ GitHub lists at most 250 commits of a pull request. The check run says so when c
 *   **Source archive name**: a `PKG_SOURCE` that starts with the version, such as `$(PKG_VERSION).tar.gz`. The archive is saved under that name in `dl/` and on the download mirror, so it needs the package name.
 *   **Dead package variables**: a per-package variable such as `TITLE` or `DEPENDS` set at the top level, where the build system ignores it.
 *   **Buildbot default** (`check_buildbot_default`, warning): a feed package that adds itself to buildbot images through `DEFAULT`. Not checked in openwrt/openwrt.
+*   **Repository rules**: an added line that breaks a rule the repository wrote into `.github/llm-review-rules.md` (see [repository rules](review-rules.md)).
 
 ## Code Patches
 

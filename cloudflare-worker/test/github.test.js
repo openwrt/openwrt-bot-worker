@@ -426,6 +426,42 @@ describe('graphqlFetchRepoSetup', { concurrency: 1 }, () => {
     assert.strictEqual(setup.configFailed, false);
   });
 
+  test('reads the review rules in the same request, from the same ref', async () => {
+    let capturedVariables = null;
+    fetchMock = (url, options) => {
+      capturedVariables = JSON.parse(options.body).variables;
+      return setupResponse({
+        labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+        cfg: null,
+        labeler: null,
+        rules: { text: '# Rules\n' }
+      });
+    };
+
+    const setup = await graphqlFetchRepoSetup('token', 'openwrt/openwrt', 'openwrt-25.12', '.github/formalities.json', '.github/labeler.yml');
+    assert.strictEqual(capturedVariables.rulesExpr, 'openwrt-25.12:.github/llm-review-rules.md');
+    assert.strictEqual(setup.rulesText, '# Rules\n');
+    assert.strictEqual(setup.rulesFailed, false);
+  });
+
+  test('reports review rules lost to a partial error as unread rather than absent', async () => {
+    fetchMock = () => setupResponseWithErrors({
+      labels: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+      cfg: { text: '{}' },
+      labeler: null,
+      rules: null
+    }, [{ message: 'Something went wrong while executing your query.', path: ['repository', 'rules'] }]);
+
+    const { result: setup, warnings } = await quietWarnings(() => graphqlFetchRepoSetup(
+      'token', 'openwrt/openwrt', 'main', '.github/formalities.json', '.github/labeler.yml'
+    ));
+
+    assert.strictEqual(setup.rulesText, null);
+    assert.strictEqual(setup.rulesFailed, true);
+    assert.strictEqual(setup.configFailed, false);
+    assert.ok(warnings.some(w => w.includes('.github/llm-review-rules.md')));
+  });
+
   test('marks no file when the partial error happened somewhere else entirely', async () => {
     fetchMock = () => setupResponseWithErrors({
       labels: { nodes: [{ name: 'bug' }], pageInfo: { hasNextPage: false, endCursor: null } },

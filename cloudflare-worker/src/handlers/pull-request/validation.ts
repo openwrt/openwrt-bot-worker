@@ -11,6 +11,7 @@ import {
   validateUciConfigs,
   validateSubjectScope,
   createSubjectScopeBudget,
+  parseRevertCommit,
   groupReleaseErrors,
   getFastPkgRoot,
   isPatchRefreshFinding,
@@ -25,6 +26,7 @@ import {
   MBOX_ENVELOPE_PATTERN
 } from '../../core/patch-utils.ts';
 import { CHERRY_PICK_MARKER } from '../../core/policy.ts';
+import { parseReviewRules, validateReviewRules, reviewRulesCover, REVIEW_RULES_PATH } from '../../core/review-rules.ts';
 import { graphqlPathHistoryCounts, GITHUB_PR_COMMIT_LIMIT } from '../../github.js';
 import type { PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult, CommitDetail } from './patches.ts';
@@ -903,6 +905,53 @@ export async function runValidations(
     if (reportDts.errors.length > 0) {
       allMakefileErrors.push(`**Device Tree Checklist**:\n` + reportDts.errors.join("\n"));
       reportDts.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
+    }
+    makefileOutputText += "\n";
+  }
+
+  // A commit is held to the rules on the lines it adds, and a backport only
+  // on what it did not carry over. Its part of a whole pull request patch is
+  // found as for the subject scope check, and a series that cannot be split
+  // is a gap only where a rule would have read it.
+  const ruleSet = parseReviewRules(ctx.reviewRulesText);
+  const rulesCanApply = !usePrWidePatch || !prPatch || reviewRulesCover(ruleSet, changedFiles);
+  const reportRules = validateReviewRules(
+    rulesCanApply ? commitDetails.map((item: CommitDetail) => {
+      const commitPatch = usePrWidePatch
+        ? splitMap.get(item.sha) || (ctx.commits.length === 1 ? prPatch : null) || null
+        : item.commitPatch;
+      return {
+        sha: item.sha,
+        commitPatch,
+        upstreamPatch: isBackportPr ? item.upstreamPatch : null,
+        skip: (item.fullCommit?.parents?.length || 0) > 1 || item.isVerbatim ||
+          (config.allow_revert !== false && parseRevertCommit(item.fullCommit?.commit?.message || '') !== null) ||
+          (!commitPatch && item.fullCommit?.changed_files === 0)
+      };
+    }) : [],
+    ruleSet,
+    repoFullname,
+    baseBranch
+  );
+  if (ctx.reviewRulesUnread) {
+    reportRules.notices.push(`\`${REVIEW_RULES_PATH}\` could not be read, so its rules were not checked.`);
+    reportRules.incomplete = true;
+  }
+  if (reportRules.incomplete) makefileChecksIncomplete = true;
+  const rulesWarnings = [...reportRules.notices, ...reportRules.warnings];
+  if (reportRules.errors.length > 0 || findingInWarnings(reportRules)) makefileReportedFinding = true;
+  if (reportRules.successes.length > 0 || ruleSet.problems.length > 0 || reportRules.errors.length > 0 || rulesWarnings.length > 0) {
+    makefileOutputText += `#### Repository Rules:\n`;
+    reportRules.successes.forEach(s => { makefileOutputText += `  ${s}\n`; });
+    // A broken rule is the repository's to fix, so the comment leaves it out.
+    ruleSet.problems.forEach(p => { makefileOutputText += `  ⚠️ Warning: ${p}\n`; });
+    if (rulesWarnings.length > 0) {
+      allPrWarnings.push(`**Repository Rules**:\n` + rulesWarnings.map(w => `- ⚠️ ${w.replace(/^- /, '')}`).join("\n"));
+      rulesWarnings.forEach(w => { makefileOutputText += `  ⚠️ Warning: ${w.replace(/^- /, '')}\n`; });
+    }
+    if (reportRules.errors.length > 0) {
+      allMakefileErrors.push(`**Repository Rules**:\n` + reportRules.errors.join("\n"));
+      reportRules.errors.forEach(err => { makefileOutputText += `  ❌ ${err.replace(/^- /, '')}\n`; });
     }
     makefileOutputText += "\n";
   }
