@@ -1,6 +1,7 @@
 import { LABEL_GUIDELINES, LABEL_ADD_PACKAGE, LABEL_DROP_PACKAGE } from '../../config.js';
 import { parseYaml, getLabelsForChangedFiles, getAllChangedFiles } from '../../labeler.js';
 import { ensureLabelExists, DECLINED_ATTEMPT } from '../../github.js';
+import { TESTER_PING_LABEL } from '../tester-ping.ts';
 import { fetchLivePrState, type PullRequestContext } from './context.ts';
 import type { ResolvedPatchesResult } from './patches.ts';
 import type { AggregatedReport } from './report.ts';
@@ -43,6 +44,12 @@ export async function syncLabels(
       return res.code === 404 ? { code: 200 } : res;
     });
   };
+
+  // Maintainers add the tester ping label by hand, so it has to exist first.
+  // Only a listing that was read can say it is missing.
+  if (!branchMoved && existingLabels && !existingLabels.has(TESTER_PING_LABEL.toLowerCase())) {
+    labelsToEnsure.push({ name: TESTER_PING_LABEL, color: '0e8a16', description: 'Ready for testing, mentions the testers listed in CODEOWNERS' });
+  }
 
   if (!branchMoved && (action === 'synchronize' || action === 'reopened') && currentPrLabels.has('stale')) {
     enqueueRemove(spelledAsOnPr('stale'));

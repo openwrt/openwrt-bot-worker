@@ -111,6 +111,27 @@ describe('label-sync lifecycle phase and error handling', () => {
     assert.strictEqual(queue.statusWrites.every(w => w.code === 200), true);
   });
 
+  test('creates the tester ping label without adding it, only from a listing that was read', async () => {
+    const missing = new GitHubWriteQueue(42);
+    const ctx = createMockContext();
+    const added = [];
+    const answer = ctx.client.optionalApiCall;
+    ctx.client.optionalApiCall = async (url, method = 'GET', payload) => {
+      if (method === 'POST') added.push(...payload.labels);
+      return answer(url, method);
+    };
+    await syncLabels(ctx, createMockPatches(), createMockReport({ allPassed: true }), missing);
+    assert.ok(missing.queue.some(([what]) => what === 'ensure label "RFT"'));
+    await withLabelCreates(() => new Response(JSON.stringify({ id: 1 }), { status: 201 }), () => missing.execute());
+    assert.ok(added.length > 0 && !added.includes('RFT'), JSON.stringify(added));
+
+    for (const existingLabels of [new Set(['rft']), null]) {
+      const queue = new GitHubWriteQueue(42);
+      await syncLabels(createMockContext({ existingLabels }), createMockPatches(), createMockReport({ allPassed: true }), queue);
+      assert.ok(!queue.queue.some(([what]) => what === 'ensure label "RFT"'), String(existingLabels));
+    }
+  });
+
   test('returns 502 Bad Gateway when the label assignment fails in GitHubWriteQueue', async () => {
     const queue = new GitHubWriteQueue(42);
     // Simulating API failure (HTTP 500) during label addition
@@ -144,7 +165,7 @@ describe('label-sync lifecycle phase and error handling', () => {
     const budget = { limit: 45, used: 34, reserve: 15 };
     const client = createGitHubClient('fake-token', budget);
     const queue = new GitHubWriteQueue(42);
-    const ctx = createMockContext({ client });
+    const ctx = createMockContext({ client, existingLabels: new Set(['rft']) });
     const patches = createMockPatches();
     const report = createMockReport({ allPassed: false });
 

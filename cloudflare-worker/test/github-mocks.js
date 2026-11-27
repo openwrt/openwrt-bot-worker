@@ -227,3 +227,20 @@ export function graphqlCommentFromRest(c) {
     author: c.user ? { login: login.replace(/\[bot\]$/, ''), __typename: isBot ? 'Bot' : 'User' } : null
   };
 }
+
+export async function generateTestPrivateKeyPEM() {
+  const keyPair = await crypto.subtle.generateKey(
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256"
+    },
+    true,
+    ["sign", "verify"]
+  );
+
+  const exported = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+  const exportedB64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
+  return `-----BEGIN PRIVATE KEY-----\n${exportedB64}\n-----END PRIVATE KEY-----`;
+}

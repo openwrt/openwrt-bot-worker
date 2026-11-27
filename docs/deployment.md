@@ -12,7 +12,7 @@ Repository permissions:
 
 Event subscriptions:
 
-*   **Pull request**: opened, synchronized, reopened, and edited when the title, body or base branch changed.
+*   **Pull request**: opened, synchronized, reopened, labeled with `RFT`, and edited when the title, body or base branch changed.
 *   **Issue comment**: created, for the overrides and for re-running the checks.
 *   **Issues**: opened, reopened, and edited when the body changed, for the issue labeller.
 
